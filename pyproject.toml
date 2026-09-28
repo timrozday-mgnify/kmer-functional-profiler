@@ -11,7 +11,14 @@ dependencies = ["numpy", "typer"]
 kmer-functional-profiler = "kmer_functional_profiler.cli:app"
 
 [dependency-groups]
-dev = ["hypothesis", "maturin", "mypy", "pytest", "ruff"]
+dev = [
+  "hypothesis",
+  "maturin",
+  "mypy",
+  "pytest",
+  "pytest-benchmark>=5.3.0",
+  "ruff",
+]
 
 [build-system]
 requires = ["maturin>=1.15,<2"]
@@ -36,6 +43,7 @@ cache-keys = [
 [tool.ruff]
 target-version = "py311"
 src = ["python"]
+line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

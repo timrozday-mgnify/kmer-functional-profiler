@@ -1,0 +1,17 @@
+/// Errors from parameter validation and FASTX input.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("k = {k} is outside 1..={max} for this alphabet")]
+    InvalidK { k: usize, max: usize },
+    #[error("unknown alphabet {0:?} (expected protein, murphy10 or dayhoff)")]
+    UnknownAlphabet(String),
+    #[error("unsupported genetic code {0} (expected 11 or 4)")]
+    UnknownGeneticCode(u8),
+    #[error("unknown frame mode {0:?} (expected stopfree or all)")]
+    UnknownFrameMode(String),
+    #[error("mate files have different read counts")]
+    MateCountMismatch,
+    #[error(transparent)]
+    Fastx(#[from] needletail::errors::ParseError),
+}

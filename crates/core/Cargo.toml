@@ -9,3 +9,13 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+needletail = { version = "0.7.3", default-features = false, features = [
+  "flate2",
+  "zstd",
+] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.11.0"

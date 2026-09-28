@@ -12,6 +12,16 @@ uv sync                  # builds the Rust extension (release profile)
 uv run pytest
 cargo test --workspace
 prek install --hook-type pre-commit --hook-type pre-push
+uv run pytest tests/bench                        # throughput (phase 1 gate: >= 1 M reads/min/thread)
+uv run python scripts/make_fixtures.py           # regenerate tests/data
+uv run python scripts/fetch_mgnify_sample.py     # small MGnify sample into data/ (gitignored)
+```
+
+```python
+from kmer_functional_profiler import _core
+
+for batch in _core.FastxHits("r1.fq.gz", "r2.fq.gz", k=11, max_hash=_core.max_hash(1 / 1000)):
+    batch["read"], batch["mate"], batch["frame"], batch["hash"]  # numpy columns
 ```
 
 Python prototype in `python/`, Rust kernels in `crates/core` (no PyO3),
