@@ -63,7 +63,7 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--replicates` | `10` | Metagenomes (seeds 1..N) |
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
-| `--bootstrap` | `100` | Read-resampling replicates for 95% intervals on `coverage_zi` / `abundance_zi` (0: none) |
+| `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 

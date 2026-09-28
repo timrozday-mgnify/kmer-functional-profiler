@@ -23,7 +23,8 @@ from typing import Final
 
 import numpy as np
 import polars as pl
-from scipy.sparse import csr_array
+from scipy.sparse import coo_array, csr_array
+from scipy.sparse.csgraph import connected_components
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
@@ -271,56 +272,144 @@ def fit_present_prior(
     return max(mean * strength, 1.0), max((1 - mean) * strength, 1.0)
 
 
-def bootstrap_zi(
+MH_STEPS: Final = 5  # Metropolis steps on coverage per sweep
+PI_GRID: Final = (np.arange(512) + 0.5) / 512  # present-fraction grid for exact draws
+
+
+def _ztp_log_post(lam: np.ndarray, hits: np.ndarray, hit: np.ndarray) -> np.ndarray:
+    """Log posterior of coverage from ``hits`` over ``hit`` k-mers, zero-truncated Poisson."""
+    out: np.ndarray = hits * np.log(lam) - hit * (lam + np.log(-np.expm1(-lam))) - 0.01 * lam
+    return out
+
+
+def posterior_zi(
     hit_reads: pl.DataFrame,
     m_g: np.ndarray,
     pin_sum: np.ndarray,
-    replicates: int,
+    draws: int,
     *,
+    sweeps: int = 10,
     level: float = 0.95,
+    anticorrelation: float = 0.5,
     seed: int = 0,
 ) -> pl.DataFrame:
-    """Percentile intervals for ``coverage_zi`` and ``abundance_zi`` by resampling reads.
+    """Intervals and ambiguity groups for the zero-inflated model: resampled reads + Gibbs.
 
-    ``hit_reads`` has one row per (``unit``, ``hash``, ``read``) with ``n`` hits. Each
-    replicate weights every read (pair) by a Poisson(1) draw, rebuilds the k-mer counts and
-    refits zero-inflated :func:`em`. Reads, not k-mers, are resampled because one read hits
-    many neighbouring k-mers of the same unit, so k-mer counts are not independent. A unit
-    left without hits in a replicate gets 0 there. Returns ``unit`` and ``coverage_zi_lo``,
-    ``coverage_zi_hi``, ``abundance_zi_lo``, ``abundance_zi_hi`` at ``level``.
+    ``hit_reads`` has one row per (``unit``, ``hash``, ``read``) with ``n`` hits. Each of
+    ``draws`` replicates
+
+    1. reweights every read (pair) by a Poisson(1) draw and rebuilds the k-mer counts (one
+       read hits many neighbouring k-mers, so counts are not independent), and refits
+       zero-inflated :func:`em`: this carries the read-sampling uncertainty;
+    2. runs ``sweeps`` Gibbs sweeps from that fit on those counts and keeps the last state,
+       which adds the uncertainty of splitting shared k-mers between similar units. A sweep
+       splits each hit k-mer's count among its holders multinomially, in proportion to
+       coverage x present fraction (EM's shares, approximating the holders' joint presence);
+       updates coverage from the counts on the k-mers each unit was given, a zero-truncated
+       Poisson likelihood free of the present fraction (Metropolis on log coverage,
+       Gamma(1, 0.01) prior); and draws the present fraction exactly on a grid from hit
+       k-mers ~ Binomial(m, pi (1 - e^-lambda)), plus the present unhit k-mers for copies.
+
+    A unit given no hits in a draw is absent in it (coverage and abundance 0). Where units
+    cannot be told apart, their shared counts move between them across draws, so their
+    intervals widen. Units whose coverage draws are anti-correlated below
+    -``anticorrelation`` (only pairs sharing a hit k-mer are tested) are linked into
+    ambiguity groups; a group's total is usually far better determined than its members.
+    Returns per unit ``coverage_zi_lo``/``_hi``, ``abundance_zi_lo``/``_hi`` at ``level``,
+    and ``ambiguity_group`` (the group's smallest unit id; null when alone), ``group_size``
+    and the group totals ``group_coverage_zi_lo``/``_hi`` and ``group_abundance_zi_lo``/``_hi``.
     """
-    kmers = hit_reads.group_by("unit", "hash", maintain_order=True).agg("read", "n")
-    key = np.repeat(np.arange(kmers.height), kmers["read"].list.len().to_numpy())
-    reads, read_of = np.unique(
-        kmers["read"].explode(empty_as_null=False).to_numpy(), return_inverse=True
-    )
-    n = kmers["n"].explode(empty_as_null=False).to_numpy().astype(np.float64)
-    units = np.unique(kmers["unit"].to_numpy())
-    coverage = np.zeros((replicates, len(units)))
-    abundance = np.zeros_like(coverage)
     rng = np.random.default_rng(seed)
-    for b in range(replicates):
+    keyed = hit_reads.group_by("unit", "hash", maintain_order=True).agg("read", "n")
+    units, col = np.unique(keyed["unit"].to_numpy(), return_inverse=True)
+    hashes, row = np.unique(keyed["hash"].to_numpy(), return_inverse=True)
+    n_units, n_rows = len(units), len(hashes)
+    key_of_hit = np.repeat(np.arange(keyed.height), keyed["read"].list.len().to_numpy())
+    reads, read_of = np.unique(
+        keyed["read"].explode(empty_as_null=False).to_numpy(), return_inverse=True
+    )
+    n = keyed["n"].explode(empty_as_null=False).to_numpy().astype(np.int64)
+    # Entries sorted by k-mer, with their position within it, for sequential binomial splits.
+    order = np.argsort(row, kind="stable")
+    row_s, col_s = row[order], col[order]
+    starts = np.searchsorted(row_s, np.arange(n_rows))
+    position = np.arange(len(row_s)) - starts[row_s]
+    holders = np.bincount(row_s, minlength=n_rows)
+    m = m_g[units].astype(np.float64)
+    coverage = np.zeros((draws, n_units))
+    abundance = np.zeros_like(coverage)
+    for b in range(draws):
         weight = rng.poisson(1.0, len(reads))[read_of]
-        hits = np.bincount(key, weights=n * weight, minlength=kmers.height)
-        table = kmers.select("unit", "hash").with_columns(hits=hits).filter(pl.col("hits") > 0)
+        per_key = np.rint(np.bincount(key_of_hit, weights=n * weight, minlength=keyed.height))
+        table = keyed.select("unit", "hash").with_columns(hits=per_key).filter(pl.col("hits") > 0)
+        if table.height == 0:
+            continue
         fit = em(table, m_g, zero_inflated=True)
         at = np.searchsorted(units, fit["unit"].to_numpy())
-        lam, present = fit["coverage"].to_numpy(), fit["present"].to_numpy()
-        coverage[b, at] = lam
-        abundance[b, at] = lam * present * m_g[units[at]] / pin_sum[units[at]]
-    tails = [(1 - level) / 2, (1 + level) / 2]
-    (c_lo, c_hi), (a_lo, a_hi) = (
-        np.quantile(coverage, tails, axis=0),
-        np.quantile(abundance, tails, axis=0),
+        lam, pi = np.full(n_units, 1e-6), np.full(n_units, 1e-6)
+        lam[at] = np.maximum(fit["coverage"].to_numpy(), 1e-6)
+        pi[at] = np.clip(fit["present"].to_numpy(), 1e-6, 1 - 1e-6)
+        # Holders of a k-mer see the same reads, so any holder's count is the k-mer's.
+        count = np.zeros(n_rows, dtype=np.int64)
+        count[row] = per_key.astype(np.int64)
+        for _ in range(sweeps):
+            rate = (lam * pi)[col_s]
+            rest = np.bincount(row_s, weights=rate, minlength=n_rows)  # rate not yet visited
+            left = count.copy()
+            given = np.zeros(len(row_s), dtype=np.int64)
+            for j in range(int(holders.max(initial=0))):
+                here = position == j
+                r = row_s[here]
+                last = holders[r] == j + 1
+                share = np.where(last, 1.0, _div(rate[here], rest[r]))
+                given[here] = rng.binomial(left[r], np.clip(share, 0.0, 1.0))
+                left[r] -= given[here]
+                rest[r] -= rate[here]
+            hits = np.bincount(col_s, weights=given, minlength=n_units)
+            hit = np.bincount(col_s, weights=given > 0, minlength=n_units)  # k-mers given
+            alive = hit > 0
+            for _ in range(MH_STEPS):
+                step = rng.normal(0.0, 1.5 / np.sqrt(hits + 1))
+                new = lam * np.exp(step)
+                gain = _ztp_log_post(new, hits, hit) - _ztp_log_post(lam, hits, hit) + step
+                lam = np.where(alive & (np.log(rng.random(n_units)) < gain), new, lam)
+            seen = -np.expm1(-lam)
+            log_post = hit[:, None] * np.log(PI_GRID) + (m - hit)[:, None] * np.log1p(
+                -PI_GRID * seen[:, None]
+            )
+            cdf = np.cumsum(np.exp(log_post - log_post.max(axis=1, keepdims=True)), axis=1)
+            pick = (cdf < rng.random(n_units)[:, None] * cdf[:, -1:]).sum(axis=1)
+            pi = PI_GRID[np.minimum(pick, len(PI_GRID) - 1)]
+        unhit_odds = pi * (1 - seen) / (1 - pi * seen)
+        present = hit + rng.binomial(np.maximum(m - hit, 0).astype(np.int64), unhit_odds)
+        coverage[b] = np.where(alive, lam, 0.0)
+        abundance[b] = np.where(alive, lam * present / pin_sum[units], 0.0)
+
+    # Ambiguity groups: link holders of a shared k-mer whose coverage draws anti-correlate.
+    first = np.repeat(np.arange(len(row_s))[position == 0], holders[holders > 0] - 1)
+    others = np.flatnonzero(position > 0)
+    pairs = np.unique(np.stack([col_s[first], col_s[others]], axis=1), axis=0)
+    z = (coverage - coverage.mean(axis=0)) / np.maximum(coverage.std(axis=0), 1e-12)
+    rho = (z[:, pairs[:, 0]] * z[:, pairs[:, 1]]).mean(axis=0) if len(pairs) else np.empty(0)
+    linked = pairs[rho < -anticorrelation]
+    graph = coo_array(
+        (np.ones(len(linked)), (linked[:, 0], linked[:, 1])), shape=(n_units, n_units)
     )
-    return pl.DataFrame(
-        {
-            "unit": units.astype(np.uint32),
-            "coverage_zi_lo": c_lo,
-            "coverage_zi_hi": c_hi,
-            "abundance_zi_lo": a_lo,
-            "abundance_zi_hi": a_hi,
-        }
+    _, group = connected_components(graph, directed=False)
+    size = np.bincount(group)[group]
+    group_id = np.full(n_units, len(units), dtype=np.int64)
+    np.minimum.at(group_id, group, np.arange(n_units))  # smallest member index per group
+    group_unit = units[group_id[group]]
+    total = [np.stack([np.bincount(group, w, minlength=group.max() + 1) for w in x])[:, group]
+             for x in (coverage, abundance)]  # fmt: skip
+    tails = [(1 - level) / 2, (1 + level) / 2]
+    columns = {"unit": units.astype(np.uint32)}
+    for name, x in (("coverage_zi", coverage), ("abundance_zi", abundance),
+                    ("group_coverage_zi", total[0]), ("group_abundance_zi", total[1])):  # fmt: skip
+        columns[f"{name}_lo"], columns[f"{name}_hi"] = np.quantile(x, tails, axis=0)
+    return pl.DataFrame(columns).with_columns(
+        ambiguity_group=pl.when(pl.Series(size) > 1).then(pl.Series(group_unit.astype(np.uint32))),
+        group_size=pl.Series(size.astype(np.uint32)),
     )
 
 
@@ -332,7 +421,7 @@ def profile(
     genetic_code: int = 11,
     frames: str = "stopfree",
     batch_reads: int = 100_000,
-    bootstrap: int = 0,
+    draws: int = 0,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -352,8 +441,8 @@ def profile(
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
     gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
 
-    ``bootstrap`` > 0 adds 95% intervals for ``coverage_zi`` and ``abundance_zi`` from that
-    many read-resampling replicates (:func:`bootstrap_zi`).
+    ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
+    ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`).
     """
     params = IndexParams(**index.meta["params"])
 
@@ -450,8 +539,8 @@ def profile(
         .join(shrunk, on="unit", how="left")
         .join(weighted, on="unit", how="left")
     )
-    if bootstrap > 0:
-        intervals = bootstrap_zi(detected_reads, m_g, pin_sum.to_numpy(), bootstrap)
+    if draws > 0:
+        intervals = posterior_zi(detected_reads, m_g, pin_sum.to_numpy(), draws)
         result = result.join(intervals, on="unit", how="left")
     if dense is not None:
         result = result.join(
