@@ -264,7 +264,7 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
 | 2. Index prototype (built; gate needs a real subset) | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
-| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
+| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
 | 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
@@ -385,6 +385,44 @@ What each step did, and the choices, results and interpretations behind it, newe
   **Decided:** keep the dense tier as an option (default off) and measure it on real data before choosing a rate: `kfp_s100_d10` (tier 2 at 0.01, dense at 0.1) added to the fmh benchmark. Open: restrict the dense tier to non-singleton clusters, or to a rate that keeps it ≤ 1× tier 2 at MGnify scale; decide once the MGnify subset build reports `dense_bytes`.
 
 * **Fix (fmh benchmark):** `index_*/meta.json` (index sizes, incl. `dense_bytes`) was never published: Nextflow folds a file inside a declared directory output into that directory, which did not match the publish pattern. INDEX and IMPORT\_SKETCHES now copy `meta.json` out and publish it to `<outdir>/index_<name>/meta.json`.
+
+* **Phase 4, step 8 — *p\_in*-weighted presence (`em_pin`, `coverage_zip`, `present_zip`, experimental).** Zero-inflated EM with a per-k-mer presence probability from *p\_in(x)* (the plan's *z\_x* ~ Bernoulli(*π\_x*), *π\_x* informed by *p\_in*). The index stores per unit a histogram of kept k-mers over the 16 quantised *p\_in* levels (`pin_hist`, `pin_hist_dense`), so unhit k-mers are summed by level; the query now carries each hit's `pin_q` from tier 2 / the dense table. *p\_in* is the level midpoint, so no k-mer is certainly absent. Hit k-mers count as present by their share, as in `em`. Tests: all k-mers at one level reproduces zero-inflated EM; a k-mer shared between a unit where it is core and one where it is private goes mostly to the first.
+  - *First link, logistic:* presence = σ(α\_g + logit *p\_in*), α\_g fitted by a Newton step per iteration. Worse than plain ZI everywhere (5 seeds): dense Spearman 0.948 → 0.936, bias at 85% 0.91 → 0.82, sd 0.52 → 0.55. Divergence scales presence multiplicatively (each k-mer survives with probability ≈ identity^k whatever its *p\_in*), and a logit shift cannot do that: bringing core k-mers down drives low-*p\_in* ones to 0.
+  - *Adopted link, multiplicative:* presence = *s\_g*·*p\_in(x)* (*s\_g* = 1: the strain carries k-mers like a random member; < 1: divergent), capped so presence ≤ 1. Closed-form M-step: *s\_g* = expected present k-mers / Σ *p\_in*.
+
+  Simulation, 5 seeds, `gather_zi` → `gather_zip`:
+
+  | Config | Spearman | L1 | log-ratio sd | bias 85% |
+  | --- | --- | --- | --- | --- |
+  | dense | 0.948 → 0.947 | 0.228 → 0.229 | 0.517 → 0.411 | 0.91 → 0.88 |
+  | s10 | 0.919 → 0.918 | 0.213 → 0.209 | 0.653 → 0.481 | 0.89 → 0.84 |
+  | floor | 0.835 → 0.829 | 0.391 → 0.394 | 0.719 → 0.672 | 0.84 → 0.82 |
+  | floor + dense 1/50 | 0.891 → 0.892 | 0.325 → 0.315 | 0.715 → 0.496 | 0.90 → 0.86 |
+  | floor + dense 1/5 | 0.922 → 0.923 | 0.251 → 0.244 | 0.519 → 0.405 | 0.92 → 0.87 |
+  | floor + dense 1/1 | 0.940 → 0.940 | 0.231 → 0.227 | 0.443 → 0.348 | 0.93 → 0.89 |
+
+  *Interpretation.* *p\_in* tells the model which zeros are expected (private k-mers) and which are informative (core k-mers missed), so per-unit estimates scatter 20–30% less; ranks and L1 barely move, because they are dominated by the large depth range. The residual bias (≈ 4% at 85% identity) fits the simulation's cluster model, where presence given *p\_in* is not proportional to *p\_in*: members are star-like mutants of a centroid, so a k-mer at *p\_in* = 1/4 is almost never in the centroid, while the model expects it in a quarter of strains. Against the empirical-Bayes prior (step 6), it gives a similar precision gain at a quarter of the bias cost and does not break the floor index. **Decided:** not the default yet: `coverage_zip` joins the fmh benchmark, where KO units are unions over many species and *p\_in* is low for most k-mers, a very different regime. Adopt it if it holds there.
+
+* **Fix (fmh benchmark):** INDEX and IMPORT\_SKETCHES now take the package sources as an input, like PROFILE, so `-resume` rebuilds indexes when the build code changes; cached indexes without `pin_hist` made every PROFILE fail. Indexes from runs before this change are rebuilt once.
+
+* **Phase 4, step 9 — fmh benchmark with abundance (HPC, PR #13 code, 10 InSilicoSeq metagenomes).** Detection reproduced the phase-3 numbers exactly. Abundance against truth depth (Σ over the KO's genes of aligned bases / gene length), true positives, `kmers_unique` ≥ 1:
+
+  | Index | Abundance | Spearman | L1 |
+  | --- | --- | --- | --- |
+  | fmh\_compat | coverage (hits / *m\_g*) | 0.08 | 1.41 |
+  | fmh\_compat | ZI EM | 0.40 | 0.97 |
+  | kfp\_s100 | coverage | 0.32 | 1.35 |
+  | kfp\_s100 | EM / winner-take-all / uniqueness-first | 0.35 / 0.34 / 0.37 | 1.25 / 1.32 / 1.23 |
+  | kfp\_s100 | ZI EM | 0.58 | 0.94 |
+  | kfp\_s100 | ZI EM + prior | 0.53 | 0.98 |
+  | kfp\_s100\_d10 | ZI EM (dense tier 1/10) | 0.63 | 0.93 |
+
+  As in the simulation, zero-inflation is the largest gain and the three simple rules and plain EM are indistinguishable; the prior does not help. But the level is far below the simulation's 0.95. *Why:* a KO unit is the union of its genes from many species, and a sample holds several of them at different depths; truth sums depth over those copies, while ZI coverage is depth per present k-mer, about one copy's. Scaling by copies present (offline, from the profiles, with copies ≈ `present_zi` × `n_members`, valid when members share few k-mers as KO members do) gives Spearman **0.935** (kfp\_s100) and **0.964** (d10), log-ratio sd 0.63 and 0.45. Hits / *t\_g* / (k-mers per member), with no model at all, gives 0.92: most of the gap was the estimand, not the model.
+  **Decided:** profiles report `copies_zi` = present k-mers / `pin_sum` and `abundance_zi` = `coverage_zi` × `copies_zi`. `pin_sum` (`pin_sum_dense`) is Σ *p\_in* over a unit's kept k-mers, computed at build from unquantised *p\_in*: how many kept k-mers an average member holds, so present / `pin_sum` counts member-equivalents present. The 4-bit *p\_in* levels cannot give this for KOs (most KO k-mers have *p\_in* < 1/15). The two estimates answer different questions: `coverage_zi` is depth per copy and stays the per-cluster estimate for MGnify90 units (one strain each; the simulation shows `abundance_zi` there brings back the divergence bias, 0.16 at 85%, because a divergent strain looks like fewer copies); `abundance_zi` is total depth over copies, which is what the KO-unit benchmark measures. For the real tool, function-level abundance is Σ over clusters of `coverage_zi`, per the plan (EM at cluster level, then aggregate). The fmh benchmark now scores `abundance_zi` to confirm the exact form (needs a rerun; these indexes predate `pin_sum`).
+
+  *Dense tier cost on real data* (kfp\_s100\_d10 vs kfp\_s100): tables 1.09 GB vs 72 MB (15×; 7.9 B vs 5.2 B per posting), index build 36.5 GB vs 7.8 GB peak memory, query 2m16–2m46 vs 23 s and 5 GB vs 0.58 GB (the prototype materialises 8 B per key for lookup). For +0.05 Spearman (ZI) or +0.03 (copies-scaled), and a 30% lower log-ratio sd. **Decided:** the dense tier stays off by default; revisit after the Rust lookup (memory-mapped, no materialised keys) and with a rate or singleton restriction chosen from MGnify-subset `dense_bytes`.
+
+  *Also:* `em_pin` read quantised *p\_in* levels as (*l* + 0.5)/16, but the build quantises as round(15·*p\_in*); now *l*/15 with level 0 at 1/30. Simulation after the fix (`gather_zip` vs `gather_zi`): dense sd 0.52 → 0.42 as before, floor Spearman 0.835 → 0.806 (was 0.829). The `gut-lin10000` archive from the same HPC batch is the pre-fix phase-2 build (*t\_max* 0.57, 19.4 B per hash), already recorded under Phase 2.
 
 ## Libraries
 

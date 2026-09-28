@@ -19,5 +19,5 @@ def test_sim_benchmark(tmp_path: Path) -> None:
         capture_output=True,
     )  # fmt: skip
     summary = pl.read_csv(tmp_path / "summary.tsv", separator="\t")
-    assert summary.height == 6  # one row per rule
+    assert summary.height == 8  # one row per rule
     assert (summary["completeness"] > 0.5).all()

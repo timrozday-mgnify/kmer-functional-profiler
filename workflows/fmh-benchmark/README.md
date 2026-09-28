@@ -73,15 +73,20 @@ at 1 in 10 (`--t-dense 0.1`: detection unchanged, EM abundances fitted on 10x mo
 k-mers). `index_*/meta.json` in the output records each index's size (`dense_bytes` for the
 dense tier); `trace.tsv` records each PROFILE task's runtime.
 
+With `-resume`, INDEX, IMPORT_SKETCHES and PROFILE rerun when the Python package changes,
+and TRUTH and SCORE when `bench.py` does; Rust kernel changes need a fresh run.
+
 Abundance is scored per row (`abundance` column) with an estimate that goes with its count:
 `coverage` (hits per kept k-mer) with `kmers_hit`; `coverage_em` (EM over the units gather
 keeps), `coverage_zi` (zero-inflated EM: coverage of the k-mers present) and `coverage_zib`
-(zero-inflated with an empirical-Bayes prior on the present fraction) with `kmers_unique`; and the hits each one-pass rule assigns per kept k-mer with its count:
+(zero-inflated with an empirical-Bayes prior on the present fraction) and `coverage_zip`
+(zero-inflated with each k-mer's presence proportional to its in-KO frequency *p_in*) and
+`abundance_zi` (`coverage_zi` times the gene copies present) with `kmers_unique`; and the hits each one-pass rule assigns per kept k-mer with its count:
 `coverage_wta` with `kmers_wta` (each hit k-mer to the holding KO with the highest
 containment, as sylph) and `coverage_ufirst` with `kmers_ufirst` (to the holding KO with the
 highest Σ 1 / KOs-per-hit-k-mer, scaled by 1 / *t_g*). `spearman_tp` is the rank correlation with truth depth over true positives;
 `l1` is the L1 distance between relative abundances over all true and detected KOs (0 is
-exact, 2 is disjoint). Results for abundance and the two new rules are not in yet.
+exact, 2 is disjoint).
 
 ## Results (10 metagenomes, InSilicoSeq novaseq)
 
@@ -116,3 +121,19 @@ The floor helps at scaled 1000 but not at scaled 100, where nearly every KO alre
 samples more than 8 k-mers (`n_min 8` at `t_base 0.01` scored within 0.005 of `n_min 0`),
 so that configuration was dropped. Gather adds no measurable query time (10-15 s per
 sample either way).
+
+### Abundance (same run design, `kmers_unique` >= 1, true positives)
+
+| Index | Abundance | Spearman | L1 |
+| --- | --- | --- | --- |
+| fmh_compat | coverage | 0.08 | 1.41 |
+| kfp_s100 | coverage | 0.32 | 1.35 |
+| kfp_s100 | coverage_em | 0.35 | 1.25 |
+| kfp_s100 | coverage_zi | 0.58 | 0.94 |
+| kfp_s100_d10 | coverage_zi | 0.63 | 0.93 |
+
+Truth depth sums over each KO's gene copies in the sample, while `coverage_zi` is depth per
+copy, hence the low ceiling. Scaled by copies present (computed offline from these profiles),
+Spearman is 0.935 for kfp_s100 and 0.964 for kfp_s100_d10; profiles now report this as
+`abundance_zi`, to be confirmed by the next run. The dense tier costs 15x the table size,
+~6x the query time and 36.5 GB to build, for +0.03-0.05 Spearman.
