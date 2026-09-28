@@ -482,6 +482,8 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Removed:* `bootstrap_zi` and `--bootstrap` (`--draws` replaces them; the fmh benchmark's `params.bootstrap` is now `params.draws`). *fmh benchmark:* SCORE adds `fp_grouped` (share of false-positive KOs grouped with a true KO) and `group_cover` for `abundance_zi`; result pending on HPC. The copies model error found in step 12 is separate and not addressed here.
   - *Next:* model the holders' joint presence exactly in the split (most shared k-mers have two holders, so enumeration is cheap), and check whether twin coverage and grouping improve; tune the anti-correlation threshold on the twin simulation.
 
+* **Fix (fmh benchmark):** SUMMARY failed when a metric was empty in one sample's score file (e.g. `group_cover` when no ambiguity group formed): Polars reads an all-empty column as String and cannot stack it with Float64. Metrics are now cast to Float64 on read; a regression test stacks a file with an empty metric.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
