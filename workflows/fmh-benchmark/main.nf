@@ -129,6 +129,7 @@ process TRUTH {
     input:
     tuple val(seed), path(fna), path(genes), path(r1), path(r2)
     path kos
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
     tuple val(seed), path('truth.csv'), emit: truth
@@ -211,7 +212,7 @@ workflow {
 
     SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
-    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos)
+    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, file("${projectDir}/bench.py"))
 
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
     ch_query_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()

@@ -263,13 +263,106 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 0. Skeleton | Mixed repo (uv + maturin + Cargo workspace), CI, pre-commit, stub Python CLI. Fixtures, the parity job, coverage and `bench.yml` move to phase 1, when there are kernels to test. | Both | CI green on Linux and macOS arm64 for both languages. |
 | 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
 | 2. Index prototype (built; gate needs a real subset) | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
-| 3. Query + naive counts (query and compat mode built; benchmark next) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
-| 4. Model | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
+| 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
+| 4. Model (in progress: baselines, EM, zero-inflated EM adopted; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
 | 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
+
+## Progress log
+
+What each step did, and the choices, results and interpretations behind it, newest phase last. Add an entry with every step; keep superseded choices and say what replaced them.
+
+### Project-wide
+
+* **Decided:** MGnify90 clusters are the only grouping level; no 30% families.
+* **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
+* **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
+
+### Phase 1
+
+* **Decided (phase 1):** k-mer hash is the splitmix64 finalizer of the bit-packed k-mer (5/4/3 bits per residue for protein/Murphy-10/Dayhoff, so k ≤ 12/16/21), a bijection on u64; threshold rule is keep iff hash ≤ max\_hash, with max\_hash = ⌊*t*·2^64⌋ − 1. The sourmash hash is used only in `--sourmash-compat`.
+
+### Phase 2
+
+* **Decided (phase 2):** the build hashes members three times (distinct k-mers per unit; candidate hashes at *t\_max*; presence of candidates in every unit) so no dense k-mer table is held. *p\_in* is the unweighted fraction of full-length members (all members if a unit has none); sequence weights are deferred until over-sampled lineages are seen to skew it. Score = log2(max(*p\_in*, 0.5/*n*) / *n\_groups*), *n\_groups* counting the unit itself. *p\_in* is quantised to 4 bits in tier 2 (value = unit << 4 | *p\_in* level). Every candidate is kept (no score-based trimming beyond the promiscuity cut, default 64 groups); tier 1 is the top 4 by score per unit, mapped to component ids. Fingerprint layout: leading zero bits implicit, ⌈log2 keys⌉ bucket bits addressing an offsets array, 16 fingerprint bits stored; colliding keys share the union of their unit sets.
+* **Phase 2 subsets:** member sequences are spread over the whole 1 TB sequence file, so no real subset fits a laptop download; `workflows/mgnify-subset` extracts one on HPC (default: human gut, 1 in 1000 clusters).
+* **Phase 2 gate (gut, 1 in 10,000 clusters: 213,645 proteins, 24,117 clusters):** candidates matched Σ *t\_g*·*n\_kmers* (67,652 vs 67,493); shared k-mers link clusters with a common Pfam (562 of 574 labelled). Four problems, fixed on `index-fixes`:
+  1. *Query density.* 90% clusters have few distinct k-mers (median 114), so the floor applied to 8,136 of 8,141 non-singletons and *t\_max* reached 0.57. **Decided:** *t\_g* = max(*t\_base*, min(*t\_cap*, oversample·*n\_min*/*n\_kmers*)) with *t\_cap* = 0.2, so the query samples 20%; clusters with fewer than 40 distinct k-mers get fewer than *n\_min* (430 of 8,141 non-singletons, 4 with none). A 0.05 cap was tried first: 5% sampling but 3,322 clusters below the floor.
+  2. *Layout.* 19.4 B per hash, mostly one offsets bucket per key. Now ~4 keys per bucket and the smallest unsigned dtype per array: 7.7 B per hash on the subset (small unit ids; larger ids at full scale need wider values).
+  3. *Floor k-mers chosen by hash only.* 30% had *p\_in* = 0 (fragments only). **Decided:** floored clusters sample at 4× (`oversample`) and keep their *n\_min* best-scoring candidates; median *p\_in* rose from 0.13 to 0.87, *p\_in* = 0 fell to 1%.
+  4. *Adapter artefacts.* The most shared k-mers were six-frame translations of Illumina TruSeq/Nextera adapters and P5/P7 ends in MGnify proteins (4.1% of members). **Decided:** mask every 6-mer of those translations with X before hashing (shuffled-protein control: 0.08% hit). After masking no k-mer exceeded 64 clusters and the largest component fell from 59 to 6 clusters.
+
+  Rebuilt subset (*t\_cap* = 0.2): 66,337 postings (candidates 210,658 vs 210,940 expected), about 3.7×10⁹ for the full release, so roughly 30–45 GB depending on value widths at full scale.
+
+### Phase 3
+
+* **Decided (phase 3):** the query samples at *t\_max*, looks hashes up in tier 2 and counts a hit for a unit only if hash ≤ *t\_g* of that unit, which also drops most fingerprint false hits. Output per unit: hits, distinct k-mers hit, reads hit, containment (k-mers hit / *m\_g*) and coverage (hits / *m\_g*).
+* **Done (phase 3, compat):** `import-sourmash` loads protein signatures (e.g. fmh-funprofiler's KO sketches) as an index; queries on it hash reads with sourmash. On fmh-funprofiler's demo reads (k = 11, scaled = 1000) it reports the same 211 KOs with the same overlaps as `sourmash prefetch`, so the same abundances (fmh-funprofiler's abundance is `f_match_query` = overlap / query hashes, renormalised). Our containment is raw (overlap / *m\_g*); sourmash's `f_query_match` divides it by 1 − (1 − 1/scaled)^(*m\_g*·scaled).
+* **Benchmark data (phase 3 gate):** fmh-funprofiler's paper does not publish its simulated metagenomes. It publishes 64-genome-scale inputs to regenerate them with CAMISIM (Zenodo 10055954, CC-BY: KEGG genomes 9.1 GB, `protein_ref_db_giant.faa` 3.2 GB, `present_genes_and_koids.csv` 0.26 GB) and its mean metrics (sourmash k = 11: purity 0.98, completeness 0.61 at 0% error).
+* **Benchmark pipeline:** `workflows/fmh-benchmark` builds our KO indexes from the same KEGG proteins as the sketches, simulates metagenomes with InSilicoSeq (64 genomes, ~1 Gbp, lognormal abundances) instead of CAMISIM, derives KO truth by mapping reads back with minimap2 (a KO is present if a read overlaps one of its genes, the paper's rule) and scores purity and completeness for fmh-funprofiler (compat) and our indexes. Runs on HPC; results under Phase 3 below and in `workflows/fmh-benchmark/README.md`.
+* **Phase 3 gate: passed (10 InSilicoSeq novaseq metagenomes, 64 genomes, ~1 Gbp, k = 11).** Means over seeds 1..10, sd ≤ 0.015; full table in `workflows/fmh-benchmark/README.md`.
+
+  | Index | Count | min\_hits | Purity | Completeness | Low 25% |
+  | --- | --- | --- | --- | --- | --- |
+  | fmh\_compat (fmh-funprofiler, scaled 1000) | kmers\_hit | 1 | 0.975 | 0.688 | 0.295 |
+  | kfp\_s1000 (ours, same density) | kmers\_hit | 1 | 0.985 | 0.677 | 0.285 |
+  | kfp\_s1000\_floor8 | kmers\_hit | 1 | 0.976 | 0.719 | 0.404 |
+  | kfp\_s100 (*t\_base* 0.01) | kmers\_hit | 1 | 0.951 | 0.960 | 0.853 |
+  | **kfp\_s100** | **kmers\_unique** | **1** | **0.985** | **0.955** | **0.837** |
+
+  *Interpretation.* At equal density we match fmh-funprofiler (parity, as the gate requires); the floor adds 4 points of completeness and 11 on the least-covered quarter. The real gain is density: scaled 100 lifts completeness from 0.69 to 0.96. Its false positives were mostly modular PKS/NRPS KOs whose shared domains carry identical k-mers, so a hit on a shared k-mer is weak evidence.
+
+  **Decided:** add gather-style reassignment (`query.gather`: repeatedly take the unit with the most unassigned hit k-mers, scaled by 1/*t\_g*) as the phase-4 detection baseline; profiles report `kmers_unique` beside `kmers_hit`. Gather removes 70% of false positives (348 → 105 per sample) for 31 true KOs lost, and adds no measurable query time. Recommended setting: `kfp_s100`, `kmers_unique` ≥ 1. `min_hits` > 1 trades too much low-coverage completeness (0.49 at 2 on scaled 1000). The floor does not help at scaled 100 (within 0.005 of *n\_min* 0), so `kfp_s100_floor8` was dropped from the defaults.
+
+  *Caveats.* InSilicoSeq, not CAMISIM, so not directly comparable with the paper's 0.98 / 0.61; KO units from KEGG proteins, not MGnify90 clusters. The phase-2 gate on a real MGnify subset (index size at scale) is still open.
+
+### Phase 4
+
+* **Phase 4, step 1 — EM quantification (`query.em`).** On the units gather keeps, each hit k-mer's count is Poisson with mean Σ λ\_g over the units holding it, and every kept k-mer of a unit (*m\_g*, hit or not) counts in its expectation; the multiplicative EM update gives the MLE. Profiles gain `coverage_em` (0 for units gather drops). Choices: EM on k-mer counts, not read equivalence classes (see Assignment); all components in one sparse product, since they share no k-mers and so update independently (per-component parallelism only matters in the Rust port); stop at max relative change 10⁻⁶ or 1,000 iterations. Tests: a two-unit case against the closed-form MLE, and Σ λ\_g·*m\_g* = observed hits on the fixture reads.
+
+  *Not yet:* zero-inflation and *p\_in* weights, fingerprint false-hit background, uniqueness-first and winner-take-all baselines, dispersion flag, genome normalisation, dense tier 2. *Result pending:* abundance accuracy has not been benchmarked; the fmh benchmark scores detection only (truth has per-KO read and base counts to compare against).
+
+* **Phase 4, step 2 — abundance scoring in the fmh benchmark.** TRUTH adds per-KO `depth` = Σ over the KO's genes of aligned bases / gene length (read depth × copies, the quantity λ should track up to a constant). SCORE pairs each detection count with an abundance estimate: `coverage` (hits / *m\_g*) with `kmers_hit`, `coverage_em` with `kmers_unique`. On the detected KOs it reports `spearman_tp` (rank correlation with depth over true positives, so it measures quantification separately from detection) and `l1` (L1 between relative abundances over true ∪ detected KOs, so misses and false positives count). TRUTH now takes `bench.py` as an input, so `-resume` recomputes the truth tables (one minimap2 pass per sample). Checked on the test profile only; *result pending* on HPC.
+
+  *Expectation to test.* A KO unit is the union of k-mers of every KEGG gene with that KO, and a sample carries only a few of those genes, so λ = hits / *m\_g* is diluted by the share of the unit's k-mers the sample holds, which varies widely between KOs. Plain EM does not correct this; the zero-inflated model (λ from present k-mers, as in sylph) should. If `spearman_tp` is low for both estimates, that is the case for doing zero-inflation next.
+
+* **Phase 4, step 3 — winner-take-all and uniqueness-first baselines (`query.assign_best`).** With a fixed score per unit, both rules reduce to one pass: each hit k-mer goes to the holding unit with the highest score (ties to the lowest id). Gather differs only in that its scores fall as k-mers are taken.
+  - *Winner-take-all* (sylph): score = containment, k-mers hit / *m\_g*. One pass; sylph's recomputation of containment on the reassigned k-mers is not repeated.
+  - *Uniqueness-first*: score = Σ over the unit's hit k-mers of 1 / (units holding the k-mer), an IDF weight, divided by *t\_g* as this plan requires. The plan's Poisson test of unique hits against a false-hit background waits for that background model.
+
+  Profiles gain `kmers_wta`, `coverage_wta`, `kmers_ufirst`, `coverage_ufirst` (coverage = hits on the assigned k-mers / *m\_g*). The benchmark scores each count at every `min_hits` for detection and pairs it with its coverage for abundance, so all four rules (gather + EM, winner-take-all, uniqueness-first, none) run on the same hit table as planned. Tests: hand-worked cases where the two rules disagree (a fully contained small unit wins under winner-take-all, loses under uniqueness-first unless it is sampled more sparsely), and on fixture reads every hit k-mer and hit is assigned exactly once. *Result pending* on HPC.
+
+* **Phase 4, step 4 — simulated abundance benchmark (`workflows/sim-benchmark/sim.py`).** The fmh benchmark needs HPC, so a local simulation with exact truth guides model work between HPC runs (about 3 s per seed). 100 families from the MGnify sample, each with 3 paralogous units at 85–95% identity to the seed (shared k-mers), 4 members per unit at 97%; half the units present, each as one strain at 100/95/90/85% identity to its centroid with lognormal depth; random-codon CDSs, 150 bp single-end reads, 0.2% substitutions, 20% random decoy reads. Index configs: `dense` (*t\_base* 1), `s10` (0.1), `floor` (MGnify defaults). Metrics: unit purity and completeness; Spearman over true positives; L1 over units and over families (the Pfam-level view); sd of log(estimate / depth); `bias_<identity>` = median estimate / depth at that strain identity over the median at 100%.
+
+  ```bash
+  uv run python workflows/sim-benchmark/sim.py --seeds 5
+  ```
+
+* **Phase 4, step 5 — zero-inflated EM (`em(zero_inflated=True)`, `coverage_zi`, `present_zi`).** Each unit gets a present fraction π\_g beside λ\_g: only π\_g·*m\_g* of its kept k-mers occur in the sample, the rest are structural zeros. Hits are shared in proportion to λ·π; π\_g = (unit's share of hit k-mers) / (*m\_g*·(1 − e^−λ)), capped at 1. With no shared k-mers the fixed point is sylph's zero-truncated Poisson MLE; with no excess zeros it reduces to plain EM (both tested).
+
+  Simulation, 5 seeds (min\_hits 1):
+
+  | Config | Rule | Purity | Spearman | L1 | L1 family | log-ratio sd | bias 95% | bias 90% | bias 85% |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | dense | none (all hits) | 0.58 | 0.75 | 0.55 | 0.41 | 0.74 | 0.58 | 0.34 | 0.22 |
+  | dense | gather + EM | 0.91 | 0.79 | 0.50 | 0.41 | 0.78 | 0.56 | 0.30 | 0.16 |
+  | dense | winner-take-all | 0.90 | 0.76 | 0.52 | 0.41 | 0.84 | 0.55 | 0.28 | 0.14 |
+  | dense | uniqueness-first | 0.90 | 0.76 | 0.52 | 0.41 | 0.84 | 0.55 | 0.28 | 0.14 |
+  | **dense** | **gather + ZI EM** | 0.91 | **0.95** | **0.23** | **0.18** | **0.52** | **0.94** | **0.94** | **0.91** |
+  | s10 | gather + EM | 0.97 | 0.75 | 0.54 | 0.45 | 0.83 | 0.56 | 0.29 | 0.16 |
+  | s10 | gather + ZI EM | 0.97 | 0.92 | 0.21 | 0.17 | 0.65 | 0.95 | 0.98 | 0.89 |
+  | floor | gather + EM | 0.96 | 0.71 | 0.60 | 0.49 | 0.77 | 0.54 | 0.32 | 0.25 |
+  | floor | gather + ZI EM | 0.96 | 0.84 | 0.39 | 0.32 | 0.72 | 0.94 | 0.92 | 0.84 |
+
+  *Interpretation.* Divergence, not shared k-mers, dominates abundance error. Without zero-inflation, estimates fall roughly as identity^k (0.95^11 = 0.57, 0.90^11 = 0.31, 0.85^11 = 0.17), because a divergent strain carries only that share of its unit's k-mers; members' own variation dilutes further (median π ≈ 0.25 even at 100% identity). Zero-inflation removes the bias at every config. The three simple rules and plain EM differ little from each other (EM best by 0.03 Spearman); all gain purity over counting every hit (0.58 → 0.91 dense), and gather's detection is what does that. Residuals by depth (dense): median log-ratio within ±0.07 above depth 1 (−0.14 at ≤ 1), with sd 1.15 at depth ≤ 1, 0.45 at 1–3, 0.14 at 3–10, 0.09 above 10. With the floor index units have 2–4 hit k-mers and sd stays 0.25–1.0 at every depth. So the remaining error is thin data: low coverage, few k-mers.
+  **Decided:** `coverage_zi` is the recommended abundance estimate; gather stays the detection rule. `coverage_em`, `coverage_wta` and `coverage_ufirst` remain as baselines for the fmh benchmark.
+
+* **Phase 4, step 6 — empirical-Bayes prior on the present fraction (`fit_present_prior`, `coverage_zib`, experimental).** A Beta prior on π, matched by moments to units with λ ≥ 3 (where π is measured), with π updated by EM over unhit k-mers' presence. Result (5 seeds): dense log-ratio sd 0.52 → 0.42 and L1 0.23 → 0.21 at a small bias cost (85%: 0.91 → 0.88); s10 sd 0.65 → 0.46 but bias at 85% 0.89 → 0.76; floor worse everywhere (Spearman 0.84 → 0.74, bias at 85% 0.84 → 0.39), because with ~8 kept k-mers the prior outweighs the data and pulls divergent strains' π up, so λ down. **Decided:** not the default. It helps only where units have many k-mers, which is what the dense tier 2 will give, so revisit it there; `coverage_zib` stays in profiles so the HPC fmh run measures it on real data.
+
+  *Next, by this evidence:* (1) the fmh benchmark on HPC, to confirm ZI on real genomes (KO units are far larger unions than MGnify90 clusters, so π is smaller); (2) dense tier 2 for candidate units, since k-mer count per unit limits precision more than the model does; (3) *p\_in*-weighted presence (core k-mers more likely present); (4) confidence intervals, which low-coverage units need.
 
 ## Libraries
 
@@ -386,25 +479,8 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * **Shared k-mers and hierarchy.** EM at protein-cluster level, then aggregation to function, is likely better than EM directly on functions. Untested.
 * **Normalisation.** Which single-copy marker set, and whether to report per-genome copies by default.
 * **Frame filter at high GC.** Keeps \~3 frames at 70% GC; acceptable, but check false positives there specifically.
-* **Decided (phase 1):** k-mer hash is the splitmix64 finalizer of the bit-packed k-mer (5/4/3 bits per residue for protein/Murphy-10/Dayhoff, so k ≤ 12/16/21), a bijection on u64; threshold rule is keep iff hash ≤ max\_hash, with max\_hash = ⌊*t*·2^64⌋ − 1. The sourmash hash is used only in `--sourmash-compat`.
-* **Decided:** MGnify90 clusters are the only grouping level; no 30% families.
-* **Decided (phase 2):** the build hashes members three times (distinct k-mers per unit; candidate hashes at *t\_max*; presence of candidates in every unit) so no dense k-mer table is held. *p\_in* is the unweighted fraction of full-length members (all members if a unit has none); sequence weights are deferred until over-sampled lineages are seen to skew it. Score = log2(max(*p\_in*, 0.5/*n*) / *n\_groups*), *n\_groups* counting the unit itself. *p\_in* is quantised to 4 bits in tier 2 (value = unit << 4 | *p\_in* level). Every candidate is kept (no score-based trimming beyond the promiscuity cut, default 64 groups); tier 1 is the top 4 by score per unit, mapped to component ids. Fingerprint layout: leading zero bits implicit, ⌈log2 keys⌉ bucket bits addressing an offsets array, 16 fingerprint bits stored; colliding keys share the union of their unit sets.
-* **Decided (phase 3):** the query samples at *t\_max*, looks hashes up in tier 2 and counts a hit for a unit only if hash ≤ *t\_g* of that unit, which also drops most fingerprint false hits. Output per unit: hits, distinct k-mers hit, reads hit, containment (k-mers hit / *m\_g*) and coverage (hits / *m\_g*).
-* **Done (phase 3, compat):** `import-sourmash` loads protein signatures (e.g. fmh-funprofiler's KO sketches) as an index; queries on it hash reads with sourmash. On fmh-funprofiler's demo reads (k = 11, scaled = 1000) it reports the same 211 KOs with the same overlaps as `sourmash prefetch`, so the same abundances (fmh-funprofiler's abundance is `f_match_query` = overlap / query hashes, renormalised). Our containment is raw (overlap / *m\_g*); sourmash's `f_query_match` divides it by 1 − (1 − 1/scaled)^(*m\_g*·scaled).
-* **Benchmark data (phase 3 gate):** fmh-funprofiler's paper does not publish its simulated metagenomes. It publishes 64-genome-scale inputs to regenerate them with CAMISIM (Zenodo 10055954, CC-BY: KEGG genomes 9.1 GB, `protein_ref_db_giant.faa` 3.2 GB, `present_genes_and_koids.csv` 0.26 GB) and its mean metrics (sourmash k = 11: purity 0.98, completeness 0.61 at 0% error).
-* **Benchmark pipeline:** `workflows/fmh-benchmark` builds our KO indexes from the same KEGG proteins as the sketches, simulates metagenomes with InSilicoSeq (64 genomes, ~1 Gbp, lognormal abundances) instead of CAMISIM, derives KO truth by mapping reads back with minimap2 (a KO is present if a read overlaps one of its genes, the paper's rule) and scores purity and completeness for fmh-funprofiler (compat) and our indexes. Runs on HPC; results pending.
-* **Phase 2 gate (gut, 1 in 10,000 clusters: 213,645 proteins, 24,117 clusters):** candidates matched Σ *t\_g*·*n\_kmers* (67,652 vs 67,493); shared k-mers link clusters with a common Pfam (562 of 574 labelled). Four problems, fixed on `index-fixes`:
-  1. *Query density.* 90% clusters have few distinct k-mers (median 114), so the floor applied to 8,136 of 8,141 non-singletons and *t\_max* reached 0.57. **Decided:** *t\_g* = max(*t\_base*, min(*t\_cap*, oversample·*n\_min*/*n\_kmers*)) with *t\_cap* = 0.2, so the query samples 20%; clusters with fewer than 40 distinct k-mers get fewer than *n\_min* (430 of 8,141 non-singletons, 4 with none). A 0.05 cap was tried first: 5% sampling but 3,322 clusters below the floor.
-  2. *Layout.* 19.4 B per hash, mostly one offsets bucket per key. Now ~4 keys per bucket and the smallest unsigned dtype per array: 7.7 B per hash on the subset (small unit ids; larger ids at full scale need wider values).
-  3. *Floor k-mers chosen by hash only.* 30% had *p\_in* = 0 (fragments only). **Decided:** floored clusters sample at 4× (`oversample`) and keep their *n\_min* best-scoring candidates; median *p\_in* rose from 0.13 to 0.87, *p\_in* = 0 fell to 1%.
-  4. *Adapter artefacts.* The most shared k-mers were six-frame translations of Illumina TruSeq/Nextera adapters and P5/P7 ends in MGnify proteins (4.1% of members). **Decided:** mask every 6-mer of those translations with X before hashing (shuffled-protein control: 0.08% hit). After masking no k-mer exceeded 64 clusters and the largest component fell from 59 to 6 clusters.
-
-  Rebuilt subset (*t\_cap* = 0.2): 66,337 postings (candidates 210,658 vs 210,940 expected), about 3.7×10⁹ for the full release, so roughly 30–45 GB depending on value widths at full scale.
-* **Phase 2 subsets:** member sequences are spread over the whole 1 TB sequence file, so no real subset fits a laptop download; `workflows/mgnify-subset` extracts one on HPC (default: human gut, 1 in 1000 clusters).
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
-* **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
 * **Open:** whether KO/eggNOG labels are worth the annotation run, or Pfam suffices.
-* **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
 
 ## Sources
 
