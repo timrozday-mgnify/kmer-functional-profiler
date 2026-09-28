@@ -150,6 +150,7 @@ process PROFILE {
 
     input:
     tuple val(seed), path(r1), path(r2), val(name), path(index)
+    path code, stageAs: 'code/*'  // query sources: only here so -resume reruns on changes
 
     output:
     tuple val(seed), val(name), path('profile.tsv'), emit: profile
@@ -167,6 +168,7 @@ process SCORE {
 
     input:
     tuple val(seed), val(name), path(profile), path(truth)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
     path 'score.tsv', emit: score
@@ -211,7 +213,9 @@ workflow {
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
     TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos)
 
-    PROFILE(SIMULATE.out.reads.combine(ch_indexes))
-    SCORE(PROFILE.out.profile.combine(TRUTH.out.truth, by: 0))
+    // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
+    ch_query_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()
+    PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_query_code)
+    SCORE(PROFILE.out.profile.combine(TRUTH.out.truth, by: 0), file("${projectDir}/bench.py"))
     SUMMARY(SCORE.out.score.collect())
 }

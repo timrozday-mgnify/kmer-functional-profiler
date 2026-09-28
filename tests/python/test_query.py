@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 from typer.testing import CliRunner
@@ -9,7 +10,7 @@ from typer.testing import CliRunner
 from kmer_functional_profiler import _core, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import Index, IndexParams, build_index
-from kmer_functional_profiler.query import profile
+from kmer_functional_profiler.query import gather, profile
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 READS = (DATA / "reads_1.fastq.gz", DATA / "reads_2.fastq.gz")
@@ -51,6 +52,10 @@ def test_dense_counts_match_direct_intersection(members: Path) -> None:
             expected[unit] = (len(mine), len({h for h, _ in mine}), len({r for _, r in mine}))
     got = {row[0]: row[1:] for row in result.select("unit", "hits", "kmers_hit", "reads").rows()}
     assert got == expected
+    # Gather hands every distinct hit k-mer to exactly one unit.
+    all_kmers = set().union(*(reference.protein_kmers(s.encode(), K) for s in proteins().values()))
+    assert result["kmers_unique"].sum() == len(set(hashes) & all_kmers)
+    assert (result["kmers_unique"] <= result["kmers_hit"]).all()
     # Every source protein is found by its reads.
     assert len(got) == len(proteins())
 
@@ -65,6 +70,20 @@ def test_sampled_index_hits_respect_unit_thresholds(members: Path) -> None:
     assert (both["hits"] - both["hits_exact"]).sum() <= 2
     assert (result["kmers_hit"] <= result["m_g"]).all()
     assert result["containment"].is_between(0, 1).all()
+
+
+def test_gather_explains_away_shared_kmers() -> None:
+    kmers = pl.DataFrame(
+        {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64},
+    )
+    t_g = np.array([0.01, 0.01, 0.01, 0.01])
+    got = {u: (n, r) for u, n, r in gather(kmers, t_g).iter_rows()}
+    # 1 is a subset of 0: explained away. 2 keeps only hash 5; 3 shares nothing.
+    assert got == {0: (4, 0), 2: (1, 2), 3: (2, 1)}
+    # Sampled 10x more sparsely, unit 1's 2 k-mers stand for more than unit 0's 4.
+    got = {u: n for u, n, _ in gather(kmers, np.array([0.01, 0.001, 0.01, 0.01])).iter_rows()}
+    assert got == {1: 2, 0: 2, 2: 1, 3: 2}
 
 
 def test_cli_query(members: Path, tmp_path: Path) -> None:

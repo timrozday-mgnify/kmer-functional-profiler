@@ -8,11 +8,13 @@
   present if a primary alignment overlaps one of its genes, as in the paper's CAMISIM
   ground truth. Writes ``ko_id``, ``n_reads``, ``bases`` (overlapping aligned bases).
 - ``score``: purity and completeness of one profile against a truth table, one row per
-  ``--min-hits`` threshold.
-- ``summary``: mean and sd of the scores per index and threshold.
+  count (``kmers_hit``, and ``kmers_unique`` after gather when present) and ``--min-hits``
+  threshold.
+- ``summary``: mean and sd of the scores per index, count and threshold.
 """
 
 import argparse
+import itertools
 import random
 from collections.abc import Iterator
 from multiprocessing.pool import ThreadPool
@@ -152,8 +154,9 @@ def score(args: argparse.Namespace) -> None:
     truth = pl.read_csv(args.truth)
     profile = pl.read_csv(args.profile, separator="\t")
     rows = []
-    for min_hits in args.min_hits:
-        predicted = set(profile.filter(pl.col("kmers_hit") >= min_hits)["name"])
+    counts = [c for c in ("kmers_hit", "kmers_unique") if c in profile.columns]
+    for count, min_hits in itertools.product(counts, args.min_hits):
+        predicted = set(profile.filter(pl.col(count) >= min_hits)["name"])
         present = truth.with_columns(found=pl.col("ko_id").is_in(predicted))
         low = present.filter(pl.col("n_reads") <= pl.col("n_reads").quantile(0.25))
         tp = int(present["found"].sum())
@@ -161,6 +164,7 @@ def score(args: argparse.Namespace) -> None:
             {
                 "sample": args.sample,
                 "index": args.index,
+                "count": count,
                 "min_hits": min_hits,
                 "n_truth": truth.height,
                 "n_pred": len(predicted),
@@ -177,18 +181,18 @@ def score(args: argparse.Namespace) -> None:
 
 def summary(args: argparse.Namespace) -> None:
     scores = pl.concat([pl.read_csv(p, separator="\t") for p in args.scores])
-    metrics = [c for c in scores.columns if c not in ("sample", "index", "min_hits")]
+    metrics = [c for c in scores.columns if c not in ("sample", "index", "count", "min_hits")]
     (
-        scores.group_by("index", "min_hits")
+        scores.group_by("index", "count", "min_hits")
         .agg(
             pl.len().alias("n_samples"),
             pl.col(metrics).mean().name.suffix("_mean"),
             pl.col(metrics).std().name.suffix("_sd"),
         )
-        .sort("index", "min_hits")
+        .sort("index", "count", "min_hits")
         .write_csv(args.out, separator="\t")
     )
-    scores.sort("index", "min_hits", "sample").write_csv("scores.tsv", separator="\t")
+    scores.sort("index", "count", "min_hits", "sample").write_csv("scores.tsv", separator="\t")
 
 
 def main() -> None:
