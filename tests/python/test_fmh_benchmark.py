@@ -92,5 +92,10 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     zi = scores.filter(abundance="abundance_zi", min_hits=1).row(0, named=True)
     assert zi["ci_cover"] == 1.0
     assert zi["ci_width"] == pytest.approx(math.log(4))
-    run(tmp_path, "summary", "score.tsv")
-    assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [1] * 3
+    # A score file where a metric is empty (read as String) still stacks with the others.
+    empty = pl.read_csv(tmp_path / "score.tsv", separator="\t").with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("l1"), sample=pl.lit("t")
+    )
+    empty.write_csv(tmp_path / "score2.tsv", separator="\t")
+    run(tmp_path, "summary", "score.tsv", "score2.tsv")
+    assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [2] * 3

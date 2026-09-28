@@ -292,8 +292,18 @@ def score(args: argparse.Namespace) -> None:
 
 
 def summary(args: argparse.Namespace) -> None:
-    scores = pl.concat([pl.read_csv(p, separator="\t") for p in args.scores])
     keys = ["index", "count", "abundance", "min_hits"]
+    # A metric that is empty in one file (e.g. group_cover when no group formed) reads as
+    # String there; every metric is numeric, so cast before stacking.
+    scores = pl.concat(
+        [
+            pl.read_csv(p, separator="\t").with_columns(
+                pl.exclude("sample", *keys).cast(pl.Float64, strict=False)
+            )
+            for p in args.scores
+        ],
+        how="diagonal_relaxed",
+    )
     metrics = [c for c in scores.columns if c not in ("sample", *keys)]
     (
         scores.group_by(keys)
