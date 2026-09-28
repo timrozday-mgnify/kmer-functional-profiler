@@ -125,7 +125,8 @@ pub(crate) fn six_frames_into(
     }
 }
 
-/// Translates all six frames of `dna` (see [`six_frames_into`] for frame numbering).
+/// Translates all six frames of `dna`: frames 0–2 start at offsets 0–2 of `dna`, frames 3–5
+/// at offsets 0–2 of its reverse complement.
 pub fn six_frames(dna: &[u8], code: GeneticCode) -> [Vec<u8>; 6] {
     let mut frames = Default::default();
     six_frames_into(dna, code, &mut Vec::new(), &mut frames);
