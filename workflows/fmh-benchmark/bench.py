@@ -14,7 +14,7 @@
 import argparse
 import random
 from collections.abc import Iterator
-from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 import mappy
@@ -83,22 +83,26 @@ def sample(args: argparse.Namespace) -> None:
     Path("genomes.txt").write_text("\n".join(chosen) + "\n")
 
 
-_aligner: mappy.Aligner | None = None
+_BIN = 1000  # bp; overlap candidates are only compared within a shared bin
 
 
-def _init(fna: str) -> None:
-    global _aligner
-    _aligner = mappy.Aligner(fna, preset="sr")
-
-
-def _map(chunk: list[tuple[int, str, str]]) -> list[tuple[int, str, int, int]]:
-    assert _aligner is not None
+def _map(
+    aligner: mappy.Aligner, chunk: list[tuple[int, str, str]]
+) -> list[tuple[int, str, int, int]]:
+    buf = mappy.ThreadBuffer()
     return [
         (read, h.ctg, h.r_st, h.r_en)
         for read, s1, s2 in chunk
-        for h in _aligner.map(s1, s2)
+        for h in aligner.map(s1, s2, buf=buf)
         if h.is_primary
     ]
+
+
+def _binned(df: pl.DataFrame, start: str, end: str) -> pl.DataFrame:
+    """One row per ``_BIN``-sized window the [start, end) interval touches."""
+    return df.with_columns(
+        bin=pl.int_ranges(pl.col(start) // _BIN, (pl.col(end) - 1) // _BIN + 1)
+    ).explode("bin")
 
 
 def _pairs(r1: str, r2: str, size: int = 10_000) -> Iterator[list[tuple[int, str, str]]]:
@@ -115,15 +119,21 @@ def _pairs(r1: str, r2: str, size: int = 10_000) -> Iterator[list[tuple[int, str
 
 
 def truth(args: argparse.Namespace) -> None:
-    with Pool(args.threads, initializer=_init, initargs=(args.fna,)) as pool:
-        hits = [h for part in pool.imap(_map, _pairs(args.r1, args.r2)) for h in part]
+    # mappy releases the GIL while aligning, so threads share one index instead of one per process
+    aligner = mappy.Aligner(args.fna, preset="sr")
+    with ThreadPool(args.threads) as pool:
+        parts = pool.imap(lambda chunk: _map(aligner, chunk), _pairs(args.r1, args.r2))
+        hits = [h for part in parts for h in part]
     schema = {"read": pl.Int64, "contig": pl.String, "r_start": pl.Int64, "r_end": pl.Int64}
     aligned = pl.DataFrame(hits, schema=schema, orient="row")
-    overlaps = aligned.join_where(
-        pl.read_parquet(args.genes).rename({"contig": "gene_contig"}),
-        pl.col("contig") == pl.col("gene_contig"),
-        pl.col("r_start") < pl.col("end"),
-        pl.col("r_end") > pl.col("start"),
+    # join_where on contig + ranges is a contig hash join then a filter (reads x genes per
+    # contig, billions of rows on complete genomes); joining on (contig, bin) keeps it local
+    overlaps = (
+        _binned(aligned, "r_start", "r_end")
+        .join(_binned(pl.read_parquet(args.genes), "start", "end"), on=["contig", "bin"])
+        .filter(pl.col("r_start") < pl.col("end"), pl.col("r_end") > pl.col("start"))
+        .drop("bin")
+        .unique()
     )
     (
         overlaps.with_columns(
