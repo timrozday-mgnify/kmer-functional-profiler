@@ -18,6 +18,7 @@ from kmer_functional_profiler.query import (
     em_pin,
     fit_present_prior,
     gather,
+    posterior_zi,
     profile,
 )
 
@@ -126,12 +127,40 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     got = profile(index, *READS, draws=60)
     assert "coverage_zi_lo" not in plain.columns
     # intervals and groups change nothing else
-    assert got.drop("^.*_(lo|hi)$", "ambiguity_group", "group_size").equals(plain)
+    assert got.drop("^.*_(lo|hi)$", "ambiguity_group", "group_size", "own_evidence").equals(plain)
+    assert got["own_evidence"].drop_nulls().is_between(0, 1).all()
     found = got.filter(pl.col("coverage_zi") > 0)
     assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
     inside = found["coverage_zi"].is_between(found["coverage_zi_lo"], found["coverage_zi_hi"])
     assert inside.mean() >= 0.9  # type: ignore[operator]
     assert got.equals(profile(index, *READS, draws=60))  # seeded
+
+
+def test_shared_evidence_groups_lopsided_pair() -> None:
+    # Unit 0: 20 k-mers of its own and 3 shared with unit 1; unit 2 stands alone. 4 hits
+    # (one read each) per k-mer. Unit 1 lives mostly on the shared k-mers, which barely move
+    # unit 0's coverage, so the pair is lopsided.
+    def run(own_of_1: list[int]) -> tuple[dict[int, int | None], dict[int, float]]:
+        kmer_units = [(h, [0]) for h in range(20)] + [(h, [0, 1]) for h in (20, 21, 22)]
+        kmer_units += [(h, [1]) for h in own_of_1] + [(h, [2]) for h in range(30, 40)]
+        rows = [(u, h, h * 10 + r, 1) for h, us in kmer_units for u in us for r in range(4)]
+        rows = [x for x in rows if x[1] not in own_of_1 or x[2] % 10 == 0]  # 1 stray hit
+        schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
+        hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
+        got = posterior_zi(hit_reads, np.array([25, 5, 12]), np.array([25.0, 5.0, 12.0]), 30)
+        return (
+            dict(got.select("unit", "ambiguity_group").iter_rows()),
+            dict(got.select("unit", "own_evidence").iter_rows()),
+        )
+
+    # One k-mer of its own with a single stray hit (a typical false positive after gather):
+    # mostly shared evidence.
+    group, own = run([25])
+    assert group[0] == group[1] == 0 and group[2] is None
+    assert own[2] == 1 and 0.8 < own[0] < 1 and own[1] < 0.5
+    # None of its own: explained away in every draw, still grouped with unit 0.
+    group, own = run([])
+    assert group[0] == group[1] == 0 and group[2] is None
 
 
 def test_gather_explains_away_shared_kmers() -> None:
