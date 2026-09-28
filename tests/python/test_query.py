@@ -120,6 +120,19 @@ def test_copies_count_member_equivalents(tmp_path: Path) -> None:
     assert (result["abundance_zi"] == 2 * result["coverage_zi"]).all()
 
 
+def test_bootstrap_intervals_bracket_estimates(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    plain = profile(index, *READS)
+    got = profile(index, *READS, bootstrap=30)
+    assert "coverage_zi_lo" not in plain.columns
+    assert got.drop("^.*_(lo|hi)$").equals(plain)  # intervals change nothing else
+    found = got.filter(pl.col("coverage_zi") > 0)
+    assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
+    inside = found["coverage_zi"].is_between(found["coverage_zi_lo"], found["coverage_zi_hi"])
+    assert inside.mean() >= 0.9  # type: ignore[operator]
+    assert got.equals(profile(index, *READS, bootstrap=30))  # seeded
+
+
 def test_gather_explains_away_shared_kmers() -> None:
     kmers = pl.DataFrame(
         {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},

@@ -23,8 +23,9 @@ the true depth:
 - ``bias_<identity>``: median estimate / depth of true positives at that strain identity,
   over the median at 100%; 1 = divergence costs nothing.
 
-``index_mb`` is the size of the index's lookup tables. Writes ``scores.tsv`` (per seed) and
-``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds per seed.
+``index_mb`` is the size of the index's lookup tables. With ``--bootstrap`` B, the
+``gather_zi`` rows add interval calibration (:func:`calibration`). Writes ``scores.tsv`` (per
+seed) and ``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds per seed.
 """
 
 import argparse
@@ -166,6 +167,35 @@ def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> d
     }
 
 
+def calibration(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, float]:
+    """How often ``coverage_zi``'s bootstrap interval holds the true k-mer coverage.
+
+    Truth is read depth; k-mer coverage is depth times a constant (read length, k, errors),
+    taken as the median estimate / depth over well-covered strains at 100% identity.
+    ``ci_cover`` is over true positives, ``ci_cover_low`` over those at depth <= 2, and
+    ``ci_width`` the median log(hi / lo).
+    """
+    tp = truth.join(result.filter(pl.col("kmers_unique") >= 1), on="unit").filter(
+        pl.col("coverage_zi") > 0
+    )
+    scale = (
+        tp.filter(pl.col("identity") == 1.0, pl.col("depth") > 5)
+        .select((pl.col("coverage_zi") / pl.col("depth")).median())
+        .item()
+    )
+    held = tp.select(
+        low=pl.col("depth") <= 2,
+        inside=(pl.col("coverage_zi_lo") <= pl.col("depth") * scale)
+        & (pl.col("depth") * scale <= pl.col("coverage_zi_hi")),
+        width=(pl.col("coverage_zi_hi") / pl.col("coverage_zi_lo")).log(),
+    )
+    return {
+        "ci_cover": held["inside"].mean(),  # type: ignore[dict-item]
+        "ci_cover_low": held.filter("low")["inside"].mean(),  # type: ignore[dict-item]
+        "ci_width": held["width"].median(),  # type: ignore[dict-item]
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed-fasta", type=Path, default=SEEDS_FASTA)
@@ -176,6 +206,7 @@ def main() -> None:
     parser.add_argument("--error", type=float, default=0.002)
     parser.add_argument("--decoys", type=float, default=0.2)
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--bootstrap", type=int, default=0, help="replicates for intervals")
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
     parser.add_argument("--out", type=Path, default=Path("sim-results"))
     args = parser.parse_args()
@@ -193,12 +224,15 @@ def main() -> None:
         for seed in range(1, args.seeds + 1):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)
-            result = profile(index, reads).with_columns(unit=pl.col("cluster_rep").cast(pl.Int64))
+            result = profile(index, reads, bootstrap=args.bootstrap).with_columns(
+                unit=pl.col("cluster_rep").cast(pl.Int64)
+            )
             for rule, (count, abundance) in RULES.items():
                 found = result.filter(pl.col(count) >= 1).select("unit", estimate=abundance)
+                extra = calibration(truth, result) if args.bootstrap and rule == "gather_zi" else {}
                 rows.append({"config": config, "rule": rule, "seed": seed, "index_mb": index_mb,
-                             **score(truth, found, families)})  # fmt: skip
-    scores = pl.DataFrame(rows)
+                             **score(truth, found, families), **extra})  # fmt: skip
+    scores = pl.DataFrame(rows, infer_schema_length=None)
     scores.write_csv(args.out / "scores.tsv", separator="\t")
     summary = (
         scores.group_by("config", "rule", maintain_order=True)

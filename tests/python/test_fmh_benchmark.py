@@ -1,5 +1,6 @@
 """The fmh-benchmark steps on the mini fixture, with reads from known positions."""
 
+import math
 import random
 import subprocess
 import sys
@@ -72,12 +73,24 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     assert score["spearman_tp"] is None  # no abundance column in this profile
 
     # An exact abundance estimate scores perfectly.
-    exact = truth.select(name="ko_id", kmers_hit=pl.lit(1), coverage="depth")
+    exact = truth.select(
+        name="ko_id",
+        kmers_hit=pl.lit(1),
+        kmers_unique=pl.lit(1),
+        coverage="depth",
+        abundance_zi="depth",
+        abundance_zi_lo=pl.col("depth") / 2,
+        abundance_zi_hi=pl.col("depth") * 2,
+    )
     exact.write_csv(tmp_path / "p.tsv", separator="\t")
     run(tmp_path, "score", "--truth", "truth.csv", "--profile", "p.tsv", "--sample", "s",
         "--index", "i")  # fmt: skip
     score = pl.read_csv(tmp_path / "score.tsv", separator="\t").row(0, named=True)
     assert score["spearman_tp"] == pytest.approx(1.0)
     assert score["l1"] == pytest.approx(0.0)
+    scores = pl.read_csv(tmp_path / "score.tsv", separator="\t")
+    zi = scores.filter(abundance="abundance_zi", min_hits=1).row(0, named=True)
+    assert zi["ci_cover"] == 1.0
+    assert zi["ci_width"] == pytest.approx(math.log(4))
     run(tmp_path, "summary", "score.tsv")
-    assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [1]
+    assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [1] * 3
