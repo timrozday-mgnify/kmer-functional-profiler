@@ -7,7 +7,9 @@ true frames cover all six. ``truth.tsv`` records each read's source protein, tru
 frame and amino-acid span.
 
 ``mini_release/`` holds a few MGnify90 clusters in the release's Parquet schemas, for
-testing ``workflows/mgnify-subset`` without the real release.
+testing ``workflows/mgnify-subset`` without the real release. ``mini_fmh/`` mimics the
+fmh-funprofiler benchmark inputs (Zenodo 10055954) for ``workflows/fmh-benchmark``: three
+genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches.
 """
 
 import gzip
@@ -15,6 +17,8 @@ import random
 from pathlib import Path
 
 import polars as pl
+import sourmash
+from sourmash.signature import save_signatures_to_json
 
 from kmer_functional_profiler.reference import BASES, CODE_11, reverse_complement
 
@@ -153,6 +157,56 @@ def mini_release(rng: random.Random) -> None:
         frame.sort(schema[0]).write_parquet(out / f"{name}.parquet")
 
 
+def mini_fmh(rng: random.Random) -> None:
+    """Three one-contig genomes of 25 genes each on both strands, 12 KOs, 10% genes unlabelled."""
+    out = OUT / "mini_fmh"
+    genomes_dir = out / "genomes_extracted_from_kegg"
+    kos = [f"ko:K{i:05d}" for i in range(1, 13)]
+    ko_proteins: dict[str, list[str]] = {ko: [] for ko in kos}
+    faa, ko_rows = [], []
+    for g in ("gaa", "gbb", "gcc"):
+        contig, genome, rows = f"CP{rng.randrange(10**6):06d}.1", [], []
+        for i in range(25):
+            genome.append("".join(rng.choices("ACGT", k=rng.randint(50, 300))))
+            protein = "M" + "".join(rng.choices(AMINO_ACIDS, k=rng.randint(100, 300)))
+            cds = "".join(rng.choice(SYNONYMS[aa]) for aa in protein) + rng.choice(SYNONYMS["*"])
+            strand = rng.choice("+-")
+            start = sum(map(len, genome)) + 1
+            genome.append(cds if strand == "+" else reverse_complement(cds.encode()).decode())
+            gene = f"{g}:G{i:04d}"
+            rows.append((g, f"{g}_{contig}", gene, gene, contig, start, start + len(cds) - 1,
+                         strand, protein, cds))  # fmt: skip
+            faa.append(f">{gene}|{gene}|{g}_{contig}|{contig}|{i}|{len(protein)}\n{protein}\n")
+            if rng.random() < 0.9:
+                ko = rng.choice(kos)
+                ko_rows.append((gene, ko))
+                ko_proteins[ko].append(protein)
+        (genomes_dir / g).mkdir(parents=True, exist_ok=True)
+        seq = "".join(genome) + "".join(rng.choices("ACGT", k=300))
+        lines = "\n".join(seq[i : i + 80] for i in range(0, len(seq), 80))
+        (genomes_dir / g / f"{g}.fasta").write_text(f"> {contig} Mini genome {g}\n{lines}\n")
+        pl.DataFrame(
+            rows,
+            schema=["genome_name", "assembly_id", "gene_name", "protein_id", "contig_id",
+                    "start_position", "end_position", "strand", "aa_sequence", "nt_sequence"],
+            orient="row",
+        ).with_row_index("").write_csv(genomes_dir / g / f"{g}_mapping.csv")  # fmt: skip
+    (out / "protein_ref_db_giant.faa").write_text("".join(faa))
+    pl.DataFrame(ko_rows, schema=["gene_id", "ko_id"], orient="row").with_row_index("").write_csv(
+        out / "present_genes_and_koids.csv"
+    )
+    sigs = []
+    for ko, proteins in ko_proteins.items():
+        mh = sourmash.MinHash(n=0, ksize=11, is_protein=True, scaled=10, track_abundance=True)
+        for protein in proteins:
+            mh.add_protein(protein)
+        sigs.append(sourmash.SourmashSignature(mh, name=ko))
+    with (out / "KOs_mini.sig").open("w") as f:
+        save_signatures_to_json(sigs, f)
+        f.write("\n")
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
+    mini_fmh(random.Random(20260930))
