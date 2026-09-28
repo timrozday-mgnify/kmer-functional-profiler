@@ -33,9 +33,10 @@ from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedT
 def unit_hits(
     table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray, reads: np.ndarray
 ) -> pl.DataFrame:
-    """Expand sampled query hashes to (unit, hash, read) hits through ``table``.
+    """Expand sampled query hashes to (unit, hash, read, pin_q) hits through ``table``.
 
-    A hit counts for a unit only if the hash passes that unit's ``max_hash_g``.
+    A hit counts for a unit only if the hash passes that unit's ``max_hash_g``; ``pin_q`` is
+    the k-mer's quantised ``p_in`` in that unit.
     """
     set_ids = table.lookup(hashes)
     found = set_ids >= 0
@@ -46,9 +47,12 @@ def unit_hits(
     within = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
     values = table.set_values[np.repeat(starts, lengths) + within]
     units = (values >> np.uint64(PIN_BITS)).astype(np.uint32)
+    pin_q = (values & np.uint64(2**PIN_BITS - 1)).astype(np.uint8)
     hashes, reads = np.repeat(hashes, lengths), np.repeat(reads, lengths)
     keep = hashes <= max_hash_g[units]
-    return pl.DataFrame({"unit": units[keep], "hash": hashes[keep], "read": reads[keep]})
+    return pl.DataFrame(
+        {"unit": units[keep], "hash": hashes[keep], "read": reads[keep], "pin_q": pin_q[keep]}
+    )
 
 
 def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> pl.DataFrame:
@@ -187,6 +191,64 @@ def em(
     )
 
 
+PIN_P: Final = (np.arange(2**PIN_BITS) + 0.5) / 2**PIN_BITS  # midpoint of each p_in level
+
+
+def em_pin(
+    kmers: pl.DataFrame, pin_hist: np.ndarray, *, tol: float = 1e-6, max_iter: int = 1000
+) -> pl.DataFrame:
+    """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
+
+    k-mer x of unit g is present in the sample with probability s_g * p_in(x): a strain
+    like a random member carries each k-mer with probability p_in (s_g = 1), and a more
+    divergent one loses k-mers uniformly (s_g < 1). So core k-mers are expected present
+    more often than private ones, which changes both how shared hits are split (by
+    coverage x presence of that k-mer in each unit) and how much an unhit k-mer argues for
+    low coverage rather than absence. ``p_in`` is the midpoint of its quantised level
+    (``pin_q``), so no k-mer is certainly absent; s_g is capped so presence stays <= 1.
+
+    ``kmers`` has ``unit``, ``hash``, ``hits`` and ``pin_q``; ``pin_hist[unit]`` counts the
+    unit's kept k-mers per level (its sum is ``m_g``). Coverage is attributed hits over
+    expected present k-mers (hit ones by their share, unhit ones by their posterior
+    presence), and s_g is expected present k-mers over the sum of p_in. Like :func:`em`, a
+    hit k-mer counts as present for a unit by its share of the hits. Returns ``unit``,
+    ``coverage`` and ``present`` (expected fraction of kept k-mers present); units
+    explained away get coverage 0.
+    """
+    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
+    hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    level = kmers["pin_q"].to_numpy().astype(np.intp)
+    hits = np.zeros(len(hashes))
+    hits[row] = kmers["hits"].to_numpy()
+    n = len(units)
+    hist = pin_hist[units].astype(np.float64)
+    m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
+    lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
+    for _ in range(max_iter):
+        weight = lam[col] * scale[col] * PIN_P[level]
+        share = _div(weight, np.bincount(row, weights=weight, minlength=len(hashes))[row])
+        attributed = np.bincount(col, weights=share * hits[row], minlength=n)
+        hit = np.zeros_like(hist)
+        np.add.at(hit, (col, level), share)
+        seen = -np.expm1(-lam)[:, None]  # chance a present k-mer is hit
+        pi = scale[:, None] * PIN_P
+        odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
+        present = hit.sum(axis=1) + (np.maximum(hist - hit, 0) * odds).sum(axis=1)
+        new = _div(attributed, present)
+        new_scale = np.clip(_div(present, expected), 0.0, 1 / PIN_P[-1])
+        done = np.abs(new - lam).max(initial=0) <= tol * new.max(initial=0) and np.allclose(
+            new_scale, scale, rtol=0, atol=tol
+        )
+        lam, scale = new, new_scale
+        if done:
+            break
+    lam[attributed < EXPLAINED_AWAY] = 0.0
+    return pl.DataFrame(
+        {"unit": units, "coverage": lam, "present": scale * expected / m},
+        schema={"unit": pl.UInt32, "coverage": pl.Float64, "present": pl.Float64},
+    )
+
+
 def fit_present_prior(
     fit: pl.DataFrame, min_coverage: float = 3.0, min_units: int = 10
 ) -> tuple[float, float] | None:
@@ -219,9 +281,10 @@ def profile(
     ``coverage`` is hits per kept k-mer; ``kmers_unique`` and ``gather_rank`` come from
     :func:`gather` (0 and null for units explained away) and ``coverage_em`` from :func:`em`
     over the units gather keeps (0 for the rest), with ``coverage_zi`` and ``present_zi``
-    from its zero-inflated form. ``kmers_wta``/``coverage_wta`` and
-    ``kmers_ufirst``/``coverage_ufirst`` are the k-mers :func:`assign_best` gives each unit
-    and their hits per kept k-mer. Units without hits are omitted.
+    from its zero-inflated form, and ``coverage_zip``/``present_zip`` from :func:`em_pin`.
+    ``kmers_wta``/``coverage_wta`` and ``kmers_ufirst``/``coverage_ufirst`` are the k-mers
+    :func:`assign_best` gives each unit and their hits per kept k-mer. Units without hits
+    are omitted.
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
@@ -247,7 +310,9 @@ def profile(
 
     def counts(hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
         hits = unit_hits(index.tier2, max_hash_g, hashes, reads)
-        return hits.group_by("unit", "hash").agg(hits=pl.len(), reads=pl.col("read").unique())
+        return hits.group_by("unit", "hash").agg(
+            hits=pl.len(), reads=pl.col("read").unique(), pin_q=pl.col("pin_q").first()
+        )
 
     empty = np.empty(0, dtype=np.uint64)
     per_kmer = pl.concat(
@@ -256,10 +321,11 @@ def profile(
             *(counts(b["hash"], b["read"]) for b in stream(index.tier2.max_hash)),
         ]
     )
-    kmer_hits = per_kmer.group_by("unit", "hash").agg(pl.col("hits").sum())
+    kmer_hits = per_kmer.group_by("unit", "hash").agg(pl.col("hits").sum(), pl.col("pin_q").first())
     assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
+    pin_hist = index.units["pin_hist"].to_numpy()
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -269,14 +335,19 @@ def profile(
             unit_hits(dense, max_hash_dense, b["hash"], b["read"])
             .join(keep, on="unit", how="semi")
             .group_by("unit", "hash")
-            .agg(hits=pl.len())
+            .agg(hits=pl.len(), pin_q=pl.col("pin_q").first())
             for b in stream(dense.max_hash)
         )
-        empty_hits = pl.DataFrame(schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32})
+        empty_hits = pl.DataFrame(
+            schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8}
+        )
         detected = (
-            pl.concat([empty_hits, *parts]).group_by("unit", "hash").agg(pl.col("hits").sum())
+            pl.concat([empty_hits, *parts])
+            .group_by("unit", "hash")
+            .agg(pl.col("hits").sum(), pl.col("pin_q").first())
         )
         m_g = index.units["m_dense"].to_numpy()
+        pin_hist = index.units["pin_hist_dense"].to_numpy()
     plain = em(detected, m_g).select("unit", coverage_em="coverage")
     inflated = em(detected, m_g, zero_inflated=True)
     prior = fit_present_prior(inflated)
@@ -284,6 +355,9 @@ def profile(
         "unit", coverage_zib="coverage", present_zib="present"
     )
     inflated = inflated.select("unit", coverage_zi="coverage", present_zi="present")
+    weighted = em_pin(detected, pin_hist).select(
+        "unit", coverage_zip="coverage", present_zip="present"
+    )
     rated = kmer_hits.join(index.units.select("unit", "m_g", "t_g"), on="unit")
     result = (
         per_kmer.group_by("unit")
@@ -292,11 +366,12 @@ def profile(
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("reads").explode(empty_as_null=False).n_unique().cast(pl.UInt64),
         )
-        .join(index.units, on="unit")
+        .join(index.units.select(pl.exclude("^pin_hist.*$")), on="unit")
         .join(assigned, on="unit", how="left")
         .join(plain, on="unit", how="left")
         .join(inflated, on="unit", how="left")
         .join(shrunk, on="unit", how="left")
+        .join(weighted, on="unit", how="left")
     )
     if dense is not None:
         result = result.join(
@@ -316,7 +391,7 @@ def profile(
         result = result.join(won, on="unit", how="left")
     return (
         result.with_columns(
-            pl.col("^(coverage|present)_(em|zi|zib)$").fill_null(0.0),
+            pl.col("^(coverage|present)_(em|zi|zib|zip)$").fill_null(0.0),
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
             kmers_unique=pl.col("kmers_unique").fill_null(0),

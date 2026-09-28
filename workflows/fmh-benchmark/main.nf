@@ -53,6 +53,7 @@ process INDEX {
     input:
     tuple val(name), val(args)
     path members
+    path code, stageAs: 'code/*'  // package sources: only here so -resume rebuilds on changes
 
     output:
     tuple val(name), path("index_${name}"), emit: index
@@ -71,6 +72,7 @@ process IMPORT_SKETCHES {
 
     input:
     path sketches
+    path code, stageAs: 'code/*'  // package sources: only here so -resume rebuilds on changes
 
     output:
     tuple val('fmh_compat'), path('index_fmh_compat'), emit: index
@@ -210,18 +212,18 @@ process SUMMARY {
 workflow {
     FETCH()
     MEMBERS(FETCH.out.faa, FETCH.out.kos)
+    // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
+    ch_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()
     ch_configs = channel.fromList(params.indexes).map { cfg -> [cfg.name, cfg.args] }
-    INDEX(ch_configs, MEMBERS.out.members)
-    IMPORT_SKETCHES(FETCH.out.sketches)
+    INDEX(ch_configs, MEMBERS.out.members, ch_code)
+    IMPORT_SKETCHES(FETCH.out.sketches, ch_code)
     ch_indexes = INDEX.out.index.mix(IMPORT_SKETCHES.out.index)
 
     SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
     TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, file("${projectDir}/bench.py"))
 
-    // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
-    ch_query_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()
-    PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_query_code)
+    PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_code)
     SCORE(PROFILE.out.profile.combine(TRUTH.out.truth, by: 0), file("${projectDir}/bench.py"))
     SUMMARY(SCORE.out.score.collect())
 }

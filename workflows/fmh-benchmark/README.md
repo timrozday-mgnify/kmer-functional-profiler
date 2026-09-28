@@ -73,10 +73,15 @@ at 1 in 10 (`--t-dense 0.1`: detection unchanged, EM abundances fitted on 10x mo
 k-mers). `index_*/meta.json` in the output records each index's size (`dense_bytes` for the
 dense tier); `trace.tsv` records each PROFILE task's runtime.
 
+With `-resume`, INDEX, IMPORT_SKETCHES and PROFILE rerun when the Python package changes,
+and TRUTH and SCORE when `bench.py` does; Rust kernel changes need a fresh run.
+
 Abundance is scored per row (`abundance` column) with an estimate that goes with its count:
 `coverage` (hits per kept k-mer) with `kmers_hit`; `coverage_em` (EM over the units gather
 keeps), `coverage_zi` (zero-inflated EM: coverage of the k-mers present) and `coverage_zib`
-(zero-inflated with an empirical-Bayes prior on the present fraction) with `kmers_unique`; and the hits each one-pass rule assigns per kept k-mer with its count:
+(zero-inflated with an empirical-Bayes prior on the present fraction) and `coverage_zip`
+(zero-inflated with each k-mer's presence proportional to its in-KO frequency *p_in*) with
+`kmers_unique`; and the hits each one-pass rule assigns per kept k-mer with its count:
 `coverage_wta` with `kmers_wta` (each hit k-mer to the holding KO with the highest
 containment, as sylph) and `coverage_ufirst` with `kmers_ufirst` (to the holding KO with the
 highest Σ 1 / KOs-per-hit-k-mer, scaled by 1 / *t_g*). `spearman_tp` is the rank correlation with truth depth over true positives;

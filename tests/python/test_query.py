@@ -15,6 +15,7 @@ from kmer_functional_profiler.query import (
     WTA_SCORE,
     assign_best,
     em,
+    em_pin,
     fit_present_prior,
     gather,
     profile,
@@ -176,6 +177,44 @@ def test_zero_inflated_em_fits_present_kmers() -> None:
     # All kept k-mers hit once: no excess zeros, so present stays 1 and it matches plain EM.
     got = em(kmers.with_columns(hits=pl.lit(1, pl.UInt32)), np.array([10]), zero_inflated=True)
     assert got.row(0) == (0, pytest.approx(1.0), 1.0)
+
+
+def test_pin_presence_matches_zero_inflated_em_at_one_level() -> None:
+    # Every kept k-mer at the same p_in level: presence cannot vary between k-mers, so the
+    # fit is zero-inflated EM's (10 of 40 k-mers present, 3 hits each).
+    kmers = pl.DataFrame(
+        {"unit": [0] * 10, "hash": range(10), "hits": [3] * 10, "pin_q": [7] * 10},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8},
+    )
+    hist = np.zeros((1, 16))
+    hist[0, 7] = 40
+    got = em_pin(kmers, hist).row(0, named=True)
+    want = em(kmers.drop("pin_q"), np.array([40]), zero_inflated=True).row(0, named=True)
+    assert got["coverage"] == pytest.approx(want["coverage"], rel=1e-4)
+    assert got["present"] == pytest.approx(want["present"], rel=1e-4)
+
+
+def test_pin_presence_splits_shared_kmer_by_p_in() -> None:
+    # Units 0 and 1 have one mid-p_in k-mer each (5 hits) and share one (10 hits) that is
+    # core (p_in ~1) in unit 0 and private (p_in ~0) in unit 1: unit 0 should take it.
+    kmers = pl.DataFrame(
+        {
+            "unit": [0, 0, 1, 1],
+            "hash": [1, 3, 2, 3],
+            "hits": [5, 10, 5, 10],
+            "pin_q": [8, 15, 8, 0],
+        },
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8},
+    )
+    hist = np.zeros((2, 16))
+    hist[0, [8, 15]] = 1
+    hist[1, [8, 0]] = 1
+    got = dict(em_pin(kmers, hist).select("unit", "coverage").iter_rows())
+    assert got[0] > 1.2 * got[1]  # unit 1's alpha rises to explain the k-mer, so not all
+    flat = dict(
+        em(kmers, np.array([2, 2]), zero_inflated=True).select("unit", "coverage").iter_rows()
+    )
+    assert flat[0] == pytest.approx(flat[1])
 
 
 def test_present_prior_shrinks_thin_units() -> None:

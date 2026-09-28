@@ -264,7 +264,7 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
 | 2. Index prototype (built; gate needs a real subset) | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
-| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
+| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
 | 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
@@ -385,6 +385,25 @@ What each step did, and the choices, results and interpretations behind it, newe
   **Decided:** keep the dense tier as an option (default off) and measure it on real data before choosing a rate: `kfp_s100_d10` (tier 2 at 0.01, dense at 0.1) added to the fmh benchmark. Open: restrict the dense tier to non-singleton clusters, or to a rate that keeps it ≤ 1× tier 2 at MGnify scale; decide once the MGnify subset build reports `dense_bytes`.
 
 * **Fix (fmh benchmark):** `index_*/meta.json` (index sizes, incl. `dense_bytes`) was never published: Nextflow folds a file inside a declared directory output into that directory, which did not match the publish pattern. INDEX and IMPORT\_SKETCHES now copy `meta.json` out and publish it to `<outdir>/index_<name>/meta.json`.
+
+* **Phase 4, step 8 — *p\_in*-weighted presence (`em_pin`, `coverage_zip`, `present_zip`, experimental).** Zero-inflated EM with a per-k-mer presence probability from *p\_in(x)* (the plan's *z\_x* ~ Bernoulli(*π\_x*), *π\_x* informed by *p\_in*). The index stores per unit a histogram of kept k-mers over the 16 quantised *p\_in* levels (`pin_hist`, `pin_hist_dense`), so unhit k-mers are summed by level; the query now carries each hit's `pin_q` from tier 2 / the dense table. *p\_in* is the level midpoint, so no k-mer is certainly absent. Hit k-mers count as present by their share, as in `em`. Tests: all k-mers at one level reproduces zero-inflated EM; a k-mer shared between a unit where it is core and one where it is private goes mostly to the first.
+  - *First link, logistic:* presence = σ(α\_g + logit *p\_in*), α\_g fitted by a Newton step per iteration. Worse than plain ZI everywhere (5 seeds): dense Spearman 0.948 → 0.936, bias at 85% 0.91 → 0.82, sd 0.52 → 0.55. Divergence scales presence multiplicatively (each k-mer survives with probability ≈ identity^k whatever its *p\_in*), and a logit shift cannot do that: bringing core k-mers down drives low-*p\_in* ones to 0.
+  - *Adopted link, multiplicative:* presence = *s\_g*·*p\_in(x)* (*s\_g* = 1: the strain carries k-mers like a random member; < 1: divergent), capped so presence ≤ 1. Closed-form M-step: *s\_g* = expected present k-mers / Σ *p\_in*.
+
+  Simulation, 5 seeds, `gather_zi` → `gather_zip`:
+
+  | Config | Spearman | L1 | log-ratio sd | bias 85% |
+  | --- | --- | --- | --- | --- |
+  | dense | 0.948 → 0.947 | 0.228 → 0.229 | 0.517 → 0.411 | 0.91 → 0.88 |
+  | s10 | 0.919 → 0.918 | 0.213 → 0.209 | 0.653 → 0.481 | 0.89 → 0.84 |
+  | floor | 0.835 → 0.829 | 0.391 → 0.394 | 0.719 → 0.672 | 0.84 → 0.82 |
+  | floor + dense 1/50 | 0.891 → 0.892 | 0.325 → 0.315 | 0.715 → 0.496 | 0.90 → 0.86 |
+  | floor + dense 1/5 | 0.922 → 0.923 | 0.251 → 0.244 | 0.519 → 0.405 | 0.92 → 0.87 |
+  | floor + dense 1/1 | 0.940 → 0.940 | 0.231 → 0.227 | 0.443 → 0.348 | 0.93 → 0.89 |
+
+  *Interpretation.* *p\_in* tells the model which zeros are expected (private k-mers) and which are informative (core k-mers missed), so per-unit estimates scatter 20–30% less; ranks and L1 barely move, because they are dominated by the large depth range. The residual bias (≈ 4% at 85% identity) fits the simulation's cluster model, where presence given *p\_in* is not proportional to *p\_in*: members are star-like mutants of a centroid, so a k-mer at *p\_in* = 1/4 is almost never in the centroid, while the model expects it in a quarter of strains. Against the empirical-Bayes prior (step 6), it gives a similar precision gain at a quarter of the bias cost and does not break the floor index. **Decided:** not the default yet: `coverage_zip` joins the fmh benchmark, where KO units are unions over many species and *p\_in* is low for most k-mers, a very different regime. Adopt it if it holds there.
+
+* **Fix (fmh benchmark):** INDEX and IMPORT\_SKETCHES now take the package sources as an input, like PROFILE, so `-resume` rebuilds indexes when the build code changes; cached indexes without `pin_hist` made every PROFILE fail. Indexes from runs before this change are rebuilt once.
 
 ## Libraries
 

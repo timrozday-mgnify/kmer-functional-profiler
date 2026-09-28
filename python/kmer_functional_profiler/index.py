@@ -24,6 +24,7 @@ Parquet tables for inspection.
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
 ``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
 promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
+``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level.
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
@@ -451,6 +452,13 @@ def build_index(
     return write_index(out, params, units, postings, stats, dense=dense)
 
 
+def _pin_hist(postings: pl.DataFrame, n_units: int) -> pl.Series:
+    """Per unit, how many kept k-mers sit at each quantised ``p_in`` level."""
+    hist = np.zeros((n_units, 2**PIN_BITS), dtype=np.uint32)
+    np.add.at(hist, (postings["unit"].to_numpy(), postings["pin_q"].to_numpy()), 1)
+    return pl.Series(hist)
+
+
 def write_index(
     out: Path,
     params: IndexParams,
@@ -480,6 +488,7 @@ def write_index(
     )
     n_components, component = connected_components(graph, directed=False)
 
+    units = units.with_columns(pin_hist=_pin_hist(postings, units.height))
     per_unit = postings.group_by("unit").agg(
         m_g=pl.len().cast(pl.UInt32), u_g=(pl.col("n_groups") == 1).sum().cast(pl.UInt32)
     )
@@ -526,7 +535,9 @@ def write_index(
             on="unit",
             how="left",
             maintain_order="left",
-        ).with_columns(pl.col("m_dense").fill_null(0))
+        ).with_columns(
+            pl.col("m_dense").fill_null(0), pin_hist_dense=_pin_hist(dense, units.height)
+        )
         stats["dense_postings"] = dense.height
         stats["dense_bytes"] = tables["dense"].nbytes()
 
