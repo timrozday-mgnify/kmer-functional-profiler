@@ -15,6 +15,8 @@ prek install --hook-type pre-commit --hook-type pre-push
 uv run pytest tests/bench                        # throughput (phase 1 gate: >= 1 M reads/min/thread)
 uv run python scripts/make_fixtures.py           # regenerate tests/data
 uv run python scripts/fetch_mgnify_sample.py     # small MGnify sample into data/ (gitignored)
+uv run kmer-functional-profiler index members.parquet idx/ --pfam pfam.parquet
+nextflow run workflows/mgnify-subset -profile test   # MGnify subset + index; see its README
 ```
 
 ```python

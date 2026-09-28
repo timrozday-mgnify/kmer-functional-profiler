@@ -5,11 +5,16 @@ Each protein yields two read pairs (300 bp fragment, 2 x 150 bp); R1 gets one of
 test cases below and R2 is the reverse complement of the fragment's far end, so the
 true frames cover all six. ``truth.tsv`` records each read's source protein, true
 frame and amino-acid span.
+
+``mini_release/`` holds a few MGnify90 clusters in the release's Parquet schemas, for
+testing ``workflows/mgnify-subset`` without the real release.
 """
 
 import gzip
 import random
 from pathlib import Path
+
+import polars as pl
 
 from kmer_functional_profiler.reference import BASES, CODE_11, reverse_complement
 
@@ -17,6 +22,7 @@ OUT = Path(__file__).resolve().parent.parent / "tests" / "data"
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 CASES = ["clean", "synonymous", "nonsynonymous", "n", "indel", "stop"]
 READ_LEN, FRAG_LEN, FLANK_LEN = 150, 300, 300
+GUT, MARINE = "root:Host-associated:Human:Digestive system", "root:Environmental:Aquatic:Marine"
 
 CODONS = [a + b + c for a in BASES for b in BASES for c in BASES]
 SYNONYMS = {aa: [c for c, t in zip(CODONS, CODE_11, strict=True) if t == aa] for aa in CODE_11}
@@ -96,5 +102,57 @@ def main() -> None:
             gz.write("".join(records).encode())
 
 
+def mini_release(rng: random.Random) -> None:
+    """Twelve clusters of 1-5 mutated copies, with member ids scattered over 1..999."""
+    out = OUT / "mini_release"
+    out.mkdir(exist_ok=True)
+    ids = iter(rng.sample(range(1, 1000), 60))
+    clusters, members, proteins, pfam = [], [], [], []
+    for c in range(12):
+        base = "M" + "".join(rng.choices(AMINO_ACIDS, k=rng.randint(40, 150)))
+        size = rng.choice([1, 1, 2, 3, 5])
+        member_ids = sorted(next(ids) for _ in range(size))
+        rep = member_ids[0]
+        biomes = f"root;{GUT}:Large intestine" if c % 2 else f"root;{MARINE}"
+        clusters.append((rep, size, size, biomes, biomes))
+        for m in member_ids:
+            seq = "".join(rng.choice(AMINO_ACIDS) if rng.random() < 0.05 else a for a in base)
+            members.append((rep, m))
+            proteins.append((m, rng.random() < 0.7, seq))
+            if c % 3:
+                pfam.append((m, 1000 + c, 1e-10, 50.0, 1, 30, 2, 31))
+    tables = {
+        "mgy_clusters": (
+            clusters,
+            [
+                "cluster_rep",
+                "cluster_size",
+                "cluster_assembly_count",
+                "cluster_rep_biomes",
+                "cluster_members_biomes",
+            ],
+        ),
+        "mgy_cluster_seqs": (members, ["cluster_rep", "cluster_member"]),
+        "mgy_protein_sequences": (proteins, ["protein_id", "full_length", "sequence"]),
+        "mgy_proteins_pfam": (
+            pfam,
+            [
+                "protein_id",
+                "pfam_accession",
+                "i_evalue",
+                "score",
+                "hmm_from",
+                "hmm_to",
+                "env_from",
+                "env_to",
+            ],
+        ),
+    }
+    for name, (rows, schema) in tables.items():
+        frame = pl.DataFrame(rows, schema=schema, orient="row")
+        frame.sort(schema[0]).write_parquet(out / f"{name}.parquet")
+
+
 if __name__ == "__main__":
     main()
+    mini_release(random.Random(20260929))

@@ -1,0 +1,147 @@
+"""Index build on hand-built clusters, against the analytical sample size, and lookup."""
+
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import pytest
+from typer.testing import CliRunner
+
+from kmer_functional_profiler import reference
+from kmer_functional_profiler.cli import app
+from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
+
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+K = 6
+RNG = random.Random(7)
+X, D, Y, P, Q, S = ("".join(RNG.choices(AMINO_ACIDS, k=n)) for n in (30, 30, 30, 20, 20, 40))
+# (protein_id, cluster_rep, full_length, sequence): unit A = 1, B = 10, singleton S = 20.
+HAND = [
+    (1, 1, True, X + D),
+    (2, 1, True, X + D),
+    (3, 1, True, X + D),
+    (4, 1, True, X + D + P),
+    (5, 1, False, Q + X[:10]),
+    (10, 10, True, D + Y),
+    (11, 10, True, D + Y),
+    (20, 20, True, S),
+]
+
+
+def write_members(path: Path, rows: list[tuple[int, int, bool, str]]) -> Path:
+    pl.DataFrame(
+        rows, schema=["protein_id", "cluster_rep", "full_length", "sequence"], orient="row"
+    ).write_parquet(path)
+    return path
+
+
+def kmers(seq: str) -> set[int]:
+    return set(reference.protein_kmers(seq.encode(), K))
+
+
+@pytest.fixture
+def hand(tmp_path: Path) -> tuple[Index, pl.DataFrame]:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=1.0, n_min=1, tier1_per_unit=2))
+    index = Index.load(tmp_path / "idx")
+    postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
+        index.units.select("unit", "cluster_rep"), on="unit"
+    )
+    return index, postings
+
+
+def rows_for(postings: pl.DataFrame, rep: int, part: str) -> pl.DataFrame:
+    return postings.filter(pl.col("cluster_rep") == rep, pl.col("hash").is_in(kmers(part)))
+
+
+def test_scores_on_hand_built_clusters(hand: tuple[Index, pl.DataFrame]) -> None:
+    _, postings = hand
+    core, private, partial_only, shared = (rows_for(postings, 1, part) for part in (X, P, Q, D))
+    assert core.height == len(kmers(X))
+    assert (core["p_in"] == 1).all() and (core["score"] == 0).all()
+    assert (private["p_in"] == 0.25).all() and (private["score"] == -2).all()
+    assert (partial_only["p_in"] == 0).all() and (partial_only["score"] == -3).all()
+    assert (shared["n_groups"] == 2).all() and (shared["score"] == -1).all()
+    assert (rows_for(postings, 10, D)["score"] == -1).all()
+    # The best k-mers of A (tier 1) are core ones, not shared or private.
+    tier1 = set(postings.filter("tier1", pl.col("cluster_rep") == 1)["hash"])
+    assert tier1 <= kmers(X + D) - kmers(D)
+
+
+def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
+    index, _ = hand
+    units = {row["cluster_rep"]: row for row in index.units.iter_rows(named=True)}
+    a, b, s = units[1], units[10], units[20]
+    assert (a["n_members"], a["n_full_length"], a["n_counting"]) == (5, 4, 4)
+    assert a["n_kmers"] == len(set().union(*(kmers(r[3]) for r in HAND if r[1] == 1)))
+    assert a["u_g"] == a["m_g"] - len(kmers(D))
+    assert a["component"] == b["component"] != s["component"]
+    assert index.meta["stats"]["components"] == 2  # type: ignore[index]
+
+
+def test_promiscuous_kmers_are_dropped(tmp_path: Path) -> None:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    params = IndexParams(k=K, t_base=1.0, n_min=1, max_groups=1)
+    build_index(members, tmp_path / "idx", params)
+    units = Index.load(tmp_path / "idx").units.sort("cluster_rep")
+    assert units["n_promiscuous"].to_list() == [len(kmers(D))] * 2 + [0]
+    assert units["component"].n_unique() == 3
+
+
+def test_tier2_lookup_returns_postings(hand: tuple[Index, pl.DataFrame]) -> None:
+    index, postings = hand
+    set_ids = index.tier2.lookup(postings["hash"].to_numpy())
+    assert (set_ids >= 0).all()
+    for set_id, unit, pin_q in zip(set_ids, postings["unit"], postings["pin_q"], strict=True):
+        assert (unit << PIN_BITS | pin_q) in index.tier2.values(int(set_id))
+
+
+def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
+    rng = random.Random(1)
+    rows = []
+    for rep in range(1, 400):
+        base = "".join(rng.choices(AMINO_ACIDS, k=rng.randint(30, 400)))
+        for m in range(rng.choice([1, 1, 1, 2, 5])):
+            mutated = "".join(rng.choice(AMINO_ACIDS) if rng.random() < 0.05 else a for a in base)
+            rows.append((rep * 100 + m, rep * 100, rng.random() < 0.7, mutated))
+    members = write_members(tmp_path / "members.parquet", rows)
+    params = IndexParams(k=K, t_base=0.02, n_min=8)
+    stats = build_index(members, tmp_path / "a", params)
+    expected = stats["candidates_expected"]
+    assert isinstance(expected, float)
+    assert abs(stats["candidates"] - expected) < 5 * expected**0.5  # type: ignore[operator]
+
+    units = Index.load(tmp_path / "a").units
+    floored = units.filter(pl.col("n_members") > 1)
+    assert (floored["t_g"] * floored["n_kmers"] >= params.n_min - 1e-9).all()
+    postings = pl.read_parquet(tmp_path / "a" / "postings.parquet").join(units, on="unit")
+    assert (postings["hash"] <= postings["max_hash_g"]).all()
+
+    # Unit-aligned batching does not change the result.
+    build_index(members, tmp_path / "b", IndexParams(k=K, t_base=0.02, n_min=8, batch_residues=900))
+    for name in ("postings", "units"):
+        a, b = (pl.read_parquet(tmp_path / d / f"{name}.parquet") for d in "ab")
+        assert a.equals(b)
+
+
+def test_packed_table_false_hits_and_range() -> None:
+    rng = np.random.default_rng(3)
+    max_hash = 2**60 - 1
+    hashes = rng.integers(0, max_hash, 5000, dtype=np.uint64)
+    table = PackedTable.build(hashes, np.arange(5000, dtype=np.uint64), max_hash, 16)
+    assert table.lead_bits == 4
+    assert (table.lookup(hashes) >= 0).all()
+    other = rng.integers(0, max_hash, 100_000, dtype=np.uint64)
+    assert (table.lookup(other) >= 0).mean() < 1e-3
+    assert table.lookup(np.array([max_hash + 1], dtype=np.uint64))[0] == -1
+
+
+def test_cli_index(tmp_path: Path) -> None:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    result = CliRunner().invoke(
+        app, ["index", str(members), str(tmp_path / "idx"), "--k", str(K), "--t-base", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["n_units"] == 3
