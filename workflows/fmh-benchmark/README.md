@@ -17,7 +17,8 @@ TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a r
                  overlaps one of its genes (the paper's rule, on CAMISIM's alignments)
 PROFILE          kmer-functional-profiler query, every metagenome x every index
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,
-                 base-weighted completeness per --min_hits value -> summary.tsv (mean, sd),
+                 base-weighted completeness per count (kmers_hit; kmers_unique after gather)
+                 and --min_hits value -> summary.tsv (mean, sd),
                  scores.tsv; profiles/ and truth/ keep the per-sample tables
 ```
 
@@ -59,10 +60,32 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--replicates` | `10` | Metagenomes (seeds 1..N) |
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
-| `--min_hits` | `1,2,3,5` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
-| `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
+| `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
+| `--indexes` | three configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
-density (`--t-base 0.01`), the plan's "scaled = 100" baseline, without and with the floor. `index_*/meta.json` in the
+density (`--t-base 0.01`), the plan's "scaled = 100" baseline. `index_*/meta.json` in the
 output records each index's size; `trace.tsv` records each PROFILE task's runtime.
+
+## Results (10 metagenomes, InSilicoSeq novaseq)
+
+Means over seeds 1..10; sd of purity and completeness <= 0.015. "Low 25%" is completeness
+on the least-covered quarter of true KOs.
+
+| Index | min_hits | Purity | Completeness | Low 25% |
+| --- | --- | --- | --- | --- |
+| fmh_compat | 1 | 0.975 | 0.688 | 0.295 |
+| kfp_s1000 | 1 | 0.985 | 0.677 | 0.285 |
+| kfp_s1000_floor8 | 1 | 0.976 | 0.719 | 0.404 |
+| kfp_s100 | 1 | 0.951 | 0.960 | 0.853 |
+| **kfp_s100** | **2** | **0.976** | **0.911** | **0.694** |
+| kfp_s100 | 3 | 0.985 | 0.858 | 0.533 |
+
+`kfp_s100` at `min_hits` 2 is the recommended setting: fmh_compat's purity with 22 points
+more completeness. At scaled 1000, `min_hits` above 1 costs most low-coverage KOs
+(completeness 0.49 at 2). The floor helps at scaled 1000 but not at scaled 100, where
+nearly every KO already samples more than 8 k-mers (`n_min 8` at `t_base 0.01` scored
+within 0.005 of `n_min 0`), so that configuration was dropped. Most remaining false
+positives are modular PKS/NRPS KOs (pks2, pks12, surfactin, tyrocidine synthetases, ...)
+whose shared domains carry identical k-mers; `kmers_unique` scores them after gather.

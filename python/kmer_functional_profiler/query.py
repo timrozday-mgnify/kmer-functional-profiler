@@ -6,8 +6,12 @@ is looked up in tier 2 and counts for each unit in its set whose own threshold i
 sketch is stored: only per-(unit, hash) counts are kept. Indexes imported from sourmash
 signatures (``meta["hash"] == "sourmash"``) hash reads with sourmash instead; ``frames``
 and ``genetic_code`` then do not apply.
+
+Shared k-mers count for every unit that holds them in ``kmers_hit``; ``kmers_unique`` is
+what a gather-style greedy assignment leaves each unit (the phase-4 detection baseline).
 """
 
+import heapq
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -36,6 +40,38 @@ def unit_hits(index: Index, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFra
     return pl.DataFrame({"unit": units[keep], "hash": hashes[keep], "read": reads[keep]})
 
 
+def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> pl.DataFrame:
+    """Assign each hit k-mer to one unit, greedily, as ``sourmash gather`` does.
+
+    Repeatedly take the unit with the most unassigned hit k-mers, scaled by ``1 / t_g`` so
+    units sampled at different rates compare as estimated k-mer counts, and give it those
+    k-mers. Units left with none are explained away and get no row. Returns ``unit``,
+    ``kmers_unique`` (k-mers assigned) and ``gather_rank`` (0 = taken first).
+    """
+    remaining = {u: set(h) for u, h in kmers.group_by("unit").agg("hash").iter_rows()}
+    # Scores only fall as k-mers are taken, so a lazy heap needs only stale-top rechecks.
+    heap = [(-len(h) / t_g[u], u) for u, h in remaining.items()]
+    heapq.heapify(heap)
+    taken: set[int] = set()
+    rows: list[tuple[int, int, int]] = []
+    while heap:
+        _, unit = heapq.heappop(heap)
+        mine = remaining[unit] = remaining[unit] - taken  # iterates the unit's set, not taken
+        if not mine:
+            continue
+        score = len(mine) / t_g[unit]
+        if heap and score < -heap[0][0]:
+            heapq.heappush(heap, (-score, unit))
+            continue
+        taken |= mine
+        rows.append((unit, len(mine), len(rows)))
+    return pl.DataFrame(
+        rows,
+        schema={"unit": pl.UInt32, "kmers_unique": pl.UInt32, "gather_rank": pl.UInt32},
+        orient="row",
+    )
+
+
 def profile(
     index: Index,
     r1: str | Path,
@@ -48,7 +84,8 @@ def profile(
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
     ``containment`` is the fraction of the unit's kept k-mers seen at least once;
-    ``coverage`` is hits per kept k-mer. Units without hits are omitted.
+    ``coverage`` is hits per kept k-mer; ``kmers_unique`` and ``gather_rank`` come from
+    :func:`gather` (0 and null for units explained away). Units without hits are omitted.
     """
     params = IndexParams(**index.meta["params"])
     batches: Iterable[dict[str, np.ndarray]]
@@ -71,19 +108,21 @@ def profile(
         return hits.group_by("unit", "hash").agg(hits=pl.len(), reads=pl.col("read").unique())
 
     empty = np.empty(0, dtype=np.uint64)
-    per_kmer = [counts(empty, empty), *(counts(b["hash"], b["read"]) for b in batches)]
+    per_kmer = pl.concat([counts(empty, empty), *(counts(b["hash"], b["read"]) for b in batches)])
+    assigned = gather(per_kmer.select("unit", "hash").unique(), index.units["t_g"].to_numpy())
     return (
-        pl.concat(per_kmer)
-        .group_by("unit")
+        per_kmer.group_by("unit")
         .agg(
             hits=pl.col("hits").sum().cast(pl.UInt64),
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("reads").explode(empty_as_null=False).n_unique().cast(pl.UInt64),
         )
         .join(index.units, on="unit")
+        .join(assigned, on="unit", how="left")
         .with_columns(
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
+            kmers_unique=pl.col("kmers_unique").fill_null(0),
         )
         .sort("unit")
     )
