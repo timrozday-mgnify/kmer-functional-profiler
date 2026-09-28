@@ -30,6 +30,9 @@ def index(
     alphabet: str = DEFAULTS.alphabet,
     t_base: float = DEFAULTS.t_base,
     n_min: int = DEFAULTS.n_min,
+    t_cap: float = DEFAULTS.t_cap,
+    oversample: float = DEFAULTS.oversample,
+    mask_adapters: bool = DEFAULTS.mask_adapters,
     max_groups: int = DEFAULTS.max_groups,
     tier1_per_unit: int = DEFAULTS.tier1_per_unit,
     fp_bits: int = DEFAULTS.fp_bits,
@@ -37,7 +40,17 @@ def index(
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
     params = IndexParams(
-        k, alphabet, t_base, n_min, max_groups, tier1_per_unit, fp_bits, batch_residues
+        k=k,
+        alphabet=alphabet,
+        t_base=t_base,
+        n_min=n_min,
+        t_cap=t_cap,
+        oversample=oversample,
+        mask_adapters=mask_adapters,
+        max_groups=max_groups,
+        tier1_per_unit=tier1_per_unit,
+        fp_bits=fp_bits,
+        batch_residues=batch_residues,
     )
     typer.echo(json.dumps(build_index(members, out_dir, params, pfam), indent=2))
 

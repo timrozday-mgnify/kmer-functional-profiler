@@ -114,8 +114,12 @@ def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
     assert abs(stats["candidates"] - expected) < 5 * expected**0.5  # type: ignore[operator]
 
     units = Index.load(tmp_path / "a").units
-    floored = units.filter(pl.col("n_members") > 1)
-    assert (floored["t_g"] * floored["n_kmers"] >= params.n_min - 1e-9).all()
+    raised = params.oversample * params.n_min / units["n_kmers"]
+    expected_t = raised.clip(upper_bound=params.t_cap).clip(lower_bound=params.t_base)
+    t_g = pl.Series(np.where(units["n_members"] > 1, expected_t, params.t_base))
+    assert (units["t_g"] - t_g).abs().max() < 1e-12  # type: ignore[operator]
+    floored = units.filter(pl.col("t_g") > params.t_base)
+    assert floored.height > 0 and (floored["m_g"] <= params.n_min).all()
     postings = pl.read_parquet(tmp_path / "a" / "postings.parquet").join(units, on="unit")
     assert (postings["hash"] <= postings["max_hash_g"]).all()
 
@@ -145,3 +149,42 @@ def test_cli_index(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["n_units"] == 3
+
+
+def test_floored_units_keep_best_scoring_kmers(tmp_path: Path) -> None:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    # Every k-mer is a candidate (t_cap = 1); floored units keep their n_min best.
+    params = IndexParams(k=K, t_base=0.001, n_min=5, t_cap=1.0, oversample=1000)
+    build_index(members, tmp_path / "idx", params)
+    index = Index.load(tmp_path / "idx")
+    units = index.units.sort("cluster_rep")
+    assert units["m_g"].to_list()[:2] == [5, 5]
+    postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
+        units.select("unit", "cluster_rep"), on="unit"
+    )
+    assert set(postings.filter(pl.col("cluster_rep") == 1)["hash"]) <= kmers(X + D) - kmers(D)
+    assert (postings["score"] == 0).all()
+
+
+def test_adapter_peptides_are_masked(tmp_path: Path) -> None:
+    # Translated Nextera read-through (frame 0 of CTGTCTCTTATACACATCTCCGAGCCCACGAGAC).
+    adapter = "LSLIHISEPTRPLY"
+    rows = [(1, 1, True, X + adapter), (2, 2, True, Y + adapter), (3, 3, True, S)]
+    members = write_members(tmp_path / "members.parquet", rows)
+    for mask in (True, False):
+        # At k = 11 no k-mer keeps 6 unmasked adapter residues (the mask width).
+        params = IndexParams(k=11, t_base=1.0, n_min=1, mask_adapters=mask)
+        stats = build_index(members, tmp_path / str(mask), params)
+        hashes = set(pl.read_parquet(tmp_path / str(mask) / "postings.parquet")["hash"])
+        adapter_kmers = set(reference.protein_kmers(adapter.encode(), 11))
+        assert bool(hashes & adapter_kmers) is not mask
+        assert stats["n_adapter_masked_proteins"] == (2 if mask else 0)
+
+
+def test_packed_table_layout_is_compact() -> None:
+    rng = np.random.default_rng(5)
+    hashes = rng.integers(0, 2**64 - 1, 50_000, dtype=np.uint64)
+    table = PackedTable.build(hashes, np.arange(50_000, dtype=np.uint64) % 1000, 2**64 - 1, 16)
+    assert 2 <= len(hashes) / 2**table.bucket_bits <= 4
+    assert table.set_values.dtype == np.uint16
+    assert table.nbytes() / len(hashes) < 10

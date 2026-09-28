@@ -52,7 +52,9 @@ def import_signatures(sig_path: str | Path, out_dir: str | Path, ksize: int) -> 
             score=-pl.col("n_groups").log(2),
         )
     )
-    params = IndexParams(k=ksize, t_base=1 / scaled, n_min=0, max_groups=2**32)
+    params = IndexParams(
+        k=ksize, t_base=1 / scaled, n_min=0, t_cap=1.0, max_groups=2**32, mask_adapters=False
+    )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stats = {"source": str(sig_path), "scaled": scaled}
