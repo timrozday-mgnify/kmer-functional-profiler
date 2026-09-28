@@ -164,7 +164,7 @@ process PROFILE {
     tuple val(seed), val(name), path('profile.tsv'), emit: profile
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv"
+    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --bootstrap ${params.bootstrap}"
 
     stub:
     "touch profile.tsv"

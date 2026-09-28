@@ -75,8 +75,13 @@ def query(
     out: Annotated[Path, typer.Option(help="TSV of per-unit counts")] = Path("profile.tsv"),
     frames: str = "stopfree",
     genetic_code: int = 11,
+    bootstrap: Annotated[
+        int, typer.Option(help="Read-resampling replicates for 95% intervals")
+    ] = 0,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
-    result = profile(Index.load(index_dir), r1, r2, genetic_code=genetic_code, frames=frames)
+    result = profile(
+        Index.load(index_dir), r1, r2, genetic_code=genetic_code, frames=frames, bootstrap=bootstrap
+    )
     result.write_csv(out, separator="\t")
     typer.echo(f"{result.height} units hit -> {out}", err=True)

@@ -12,7 +12,8 @@
   count present (``kmers_hit``; ``kmers_unique`` after gather; ``kmers_wta`` and
   ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
   threshold. Each count is paired with its abundance estimates (``RULES``), scored on the detected
-  KOs against ``depth``: Spearman over true positives and L1 between relative abundances.
+  KOs against ``depth``: Spearman over true positives and L1 between relative abundances,
+  and the calibration of bootstrap intervals where the profile has them.
 - ``summary``: mean and sd of the scores per index, count and threshold.
 """
 
@@ -174,7 +175,10 @@ def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, f
     """Spearman over true positives and L1 between relative abundances (0 to 2).
 
     ``truth`` has ``ko_id`` and ``depth``; ``estimate`` has ``ko_id`` and ``estimate`` for
-    the detected KOs. A KO missing from either side has abundance 0 there.
+    the detected KOs. A KO missing from either side has abundance 0 there. If ``estimate``
+    also has an interval (``lo``, ``hi``), ``ci_cover`` is the share of true positives whose
+    depth, on the estimate's scale (times the median estimate / depth), lies inside it, and
+    ``ci_width`` the median log(hi / lo).
     """
     both = truth.select("ko_id", "depth").join(estimate, on="ko_id", how="full", coalesce=True)
     both = both.fill_null(0.0)
@@ -185,6 +189,17 @@ def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, f
         if tp.height > 1
         else None,
         "l1": float((rel[0] - rel[1]).abs().sum()),
+        **interval_scores(tp),
+    }
+
+
+def interval_scores(tp: pl.DataFrame) -> dict[str, float | None]:
+    if "lo" not in tp.columns or tp.height == 0:
+        return {"ci_cover": None, "ci_width": None}
+    scaled = pl.col("depth") * (pl.col("estimate") / pl.col("depth")).median()
+    return {
+        "ci_cover": tp.select(scaled.is_between(pl.col("lo"), pl.col("hi")).mean()).item(),
+        "ci_width": tp.select((pl.col("hi") / pl.col("lo")).log().median()).item(),
     }
 
 
@@ -218,9 +233,20 @@ def score(args: argparse.Namespace) -> None:
                 "weighted_completeness": int(present.filter("found")["bases"].sum())
                 / max(int(present["bases"].sum()), 1),
                 **(
-                    abundance_scores(truth, detected.select(ko_id="name", estimate=abundance))
+                    abundance_scores(
+                        truth,
+                        detected.select(
+                            ko_id="name",
+                            estimate=abundance,
+                            **(
+                                {"lo": f"{abundance}_lo", "hi": f"{abundance}_hi"}
+                                if f"{abundance}_lo" in profile.columns
+                                else {}
+                            ),
+                        ),
+                    )
                     if abundance
-                    else {"spearman_tp": None, "l1": None}
+                    else {"spearman_tp": None, "l1": None, "ci_cover": None, "ci_width": None}
                 ),
             }
         )

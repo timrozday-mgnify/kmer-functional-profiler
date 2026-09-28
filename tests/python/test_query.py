@@ -120,6 +120,19 @@ def test_copies_count_member_equivalents(tmp_path: Path) -> None:
     assert (result["abundance_zi"] == 2 * result["coverage_zi"]).all()
 
 
+def test_bootstrap_intervals_bracket_estimates(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    plain = profile(index, *READS)
+    got = profile(index, *READS, bootstrap=30)
+    assert "coverage_zi_lo" not in plain.columns
+    assert got.drop("^.*_(lo|hi)$").equals(plain)  # intervals change nothing else
+    found = got.filter(pl.col("coverage_zi") > 0)
+    assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
+    inside = found["coverage_zi"].is_between(found["coverage_zi_lo"], found["coverage_zi_hi"])
+    assert inside.mean() >= 0.9  # type: ignore[operator]
+    assert got.equals(profile(index, *READS, bootstrap=30))  # seeded
+
+
 def test_gather_explains_away_shared_kmers() -> None:
     kmers = pl.DataFrame(
         {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},
@@ -207,6 +220,21 @@ def test_pin_presence_matches_zero_inflated_em_at_one_level() -> None:
     want = em(kmers.drop("pin_q"), np.array([40]), zero_inflated=True).row(0, named=True)
     assert got["coverage"] == pytest.approx(want["coverage"], rel=1e-4)
     assert got["present"] == pytest.approx(want["present"], rel=1e-4)
+
+
+def test_pin_presence_escapes_core_kmers() -> None:
+    # Every kept k-mer core (p_in = 1) but only 10 of 40 present: presence must fall, as in
+    # zero-inflated EM, rather than stay at 1 (it did when level 15 read as exactly 1).
+    kmers = pl.DataFrame(
+        {"unit": [0] * 10, "hash": range(10), "hits": [3] * 10, "pin_q": [15] * 10},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8},
+    )
+    hist = np.zeros((1, 16))
+    hist[0, 15] = 40
+    got = em_pin(kmers, hist).row(0, named=True)
+    want = em(kmers.drop("pin_q"), np.array([40]), zero_inflated=True).row(0, named=True)
+    assert got["coverage"] == pytest.approx(want["coverage"], rel=1e-3)
+    assert got["present"] == pytest.approx(want["present"], rel=1e-3)
 
 
 def test_pin_presence_splits_shared_kmer_by_p_in() -> None:

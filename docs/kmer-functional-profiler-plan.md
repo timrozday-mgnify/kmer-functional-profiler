@@ -264,9 +264,9 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
 | 2. Index prototype (built; gate needs a real subset) | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
-| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
+| 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence, copies-scaled abundance, bootstrap intervals; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
-| 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
+| 6. Rust port and full-scale tuning | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale, then the full build. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding, memory-mapped lookup; re-run the fmh and simulation benchmarks at each candidate to choose defaults on cost vs accuracy. Expect many iterations and some accuracy given up for cost. | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node at a chosen cost/accuracy point, with the accuracy given up versus phase 5 recorded. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
@@ -280,6 +280,8 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Decided:** MGnify90 clusters are the only grouping level; no 30% families.
 * **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
 * **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
+
+* **Decided (2026-09-28): full-scale check in phase 6, not phase 4.** No test or benchmark so far uses the full MGnify release: unit tests use fixtures, the simulation 300 synthetic units from 100 MGnify seed proteins, the fmh benchmark KEGG KO indexes (tier 2 72 MB, dense tier 1.09 GB at 1/10), and the only real MGnify build is the pre-fix gut 1-in-10,000 subset (213,645 proteins, about 4×10⁻⁵ of the release). The Python build holds the members table and k-mer tables in memory, so a full-release build needs the Rust port (or a partitioned build) anyway. Phase 6 therefore carries the full-scale cost study and tuning (see the phase table). Expect a lot of tuning there to bring cost down, and some compromises on accuracy; defaults chosen in phase 5 are provisional until phase 6 has priced them, and the phase-4/5 accuracy numbers are the reference that any cost saving is measured against.
 
 ### Phase 1
 
@@ -424,6 +426,34 @@ What each step did, and the choices, results and interpretations behind it, newe
 
   *Also:* `em_pin` read quantised *p\_in* levels as (*l* + 0.5)/16, but the build quantises as round(15·*p\_in*); now *l*/15 with level 0 at 1/30. Simulation after the fix (`gather_zip` vs `gather_zi`): dense sd 0.52 → 0.42 as before, floor Spearman 0.835 → 0.806 (was 0.829). The `gut-lin10000` archive from the same HPC batch is the pre-fix phase-2 build (*t\_max* 0.57, 19.4 B per hash), already recorded under Phase 2.
 
+* **Phase 4, step 10 — confidence intervals (`bootstrap_zi`, `query --bootstrap B`).** 95% percentile intervals for `coverage_zi` and `abundance_zi` (`*_lo`, `*_hi`) from a Poisson bootstrap over reads: each replicate weights every read pair by a Poisson(1) draw, rebuilds the k-mer counts and refits zero-inflated EM (sharing between units included). Reads, not k-mers, are resampled because one 150 bp read hits ~40 consecutive amino-acid k-mers of a unit, so k-mer counts are correlated and a Poisson/Fisher interval would be too narrow. To do this the query now keeps hits per (unit, k-mer, read) for detected units, in both passes. Off by default (B = 0); tests: intervals bracket the estimate, leave every other column unchanged, and are reproducible (fixed seed).
+  - *Simulation calibration* (5 seeds, B = 100, `coverage_zi` against true k-mer coverage = depth × a per-sample scale, the median estimate / depth over strains at 100% identity and depth > 5):
+
+  | Config | Coverage (95% nominal) | Coverage, depth ≤ 2 | Median width, log(hi / lo) |
+  | --- | --- | --- | --- |
+  | dense | 0.964 | 0.962 | 1.17 (×3.2) |
+  | s10 | 0.973 | 0.979 | 1.42 (×4.1) |
+  | floor | 0.968 | 0.983 | 2.18 (×8.8) |
+  | floor + dense 1/50 | 0.958 | 0.966 | 1.63 (×5.1) |
+  | floor + dense 1/5 | 0.950 | 0.925 | 1.15 (×3.2) |
+
+  *Interpretation.* Calibrated to slightly conservative everywhere, including at low depth where the point estimate is least reliable; widths track the information per unit (the floor index's ~8 k-mers per unit give ×9 intervals). This meets the phase-4 gate's "calibrated intervals on simulations" for `coverage_zi`. Caveat: the scale is estimated from the same sample; the ±1–2% conservatism is within what that allows.
+  - *fmh benchmark:* PROFILE runs with `--bootstrap` (`params.bootstrap`, default 100) and SCORE reports `ci_cover` and `ci_width` for estimates with intervals, against truth depth on the estimate's scale (median estimate / depth over true positives). Result pending on HPC; the dense-tier profile will be the slowest (100 EM refits over its larger hit table).
+
+* **Phase 4, step 11 — fmh benchmark with copies-scaled abundance (HPC, PR #14 code).** Detection and every earlier estimate reproduced the previous run exactly. `abundance_zi` against truth depth (`kmers_unique` ≥ 1, true positives, 10 seeds):
+
+  | Index | `coverage_zi` Spearman / L1 | `abundance_zi` Spearman (sd) / L1 |
+  | --- | --- | --- |
+  | kfp\_s1000 | 0.373 / 0.97 | 0.807 (0.011) / 0.57 |
+  | kfp\_s1000\_floor8 | 0.369 / 1.02 | 0.827 (0.014) / 0.56 |
+  | kfp\_s100 | 0.576 / 0.94 | **0.957 (0.003) / 0.22** |
+  | kfp\_s100\_d10 | 0.627 / 0.93 | **0.988 (0.002) / 0.14** |
+
+  *Interpretation.* The exact form (present k-mers / Σ *p\_in*) beats the offline approximation (0.935), and on KO units abundance is now as good as detection: kfp\_s100 detects 95.5% of KOs at 98.5% purity and ranks their abundance at 0.96. The dense tier's gain is larger here than for per-copy coverage (L1 0.22 → 0.14, 36% lower), but its cost is unchanged (15× tables, ~6× query time); still off by default, and a candidate for the phase-6 cost study. At scaled 1000 the floor helps abundance a little (0.81 → 0.83).
+  - `fmh_compat`: `abundance_zi` equals plain EM (0.09), as expected: imported sketches carry no members, so *p\_in* = 1 and `pin_sum` = *m\_g*, and copies reduce to the present fraction. fmh-funprofiler's own sketches cannot give copy-aware abundance.
+  - `coverage_zip` equals `coverage_zi` on our KO indexes (0.576 vs 0.576): nearly all KO k-mers have *p\_in* < 1/15 and fall in quantised level 0, so presence cannot vary between them. On `fmh_compat` it equalled plain EM, which exposed a bug: with level 15 read as exactly 1, a k-mer present with probability 1 stays so, because EM then reads every unhit copy as present. **Fixed:** level probabilities are clipped to [1/30, 1 − 1/30]; a test covers all-core units. The simulation is unchanged by the fix (its `coverage_zip` bias is structural, not this bug). `coverage_zip` stays experimental: it cannot help KO-like units at 4-bit *p\_in*, and its intended case, MGnify90 clusters with varied *p\_in*, has no truth-bearing benchmark until phase 6.
+  **Decided:** recommended setting for KO-like units is `kfp_s100`, detection `kmers_unique` ≥ 1, abundance `abundance_zi`; for MGnify90 clusters `coverage_zi`, summed over clusters for function-level abundance. Intervals (PR #15) have not been run on HPC yet.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
@@ -530,7 +560,7 @@ Keeping `crates/core` free of PyO3 means phase 6 reuses the kernels unchanged; o
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
 
-- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Confirm the full index fits a 64 GB node before phase 4.
+- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Deferred to phase 6 (see Progress log): the Python prototype cannot build the full release on one node, so full-scale storage and compute are measured and tuned there.
 - **Component size.** Promiscuous k-mers can chain clusters into one giant component, which makes the EM serial. Measure component sizes on the development subset in phase 2 and tune the N-clusters cut-off.
 
 * **Marginal novelty.** Setting sourmash to scaled = 100 may recover most of the completeness gap at modest cost. Run that baseline in phase 3 before building phase 4.
