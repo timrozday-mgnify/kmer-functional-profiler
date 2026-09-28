@@ -23,7 +23,7 @@ the true depth:
 - ``bias_<identity>``: median estimate / depth of true positives at that strain identity,
   over the median at 100%; 1 = divergence costs nothing.
 
-``index_mb`` is the size of the index's lookup tables. With ``--bootstrap`` B, the
+``index_mb`` is the size of the index's lookup tables. With ``--draws`` D, the
 ``gather_zi`` rows add interval calibration (:func:`calibration`). Writes ``scores.tsv`` (per
 seed) and ``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds per seed.
 """
@@ -86,22 +86,40 @@ def mutate(seq: str, identity: float, rng: random.Random) -> str:
 
 
 def reference(args: argparse.Namespace) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Members table for the index, and the unit table (``unit``, ``family``, ``centroid``)."""
+    """Members table for the index, and the unit table (``unit``, ``family``, ``centroid``,
+    ``twin_of``: the unit a near-identical twin copies, else null)."""
     rng = random.Random(0)
-    units, members = [], []
+    units: list[tuple[int, int, str, int | None]] = []
+    members: list[tuple[int, int, bool, str]] = []
+
+    def add(family: int, centroid: str, twin_of: int | None) -> None:
+        unit = len(units)
+        units.append((unit, family, centroid, twin_of))
+        first_id = len(members)
+        members.extend(
+            (first_id + i, unit, True, mutate(centroid, 0.97, rng)) for i in range(args.members)
+        )
+
     for family, seed in enumerate(seed_proteins(args.seed_fasta, args.families)):
+        first = len(units)
         for _ in range(args.paralogs):
-            centroid = mutate(seed, rng.uniform(0.85, 0.95), rng)
-            unit = len(units)
-            units.append((unit, family, centroid))
-            members += [
-                (len(members), unit, True, mutate(centroid, 0.97, rng)) for _ in range(args.members)
-            ]
+            add(family, mutate(seed, rng.uniform(0.85, 0.95), rng), None)
+        if rng.random() < args.twins:  # a near-identical paralog: barely separable
+            add(family, mutate(units[first][2], 0.99, rng), first)
     return (
         pl.DataFrame(
             members, schema=["protein_id", "cluster_rep", "full_length", "sequence"], orient="row"
         ),
-        pl.DataFrame(units, schema=["unit", "family", "centroid"], orient="row"),
+        pl.DataFrame(
+            units,
+            schema={
+                "unit": pl.Int64,
+                "family": pl.Int64,
+                "centroid": pl.String,
+                "twin_of": pl.Int64,
+            },
+            orient="row",
+        ),
     )
 
 
@@ -167,23 +185,42 @@ def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> d
     }
 
 
-def calibration(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, float]:
-    """How often ``coverage_zi``'s bootstrap interval holds the true k-mer coverage.
+def calibration(truth: pl.DataFrame, result: pl.DataFrame, units: pl.DataFrame) -> dict[str, float]:
+    """How well ``coverage_zi``'s posterior intervals and ambiguity groups hold the truth.
 
     Truth is read depth; k-mer coverage is depth times a constant (read length, k, errors),
     taken as the median estimate / depth over well-covered strains at 100% identity.
-    ``ci_cover`` is over true positives, ``ci_cover_low`` over those at depth <= 2, and
-    ``ci_width`` the median log(hi / lo).
+    ``ci_cover`` is over true positives, ``ci_cover_low`` over those at depth <= 2,
+    ``ci_cover_twin`` over those with a detected near-identical twin, and ``ci_width`` the
+    median log(hi / lo). ``group_cover`` is how often a group's interval holds its members'
+    true total; ``grouped`` the share of true positives in a group; ``twins_grouped`` the
+    share of detected twin pairs placed in one group.
     """
-    tp = truth.join(result.filter(pl.col("kmers_unique") >= 1), on="unit").filter(
-        pl.col("coverage_zi") > 0
-    )
+    detected = result.filter(pl.col("kmers_unique") >= 1)
+    tp = truth.join(detected, on="unit").filter(pl.col("coverage_zi") > 0)
     scale = (
         tp.filter(pl.col("identity") == 1.0, pl.col("depth") > 5)
         .select((pl.col("coverage_zi") / pl.col("depth")).median())
         .item()
     )
+    pairs = units.filter(pl.col("twin_of").is_not_null()).select(a="twin_of", b="unit")
+    found = detected["unit"].to_list()
+    pairs = pairs.filter(pl.col("a").is_in(found), pl.col("b").is_in(found))
+    twinned = pairs["a"].to_list() + pairs["b"].to_list()
+    group = dict(detected.select("unit", "ambiguity_group").iter_rows())
+    groups = (
+        detected.filter(pl.col("ambiguity_group").is_not_null())
+        .join(truth, on="unit", how="left")
+        .group_by("ambiguity_group")
+        .agg(
+            total=pl.col("depth").fill_null(0).sum() * scale,
+            lo=pl.col("group_coverage_zi_lo").first(),
+            hi=pl.col("group_coverage_zi_hi").first(),
+        )
+    )
     held = tp.select(
+        twin=pl.col("unit").is_in(twinned),
+        grouped=pl.col("ambiguity_group").is_not_null(),
         low=pl.col("depth") <= 2,
         inside=(pl.col("coverage_zi_lo") <= pl.col("depth") * scale)
         & (pl.col("depth") * scale <= pl.col("coverage_zi_hi")),
@@ -192,7 +229,14 @@ def calibration(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, float]:
     return {
         "ci_cover": held["inside"].mean(),  # type: ignore[dict-item]
         "ci_cover_low": held.filter("low")["inside"].mean(),  # type: ignore[dict-item]
+        "ci_cover_twin": held.filter("twin")["inside"].mean(),  # type: ignore[dict-item]
         "ci_width": held["width"].median(),  # type: ignore[dict-item]
+        "grouped": held["grouped"].mean(),  # type: ignore[dict-item]
+        "group_cover": groups.select(pl.col("total").is_between("lo", "hi").mean()).item(),
+        "twins_grouped": sum(
+            group[a] is not None and group[a] == group[b] for a, b in pairs.iter_rows()
+        )
+        / max(pairs.height, 1),
     }
 
 
@@ -206,7 +250,8 @@ def main() -> None:
     parser.add_argument("--error", type=float, default=0.002)
     parser.add_argument("--decoys", type=float, default=0.2)
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--bootstrap", type=int, default=0, help="replicates for intervals")
+    parser.add_argument("--draws", type=int, default=0, help="posterior draws for intervals")
+    parser.add_argument("--twins", type=float, default=0.0, help="families with a 99%% twin")
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
     parser.add_argument("--out", type=Path, default=Path("sim-results"))
     args = parser.parse_args()
@@ -224,12 +269,14 @@ def main() -> None:
         for seed in range(1, args.seeds + 1):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)
-            result = profile(index, reads, bootstrap=args.bootstrap).with_columns(
+            result = profile(index, reads, draws=args.draws).with_columns(
                 unit=pl.col("cluster_rep").cast(pl.Int64)
             )
             for rule, (count, abundance) in RULES.items():
                 found = result.filter(pl.col(count) >= 1).select("unit", estimate=abundance)
-                extra = calibration(truth, result) if args.bootstrap and rule == "gather_zi" else {}
+                extra = (
+                    calibration(truth, result, units) if args.draws and rule == "gather_zi" else {}
+                )
                 rows.append({"config": config, "rule": rule, "seed": seed, "index_mb": index_mb,
                              **score(truth, found, families), **extra})  # fmt: skip
     scores = pl.DataFrame(rows, infer_schema_length=None)

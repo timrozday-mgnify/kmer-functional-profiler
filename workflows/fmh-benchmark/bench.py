@@ -13,7 +13,7 @@
   ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
   threshold. Each count is paired with its abundance estimates (``RULES``), scored on the detected
   KOs against ``depth``: Spearman over true positives and L1 between relative abundances,
-  and the calibration of bootstrap intervals where the profile has them.
+  and the calibration of posterior intervals where the profile has them.
 - ``summary``: mean and sd of the scores per index, count and threshold.
 """
 
@@ -193,6 +193,39 @@ def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, f
     }
 
 
+def group_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, float | None]:
+    """How ambiguity groups relate to truth, for profiles that have them.
+
+    ``fp_grouped``: share of false-positive KOs in a group that holds a true KO (the call
+    is ambiguous, not wrong). ``group_cover``: share of groups whose ``abundance_zi``
+    interval holds the members' true total depth, on the estimate's scale.
+    """
+    if "ambiguity_group" not in detected.columns:
+        return {"fp_grouped": None, "group_cover": None}
+    d = detected.join(truth.select("ko_id", "depth"), left_on="name", right_on="ko_id", how="left")
+    scale = (
+        d.filter(pl.col("depth") > 0, pl.col("abundance_zi") > 0)
+        .select((pl.col("abundance_zi") / pl.col("depth")).median())
+        .item()
+    )
+    grouped = d.filter(pl.col("ambiguity_group").is_not_null())
+    with_tp = grouped.filter(pl.col("depth").is_not_null())["ambiguity_group"].unique()
+    fp = d.filter(pl.col("depth").is_null())
+    groups = grouped.group_by("ambiguity_group").agg(
+        total=pl.col("depth").fill_null(0).sum() * scale,
+        lo=pl.col("group_abundance_zi_lo").first(),
+        hi=pl.col("group_abundance_zi_hi").first(),
+    )
+    return {
+        "fp_grouped": fp.select(pl.col("ambiguity_group").is_in(with_tp.implode()).mean()).item()
+        if fp.height
+        else None,
+        "group_cover": groups.select(pl.col("total").is_between("lo", "hi").mean()).item()
+        if groups.height
+        else None,
+    }
+
+
 def interval_scores(tp: pl.DataFrame) -> dict[str, float | None]:
     if "lo" not in tp.columns or tp.height == 0:
         return {"ci_cover": None, "ci_width": None}
@@ -247,6 +280,11 @@ def score(args: argparse.Namespace) -> None:
                     )
                     if abundance
                     else {"spearman_tp": None, "l1": None, "ci_cover": None, "ci_width": None}
+                ),
+                **(
+                    group_scores(truth, detected)
+                    if abundance == "abundance_zi"
+                    else {"fp_grouped": None, "group_cover": None}
                 ),
             }
         )
