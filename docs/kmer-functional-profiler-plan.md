@@ -454,6 +454,18 @@ What each step did, and the choices, results and interpretations behind it, newe
   - `coverage_zip` equals `coverage_zi` on our KO indexes (0.576 vs 0.576): nearly all KO k-mers have *p\_in* < 1/15 and fall in quantised level 0, so presence cannot vary between them. On `fmh_compat` it equalled plain EM, which exposed a bug: with level 15 read as exactly 1, a k-mer present with probability 1 stays so, because EM then reads every unhit copy as present. **Fixed:** level probabilities are clipped to [1/30, 1 − 1/30]; a test covers all-core units. The simulation is unchanged by the fix (its `coverage_zip` bias is structural, not this bug). `coverage_zip` stays experimental: it cannot help KO-like units at 4-bit *p\_in*, and its intended case, MGnify90 clusters with varied *p\_in*, has no truth-bearing benchmark until phase 6.
   **Decided:** recommended setting for KO-like units is `kfp_s100`, detection `kmers_unique` ≥ 1, abundance `abundance_zi`; for MGnify90 clusters `coverage_zi`, summed over clusters for function-level abundance. Intervals (PR #15) have not been run on HPC yet.
 
+* **Phase 4, step 12 — bootstrap intervals on real data (HPC, PR #15 code, B = 100).** Detection and all point estimates reproduced the previous run; the `em_pin` fix shows as expected (`fmh_compat` `coverage_zip` 0.09 → 0.395, in line with `coverage_zi`). Interval coverage of truth depth on the estimate's scale (nominal 95%, true positives):
+
+  | Index | `abundance_zi` coverage | median width, log(hi / lo) | `coverage_zi` coverage |
+  | --- | --- | --- | --- |
+  | kfp\_s1000 | 0.556 | 1.28 | 0.529 |
+  | kfp\_s100 | 0.607 | 0.62 | 0.333 |
+  | kfp\_s100\_d10 | 0.717 | 0.38 | 0.163 |
+
+  (`coverage_zi` estimates depth per copy, not the KO total, so its low coverage is expected.) *Why `abundance_zi` intervals are too narrow:* the estimate is unbiased at every depth (median log residual within ±0.03 per depth quartile on kfp\_s100), but the bootstrap half-width shrinks with depth (0.88 → 0.12 from the lowest to the highest quartile) while the residual sd does not (0.69 → 0.34). Coverage therefore falls with depth, 0.80 → 0.43 on kfp\_s100 and 0.88 → 0.49 with the dense tier. The bootstrap measures read-sampling noise only; what it misses is a per-unit model error. Adding a constant σ on the log scale in quadrature restores calibration offline: σ = 0.2 gives 0.95 (d10) and 0.88 (s100), σ = 0.3 gives 0.97 and 0.93 (s1000 needs more: 0.82 at 0.3). The simulation had no such error (single-strain units, so copies are exact), which is why it was calibrated there. The likeliest source is the copies estimate: it divides present k-mers by an *average* member's kept k-mers, but the KO genes in a sample are specific members whose lengths vary between species.
+  *Cost:* the bootstrap multiplies PROFILE time by 4–6 on kfp\_s100 (23 s → 1m31–2m09) and 8–11 with the dense tier (2m16–2m46 → 18–30 min; peak memory 6 GB).
+  **Decided:** intervals are not calibrated on real data yet; `--bootstrap` stays off by default in the tool, and results must not be read as 95% intervals. Next: add a per-unit model-error term, from the spread of member lengths (kept k-mers per member, measurable at build) divided by the square root of the copies present, plus a small calibrated floor, and test it on the next HPC run; reduce the benchmark's default replicates (or bootstrap only non-dense indexes) to cut cost.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
