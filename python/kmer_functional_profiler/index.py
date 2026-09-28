@@ -24,7 +24,9 @@ Parquet tables for inspection.
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
 ``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
 promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
-``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level.
+``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level,
+and ``pin_sum`` (``pin_sum_dense``) sums their ``p_in``: how many of them an average member
+holds, which turns present k-mers into member-equivalents (copies).
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
@@ -441,12 +443,12 @@ def build_index(
             .filter(pl.len().over("hash") <= params.max_groups)
             .join(units.select("unit", "n_counting", "max_hash_dense"), on="unit")
             .filter(pl.col("hash") <= pl.col("max_hash_dense"))
+            .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
             .select(
                 "hash",
                 "unit",
-                pin_q=(pl.col("c") / pl.col("n_counting") * (2**PIN_BITS - 1))
-                .round()
-                .cast(pl.UInt64),
+                "p_in",
+                pin_q=(pl.col("p_in") * (2**PIN_BITS - 1)).round().cast(pl.UInt64),
             )
         )
     return write_index(out, params, units, postings, stats, dense=dense)
@@ -457,6 +459,13 @@ def _pin_hist(postings: pl.DataFrame, n_units: int) -> pl.Series:
     hist = np.zeros((n_units, 2**PIN_BITS), dtype=np.uint32)
     np.add.at(hist, (postings["unit"].to_numpy(), postings["pin_q"].to_numpy()), 1)
     return pl.Series(hist)
+
+
+def _pin_sum(postings: pl.DataFrame, n_units: int) -> pl.Series:
+    """Per unit, the sum of ``p_in`` over kept k-mers: the kept k-mers of an average member."""
+    return pl.Series(
+        np.bincount(postings["unit"].to_numpy(), postings["p_in"].to_numpy(), minlength=n_units)
+    )
 
 
 def write_index(
@@ -473,8 +482,8 @@ def write_index(
     ``units`` needs ``unit`` (0..n-1), ``t_g`` and ``max_hash_g``; ``postings`` holds one row
     per kept (hash, unit), each with ``hash <= max_hash_g``: ``p_in``, ``pin_q``,
     ``n_groups`` and ``score``. ``hash_scheme`` tells the query how to hash reads. ``dense``
-    (``hash``, ``unit``, ``pin_q``) becomes the dense table. Returns ``stats`` extended with
-    sizes.
+    (``hash``, ``unit``, ``p_in``, ``pin_q``) becomes the dense table. Returns ``stats``
+    extended with sizes.
     """
     t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     postings = postings.sort("hash", "unit")
@@ -488,7 +497,9 @@ def write_index(
     )
     n_components, component = connected_components(graph, directed=False)
 
-    units = units.with_columns(pin_hist=_pin_hist(postings, units.height))
+    units = units.with_columns(
+        pin_hist=_pin_hist(postings, units.height), pin_sum=_pin_sum(postings, units.height)
+    )
     per_unit = postings.group_by("unit").agg(
         m_g=pl.len().cast(pl.UInt32), u_g=(pl.col("n_groups") == 1).sum().cast(pl.UInt32)
     )
@@ -536,7 +547,9 @@ def write_index(
             how="left",
             maintain_order="left",
         ).with_columns(
-            pl.col("m_dense").fill_null(0), pin_hist_dense=_pin_hist(dense, units.height)
+            pl.col("m_dense").fill_null(0),
+            pin_hist_dense=_pin_hist(dense, units.height),
+            pin_sum_dense=_pin_sum(dense, units.height),
         )
         stats["dense_postings"] = dense.height
         stats["dense_bytes"] = tables["dense"].nbytes()

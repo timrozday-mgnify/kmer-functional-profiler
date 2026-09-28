@@ -105,6 +105,21 @@ def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
     assert (joined["kmers_dense"] > 0).all()
 
 
+def test_copies_count_member_equivalents(tmp_path: Path) -> None:
+    # Units of two unrelated proteins, both sequenced (a KO seen in two genomes): with every
+    # kept k-mer present, copies = kept k-mers / an average member's = 2.
+    seqs = list(proteins().values())
+    rows = [(i, i // 2, True, seq) for i, seq in enumerate(seqs)]
+    path = tmp_path / "pairs.parquet"
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    build_index(path, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    result = profile(Index.load(tmp_path / "idx"), *READS).filter(pl.col("present_zi") == 1)
+    assert result.height > 0
+    assert result["copies_zi"].to_list() == pytest.approx([2.0] * result.height)
+    assert (result["abundance_zi"] == 2 * result["coverage_zi"]).all()
+
+
 def test_gather_explains_away_shared_kmers() -> None:
     kmers = pl.DataFrame(
         {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},

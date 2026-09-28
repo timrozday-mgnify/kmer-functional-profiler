@@ -191,7 +191,9 @@ def em(
     )
 
 
-PIN_P: Final = (np.arange(2**PIN_BITS) + 0.5) / 2**PIN_BITS  # midpoint of each p_in level
+# p_in of each quantised level (pin_q = round(15 p_in)); level 0 at 1/30, not 0, so no k-mer
+# is certainly absent.
+PIN_P: Final = np.maximum(np.arange(2**PIN_BITS) / (2**PIN_BITS - 1), 0.5 / (2**PIN_BITS - 1))
 
 
 def em_pin(
@@ -204,8 +206,8 @@ def em_pin(
     divergent one loses k-mers uniformly (s_g < 1). So core k-mers are expected present
     more often than private ones, which changes both how shared hits are split (by
     coverage x presence of that k-mer in each unit) and how much an unhit k-mer argues for
-    low coverage rather than absence. ``p_in`` is the midpoint of its quantised level
-    (``pin_q``), so no k-mer is certainly absent; s_g is capped so presence stays <= 1.
+    low coverage rather than absence. ``p_in`` is read from its quantised level (``PIN_P``);
+    s_g is capped so presence stays <= 1.
 
     ``kmers`` has ``unit``, ``hash``, ``hits`` and ``pin_q``; ``pin_hist[unit]`` counts the
     unit's kept k-mers per level (its sum is ``m_g``). Coverage is attributed hits over
@@ -282,6 +284,9 @@ def profile(
     :func:`gather` (0 and null for units explained away) and ``coverage_em`` from :func:`em`
     over the units gather keeps (0 for the rest), with ``coverage_zi`` and ``present_zi``
     from its zero-inflated form, and ``coverage_zip``/``present_zip`` from :func:`em_pin`.
+    ``copies_zi`` is present k-mers over an average member's kept k-mers (``pin_sum``), the
+    member-equivalents present, and ``abundance_zi`` = ``coverage_zi`` x ``copies_zi``: for a
+    unit whose members come from many genomes (a KO), total depth over its gene copies.
     ``kmers_wta``/``coverage_wta`` and ``kmers_ufirst``/``coverage_ufirst`` are the k-mers
     :func:`assign_best` gives each unit and their hits per kept k-mer. Units without hits
     are omitted.
@@ -326,6 +331,7 @@ def profile(
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
     pin_hist = index.units["pin_hist"].to_numpy()
+    pin_sum = index.units["pin_sum"]
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -348,13 +354,25 @@ def profile(
         )
         m_g = index.units["m_dense"].to_numpy()
         pin_hist = index.units["pin_hist_dense"].to_numpy()
+        pin_sum = index.units["pin_sum_dense"]
     plain = em(detected, m_g).select("unit", coverage_em="coverage")
     inflated = em(detected, m_g, zero_inflated=True)
     prior = fit_present_prior(inflated)
     shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
         "unit", coverage_zib="coverage", present_zib="present"
     )
-    inflated = inflated.select("unit", coverage_zi="coverage", present_zi="present")
+    # Present k-mers over an average member's kept k-mers: member-equivalents present.
+    copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
+    inflated = inflated.join(
+        pl.DataFrame({"unit": np.arange(len(m_g), dtype=np.uint32), "m": m_g, "pin_sum": pin_sum}),
+        on="unit",
+    ).select(
+        "unit",
+        coverage_zi="coverage",
+        present_zi="present",
+        copies_zi=copies,
+        abundance_zi=pl.col("coverage") * copies,
+    )
     weighted = em_pin(detected, pin_hist).select(
         "unit", coverage_zip="coverage", present_zip="present"
     )
@@ -366,7 +384,7 @@ def profile(
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("reads").explode(empty_as_null=False).n_unique().cast(pl.UInt64),
         )
-        .join(index.units.select(pl.exclude("^pin_hist.*$")), on="unit")
+        .join(index.units.select(pl.exclude("^pin_(hist|sum).*$")), on="unit")
         .join(assigned, on="unit", how="left")
         .join(plain, on="unit", how="left")
         .join(inflated, on="unit", how="left")
@@ -391,7 +409,7 @@ def profile(
         result = result.join(won, on="unit", how="left")
     return (
         result.with_columns(
-            pl.col("^(coverage|present)_(em|zi|zib|zip)$").fill_null(0.0),
+            pl.col("^(coverage|present|copies|abundance)_(em|zi|zib|zip)$").fill_null(0.0),
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
             kmers_unique=pl.col("kmers_unique").fill_null(0),

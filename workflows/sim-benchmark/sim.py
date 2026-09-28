@@ -60,6 +60,7 @@ RULES = {
     "gather_zi": ("kmers_unique", "coverage_zi"),
     "gather_zib": ("kmers_unique", "coverage_zib"),
     "gather_zip": ("kmers_unique", "coverage_zip"),
+    "gather_zi_copies": ("kmers_unique", "abundance_zi"),
     "wta": ("kmers_wta", "coverage_wta"),
     "ufirst": ("kmers_ufirst", "coverage_ufirst"),
 }

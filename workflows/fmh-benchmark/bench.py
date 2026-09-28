@@ -98,6 +98,7 @@ RULES = (
     ("kmers_unique", "coverage_zi"),
     ("kmers_unique", "coverage_zib"),
     ("kmers_unique", "coverage_zip"),
+    ("kmers_unique", "abundance_zi"),
     ("kmers_wta", "coverage_wta"),
     ("kmers_ufirst", "coverage_ufirst"),
 )

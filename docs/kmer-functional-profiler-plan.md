@@ -405,6 +405,25 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 * **Fix (fmh benchmark):** INDEX and IMPORT\_SKETCHES now take the package sources as an input, like PROFILE, so `-resume` rebuilds indexes when the build code changes; cached indexes without `pin_hist` made every PROFILE fail. Indexes from runs before this change are rebuilt once.
 
+* **Phase 4, step 9 — fmh benchmark with abundance (HPC, PR #13 code, 10 InSilicoSeq metagenomes).** Detection reproduced the phase-3 numbers exactly. Abundance against truth depth (Σ over the KO's genes of aligned bases / gene length), true positives, `kmers_unique` ≥ 1:
+
+  | Index | Abundance | Spearman | L1 |
+  | --- | --- | --- | --- |
+  | fmh\_compat | coverage (hits / *m\_g*) | 0.08 | 1.41 |
+  | fmh\_compat | ZI EM | 0.40 | 0.97 |
+  | kfp\_s100 | coverage | 0.32 | 1.35 |
+  | kfp\_s100 | EM / winner-take-all / uniqueness-first | 0.35 / 0.34 / 0.37 | 1.25 / 1.32 / 1.23 |
+  | kfp\_s100 | ZI EM | 0.58 | 0.94 |
+  | kfp\_s100 | ZI EM + prior | 0.53 | 0.98 |
+  | kfp\_s100\_d10 | ZI EM (dense tier 1/10) | 0.63 | 0.93 |
+
+  As in the simulation, zero-inflation is the largest gain and the three simple rules and plain EM are indistinguishable; the prior does not help. But the level is far below the simulation's 0.95. *Why:* a KO unit is the union of its genes from many species, and a sample holds several of them at different depths; truth sums depth over those copies, while ZI coverage is depth per present k-mer, about one copy's. Scaling by copies present (offline, from the profiles, with copies ≈ `present_zi` × `n_members`, valid when members share few k-mers as KO members do) gives Spearman **0.935** (kfp\_s100) and **0.964** (d10), log-ratio sd 0.63 and 0.45. Hits / *t\_g* / (k-mers per member), with no model at all, gives 0.92: most of the gap was the estimand, not the model.
+  **Decided:** profiles report `copies_zi` = present k-mers / `pin_sum` and `abundance_zi` = `coverage_zi` × `copies_zi`. `pin_sum` (`pin_sum_dense`) is Σ *p\_in* over a unit's kept k-mers, computed at build from unquantised *p\_in*: how many kept k-mers an average member holds, so present / `pin_sum` counts member-equivalents present. The 4-bit *p\_in* levels cannot give this for KOs (most KO k-mers have *p\_in* < 1/15). The two estimates answer different questions: `coverage_zi` is depth per copy and stays the per-cluster estimate for MGnify90 units (one strain each; the simulation shows `abundance_zi` there brings back the divergence bias, 0.16 at 85%, because a divergent strain looks like fewer copies); `abundance_zi` is total depth over copies, which is what the KO-unit benchmark measures. For the real tool, function-level abundance is Σ over clusters of `coverage_zi`, per the plan (EM at cluster level, then aggregate). The fmh benchmark now scores `abundance_zi` to confirm the exact form (needs a rerun; these indexes predate `pin_sum`).
+
+  *Dense tier cost on real data* (kfp\_s100\_d10 vs kfp\_s100): tables 1.09 GB vs 72 MB (15×; 7.9 B vs 5.2 B per posting), index build 36.5 GB vs 7.8 GB peak memory, query 2m16–2m46 vs 23 s and 5 GB vs 0.58 GB (the prototype materialises 8 B per key for lookup). For +0.05 Spearman (ZI) or +0.03 (copies-scaled), and a 30% lower log-ratio sd. **Decided:** the dense tier stays off by default; revisit after the Rust lookup (memory-mapped, no materialised keys) and with a rate or singleton restriction chosen from MGnify-subset `dense_bytes`.
+
+  *Also:* `em_pin` read quantised *p\_in* levels as (*l* + 0.5)/16, but the build quantises as round(15·*p\_in*); now *l*/15 with level 0 at 1/30. Simulation after the fix (`gather_zip` vs `gather_zi`): dense sd 0.52 → 0.42 as before, floor Spearman 0.835 → 0.806 (was 0.829). The `gut-lin10000` archive from the same HPC batch is the pre-fix phase-2 build (*t\_max* 0.57, 19.4 B per hash), already recorded under Phase 2.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
