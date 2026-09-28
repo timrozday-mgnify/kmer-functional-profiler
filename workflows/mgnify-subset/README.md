@@ -19,7 +19,7 @@ so `p_in` is computed over the whole cluster.
 Needs Java 17+, Nextflow, [uv](https://docs.astral.sh/uv/) and a Rust toolchain.
 
 ```bash
-bash workflows/mgnify-subset/setup.sh   # creates .venv in the repo root
+bash workflows/setup.sh   # creates .venv in the repo root
 ```
 
 ## Run

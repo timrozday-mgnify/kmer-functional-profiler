@@ -21,8 +21,9 @@ Parquet tables for inspection.
 import json
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
+from functools import cached_property
 from pathlib import Path
-from typing import Final, Self
+from typing import Any, Final, Self
 
 import numpy as np
 import polars as pl
@@ -119,7 +120,7 @@ class PackedTable:
     def lookup(self, hashes: NDArray[np.uint64]) -> NDArray[np.int64]:
         """Set id per hash, or -1 (includes false hits at rate ~2**-fp_bits per bucket key)."""
         hashes = np.asarray(hashes, dtype=np.uint64)
-        stored = self._stored_keys()
+        stored = self.stored_keys
         if not len(stored):
             return np.full(len(hashes), -1, dtype=np.int64)
         keys = hashes >> np.uint64(self.shift)
@@ -131,8 +132,10 @@ class PackedTable:
         """Values of one set."""
         return self.set_values[self.set_offsets[set_id] : self.set_offsets[set_id + 1]]
 
-    def _stored_keys(self) -> NDArray[np.uint64]:
-        # ponytail: rebuilt per lookup; the phase-3 Rust lookup walks offsets directly
+    @cached_property
+    def stored_keys(self) -> NDArray[np.uint64]:
+        """Full sorted keys (bucket and fingerprint), materialised once for ``lookup``."""
+        # ponytail: 8 bytes per key in RAM; the Rust lookup will walk offsets directly
         buckets = np.repeat(
             np.arange(len(self.offsets) - 1, dtype=np.uint64),
             np.diff(self.offsets).astype(np.int64),
@@ -164,7 +167,7 @@ class PackedTable:
 class Index:
     """A built index: unit table, tiers and the metadata written by ``build_index``."""
 
-    meta: dict[str, object]
+    meta: dict[str, Any]
     units: pl.DataFrame
     tier1: PackedTable
     tier2: PackedTable
@@ -232,6 +235,7 @@ def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParam
         members.group_by("unit")
         .agg(
             pl.col("cluster_rep").first(),
+            name=pl.col("cluster_rep").first().cast(pl.String),
             n_members=pl.len().cast(pl.UInt32),
             n_full_length=pl.col("full_length").sum().cast(pl.UInt32),
             n_counting=pl.col("counts").sum().cast(pl.UInt32),
@@ -313,6 +317,40 @@ def build_index(
         )
         .select("hash", "unit", "p_in", "pin_q", "n_groups", "score")
     )
+    if pfam_path is not None:
+        (
+            pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
+            .join(members.select("protein_id", "unit"), on="protein_id")
+            .group_by("unit", "pfam_accession")
+            .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
+            .sort("unit", "pfam_accession")
+            .write_parquet(out / "unit_pfam.parquet")
+        )
+    stats: dict[str, object] = {
+        "n_proteins": members.height,
+        "n_residues": int(members["sequence"].str.len_bytes().sum()),
+        "n_singletons": int((units["n_members"] == 1).sum()),
+        "candidates_expected": float((units["t_g"] * units["n_kmers"]).sum()),
+    }
+    return write_index(out, params, units, scored, stats)
+
+
+def write_index(
+    out: Path,
+    params: IndexParams,
+    units: pl.DataFrame,
+    scored: pl.DataFrame,
+    stats: dict[str, object],
+    hash_scheme: str = "kfp",
+) -> dict[str, object]:
+    """Cut promiscuous k-mers, find components, pack tiers and write the index files.
+
+    ``units`` needs ``unit`` (0..n-1), ``t_g`` and ``max_hash_g``; ``scored`` holds one row
+    per (hash, unit) present with ``hash <= max_hash_g``: ``p_in``, ``pin_q``, ``n_groups``
+    and ``score``. ``hash_scheme`` tells the query how to hash reads. Returns ``stats``
+    extended with sizes.
+    """
+    t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     postings = scored.filter(pl.col("n_groups") <= params.max_groups).sort("hash", "unit")
 
     # Components: link consecutive units sharing a posting hash.
@@ -360,26 +398,13 @@ def build_index(
 
     units.write_parquet(out / "units.parquet")
     postings.write_parquet(out / "postings.parquet")
-    if pfam_path is not None:
-        (
-            pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
-            .join(members.select("protein_id", "unit"), on="protein_id")
-            .group_by("unit", "pfam_accession")
-            .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
-            .sort("unit", "pfam_accession")
-            .write_parquet(out / "unit_pfam.parquet")
-        )
 
     component_sizes = np.bincount(component)
     distinct_hashes = postings["hash"].n_unique()
-    expected = float((units["t_g"] * units["n_kmers"]).sum())
-    stats: dict[str, object] = {
-        "n_proteins": members.height,
-        "n_residues": int(members["sequence"].str.len_bytes().sum()),
+    stats = {
+        **stats,
         "n_units": n_units,
-        "n_singletons": int((units["n_members"] == 1).sum()),
         "t_max": float(units["t_g"].max()),  # type: ignore[arg-type]
-        "candidates_expected": expected,
         "candidates": scored.height,
         "postings": postings.height,
         "promiscuous_dropped": scored.height - postings.height,
@@ -395,6 +420,7 @@ def build_index(
     }
     meta = {
         "format": 1,
+        "hash": hash_scheme,
         "params": asdict(params),
         "tier1": tier1.save(out, "tier1"),
         "tier2": tier2.save(out, "tier2"),

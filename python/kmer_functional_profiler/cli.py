@@ -1,14 +1,15 @@
 """Prototype CLI; mirrors the planned Rust one."""
 
 import json
-import sys
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from kmer_functional_profiler import __version__
-from kmer_functional_profiler.index import IndexParams, build_index
+from kmer_functional_profiler.compat import import_signatures
+from kmer_functional_profiler.index import Index, IndexParams, build_index
+from kmer_functional_profiler.query import profile
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULTS = IndexParams()
@@ -42,6 +43,25 @@ def index(
 
 
 @app.command()
-def query() -> None:
-    """Profile reads against an index (phase 3)."""
-    sys.exit("not implemented yet")
+def import_sourmash(
+    signatures: Annotated[Path, typer.Argument(help="sourmash signatures, e.g. .sig.zip")],
+    out_dir: Path,
+    ksize: int = 11,
+) -> None:
+    """Build an index from protein FracMinHash signatures (queried with sourmash hashing)."""
+    typer.echo(json.dumps(import_signatures(signatures, out_dir, ksize), indent=2))
+
+
+@app.command()
+def query(
+    index_dir: Path,
+    r1: Path,
+    r2: Annotated[Path | None, typer.Argument()] = None,
+    out: Annotated[Path, typer.Option(help="TSV of per-unit counts")] = Path("profile.tsv"),
+    frames: str = "stopfree",
+    genetic_code: int = 11,
+) -> None:
+    """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
+    result = profile(Index.load(index_dir), r1, r2, genetic_code=genetic_code, frames=frames)
+    result.write_csv(out, separator="\t")
+    typer.echo(f"{result.height} units hit -> {out}", err=True)
