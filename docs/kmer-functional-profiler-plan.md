@@ -266,7 +266,7 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
 | 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence, copies-scaled abundance, bootstrap intervals; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
-| 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
+| 6. Rust port and full-scale tuning | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale, then the full build. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding, memory-mapped lookup; re-run the fmh and simulation benchmarks at each candidate to choose defaults on cost vs accuracy. Expect many iterations and some accuracy given up for cost. | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node at a chosen cost/accuracy point, with the accuracy given up versus phase 5 recorded. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
@@ -280,6 +280,8 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Decided:** MGnify90 clusters are the only grouping level; no 30% families.
 * **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
 * **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
+
+* **Decided (2026-09-28): full-scale check in phase 6, not phase 4.** No test or benchmark so far uses the full MGnify release: unit tests use fixtures, the simulation 300 synthetic units from 100 MGnify seed proteins, the fmh benchmark KEGG KO indexes (tier 2 72 MB, dense tier 1.09 GB at 1/10), and the only real MGnify build is the pre-fix gut 1-in-10,000 subset (213,645 proteins, about 4×10⁻⁵ of the release). The Python build holds the members table and k-mer tables in memory, so a full-release build needs the Rust port (or a partitioned build) anyway. Phase 6 therefore carries the full-scale cost study and tuning (see the phase table). Expect a lot of tuning there to bring cost down, and some compromises on accuracy; defaults chosen in phase 5 are provisional until phase 6 has priced them, and the phase-4/5 accuracy numbers are the reference that any cost saving is measured against.
 
 ### Phase 1
 
@@ -544,7 +546,7 @@ Keeping `crates/core` free of PyO3 means phase 6 reuses the kernels unchanged; o
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
 
-- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Confirm the full index fits a 64 GB node before phase 4.
+- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Deferred to phase 6 (see Progress log): the Python prototype cannot build the full release on one node, so full-scale storage and compute are measured and tuned there.
 - **Component size.** Promiscuous k-mers can chain clusters into one giant component, which makes the EM serial. Measure component sizes on the development subset in phase 2 and tune the N-clusters cut-off.
 
 * **Marginal novelty.** Setting sourmash to scaled = 100 may recover most of the completeness gap at modest cost. Run that baseline in phase 3 before building phase 4.
