@@ -290,7 +290,7 @@ def posterior_zi(
     *,
     sweeps: int = 10,
     level: float = 0.95,
-    anticorrelation: float = 0.5,
+    shared_evidence: float = 0.5,
     seed: int = 0,
 ) -> pl.DataFrame:
     """Intervals and ambiguity groups for the zero-inflated model: resampled reads + Gibbs.
@@ -312,12 +312,16 @@ def posterior_zi(
 
     A unit given no hits in a draw is absent in it (coverage and abundance 0). Where units
     cannot be told apart, their shared counts move between them across draws, so their
-    intervals widen. Units whose coverage draws are anti-correlated below
-    -``anticorrelation`` (only pairs sharing a hit k-mer are tested) are linked into
-    ambiguity groups; a group's total is usually far better determined than its members.
+    intervals widen. Ambiguity groups come from shared evidence: over all draws, a unit is
+    linked to another when at least ``shared_evidence`` of the hits allocated to it lie on
+    k-mers both hold, and linked units form a group. This catches lopsided pairs, e.g. a
+    small unit living on hits it shares with a well-supported one, whose draws barely
+    correlate. ``own_evidence`` is a unit's share of allocated hits on k-mers no other
+    detected unit holds. A group's total is usually far better determined than its members.
     Returns per unit ``coverage_zi_lo``/``_hi``, ``abundance_zi_lo``/``_hi`` at ``level``,
-    and ``ambiguity_group`` (the group's smallest unit id; null when alone), ``group_size``
-    and the group totals ``group_coverage_zi_lo``/``_hi`` and ``group_abundance_zi_lo``/``_hi``.
+    ``own_evidence``, and ``ambiguity_group`` (the group's smallest unit id; null when
+    alone), ``group_size`` and the group totals ``group_coverage_zi_lo``/``_hi`` and
+    ``group_abundance_zi_lo``/``_hi``.
     """
     rng = np.random.default_rng(seed)
     keyed = hit_reads.group_by("unit", "hash", maintain_order=True).agg("read", "n")
@@ -338,6 +342,7 @@ def posterior_zi(
     m = m_g[units].astype(np.float64)
     coverage = np.zeros((draws, n_units))
     abundance = np.zeros_like(coverage)
+    evidence = np.zeros(len(row_s))  # hits allocated per (k-mer, unit) entry, all draws
     for b in range(draws):
         weight = rng.poisson(1.0, len(reads))[read_of]
         per_key = np.rint(np.bincount(key_of_hit, weights=n * weight, minlength=keyed.height))
@@ -384,16 +389,27 @@ def posterior_zi(
         present = hit + rng.binomial(np.maximum(m - hit, 0).astype(np.int64), unhit_odds)
         coverage[b] = np.where(alive, lam, 0.0)
         abundance[b] = np.where(alive, lam * present / pin_sum[units], 0.0)
+        evidence += given
 
-    # Ambiguity groups: link holders of a shared k-mer whose coverage draws anti-correlate.
-    first = np.repeat(np.arange(len(row_s))[position == 0], holders[holders > 0] - 1)
-    others = np.flatnonzero(position > 0)
-    pairs = np.unique(np.stack([col_s[first], col_s[others]], axis=1), axis=0)
-    z = (coverage - coverage.mean(axis=0)) / np.maximum(coverage.std(axis=0), 1e-12)
-    rho = (z[:, pairs[:, 0]] * z[:, pairs[:, 1]]).mean(axis=0) if len(pairs) else np.empty(0)
-    linked = pairs[rho < -anticorrelation]
+    # Ambiguity groups: link a unit to another holder of its hit k-mers when most of its
+    # allocated hits lie on k-mers the two share.
+    total_evidence = np.bincount(col_s, weights=evidence, minlength=n_units)
+    own = _div(np.bincount(col_s, weights=evidence * (holders[row_s] == 1), minlength=n_units),
+               total_evidence)  # fmt: skip
+    entries = pl.DataFrame({"row": row_s, "unit": col_s, "evidence": evidence})
+    shared = (
+        entries.join(entries.select("row", other="unit"), on="row")
+        .filter(pl.col("unit") != pl.col("other"))
+        .group_by("unit", "other")
+        .agg(pl.col("evidence").sum())
+    )
+    unit_a, unit_b = shared["unit"].to_numpy(), shared["other"].to_numpy()
+    # A unit never given hits (explained away in every draw) has total 0, so it links to
+    # every co-holder of its hit k-mers.
+    link = shared["evidence"].to_numpy() >= shared_evidence * total_evidence[unit_a]
     graph = coo_array(
-        (np.ones(len(linked)), (linked[:, 0], linked[:, 1])), shape=(n_units, n_units)
+        (np.ones(int(link.sum())), (unit_a[link], unit_b[link])),
+        shape=(n_units, n_units),
     )
     _, group = connected_components(graph, directed=False)
     size = np.bincount(group)[group]
@@ -410,6 +426,7 @@ def posterior_zi(
     return pl.DataFrame(columns).with_columns(
         ambiguity_group=pl.when(pl.Series(size) > 1).then(pl.Series(group_unit.astype(np.uint32))),
         group_size=pl.Series(size.astype(np.uint32)),
+        own_evidence=pl.Series(own),
     )
 
 

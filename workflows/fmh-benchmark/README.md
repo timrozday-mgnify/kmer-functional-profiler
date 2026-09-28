@@ -87,7 +87,11 @@ keeps), `coverage_zi` (zero-inflated EM: coverage of the k-mers present) and `co
 containment, as sylph) and `coverage_ufirst` with `kmers_ufirst` (to the holding KO with the
 highest Σ 1 / KOs-per-hit-k-mer, scaled by 1 / *t_g*). `spearman_tp` is the rank correlation with truth depth over true positives;
 `l1` is the L1 distance between relative abundances over all true and detected KOs (0 is
-exact, 2 is disjoint).
+exact, 2 is disjoint). With `--draws` > 0, `ci_cover` is the share of true
+positives whose posterior interval holds truth depth (on the estimate's scale) and
+`ci_width` the median log(hi / lo); for `abundance_zi`, `fp_grouped` is the share of false
+positives placed in an ambiguity group (shared-evidence) with a true KO, and `group_cover`
+the share of groups whose interval holds the members' true total.
 
 ## Results (10 metagenomes, InSilicoSeq novaseq)
 
