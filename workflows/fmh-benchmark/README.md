@@ -17,7 +17,8 @@ TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a r
                  overlaps one of its genes (the paper's rule, on CAMISIM's alignments)
 PROFILE          kmer-functional-profiler query, every metagenome x every index
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,
-                 base-weighted completeness -> summary.tsv (mean, sd), scores.tsv
+                 base-weighted completeness per --min_hits value -> summary.tsv (mean, sd),
+                 scores.tsv; profiles/ and truth/ keep the per-sample tables
 ```
 
 The `fmh_compat` row reproduces fmh-funprofiler's KO calls: its hits equal the overlaps
@@ -58,10 +59,10 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--replicates` | `10` | Metagenomes (seeds 1..N) |
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
-| `--min_hits` | `1` | Distinct k-mers for a KO to count as detected |
-| `--indexes` | three configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
+| `--min_hits` | `1,2,3,5` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
+| `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
-density (`--t-base 0.01`), the plan's "scaled = 100" baseline. `index_*/meta.json` in the
+density (`--t-base 0.01`), the plan's "scaled = 100" baseline, without and with the floor. `index_*/meta.json` in the
 output records each index's size; `trace.tsv` records each PROFILE task's runtime.
