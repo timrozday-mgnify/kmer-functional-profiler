@@ -87,6 +87,23 @@ def test_sampled_index_hits_respect_unit_thresholds(members: Path) -> None:
     assert result["containment"].is_between(0, 1).all()
 
 
+def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
+    # A sparse tier 2 with a fully dense tier fits EM on the same k-mers as a dense index.
+    both = build(members, t_base=0.2, n_min=0, t_dense=1.0, fp_bits=64)
+    dense = build(members, t_base=1.0, fp_bits=64)
+    assert both.dense is not None and dense.dense is None
+    assert (both.units["m_dense"] == dense.units["m_g"]).all()
+    assert both.units["m_g"].sum() < both.units["m_dense"].sum()
+    got, want = profile(both, *READS), profile(dense, *READS)
+    cols = ["unit", "coverage_em", "coverage_zi"]
+    joined = got.filter(pl.col("kmers_unique") > 0).select(*cols, "kmers_dense")
+    joined = joined.join(want.select(cols), on="unit", suffix="_want")
+    assert joined.height == len(proteins())
+    for col in cols[1:]:
+        assert joined[col].to_list() == pytest.approx(joined[f"{col}_want"].to_list())
+    assert (joined["kmers_dense"] > 0).all()
+
+
 def test_gather_explains_away_shared_kmers() -> None:
     kmers = pl.DataFrame(
         {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},

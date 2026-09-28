@@ -23,8 +23,8 @@ the true depth:
 - ``bias_<identity>``: median estimate / depth of true positives at that strain identity,
   over the median at 100%; 1 = divergence costs nothing.
 
-Writes ``scores.tsv`` (per seed) and ``summary.tsv`` (means) to ``--out`` and prints the
-summary. Seconds per seed.
+``index_mb`` is the size of the index's lookup tables. Writes ``scores.tsv`` (per seed) and
+``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds per seed.
 """
 
 import argparse
@@ -50,6 +50,8 @@ CONFIGS = {
     "dense": IndexParams(t_base=1.0, n_min=0),
     "s10": IndexParams(t_base=0.1, n_min=0),
     "floor": IndexParams(),  # MGnify defaults: t_base 0.001, n_min 8, t_cap 0.2
+    # plus a dense tier at 1 in 50, 20, 5 and 1
+    **{f"floor_d{round(t * 100)}": IndexParams(t_dense=t) for t in (0.02, 0.05, 0.2, 1.0)},
 }
 # Detection count and its abundance estimate, per assignment rule.
 RULES = {
@@ -184,13 +186,15 @@ def main() -> None:
     for config in args.configs:
         build_index(args.out / "members.parquet", args.out / f"index_{config}", CONFIGS[config])
         index = Index.load(args.out / f"index_{config}")
+        stats = index.meta["stats"]
+        index_mb = (stats["tier1_bytes"] + stats["tier2_bytes"] + stats.get("dense_bytes", 0)) / 1e6
         for seed in range(1, args.seeds + 1):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)
             result = profile(index, reads).with_columns(unit=pl.col("cluster_rep").cast(pl.Int64))
             for rule, (count, abundance) in RULES.items():
                 found = result.filter(pl.col(count) >= 1).select("unit", estimate=abundance)
-                rows.append({"config": config, "rule": rule, "seed": seed,
+                rows.append({"config": config, "rule": rule, "seed": seed, "index_mb": index_mb,
                              **score(truth, found, families)})  # fmt: skip
     scores = pl.DataFrame(rows)
     scores.write_csv(args.out / "scores.tsv", separator="\t")

@@ -27,23 +27,27 @@ from scipy.sparse import csr_array
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
-from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams
+from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable
 
 
-def unit_hits(index: Index, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
-    """Expand sampled query hashes to (unit, hash, read) hits through tier 2."""
-    tier2 = index.tier2
-    set_ids = tier2.lookup(hashes)
+def unit_hits(
+    table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray, reads: np.ndarray
+) -> pl.DataFrame:
+    """Expand sampled query hashes to (unit, hash, read) hits through ``table``.
+
+    A hit counts for a unit only if the hash passes that unit's ``max_hash_g``.
+    """
+    set_ids = table.lookup(hashes)
     found = set_ids >= 0
     hashes, reads, set_ids = hashes[found], reads[found], set_ids[found]
-    starts = tier2.set_offsets[set_ids].astype(np.int64)
-    lengths = tier2.set_offsets[set_ids + 1].astype(np.int64) - starts
+    starts = table.set_offsets[set_ids].astype(np.int64)
+    lengths = table.set_offsets[set_ids + 1].astype(np.int64) - starts
     # Positions of every set member, hit by hit.
     within = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
-    values = tier2.set_values[np.repeat(starts, lengths) + within]
+    values = table.set_values[np.repeat(starts, lengths) + within]
     units = (values >> np.uint64(PIN_BITS)).astype(np.uint32)
     hashes, reads = np.repeat(hashes, lengths), np.repeat(reads, lengths)
-    keep = hashes <= index.units["max_hash_g"].to_numpy()[units]
+    keep = hashes <= max_hash_g[units]
     return pl.DataFrame({"unit": units[keep], "hash": hashes[keep], "read": reads[keep]})
 
 
@@ -104,6 +108,14 @@ WTA_SCORE: Final = pl.col("hash").n_unique().over("unit") / pl.col("m_g")
 UFIRST_SCORE: Final = (1 / pl.len().over("hash")).sum().over("unit") / pl.col("t_g")
 
 
+EXPLAINED_AWAY: Final = 1e-3  # expected hits below which EM reports coverage 0
+
+
+def _div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+    """num / den, 0 where den is 0 (units or k-mers whose weight has vanished)."""
+    return np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den > 0)
+
+
 def em(
     kmers: pl.DataFrame,
     m_g: np.ndarray,
@@ -127,7 +139,9 @@ def em(
     and ``present`` is the unit's share of hit k-mers over the kept k-mers expected to be
     hit at that coverage, capped at 1. Without shared k-mers the fixed point is the
     zero-truncated Poisson MLE sylph uses: mean hits per hit k-mer = c / (1 - exp(-c)).
-    With no excess zeros ``present`` stays 1 and the result equals plain EM.
+    With no excess zeros ``present`` stays 1 and the result equals plain EM. Units left
+    with fewer than ``EXPLAINED_AWAY`` expected hits (their k-mers explained by other units)
+    get coverage 0.
 
     ``prior`` (a, b >= 1) puts a Beta prior on ``present`` (see :func:`fit_present_prior`),
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
@@ -143,12 +157,12 @@ def em(
     for _ in range(max_iter):
         w = lam * pi
         mu = a @ w
-        attributed = w * (a.T @ (hits / mu))  # expected hits from each unit
+        attributed = w * (a.T @ _div(hits, mu))  # expected hits from each unit
         if zero_inflated:
-            kmers_hit = w * (a.T @ (1 / mu))  # expected hit k-mers from each unit
+            kmers_hit = w * (a.T @ _div(np.ones_like(mu), mu))  # expected hit k-mers per unit
             seen = -np.expm1(-lam)  # chance a present k-mer is hit
             if prior is None:
-                new_pi = np.minimum(1.0, kmers_hit / (m * seen))
+                new_pi = np.minimum(1.0, _div(kmers_hit, m * seen))
             else:
                 # Unhit k-mers are present with odds pi (1 - seen) : (1 - pi).
                 odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
@@ -156,13 +170,15 @@ def em(
                 new_pi = (kmers_hit + unhit_present + prior[0] - 1) / (m + sum(prior) - 2)
         else:
             new_pi = pi
-        new = attributed / (m * new_pi)
+        new = _div(attributed, m * new_pi)
         done = np.abs(new - lam).max(initial=0) <= tol * new.max(initial=0) and np.allclose(
             new_pi, pi, rtol=0, atol=tol
         )
         lam, pi = new, new_pi
         if done:
             break
+    # Units explained away by others converge towards 0 without reaching it.
+    lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
         {"unit": units, "coverage": lam, "present": pi},
         schema={"unit": pl.UInt32, "coverage": pl.Float64, "present": pl.Float64},
@@ -204,33 +220,61 @@ def profile(
     from its zero-inflated form. ``kmers_wta``/``coverage_wta`` and
     ``kmers_ufirst``/``coverage_ufirst`` are the k-mers :func:`assign_best` gives each unit
     and their hits per kept k-mer. Units without hits are omitted.
+
+    With a dense tier, the reads are streamed a second time at its rate and the EM
+    estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
+    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
     """
     params = IndexParams(**index.meta["params"])
-    batches: Iterable[dict[str, np.ndarray]]
-    if index.meta.get("hash") == "sourmash":
-        batches = sourmash_hits(r1, r2, params.k, index.tier2.max_hash, batch_reads)
-    else:
-        batches = _core.FastxHits(
+
+    def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
+        if index.meta.get("hash") == "sourmash":
+            return sourmash_hits(r1, r2, params.k, max_hash, batch_reads)
+        return _core.FastxHits(
             r1,
             r2,
             k=params.k,
             alphabet=params.alphabet,
             genetic_code=genetic_code,
             frames=frames,
-            max_hash=index.tier2.max_hash,
+            max_hash=max_hash,
             batch_reads=batch_reads,
         )
 
+    max_hash_g = index.units["max_hash_g"].to_numpy()
+
     def counts(hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
-        hits = unit_hits(index, hashes, reads)
+        hits = unit_hits(index.tier2, max_hash_g, hashes, reads)
         return hits.group_by("unit", "hash").agg(hits=pl.len(), reads=pl.col("read").unique())
 
     empty = np.empty(0, dtype=np.uint64)
-    per_kmer = pl.concat([counts(empty, empty), *(counts(b["hash"], b["read"]) for b in batches)])
+    per_kmer = pl.concat(
+        [
+            counts(empty, empty),
+            *(counts(b["hash"], b["read"]) for b in stream(index.tier2.max_hash)),
+        ]
+    )
     kmer_hits = per_kmer.group_by("unit", "hash").agg(pl.col("hits").sum())
     assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
+    dense = index.dense
+    if dense is not None:
+        # Second pass: every k-mer at the dense rate, for the detected units only.
+        max_hash_dense = index.units["max_hash_dense"].to_numpy()
+        keep = assigned.select("unit")
+        parts = (
+            unit_hits(dense, max_hash_dense, b["hash"], b["read"])
+            .join(keep, on="unit", how="semi")
+            .group_by("unit", "hash")
+            .agg(hits=pl.len())
+            for b in stream(dense.max_hash)
+        )
+        empty_hits = pl.DataFrame(schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32})
+        detected = (
+            pl.concat([empty_hits, *parts]).group_by("unit", "hash").agg(pl.col("hits").sum())
+        )
+        m_g = index.units["m_dense"].to_numpy()
     plain = em(detected, m_g).select("unit", coverage_em="coverage")
     inflated = em(detected, m_g, zero_inflated=True)
     prior = fit_present_prior(inflated)
@@ -252,6 +296,12 @@ def profile(
         .join(inflated, on="unit", how="left")
         .join(shrunk, on="unit", how="left")
     )
+    if dense is not None:
+        result = result.join(
+            detected.group_by("unit").agg(kmers_dense=pl.len().cast(pl.UInt32)),
+            on="unit",
+            how="left",
+        ).with_columns(pl.col("kmers_dense").fill_null(0))
     for rule, score in (("wta", WTA_SCORE), ("ufirst", UFIRST_SCORE)):
         won = (
             assign_best(rated, score)

@@ -64,12 +64,14 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
-| `--indexes` | three configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
+| `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
-density (`--t-base 0.01`), the plan's "scaled = 100" baseline. `index_*/meta.json` in the
-output records each index's size; `trace.tsv` records each PROFILE task's runtime.
+density (`--t-base 0.01`), the plan's "scaled = 100" baseline, alone and with a dense tier
+at 1 in 10 (`--t-dense 0.1`: detection unchanged, EM abundances fitted on 10x more
+k-mers). `index_*/meta.json` in the output records each index's size (`dense_bytes` for the
+dense tier); `trace.tsv` records each PROFILE task's runtime.
 
 Abundance is scored per row (`abundance` column) with an estimate that goes with its count:
 `coverage` (hits per kept k-mer) with `kmers_hit`; `coverage_em` (EM over the units gather

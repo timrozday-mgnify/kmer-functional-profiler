@@ -20,6 +20,11 @@ linked by a shared posting form components. Tier 2 maps each posting hash to its
 (unit, quantised ``p_in``); tier 1 maps the best-scoring few hashes per unit to component
 ids. Both are stored as bucketed fingerprints (``PackedTable``) in ``.npy`` files, beside
 Parquet tables for inspection.
+
+With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
+``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
+promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
+The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
 import json
@@ -68,6 +73,7 @@ class IndexParams:
     max_groups: int = 64
     tier1_per_unit: int = 4
     fp_bits: int = 16
+    t_dense: float = 0.0  # 0: no dense tier
     batch_residues: int = 20_000_000
 
 
@@ -193,6 +199,7 @@ class Index:
     units: pl.DataFrame
     tier1: PackedTable
     tier2: PackedTable
+    dense: PackedTable | None = None
 
     @classmethod
     def load(cls, directory: str | Path) -> Self:
@@ -203,6 +210,7 @@ class Index:
             units=pl.read_parquet(directory / "units.parquet"),
             tier1=PackedTable.load(directory, "tier1", meta["tier1"]),
             tier2=PackedTable.load(directory, "tier2", meta["tier2"]),
+            dense=PackedTable.load(directory, "dense", meta["dense"]) if "dense" in meta else None,
         )
 
 
@@ -412,7 +420,35 @@ def build_index(
         "candidates": scored.height,
         "promiscuous_dropped": int(units["n_promiscuous"].sum()),
     }
-    return write_index(out, params, units, postings, stats)
+    dense = None
+    if params.t_dense > 0:
+        # Pass 4: every unit's k-mers at max(t_dense, t_g), so the dense set of each unit
+        # contains its tier-2 set, with p_in, minus promiscuous ones.
+        units = units.with_columns(
+            max_hash_dense=pl.col("max_hash_g").clip(lower_bound=_core.max_hash(params.t_dense))
+        )
+        dense_hash = int(units["max_hash_dense"].max())  # type: ignore[arg-type]
+        dense = (
+            pl.concat(
+                [
+                    _kmers(b, params, dense_hash)
+                    .group_by("unit", "hash")
+                    .agg(c=pl.col("counts").sum())
+                    for b in batches
+                ]
+            )
+            .filter(pl.len().over("hash") <= params.max_groups)
+            .join(units.select("unit", "n_counting", "max_hash_dense"), on="unit")
+            .filter(pl.col("hash") <= pl.col("max_hash_dense"))
+            .select(
+                "hash",
+                "unit",
+                pin_q=(pl.col("c") / pl.col("n_counting") * (2**PIN_BITS - 1))
+                .round()
+                .cast(pl.UInt64),
+            )
+        )
+    return write_index(out, params, units, postings, stats, dense=dense)
 
 
 def write_index(
@@ -422,13 +458,15 @@ def write_index(
     postings: pl.DataFrame,
     stats: dict[str, object],
     hash_scheme: str = "kfp",
+    dense: pl.DataFrame | None = None,
 ) -> dict[str, object]:
     """Find components, pack tiers and write the index files.
 
     ``units`` needs ``unit`` (0..n-1), ``t_g`` and ``max_hash_g``; ``postings`` holds one row
     per kept (hash, unit), each with ``hash <= max_hash_g``: ``p_in``, ``pin_q``,
-    ``n_groups`` and ``score``. ``hash_scheme`` tells the query how to hash reads. Returns
-    ``stats`` extended with sizes.
+    ``n_groups`` and ``score``. ``hash_scheme`` tells the query how to hash reads. ``dense``
+    (``hash``, ``unit``, ``pin_q``) becomes the dense table. Returns ``stats`` extended with
+    sizes.
     """
     t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     postings = postings.sort("hash", "unit")
@@ -474,6 +512,24 @@ def write_index(
         params.fp_bits,
     )
 
+    tables = {"tier1": tier1, "tier2": tier2}
+    if dense is not None:
+        tables["dense"] = PackedTable.build(
+            dense["hash"].to_numpy(),
+            (dense["unit"].cast(pl.UInt64).to_numpy() << np.uint64(PIN_BITS))
+            | dense["pin_q"].to_numpy(),
+            int(units["max_hash_dense"].max()),  # type: ignore[arg-type]
+            params.fp_bits,
+        )
+        units = units.join(
+            dense.group_by("unit").agg(m_dense=pl.len().cast(pl.UInt32)),
+            on="unit",
+            how="left",
+            maintain_order="left",
+        ).with_columns(pl.col("m_dense").fill_null(0))
+        stats["dense_postings"] = dense.height
+        stats["dense_bytes"] = tables["dense"].nbytes()
+
     units.write_parquet(out / "units.parquet")
     postings.write_parquet(out / "postings.parquet")
 
@@ -498,8 +554,7 @@ def write_index(
         "format": 1,
         "hash": hash_scheme,
         "params": asdict(params),
-        "tier1": tier1.save(out, "tier1"),
-        "tier2": tier2.save(out, "tier2"),
+        **{name: table.save(out, name) for name, table in tables.items()},
         "stats": stats,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
