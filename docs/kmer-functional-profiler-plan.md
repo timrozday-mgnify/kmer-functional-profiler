@@ -484,6 +484,11 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 * **Fix (fmh benchmark):** SUMMARY failed when a metric was empty in one sample's score file (e.g. `group_cover` when no ambiguity group formed): Polars reads an all-empty column as String and cannot stack it with Float64. Metrics are now cast to Float64 on read; a regression test stacks a file with an empty metric.
 
+* **Phase 4, step 14 — posterior intervals and ambiguity groups on real data (HPC, PR #17 + #18 code, D = 100).** Point estimates unchanged. `abundance_zi` interval coverage of truth depth (nominal 95%; the step-12 bootstrap in brackets): kfp\_s1000 0.69 (0.56), kfp\_s100 0.72 (0.61), kfp\_s100\_d10 0.75 (0.72), fmh\_compat 0.43 (0.36); widths grew by 10–30%. Better, still not calibrated: the per-KO model error of the copies estimate (step 12) is untouched by sampling. PROFILE time: kfp\_s100 2m17–2m39 (23 s without draws), dense tier 20–25 min, kfp\_s1000 39–44 s.
+  - *Ambiguity groups did not form:* none on kfp\_s100 or kfp\_s100\_d10 in any of 10 samples; groups in 2–4 samples on the scaled-1000 and compat indexes; no false-positive KO was ever grouped with a true one (`fp_grouped` empty). *Why:* the false positives left after gather are small units with a median of 1 gather-assigned k-mer (true KOs: 15), borrowing hits from a well-supported true KO. The true KO's coverage barely moves when the small unit takes or loses those hits, so their draws are not anti-correlated: correlation is the wrong signal for lopsided pairs.
+  - *Absent in some draws* (lower bound 0) as a false-positive flag: catches 52% of false positives on kfp\_s100 (21% with the dense tier) but also 8% of true KOs, so only 9% of flagged KOs are false. Weak.
+  - *Next (to decide):* group by shared evidence instead of correlation: link a unit to another when most of its allocated hits (across draws) lie on k-mers it shares with that unit, which catches lopsided pairs; and report each unit's share of evidence that is its own. Separately, the copies model error still keeps `abundance_zi` intervals from calibrating.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
