@@ -440,6 +440,20 @@ What each step did, and the choices, results and interpretations behind it, newe
   *Interpretation.* Calibrated to slightly conservative everywhere, including at low depth where the point estimate is least reliable; widths track the information per unit (the floor index's ~8 k-mers per unit give ×9 intervals). This meets the phase-4 gate's "calibrated intervals on simulations" for `coverage_zi`. Caveat: the scale is estimated from the same sample; the ±1–2% conservatism is within what that allows.
   - *fmh benchmark:* PROFILE runs with `--bootstrap` (`params.bootstrap`, default 100) and SCORE reports `ci_cover` and `ci_width` for estimates with intervals, against truth depth on the estimate's scale (median estimate / depth over true positives). Result pending on HPC; the dense-tier profile will be the slowest (100 EM refits over its larger hit table).
 
+* **Phase 4, step 11 — fmh benchmark with copies-scaled abundance (HPC, PR #14 code).** Detection and every earlier estimate reproduced the previous run exactly. `abundance_zi` against truth depth (`kmers_unique` ≥ 1, true positives, 10 seeds):
+
+  | Index | `coverage_zi` Spearman / L1 | `abundance_zi` Spearman (sd) / L1 |
+  | --- | --- | --- |
+  | kfp\_s1000 | 0.373 / 0.97 | 0.807 (0.011) / 0.57 |
+  | kfp\_s1000\_floor8 | 0.369 / 1.02 | 0.827 (0.014) / 0.56 |
+  | kfp\_s100 | 0.576 / 0.94 | **0.957 (0.003) / 0.22** |
+  | kfp\_s100\_d10 | 0.627 / 0.93 | **0.988 (0.002) / 0.14** |
+
+  *Interpretation.* The exact form (present k-mers / Σ *p\_in*) beats the offline approximation (0.935), and on KO units abundance is now as good as detection: kfp\_s100 detects 95.5% of KOs at 98.5% purity and ranks their abundance at 0.96. The dense tier's gain is larger here than for per-copy coverage (L1 0.22 → 0.14, 36% lower), but its cost is unchanged (15× tables, ~6× query time); still off by default, and a candidate for the phase-6 cost study. At scaled 1000 the floor helps abundance a little (0.81 → 0.83).
+  - `fmh_compat`: `abundance_zi` equals plain EM (0.09), as expected: imported sketches carry no members, so *p\_in* = 1 and `pin_sum` = *m\_g*, and copies reduce to the present fraction. fmh-funprofiler's own sketches cannot give copy-aware abundance.
+  - `coverage_zip` equals `coverage_zi` on our KO indexes (0.576 vs 0.576): nearly all KO k-mers have *p\_in* < 1/15 and fall in quantised level 0, so presence cannot vary between them. On `fmh_compat` it equalled plain EM, which exposed a bug: with level 15 read as exactly 1, a k-mer present with probability 1 stays so, because EM then reads every unhit copy as present. **Fixed:** level probabilities are clipped to [1/30, 1 − 1/30]; a test covers all-core units. The simulation is unchanged by the fix (its `coverage_zip` bias is structural, not this bug). `coverage_zip` stays experimental: it cannot help KO-like units at 4-bit *p\_in*, and its intended case, MGnify90 clusters with varied *p\_in*, has no truth-bearing benchmark until phase 6.
+  **Decided:** recommended setting for KO-like units is `kfp_s100`, detection `kmers_unique` ≥ 1, abundance `abundance_zi`; for MGnify90 clusters `coverage_zi`, summed over clusters for function-level abundance. Intervals (PR #15) have not been run on HPC yet.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

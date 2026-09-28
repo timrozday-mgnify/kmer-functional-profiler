@@ -132,9 +132,12 @@ sample either way).
 | kfp_s100 | coverage_em | 0.35 | 1.25 |
 | kfp_s100 | coverage_zi | 0.58 | 0.94 |
 | kfp_s100_d10 | coverage_zi | 0.63 | 0.93 |
+| kfp_s1000 | abundance_zi | 0.81 | 0.57 |
+| kfp_s100 | **abundance_zi** | **0.96** | **0.22** |
+| kfp_s100_d10 | abundance_zi | 0.99 | 0.14 |
 
 Truth depth sums over each KO's gene copies in the sample, while `coverage_zi` is depth per
-copy, hence the low ceiling. Scaled by copies present (computed offline from these profiles),
-Spearman is 0.935 for kfp_s100 and 0.964 for kfp_s100_d10; profiles now report this as
-`abundance_zi`, to be confirmed by the next run. The dense tier costs 15x the table size,
-~6x the query time and 36.5 GB to build, for +0.03-0.05 Spearman.
+copy; `abundance_zi` scales it by the copies present (present k-mers / the k-mers an average
+member holds) and matches truth closely. Recommended: `kfp_s100`, `kmers_unique` >= 1,
+`abundance_zi`. For `fmh_compat` it reduces to plain EM, since imported sketches carry no
+members. The dense tier costs 15x the table size, ~6x the query time and 36.5 GB to build.

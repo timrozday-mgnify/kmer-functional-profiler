@@ -191,9 +191,12 @@ def em(
     )
 
 
-# p_in of each quantised level (pin_q = round(15 p_in)); level 0 at 1/30, not 0, so no k-mer
-# is certainly absent.
-PIN_P: Final = np.maximum(np.arange(2**PIN_BITS) / (2**PIN_BITS - 1), 0.5 / (2**PIN_BITS - 1))
+# p_in of each quantised level (pin_q = round(15 p_in)), kept inside (0, 1): a k-mer certain to
+# be present (p_in = 1 at s_g = 1) would stay so forever, since EM then reads every unhit copy
+# of it as present; one certain to be absent could never be hit.
+PIN_P: Final = np.clip(
+    np.arange(2**PIN_BITS) / (2**PIN_BITS - 1), 0.5 / (2**PIN_BITS - 1), 1 - 0.5 / (2**PIN_BITS - 1)
+)
 
 
 def em_pin(

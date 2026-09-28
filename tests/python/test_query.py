@@ -222,6 +222,21 @@ def test_pin_presence_matches_zero_inflated_em_at_one_level() -> None:
     assert got["present"] == pytest.approx(want["present"], rel=1e-4)
 
 
+def test_pin_presence_escapes_core_kmers() -> None:
+    # Every kept k-mer core (p_in = 1) but only 10 of 40 present: presence must fall, as in
+    # zero-inflated EM, rather than stay at 1 (it did when level 15 read as exactly 1).
+    kmers = pl.DataFrame(
+        {"unit": [0] * 10, "hash": range(10), "hits": [3] * 10, "pin_q": [15] * 10},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8},
+    )
+    hist = np.zeros((1, 16))
+    hist[0, 15] = 40
+    got = em_pin(kmers, hist).row(0, named=True)
+    want = em(kmers.drop("pin_q"), np.array([40]), zero_inflated=True).row(0, named=True)
+    assert got["coverage"] == pytest.approx(want["coverage"], rel=1e-3)
+    assert got["present"] == pytest.approx(want["present"], rel=1e-3)
+
+
 def test_pin_presence_splits_shared_kmer_by_p_in() -> None:
     # Units 0 and 1 have one mid-p_in k-mer each (5 hits) and share one (10 hits) that is
     # core (p_in ~1) in unit 0 and private (p_in ~0) in unit 1: unit 0 should take it.
