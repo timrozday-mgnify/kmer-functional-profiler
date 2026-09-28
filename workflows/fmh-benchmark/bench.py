@@ -7,8 +7,9 @@
 - ``truth``: map simulated read pairs back to the sample with minimap2 (mappy); a KO is
   present if a primary alignment overlaps one of its genes, as in the paper's CAMISIM
   ground truth. Writes ``ko_id``, ``n_reads``, ``bases`` (overlapping aligned bases).
-- ``score``: purity and completeness of one profile against a truth table.
-- ``summary``: mean and sd of the scores per index.
+- ``score``: purity and completeness of one profile against a truth table, one row per
+  ``--min-hits`` threshold.
+- ``summary``: mean and sd of the scores per index and threshold.
 """
 
 import argparse
@@ -149,45 +150,45 @@ def truth(args: argparse.Namespace) -> None:
 
 def score(args: argparse.Namespace) -> None:
     truth = pl.read_csv(args.truth)
-    predicted = set(
-        pl.read_csv(args.profile, separator="\t").filter(pl.col("kmers_hit") >= args.min_hits)[
-            "name"
-        ]
-    )
-    present = truth.with_columns(found=pl.col("ko_id").is_in(predicted))
-    low = present.filter(pl.col("n_reads") <= pl.col("n_reads").quantile(0.25))
-    tp = int(present["found"].sum())
-    pl.DataFrame(
-        {
-            "sample": [args.sample],
-            "index": [args.index],
-            "n_truth": [truth.height],
-            "n_pred": [len(predicted)],
-            "tp": [tp],
-            "purity": [tp / max(len(predicted), 1)],
-            "completeness": [tp / max(truth.height, 1)],
-            "completeness_low25": [low["found"].mean()],
-            "weighted_completeness": [
-                int(present.filter("found")["bases"].sum()) / max(int(present["bases"].sum()), 1)
-            ],
-        }
-    ).write_csv(args.out, separator="\t")
+    profile = pl.read_csv(args.profile, separator="\t")
+    rows = []
+    for min_hits in args.min_hits:
+        predicted = set(profile.filter(pl.col("kmers_hit") >= min_hits)["name"])
+        present = truth.with_columns(found=pl.col("ko_id").is_in(predicted))
+        low = present.filter(pl.col("n_reads") <= pl.col("n_reads").quantile(0.25))
+        tp = int(present["found"].sum())
+        rows.append(
+            {
+                "sample": args.sample,
+                "index": args.index,
+                "min_hits": min_hits,
+                "n_truth": truth.height,
+                "n_pred": len(predicted),
+                "tp": tp,
+                "purity": tp / max(len(predicted), 1),
+                "completeness": tp / max(truth.height, 1),
+                "completeness_low25": low["found"].mean(),
+                "weighted_completeness": int(present.filter("found")["bases"].sum())
+                / max(int(present["bases"].sum()), 1),
+            }
+        )
+    pl.DataFrame(rows).write_csv(args.out, separator="\t")
 
 
 def summary(args: argparse.Namespace) -> None:
     scores = pl.concat([pl.read_csv(p, separator="\t") for p in args.scores])
-    metrics = [c for c in scores.columns if c not in ("sample", "index")]
+    metrics = [c for c in scores.columns if c not in ("sample", "index", "min_hits")]
     (
-        scores.group_by("index")
+        scores.group_by("index", "min_hits")
         .agg(
             pl.len().alias("n_samples"),
             pl.col(metrics).mean().name.suffix("_mean"),
             pl.col(metrics).std().name.suffix("_sd"),
         )
-        .sort("index")
+        .sort("index", "min_hits")
         .write_csv(args.out, separator="\t")
     )
-    scores.sort("index", "sample").write_csv("scores.tsv", separator="\t")
+    scores.sort("index", "min_hits", "sample").write_csv("scores.tsv", separator="\t")
 
 
 def main() -> None:
@@ -209,7 +210,7 @@ def main() -> None:
     p = sub.add_parser("score")
     for name in ("truth", "profile", "sample", "index"):
         p.add_argument(f"--{name}", required=True)
-    p.add_argument("--min-hits", type=int, default=1)
+    p.add_argument("--min-hits", type=int, nargs="+", default=[1])
     p.add_argument("--out", default="score.tsv")
     p = sub.add_parser("summary")
     p.add_argument("scores", nargs="+")

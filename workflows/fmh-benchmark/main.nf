@@ -124,6 +124,7 @@ process SIMULATE {
 process TRUTH {
     tag "seed ${seed}"
     label 'process_medium'
+    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { "seed${seed}.csv" }
 
     input:
     tuple val(seed), path(fna), path(genes), path(r1), path(r2)
@@ -145,6 +146,7 @@ process TRUTH {
 process PROFILE {
     tag "seed ${seed} ${name}"
     label 'process_single'
+    publishDir "${params.outdir}/profiles", mode: 'copy', saveAs: { "seed${seed}_${name}.tsv" }
 
     input:
     tuple val(seed), path(r1), path(r2), val(name), path(index)
@@ -172,7 +174,7 @@ process SCORE {
     script:
     """
     ${params.bench} score --truth ${truth} --profile ${profile} --sample seed${seed} --index ${name} \\
-        --min-hits ${params.min_hits}
+        --min-hits ${params.min_hits.toString().tokenize(',').join(' ')}
     """
 
     stub:
