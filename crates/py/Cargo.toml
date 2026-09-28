@@ -1,0 +1,23 @@
+[package]
+name = "kmer-functional-profiler-py"
+description = "PyO3 bindings over kmer-functional-profiler-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+# Tested from Python; a Rust test binary cannot load libpython here.
+test = false
+doctest = false
+
+[dependencies]
+kmer-functional-profiler-core.workspace = true
+pyo3.workspace = true
+
+[lints]
+workspace = true

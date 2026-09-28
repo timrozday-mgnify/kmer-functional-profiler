@@ -1,0 +1,48 @@
+[project]
+name = "kmer-functional-profiler"
+version = "0.1.0"
+description = "Protein k-mer functional profiling of metagenomes"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = ["numpy", "typer"]
+
+[project.scripts]
+kmer-functional-profiler = "kmer_functional_profiler.cli:app"
+
+[dependency-groups]
+dev = ["hypothesis", "maturin", "mypy", "pytest", "ruff"]
+
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "crates/py/Cargo.toml"
+python-source = "python"
+module-name = "kmer_functional_profiler._core"
+features = ["pyo3/extension-module"]
+profile = "release"
+
+[tool.uv]
+# Rebuild the extension when Rust sources change.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "crates/**/Cargo.toml" },
+  { file = "crates/**/*.rs" },
+]
+
+[tool.ruff]
+target-version = "py311"
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

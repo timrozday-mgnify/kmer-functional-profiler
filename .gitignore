@@ -1,0 +1,11 @@
+/target
+.venv/
+__pycache__/
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.DS_Store
+.serena/
