@@ -101,7 +101,7 @@ A `--sourmash-compat` mode using sourmash's protein encoding and hash lets you c
 
 Use MGnify's own 90% clusters as units and index the k-mers of all members, not just representatives; skip your own 95% dereplication. The per-unit floor must move to the 30% family level, or the index will not fit in memory.
 
-**What the release provides.** The latest release is 2026\_07, with over 5.7 billion sequences clustered at 90% and 30% identity, CC0-licensed, so pre-built indexes can be redistributed ([MGnify docs](https://docs.mgnify.org/src/docs/mgnify-proteins.html)). The 2023 paper reported 72% singleton clusters, only 12% of those full-length, and Pfam hits (HMMER gathering thresholds) on about half of cluster representatives ([NAR 2023](https://academic.oup.com/nar/article/51/D1/D753/6880769)). I could not read the 2026\_07 FTP listing, so check its cluster counts and annotation files directly.
+**What the release provides.** The latest release is 2026\_07: 5.74 billion sequences in 1.66 billion 90% clusters (73% singletons), CC0-licensed, so pre-built indexes can be redistributed. Pfam hits are provided for all proteins (52% have one). **There is no 30% membership table**: MGnify30 ships only as representative FASTAs of three subsets, so the 30% families this plan relies on need our own clustering run (an HPC job). Details, file sizes and Parquet layout: [mgnify-2026\_07.md](mgnify-2026_07.md).
 
 **95% vs 90%.**
 
@@ -115,7 +115,7 @@ Use MGnify's own 90% clusters as units and index the k-mers of all members, not 
 | Component | Estimate | Assumption |
 | --- | --- | --- |
 | Base sketch at *t\_base* = 1/1000 | \~5×10^8 hashes, \~6–10 GB | \~5.7×10^9 proteins × \~200 aa, \~half distinct |
-| Floor at 90%-cluster level, *n\_min* = 8 | ≥ 8×10^9 hashes, \~100 GB | \~10^9 clusters (718 M in the 2024 release; 2026\_07 count unconfirmed) |
+| Floor at 90%-cluster level, *n\_min* = 8 | ≥ 1.3×10^10 hashes, \~160 GB | 1.66×10^9 clusters in 2026\_07 (0.45×10^9 non-singletons) |
 | Floor at 30%-family level | Much smaller | Family count to check |
 
 So: apply the floor per 30% family (or Pfam), and apply no floor to singleton partial predictions.
@@ -261,7 +261,7 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
 | 0. Skeleton | Mixed repo (uv + maturin + Cargo workspace), CI, pre-commit, stub Python CLI. Fixtures, the parity job, coverage and `bench.yml` move to phase 1, when there are kernels to test. | Both | CI green on Linux and macOS arm64 for both languages. |
-| 1. Rust kernels | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
+| 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
 | 2. Index prototype | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-family floor, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked families. |
 | 3. Query + naive counts | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
 | 4. Model | Uniqueness-weighted detection, EM per family, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
@@ -385,8 +385,11 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * **Shared k-mers and hierarchy.** EM at protein-cluster level, then aggregation to function, is likely better than EM directly on functions. Untested.
 * **Normalisation.** Which single-copy marker set, and whether to report per-genome copies by default.
 * **Frame filter at high GC.** Keeps \~3 frames at 70% GC; acceptable, but check false positives there specifically.
+* **Decided (phase 1):** k-mer hash is the splitmix64 finalizer of the bit-packed k-mer (5/4/3 bits per residue for protein/Murphy-10/Dayhoff, so k ≤ 12/16/21), a bijection on u64; threshold rule is keep iff hash ≤ max\_hash, with max\_hash = ⌊*t*·2^64⌋ − 1. The sourmash hash is used only in `--sourmash-compat`.
+* **Open (blocks phase 2):** how to define 30% families without a published membership table: cluster the 1.66 B representatives ourselves, map them onto the 128.7 M MGnify30-C2 representatives, or use Pfam architecture as the family.
 * **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
-* **Open:** whether KO/eggNOG labels on 30% family representatives are worth the annotation run, or Pfam suffices; the real 2026\_07 cluster and family counts.
+* **Open:** whether KO/eggNOG labels on 30% family representatives are worth the annotation run, or Pfam suffices.
+* **Full-scale runs:** anything over the whole release (subset extraction, family clustering, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
 
 ## Sources
 

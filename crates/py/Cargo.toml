@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 kmer-functional-profiler-core.workspace = true
+numpy = "0.29.0"
 pyo3.workspace = true
 
 [lints]
