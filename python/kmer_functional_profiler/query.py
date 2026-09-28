@@ -113,7 +113,9 @@ EXPLAINED_AWAY: Final = 1e-3  # expected hits below which EM reports coverage 0
 
 def _div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     """num / den, 0 where den is 0 (units or k-mers whose weight has vanished)."""
-    return np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den > 0)
+    out = np.zeros_like(num, dtype=np.float64)
+    np.divide(num, den, out=out, where=den > 0)
+    return out
 
 
 def em(
