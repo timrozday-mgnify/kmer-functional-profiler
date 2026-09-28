@@ -50,6 +50,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
+    env:
+      # mappy has no macOS wheel; build it for arm64 only (its NEON code fails on x86_64).
+      ARCHFLAGS: ${{ matrix.os == 'macos-latest' && '-arch arm64' || '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
