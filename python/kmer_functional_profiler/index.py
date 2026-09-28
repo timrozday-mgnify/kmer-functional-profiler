@@ -62,7 +62,7 @@ class IndexParams:
     alphabet: str = "protein"
     t_base: float = 1 / 1000
     n_min: int = 8
-    t_cap: float = 0.05
+    t_cap: float = 0.2
     oversample: float = 4.0
     mask_adapters: bool = True
     max_groups: int = 64
