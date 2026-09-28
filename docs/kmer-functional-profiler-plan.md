@@ -76,9 +76,9 @@ One context-free sampler with nested per-unit thresholds, frame-filtered transla
 
 **Reference (index build)**
 
-1. Input: MGnify Proteins 2026\_07 FASTA plus its cluster membership: 90% clusters as units, 30% clusters as families, Pfam as the functional label (see Database below). No ORF calling.
+1. Input: MGnify Proteins 2026\_07 FASTA plus its cluster membership: 90% clusters (MGnify90) as units, Pfam as the functional label (see Database below). No ORF calling.
 2. Optional reduced alphabet (e.g. Murphy-10, Dayhoff) and optional spaced-seed mask; amino-acid k of 8–12, packed into u64.
-3. Per family *g*: *t\_g* = min(1, max(*t\_base*, *n\_min* / *n\_kmers(g)*)). Keep k-mers with hash < *t\_g*.
+3. Per 90% cluster *g*: *t\_g* = min(1, max(*t\_base*, *n\_min* / *n\_kmers(g)*)) for non-singleton clusters, *t\_g* = *t\_base* for singletons. Keep k-mers with hash < *t\_g*.
 4. Store hash → list of (unit id); store *t\_g* and *n\_kmers(g)* per unit. Sorted array or minimal perfect hash, memory-mapped.
 
 **Query (streaming, no stored sketch)**
@@ -90,7 +90,7 @@ One context-free sampler with nested per-unit thresholds, frame-filtered transla
 **Abundance**
 
 - Per unit, hits ≈ Poisson(λ\_g × *m\_g*), where *m\_g* is the sketch size and λ\_g the k-mer coverage.
-- Two-stage assignment: uniqueness-weighted detection, then EM per family (see Assignment below).
+- Two-stage assignment: uniqueness-weighted detection, then EM per connected component of clusters that share kept k-mers (see Assignment below).
 - Report: coverage λ\_g, containment (fraction of sketch k-mers seen) with a sylph-style low-coverage correction, a copies-per-genome value using a single-copy marker set, and relative abundance.
 
 **Knobs to ablate:** *t\_base*, *n\_min*, k, alphabet, frame mode, sampler (FracMinHash vs closed syncmers), unit granularity.
@@ -99,9 +99,9 @@ A `--sourmash-compat` mode using sourmash's protein encoding and hash lets you c
 
 ## Database: MGnify Proteins
 
-Use MGnify's own 90% clusters as units and index the k-mers of all members, not just representatives; skip your own 95% dereplication. The per-unit floor must move to the 30% family level, or the index will not fit in memory.
+Use MGnify's own 90% clusters as units and index the k-mers of all members, not just representatives; skip your own 95% dereplication. MGnify90 clusters are the only grouping level: the floor applies per cluster but only to non-singleton clusters, or the index will not fit in memory.
 
-**What the release provides.** The latest release is 2026\_07: 5.74 billion sequences in 1.66 billion 90% clusters (73% singletons), CC0-licensed, so pre-built indexes can be redistributed. Pfam hits are provided for all proteins (52% have one). **There is no 30% membership table**: MGnify30 ships only as representative FASTAs of three subsets, so the 30% families this plan relies on need our own clustering run (an HPC job). Details, file sizes and Parquet layout: [mgnify-2026\_07.md](mgnify-2026_07.md).
+**What the release provides.** The latest release is 2026\_07: 5.74 billion sequences in 1.66 billion 90% clusters (73% singletons), CC0-licensed, so pre-built indexes can be redistributed. Pfam hits are provided for all proteins (52% have one). There is no 30% membership table (MGnify30 ships only as representative FASTAs of three subsets), so this plan uses MGnify90 clusters only; grouping them into 30% families is future work. Details, file sizes and Parquet layout: [mgnify-2026\_07.md](mgnify-2026_07.md).
 
 **95% vs 90%.**
 
@@ -116,16 +116,16 @@ Use MGnify's own 90% clusters as units and index the k-mers of all members, not 
 | --- | --- | --- |
 | Base sketch at *t\_base* = 1/1000 | \~5×10^8 hashes, \~6–10 GB | \~5.7×10^9 proteins × \~200 aa, \~half distinct |
 | Floor at 90%-cluster level, *n\_min* = 8 | ≥ 1.3×10^10 hashes, \~160 GB | 1.66×10^9 clusters in 2026\_07 (0.45×10^9 non-singletons) |
-| Floor at 30%-family level | Much smaller | Family count to check |
+| Floor at 90% non-singleton clusters only, *n\_min* = 8 | ≥ 3.6×10^9 hashes, \~45 GB | 0.45×10^9 non-singleton clusters |
 
-So: apply the floor per 30% family (or Pfam), and apply no floor to singleton partial predictions.
+So: apply the floor to non-singleton 90% clusters only, and give singletons the base rate. If that is still too large, lower *n\_min* or restrict the floor to clusters with a full-length member.
 
-**Functional labels.** Pfam on representatives is the only annotation I can confirm. KO or eggNOG labels would need your own annotation run, which is feasible on 30% family representatives rather than all clusters.
+**Functional labels.** Pfam hits are published for every protein, so each cluster can take the Pfam labels of its members. KO or eggNOG labels would need your own annotation run on cluster representatives (0.45×10^9 non-singletons: expensive).
 
 **Practical options.**
 
 - Development index from a biome subset (e.g. human gut) using MGnify's biome counts per sequence: small enough for a laptop.
-- A two-stage screen like sylph's new `.syl2db` format: a very sparse first pass picks candidate families, a denser second pass quantifies only those ([sylph releases](https://github.com/bluenote-1577/sylph/releases)).
+- A two-stage screen like sylph's new `.syl2db` format: a very sparse first pass picks candidate clusters, a denser second pass quantifies only those ([sylph releases](https://github.com/bluenote-1577/sylph/releases)).
 
 ## Assignment of shared k-mers
 
@@ -141,18 +141,18 @@ Uniqueness-first is a good rule for deciding which units are present, but a poor
 **Why pure uniqueness-first greedy is risky for 90% clusters**
 
 - Unique k-mers are not a random sample of a unit. They sit at the variable positions, which is exactly where a sample strain tends to differ from every reference. Abundance from them is biased low for divergent strains.
-- Units in dense families have few unique k-mers, so estimates are noisy just where competition is highest.
+- Units in dense neighbourhoods (many near-identical clusters) have few unique k-mers, so estimates are noisy just where competition is highest.
 - A sample protein sitting between two references (93% to each) should split roughly evenly; any greedy rule gives it all to one.
-- With per-family thresholds, raw unique counts must be normalised by each unit's sampling rate *t\_g* before ranking.
+- With per-cluster thresholds, raw unique counts must be normalised by each unit's sampling rate *t\_g* before ranking.
 
 **Recommended two stages**
 
-1. **Detection (your idea, formalised).** At build time, store per unit its sketch size *m\_g* and unique sketch k-mers *u\_g* within its 30% family. At query time, test unique hits against a Poisson background of false hits, and rank by an IDF-weighted score Σ hits(x) / |units(x)|. Keep units that pass.
-2. **Quantification.** Within each family, EM over the surviving units: hits(x) \~ Poisson(Σ\_{g ∋ x} λ\_g), zero-inflated for divergent k-mers as in sylph. Families are independent, so this runs in parallel.
+1. **Detection (your idea, formalised).** At build time, store per unit its sketch size *m\_g* and unique sketch k-mers *u\_g* (kept k-mers found in no other cluster). At query time, test unique hits against a Poisson background of false hits, and rank by an IDF-weighted score Σ hits(x) / |units(x)|. Keep units that pass.
+2. **Quantification.** Within each connected component, EM over the surviving units: hits(x) \~ Poisson(Σ\_{g ∋ x} λ\_g), zero-inflated for divergent k-mers as in sylph. Components (clusters linked by shared kept k-mers, computed at build time after dropping promiscuous k-mers) are independent, so this runs in parallel.
 
 At the sketch densities planned, most reads carry zero or one hit, so read-level equivalence classes collapse to k-mer-level classes. Run the EM on k-mer hit counts; it is simpler and loses nothing.
 
-Family and Pfam totals do not depend on how hits are split inside a family, so errors in the within-family split do not reach the level most users will report.
+Pfam totals do not depend on how hits are split between clusters that carry the same Pfam label, so most errors in the within-component split do not reach the level most users will report.
 
 **Evaluation:** all four rules run on the same hit table, so implement gather, winner-take-all and uniqueness-first as cheap baselines in phase 4 and compare against EM in phase 5.
 
@@ -165,14 +165,14 @@ Treat each 90% group as one unit whose k-mer set is the union of its members, an
 **In-group vs out-of-group frequency.** For k-mer *x* and group *G*:
 
 - *p\_in(x)*: fraction of G's members containing *x*. High means core: a read from an unseen member of G probably carries it. Private k-mers (one member) are weak evidence.
-- *p\_out(x)*: number of other groups (or families) containing *x*. Low means specific.
+- *p\_out(x)*: number of other groups containing *x*. Low means specific.
 - Score: log(*p\_in* / *p\_out*), a naive-Bayes log-likelihood ratio. Precedents: CLARK keeps only target-discriminative k-mers; MetaPhlAn picks markers by in-clade core plus out-of-clade uniqueness.
 - Compute *p\_in* over full-length members only, with sequence weights (as in profile HMMs) so over-sampled lineages and partial predictions do not skew it. Quantise it to 2–4 bits per posting.
 
 **Score-based selection is free on the query side.** The query checks every k-mer with hash < *t\_max*. So the index can keep any score-chosen subset of those k-mers, and queries stay consistent. Rules:
 
 1. Among k-mers passing the hash threshold, keep the highest-scoring ones per group until the floor *n\_min* is met.
-2. Drop k-mers present in more than N families outright (low-complexity runs, common motifs such as Walker A). This also removes the longest posting lists.
+2. Drop k-mers present in more than N clusters outright (low-complexity runs, common motifs such as Walker A). This also removes the longest posting lists.
 3. Record which k-mers were kept, so each group's expected hit count uses the kept set, not a nominal rate.
 
 **Likelihood with *p\_in*.** hits(*x*) \~ Poisson(λ\_G · *p\_in(x)*) turns strain variation into part of the model rather than zero-inflation noise. It also yields a per-group divergence estimate: a containment-AAI analogous to sylph's containment ANI. That is a useful novelty signal per function.
@@ -205,9 +205,9 @@ Store \~12–16 bits per hash, with the high bits implicit in the layout, and sp
 
 **The floor that matters more.** Genuine chance matches already occur. With 20 amino acids and k = 11 there are \~2^47.5 possible k-mers; MGnify might hold \~2^39 distinct ones (rough), so \~0.3% of off-target query k-mers hit something by coincidence. A 16-bit fingerprint adds far less. Reduced alphabets shrink the space (Murphy-10 at k = 11 gives \~2^36.5, near saturation), so they need a larger k.
 
-**Unit IDs.** With \~10^9 units an ID costs \~30 bits, and conserved k-mers carry many. Map each k-mer to the ID of its distinct unit set and store each set once, as kallisto, Themisto and Fulgor do; sets repeat heavily. Store family IDs in tier 1 and resolve units only in tier 2.
+**Unit IDs.** With \~10^9 units an ID costs \~30 bits, and conserved k-mers carry many. Map each k-mer to the ID of its distinct unit set and store each set once, as kallisto, Themisto and Fulgor do; sets repeat heavily. Store component IDs in tier 1 and resolve units only in tier 2.
 
-**Rules.** Compare thresholds on the full 64-bit hash before truncating, so nested per-family thresholds stay exact. Keep the fingerprint width a build parameter and measure ε against index size.
+**Rules.** Compare thresholds on the full 64-bit hash before truncating, so nested per-cluster thresholds stay exact. Keep the fingerprint width a build parameter and measure ε against index size.
 
 ## Error vs variation model
 
@@ -262,9 +262,9 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | --- | --- | --- | --- |
 | 0. Skeleton | Mixed repo (uv + maturin + Cargo workspace), CI, pre-commit, stub Python CLI. Fixtures, the parity job, coverage and `bench.yml` move to phase 1, when there are kernels to test. | Both | CI green on Linux and macOS arm64 for both languages. |
 | 1. Rust kernels (done) | PyO3 module: FASTQ streaming, codon tables (11, 4), six-frame translation, stop-filter frames, reduced alphabets, amino-acid k-mer packing, hashing, FracMinHash filter; batch numpy outputs. Pure-Python reference twins. | Rust + Python tests | Property tests pass (frame symmetry, threshold nesting, synonymous invariance); Rust matches reference; ≥ 1 M reads/min/thread. |
-| 2. Index prototype | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-family floor, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked families. |
+| 2. Index prototype | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
 | 3. Query + naive counts | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
-| 4. Model | Uniqueness-weighted detection, EM per family, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
+| 4. Model | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Evaluation and freeze | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
 | 6. Rust port | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node. |
 | 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
@@ -322,7 +322,7 @@ Three tiers: tiny hand-built fixtures in the repo, a small simulated community f
 | Real cohort | A subset of HMP2/IBDMDB with published HUMAnN outputs. | Concordance with HUMAnN; runtime at scale. | IBDMDB portal. |
 | Negative controls | Shuffled reads, human reads, intergenic-only simulated reads. | False-positive rate. | Generated. |
 
-**Reference databases:** develop on a human-gut biome subset of MGnify Proteins 2026\_07; release on the full set (CC0, so pre-built indexes can be shared). Ground-truth genomes for the CI community and CAMI must be annotated against the same unit and family definitions, e.g. by mapping their predicted proteins to MGnify clusters.
+**Reference databases:** develop on a human-gut biome subset of MGnify Proteins 2026\_07; release on the full set (CC0, so pre-built indexes can be shared). Ground-truth genomes for the CI community and CAMI must be annotated against the same unit definitions, e.g. by mapping their predicted proteins to MGnify clusters.
 
 ## Repo setup
 
@@ -377,7 +377,8 @@ Keeping `crates/core` free of PyO3 means phase 6 reuses the kernels unchanged; o
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
 
-- **MGnify scale.** A floor at 90%-cluster level would need \~100 GB of index; the floor goes per 30% family. Confirm the full index fits a 64 GB node before phase 4.
+- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Confirm the full index fits a 64 GB node before phase 4.
+- **Component size.** Promiscuous k-mers can chain clusters into one giant component, which makes the EM serial. Measure component sizes on the development subset in phase 2 and tune the N-clusters cut-off.
 
 * **Marginal novelty.** Setting sourmash to scaled = 100 may recover most of the completeness gap at modest cost. Run that baseline in phase 3 before building phase 4.
 * **Query density set by the smallest units.** If *n\_min* forces *t\_max* near 1, the query does almost no sparsification. Measure the distribution of *t\_g* on the real database early.
@@ -386,10 +387,11 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * **Normalisation.** Which single-copy marker set, and whether to report per-genome copies by default.
 * **Frame filter at high GC.** Keeps \~3 frames at 70% GC; acceptable, but check false positives there specifically.
 * **Decided (phase 1):** k-mer hash is the splitmix64 finalizer of the bit-packed k-mer (5/4/3 bits per residue for protein/Murphy-10/Dayhoff, so k ≤ 12/16/21), a bijection on u64; threshold rule is keep iff hash ≤ max\_hash, with max\_hash = ⌊*t*·2^64⌋ − 1. The sourmash hash is used only in `--sourmash-compat`.
-* **Open (blocks phase 2):** how to define 30% families without a published membership table: cluster the 1.66 B representatives ourselves, map them onto the 128.7 M MGnify30-C2 representatives, or use Pfam architecture as the family.
+* **Decided:** MGnify90 clusters are the only grouping level; no 30% families.
+* **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
 * **Decided:** package name `kmer_functional_profiler` (tool name may still change before release); licence GPL-3.0-or-later, so FragGeneScanRs can be linked.
-* **Open:** whether KO/eggNOG labels on 30% family representatives are worth the annotation run, or Pfam suffices.
-* **Full-scale runs:** anything over the whole release (subset extraction, family clustering, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
+* **Open:** whether KO/eggNOG labels are worth the annotation run, or Pfam suffices.
+* **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
 
 ## Sources
 
