@@ -71,21 +71,33 @@ output records each index's size; `trace.tsv` records each PROFILE task's runtim
 ## Results (10 metagenomes, InSilicoSeq novaseq)
 
 Means over seeds 1..10; sd of purity and completeness <= 0.015. "Low 25%" is completeness
-on the least-covered quarter of true KOs.
+on the least-covered quarter of true KOs. `kmers_hit` counts every hit k-mer for every KO
+holding it; `kmers_unique` counts only the k-mers gather assigns to the KO.
 
-| Index | min_hits | Purity | Completeness | Low 25% |
-| --- | --- | --- | --- | --- |
-| fmh_compat | 1 | 0.975 | 0.688 | 0.295 |
-| kfp_s1000 | 1 | 0.985 | 0.677 | 0.285 |
-| kfp_s1000_floor8 | 1 | 0.976 | 0.719 | 0.404 |
-| kfp_s100 | 1 | 0.951 | 0.960 | 0.853 |
-| **kfp_s100** | **2** | **0.976** | **0.911** | **0.694** |
-| kfp_s100 | 3 | 0.985 | 0.858 | 0.533 |
+| Index | Count | min_hits | Purity | Completeness | Low 25% |
+| --- | --- | --- | --- | --- | --- |
+| fmh_compat | kmers_hit | 1 | 0.975 | 0.688 | 0.295 |
+| fmh_compat | kmers_unique | 1 | 0.991 | 0.672 | 0.268 |
+| kfp_s1000 | kmers_hit | 1 | 0.985 | 0.677 | 0.285 |
+| kfp_s1000 | kmers_unique | 1 | 0.996 | 0.663 | 0.263 |
+| kfp_s1000_floor8 | kmers_hit | 1 | 0.976 | 0.719 | 0.404 |
+| kfp_s100 | kmers_hit | 1 | 0.951 | 0.960 | 0.853 |
+| kfp_s100 | kmers_hit | 2 | 0.976 | 0.911 | 0.694 |
+| kfp_s100 | kmers_hit | 3 | 0.985 | 0.858 | 0.533 |
+| **kfp_s100** | **kmers_unique** | **1** | **0.985** | **0.955** | **0.837** |
+| kfp_s100 | kmers_unique | 2 | 0.994 | 0.903 | 0.665 |
 
-`kfp_s100` at `min_hits` 2 is the recommended setting: fmh_compat's purity with 22 points
-more completeness. At scaled 1000, `min_hits` above 1 costs most low-coverage KOs
-(completeness 0.49 at 2). The floor helps at scaled 1000 but not at scaled 100, where
-nearly every KO already samples more than 8 k-mers (`n_min 8` at `t_base 0.01` scored
-within 0.005 of `n_min 0`), so that configuration was dropped. Most remaining false
-positives are modular PKS/NRPS KOs (pks2, pks12, surfactin, tyrocidine synthetases, ...)
-whose shared domains carry identical k-mers; `kmers_unique` scores them after gather.
+`kfp_s100` scored on `kmers_unique` at `min_hits` 1 is the recommended setting: the purity
+of `kmers_hit` at 3 with 10 points more completeness, and 27 points more than fmh_compat.
+Gather removes 70% of the false positives (348 to 105 per sample; none left in all 10
+samples, against 29 before) for 31 true KOs per sample, 90% of them in the lowest-coverage
+quarter: single-k-mer hits taken by a more abundant relative (PTS and ABC transporter
+paralogs, for example). The false positives it removes are mostly modular PKS/NRPS KOs
+(pks2, pks8, tyrocidine and rapamycin synthases), whose shared domains carry identical
+k-mers. Collagen VII (`K16628`) is the most persistent one left, in 5 of 10 samples.
+
+At scaled 1000, `min_hits` above 1 costs most low-coverage KOs (completeness 0.49 at 2).
+The floor helps at scaled 1000 but not at scaled 100, where nearly every KO already
+samples more than 8 k-mers (`n_min 8` at `t_base 0.01` scored within 0.005 of `n_min 0`),
+so that configuration was dropped. Gather adds no measurable query time (10-15 s per
+sample either way).
