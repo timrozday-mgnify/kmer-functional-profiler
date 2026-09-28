@@ -46,7 +46,9 @@ process MEMBERS {
 process INDEX {
     tag "${name}"
     label 'process_high_memory'
-    publishDir params.outdir, mode: 'copy', pattern: 'index_*/meta.json'
+    // meta.json is copied out of the index: a file inside a declared directory output is
+    // folded into that directory and never matches the publish pattern
+    publishDir params.outdir, mode: 'copy', pattern: 'meta.json', saveAs: { "index_${name}/meta.json" }
 
     input:
     tuple val(name), val(args)
@@ -54,31 +56,34 @@ process INDEX {
 
     output:
     tuple val(name), path("index_${name}"), emit: index
-    path "index_${name}/meta.json"
+    path 'meta.json'
 
     script:
-    "${params.kfp} index ${members} index_${name} ${args}"
+    "${params.kfp} index ${members} index_${name} ${args} && cp index_${name}/meta.json meta.json"
 
     stub:
-    "mkdir index_${name} && touch index_${name}/meta.json"
+    "mkdir index_${name} && touch index_${name}/meta.json meta.json"
 }
 
 process IMPORT_SKETCHES {
     label 'process_medium'
-    publishDir params.outdir, mode: 'copy', pattern: 'index_*/meta.json'
+    publishDir params.outdir, mode: 'copy', pattern: 'meta.json', saveAs: { 'index_fmh_compat/meta.json' }
 
     input:
     path sketches
 
     output:
     tuple val('fmh_compat'), path('index_fmh_compat'), emit: index
-    path 'index_fmh_compat/meta.json'
+    path 'meta.json'
 
     script:
-    "${params.kfp} import-sourmash ${sketches} index_fmh_compat --ksize ${params.ksize}"
+    """
+    ${params.kfp} import-sourmash ${sketches} index_fmh_compat --ksize ${params.ksize}
+    cp index_fmh_compat/meta.json meta.json
+    """
 
     stub:
-    "mkdir index_fmh_compat && touch index_fmh_compat/meta.json"
+    "mkdir index_fmh_compat && touch index_fmh_compat/meta.json meta.json"
 }
 
 process SAMPLE {
@@ -129,6 +134,7 @@ process TRUTH {
     input:
     tuple val(seed), path(fna), path(genes), path(r1), path(r2)
     path kos
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
     tuple val(seed), path('truth.csv'), emit: truth
@@ -211,7 +217,7 @@ workflow {
 
     SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
-    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos)
+    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, file("${projectDir}/bench.py"))
 
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
     ch_query_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()

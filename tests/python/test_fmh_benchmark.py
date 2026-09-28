@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from kmer_functional_profiler.reference import reverse_complement
 
@@ -57,6 +58,7 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
         "--threads", "2")  # fmt: skip
     truth = pl.read_csv(tmp_path / "truth.csv")
     assert set(truth["ko_id"]) == expected
+    assert (truth["depth"] > 0).all()
 
     found = sorted(expected)[:2]
     pl.DataFrame({"name": [*found, "ko:K99999"], "kmers_hit": [3, 1, 5]}).write_csv(
@@ -67,5 +69,15 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     score = pl.read_csv(tmp_path / "score.tsv", separator="\t").row(0, named=True)
     assert (score["tp"], score["n_pred"]) == (2, 3)
     assert score["completeness"] == 2 / len(expected)
+    assert score["spearman_tp"] is None  # no abundance column in this profile
+
+    # An exact abundance estimate scores perfectly.
+    exact = truth.select(name="ko_id", kmers_hit=pl.lit(1), coverage="depth")
+    exact.write_csv(tmp_path / "p.tsv", separator="\t")
+    run(tmp_path, "score", "--truth", "truth.csv", "--profile", "p.tsv", "--sample", "s",
+        "--index", "i")  # fmt: skip
+    score = pl.read_csv(tmp_path / "score.tsv", separator="\t").row(0, named=True)
+    assert score["spearman_tp"] == pytest.approx(1.0)
+    assert score["l1"] == pytest.approx(0.0)
     run(tmp_path, "summary", "score.tsv")
     assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [1]

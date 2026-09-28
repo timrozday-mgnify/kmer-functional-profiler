@@ -6,10 +6,13 @@
   gene coordinates as ``genes.parquet``.
 - ``truth``: map simulated read pairs back to the sample with minimap2 (mappy); a KO is
   present if a primary alignment overlaps one of its genes, as in the paper's CAMISIM
-  ground truth. Writes ``ko_id``, ``n_reads``, ``bases`` (overlapping aligned bases).
+  ground truth. Writes ``ko_id``, ``n_reads``, ``bases`` (overlapping aligned bases) and
+  ``depth`` (bases / gene length, summed over the KO's genes: read depth times copies).
 - ``score``: purity and completeness of one profile against a truth table, one row per
-  count (``kmers_hit``, and ``kmers_unique`` after gather when present) and ``--min-hits``
-  threshold.
+  count present (``kmers_hit``; ``kmers_unique`` after gather; ``kmers_wta`` and
+  ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
+  threshold. Each count is paired with its abundance estimates (``RULES``), scored on the detected
+  KOs against ``depth``: Spearman over true positives and L1 between relative abundances.
 - ``summary``: mean and sd of the scores per index, count and threshold.
 """
 
@@ -86,6 +89,17 @@ def sample(args: argparse.Namespace) -> None:
     Path("genomes.txt").write_text("\n".join(chosen) + "\n")
 
 
+# (detection count, abundance estimate) pairs scored: naive coverage for every hit, plain and
+# zero-inflated EM for the units gather keeps, and the hits winner-take-all / uniqueness-first
+# assign.
+RULES = (
+    ("kmers_hit", "coverage"),
+    ("kmers_unique", "coverage_em"),
+    ("kmers_unique", "coverage_zi"),
+    ("kmers_unique", "coverage_zib"),
+    ("kmers_wta", "coverage_wta"),
+    ("kmers_ufirst", "coverage_ufirst"),
+)
 _BIN = 1000  # bp; overlap candidates are only compared within a shared bin
 
 
@@ -144,19 +158,45 @@ def truth(args: argparse.Namespace) -> None:
         )
         .join(read_kos(args.kos), left_on="gene_name", right_on="gene_id")
         .group_by("ko_id")
-        .agg(n_reads=pl.col("read").n_unique(), bases=pl.col("bases").sum())
+        .agg(
+            n_reads=pl.col("read").n_unique(),
+            bases=pl.col("bases").sum(),
+            depth=(pl.col("bases") / (pl.col("end") - pl.col("start"))).sum(),
+        )
         .sort("ko_id")
         .write_csv(args.out)
     )
+
+
+def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, float | None]:
+    """Spearman over true positives and L1 between relative abundances (0 to 2).
+
+    ``truth`` has ``ko_id`` and ``depth``; ``estimate`` has ``ko_id`` and ``estimate`` for
+    the detected KOs. A KO missing from either side has abundance 0 there.
+    """
+    both = truth.select("ko_id", "depth").join(estimate, on="ko_id", how="full", coalesce=True)
+    both = both.fill_null(0.0)
+    tp = both.filter(pl.col("depth") > 0, pl.col("estimate") > 0)
+    rel = [both[c] / both[c].sum() if both[c].sum() > 0 else both[c] for c in ("depth", "estimate")]
+    return {
+        "spearman_tp": tp.select(pl.corr("depth", "estimate", method="spearman")).item()
+        if tp.height > 1
+        else None,
+        "l1": float((rel[0] - rel[1]).abs().sum()),
+    }
 
 
 def score(args: argparse.Namespace) -> None:
     truth = pl.read_csv(args.truth)
     profile = pl.read_csv(args.profile, separator="\t")
     rows = []
-    counts = [c for c in ("kmers_hit", "kmers_unique") if c in profile.columns]
-    for count, min_hits in itertools.product(counts, args.min_hits):
-        predicted = set(profile.filter(pl.col(count) >= min_hits)["name"])
+    # Profiles from before an estimate existed are scored on detection alone.
+    rules = list(dict.fromkeys((c, a if a in profile.columns else None) for c, a in RULES))
+    for (count, abundance), min_hits in itertools.product(rules, args.min_hits):
+        if count not in profile.columns:
+            continue
+        detected = profile.filter(pl.col(count) >= min_hits)
+        predicted = set(detected["name"])
         present = truth.with_columns(found=pl.col("ko_id").is_in(predicted))
         low = present.filter(pl.col("n_reads") <= pl.col("n_reads").quantile(0.25))
         tp = int(present["found"].sum())
@@ -165,6 +205,7 @@ def score(args: argparse.Namespace) -> None:
                 "sample": args.sample,
                 "index": args.index,
                 "count": count,
+                "abundance": abundance,
                 "min_hits": min_hits,
                 "n_truth": truth.height,
                 "n_pred": len(predicted),
@@ -174,6 +215,11 @@ def score(args: argparse.Namespace) -> None:
                 "completeness_low25": low["found"].mean(),
                 "weighted_completeness": int(present.filter("found")["bases"].sum())
                 / max(int(present["bases"].sum()), 1),
+                **(
+                    abundance_scores(truth, detected.select(ko_id="name", estimate=abundance))
+                    if abundance
+                    else {"spearman_tp": None, "l1": None}
+                ),
             }
         )
     pl.DataFrame(rows).write_csv(args.out, separator="\t")
@@ -181,18 +227,19 @@ def score(args: argparse.Namespace) -> None:
 
 def summary(args: argparse.Namespace) -> None:
     scores = pl.concat([pl.read_csv(p, separator="\t") for p in args.scores])
-    metrics = [c for c in scores.columns if c not in ("sample", "index", "count", "min_hits")]
+    keys = ["index", "count", "abundance", "min_hits"]
+    metrics = [c for c in scores.columns if c not in ("sample", *keys)]
     (
-        scores.group_by("index", "count", "min_hits")
+        scores.group_by(keys)
         .agg(
             pl.len().alias("n_samples"),
             pl.col(metrics).mean().name.suffix("_mean"),
             pl.col(metrics).std().name.suffix("_sd"),
         )
-        .sort("index", "count", "min_hits")
+        .sort(keys, nulls_last=True)
         .write_csv(args.out, separator="\t")
     )
-    scores.sort("index", "count", "min_hits", "sample").write_csv("scores.tsv", separator="\t")
+    scores.sort([*keys, "sample"], nulls_last=True).write_csv("scores.tsv", separator="\t")
 
 
 def main() -> None:

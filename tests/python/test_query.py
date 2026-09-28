@@ -10,7 +10,15 @@ from typer.testing import CliRunner
 from kmer_functional_profiler import _core, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import Index, IndexParams, build_index
-from kmer_functional_profiler.query import gather, profile
+from kmer_functional_profiler.query import (
+    UFIRST_SCORE,
+    WTA_SCORE,
+    assign_best,
+    em,
+    fit_present_prior,
+    gather,
+    profile,
+)
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 READS = (DATA / "reads_1.fastq.gz", DATA / "reads_2.fastq.gz")
@@ -56,6 +64,13 @@ def test_dense_counts_match_direct_intersection(members: Path) -> None:
     all_kmers = set().union(*(reference.protein_kmers(s.encode(), K) for s in proteins().values()))
     assert result["kmers_unique"].sum() == len(set(hashes) & all_kmers)
     assert (result["kmers_unique"] <= result["kmers_hit"]).all()
+    # EM keeps every hit: expected hits over the detected units equal the observed ones.
+    expected_hits = sum(h in all_kmers for h in hashes)
+    assert (result["coverage_em"] * result["m_g"]).sum() == pytest.approx(expected_hits)
+    # So do the one-pass rules, which each give every hit k-mer to exactly one unit.
+    for rule in ("wta", "ufirst"):
+        assert result[f"kmers_{rule}"].sum() == result["kmers_unique"].sum()
+        assert (result[f"coverage_{rule}"] * result["m_g"]).sum() == pytest.approx(expected_hits)
     # Every source protein is found by its reads.
     assert len(got) == len(proteins())
 
@@ -72,6 +87,23 @@ def test_sampled_index_hits_respect_unit_thresholds(members: Path) -> None:
     assert result["containment"].is_between(0, 1).all()
 
 
+def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
+    # A sparse tier 2 with a fully dense tier fits EM on the same k-mers as a dense index.
+    both = build(members, t_base=0.2, n_min=0, t_dense=1.0, fp_bits=64)
+    dense = build(members, t_base=1.0, fp_bits=64)
+    assert both.dense is not None and dense.dense is None
+    assert (both.units["m_dense"] == dense.units["m_g"]).all()
+    assert both.units["m_g"].sum() < both.units["m_dense"].sum()
+    got, want = profile(both, *READS), profile(dense, *READS)
+    cols = ["unit", "coverage_em", "coverage_zi"]
+    joined = got.filter(pl.col("kmers_unique") > 0).select(*cols, "kmers_dense")
+    joined = joined.join(want.select(cols), on="unit", suffix="_want")
+    assert joined.height == len(proteins())
+    for col in cols[1:]:
+        assert joined[col].to_list() == pytest.approx(joined[f"{col}_want"].to_list())
+    assert (joined["kmers_dense"] > 0).all()
+
+
 def test_gather_explains_away_shared_kmers() -> None:
     kmers = pl.DataFrame(
         {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},
@@ -84,6 +116,84 @@ def test_gather_explains_away_shared_kmers() -> None:
     # Sampled 10x more sparsely, unit 1's 2 k-mers stand for more than unit 0's 4.
     got = {u: n for u, n, _ in gather(kmers, np.array([0.01, 0.001, 0.01, 0.01])).iter_rows()}
     assert got == {1: 2, 0: 2, 2: 1, 3: 2}
+
+
+def test_assign_best_rules() -> None:
+    # Same k-mers as the gather test: unit 0 holds 1-4, unit 1 holds 3-4, unit 2 holds 4-5.
+    kmers = pl.DataFrame(
+        {"unit": [0, 0, 0, 0, 1, 1, 2, 2, 3, 3], "hash": [1, 2, 3, 4, 3, 4, 4, 5, 6, 7]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64},
+    )
+
+    def won(m_g: list[int], t_g: list[float], score: pl.Expr) -> dict[int, list[int]]:
+        rated = kmers.with_columns(
+            m_g=pl.col("unit").replace_strict(range(4), m_g),
+            t_g=pl.col("unit").replace_strict(range(4), t_g),
+        )
+        rows = assign_best(rated, score).group_by("unit").agg(pl.col("hash").sort())
+        return dict(rows.sort("unit").iter_rows())
+
+    m_g, t_g = [8, 2, 4, 2], [0.01] * 4
+    # Winner-take-all: unit 1 is fully contained (2/2), so it takes 3 and 4 from unit 0 (4/8).
+    assert won(m_g, t_g, WTA_SCORE) == {0: [1, 2], 1: [3, 4], 2: [5], 3: [6, 7]}
+    # Uniqueness-first: unit 0 has the most specific support (1 + 1 + 1/2 + 1/3) and goes first.
+    assert won(m_g, t_g, UFIRST_SCORE) == {0: [1, 2, 3, 4], 2: [5], 3: [6, 7]}
+    # Sampled 10x more sparsely, unit 1's support (1/2 + 1/3) / 0.001 outranks unit 0's.
+    assert won(m_g, [0.01, 0.001, 0.01, 0.01], UFIRST_SCORE) == {
+        0: [1, 2],
+        1: [3, 4],
+        2: [5],
+        3: [6, 7],
+    }
+
+
+def test_em_splits_shared_kmer_hits() -> None:
+    # Unit 0 holds k-mers 1, 2 and unit 1 holds 2, 3; hits 10, 15, 5. The Poisson MLE
+    # solves 10/l0 + 15/(l0+l1) = 2 = 5/l1 + 15/(l0+l1): l0 = 10, l1 = 5.
+    kmers = pl.DataFrame(
+        {"unit": [0, 0, 1, 1], "hash": [1, 2, 2, 3], "hits": [10, 15, 15, 5]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32},
+    )
+    got = em(kmers, np.array([2, 2]))
+    assert got["coverage"].to_list() == pytest.approx([10.0, 5.0], rel=1e-4)
+    # Unhit kept k-mers pull coverage down: unit 1 with 4 kept k-mers.
+    got = em(kmers.filter(pl.col("unit") == 1), np.array([2, 4]))
+    assert got["coverage"].to_list() == pytest.approx([20 / 4])
+
+
+def test_zero_inflated_em_fits_present_kmers() -> None:
+    # 10 of 40 kept k-mers present, 3 hits each: the other 30 are structural zeros, not
+    # low coverage. Zero-truncated Poisson: c / (1 - exp(-c)) = 3.
+    kmers = pl.DataFrame(
+        {"unit": [0] * 10, "hash": range(10), "hits": [3] * 10},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32},
+    )
+    got = em(kmers, np.array([40]), zero_inflated=True).row(0, named=True)
+    c = got["coverage"]
+    assert c / -np.expm1(-c) == pytest.approx(3.0, rel=1e-4)
+    assert got["present"] == pytest.approx(10 / (40 * -np.expm1(-c)), rel=1e-4)
+    assert em(kmers, np.array([40]))["coverage"].item() == pytest.approx(30 / 40)
+    # All kept k-mers hit once: no excess zeros, so present stays 1 and it matches plain EM.
+    got = em(kmers.with_columns(hits=pl.lit(1, pl.UInt32)), np.array([10]), zero_inflated=True)
+    assert got.row(0) == (0, pytest.approx(1.0), 1.0)
+
+
+def test_present_prior_shrinks_thin_units() -> None:
+    fit = pl.DataFrame({"coverage": [5.0] * 20, "present": [0.2, 0.4] * 10})
+    a, b = fit_present_prior(fit)  # type: ignore[misc]
+    assert a / (a + b) == pytest.approx(0.3)
+    assert fit_present_prior(fit.head(5)) is None
+    # One hit k-mer out of 100 at coverage ~1: present is barely measured, so the prior
+    # pulls it towards 0.3 and coverage down to match; 1000 hit k-mers of 10,000 hold.
+    for n, m, moved in ((1, 100, True), (1000, 10_000, False)):
+        kmers = pl.DataFrame(
+            {"unit": [0] * n, "hash": range(n), "hits": [2] * n},
+            schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32},
+        )
+        free = em(kmers, np.array([m]), zero_inflated=True).row(0, named=True)
+        shrunk = em(kmers, np.array([m]), zero_inflated=True, prior=(a, b)).row(0, named=True)
+        assert (abs(shrunk["present"] - free["present"]) > 0.05) == moved
+        assert abs(shrunk["present"] - 0.3) <= abs(free["present"] - 0.3) + 1e-9
 
 
 def test_cli_query(members: Path, tmp_path: Path) -> None:
