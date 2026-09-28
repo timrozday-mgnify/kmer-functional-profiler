@@ -46,7 +46,9 @@ process MEMBERS {
 process INDEX {
     tag "${name}"
     label 'process_high_memory'
-    publishDir params.outdir, mode: 'copy', pattern: 'index_*/meta.json'
+    // meta.json is copied out of the index: a file inside a declared directory output is
+    // folded into that directory and never matches the publish pattern
+    publishDir params.outdir, mode: 'copy', pattern: 'meta.json', saveAs: { "index_${name}/meta.json" }
 
     input:
     tuple val(name), val(args)
@@ -54,31 +56,34 @@ process INDEX {
 
     output:
     tuple val(name), path("index_${name}"), emit: index
-    path "index_${name}/meta.json"
+    path 'meta.json'
 
     script:
-    "${params.kfp} index ${members} index_${name} ${args}"
+    "${params.kfp} index ${members} index_${name} ${args} && cp index_${name}/meta.json meta.json"
 
     stub:
-    "mkdir index_${name} && touch index_${name}/meta.json"
+    "mkdir index_${name} && touch index_${name}/meta.json meta.json"
 }
 
 process IMPORT_SKETCHES {
     label 'process_medium'
-    publishDir params.outdir, mode: 'copy', pattern: 'index_*/meta.json'
+    publishDir params.outdir, mode: 'copy', pattern: 'meta.json', saveAs: { 'index_fmh_compat/meta.json' }
 
     input:
     path sketches
 
     output:
     tuple val('fmh_compat'), path('index_fmh_compat'), emit: index
-    path 'index_fmh_compat/meta.json'
+    path 'meta.json'
 
     script:
-    "${params.kfp} import-sourmash ${sketches} index_fmh_compat --ksize ${params.ksize}"
+    """
+    ${params.kfp} import-sourmash ${sketches} index_fmh_compat --ksize ${params.ksize}
+    cp index_fmh_compat/meta.json meta.json
+    """
 
     stub:
-    "mkdir index_fmh_compat && touch index_fmh_compat/meta.json"
+    "mkdir index_fmh_compat && touch index_fmh_compat/meta.json meta.json"
 }
 
 process SAMPLE {
