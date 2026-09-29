@@ -256,7 +256,7 @@ Prototype the algorithm in Python, with stable hot loops in Rust from day one vi
 
 ## Implementation plan
 
-Ten phases, each with a go/no-go gate; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, and phase 8 ports the rest to Rust. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
+Ten phases, each with a go/no-go gate, plus an optional eleventh; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
 
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
@@ -270,6 +270,7 @@ Ten phases, each with a go/no-go gate; phases 1–5 are the Python prototype wit
 | 7. Ablations and freeze | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k; divergence ladder. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen at full-scale cost; spec reviewed. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
 | 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
+| 10. Reference extension (desirable, not essential) | `extend`: add a study's own proteins (MAG protein predictions, assembly gene calls with their functional annotations) to a released MGnify index as an overlay, without rebuilding it; query base + overlays together; `compact` folds overlays into a new base. See Extending the reference below. | Rust (+ Nextflow module) | On the divergence ladder, adding the held-out genomes' proteins as an overlay recovers ≥ 90% of the completeness of a full rebuild that includes them, with no loss on units already in the base; extending with one study (~10⁶ proteins) takes minutes on one node, not a rebuild. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -285,6 +286,7 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 * **Decided (2026-09-28): full-scale check in phase 6, not phase 4.** No test or benchmark so far uses the full MGnify release: unit tests use fixtures, the simulation 300 synthetic units from 100 MGnify seed proteins, the fmh benchmark KEGG KO indexes (tier 2 72 MB, dense tier 1.09 GB at 1/10), and the only real MGnify build is the pre-fix gut 1-in-10,000 subset (213,645 proteins, about 4×10⁻⁵ of the release). The Python build holds the members table and k-mer tables in memory, so a full-release build needs the Rust port (or a partitioned build) anyway. Phase 6 therefore carries the full-scale cost study and tuning (see the phase table). Expect a lot of tuning there to bring cost down, and some compromises on accuracy; defaults chosen in phase 5 are provisional until phase 6 has priced them, and the phase-4/5 accuracy numbers are the reference that any cost saving is measured against.
 * **Decided (2026-09-29): full-scale method before ablations; phases re-ordered.** Supersedes the phase-6 placement above. Ablations measured on the prototype at small scale could pick defaults that the full-scale cost tuning then overturns, so the full-scale method now comes first. Phase 5 keeps only the tool benchmarks; the new phase 6 (full-scale method) takes the cost study, scalable build, tuning and full build from the old phase 6; ablations, divergence ladder, spec and golden outputs move to phase 7 and run against the phase-6 method; the Rust port of query, model and CLI becomes phase 8 and release phase 9. The index build and lookup move to Rust (or a partitioned build) in phase 6, ahead of the spec, because they block full-scale work; phase 8 brings them in line with the spec.
+* **Decided (2026-09-29): reference extension is a desirable, non-essential objective (phase 10).** Users should be able to add their own proteins (a study's MAGs and assembly functions) to the MGnify90 index. It does not gate the release, but earlier phases should not rule it out: see the constraints in Extending the reference.
 
 ### Phase 1
 
@@ -673,6 +675,26 @@ Keeping `crates/core` free of PyO3 means phases 6 and 8 reuse the kernels unchan
 - `release.yml` (phase 9): `cargo-dist` binaries on tags, optional wheels via `PyO3/maturin-action`; bioconda recipe after the first tagged release.
 - Dependabot for Cargo, uv and Actions; branch protection on `main` requiring `ci.yml`.
 
+## Extending the reference (desirable)
+
+Users should be able to add their own proteins to a released index: typically MGnify90 plus a study's MAG protein predictions plus the genes and functional annotations of its assemblies. This is desirable, not essential; it is phase 10, after the release, and nothing earlier depends on it. It matters because a study's own genomes are the closest references its reads will ever have, and much of a new study's protein content is not yet in MGnify.
+
+**Approach: overlays, not rebuilds.** A full build is an HPC job over the whole release, so extension adds a small overlay index next to the base and never rewrites it.
+
+1. *Assign added proteins to units.* Proteins that match an existing MGnify90 cluster at ≥ 90% identity join it; the rest are clustered among themselves at 90% (MMseqs2 linclust, as MGnify does) into new units. Candidate clusters come cheaply from the index itself (dense-tier containment), then an alignment against their representatives confirms them, so no search of all 1.66×10⁹ representatives is needed.
+2. *Build the overlay with the same rules.* New units get *t\_g* from their own *n\_kmers*, exactly as in the build; existing units that gain members keep their *t\_g* and add the new members' k-mers under it, so nested thresholds stay consistent and the query needs no change in sampling. The overlay has the base's layout (tier 1, tier 2, dense) and unit ids that continue the base's.
+3. *Global quantities.* *n\_groups* (score and promiscuity cut) is the base value plus the overlay's, found by probing the base; components are merged at query time with a union-find over units linked across base and overlay. *p\_in* of existing units is not recomputed (added members are few against the cluster), and this approximation is recorded in the overlay's metadata.
+4. *Labels.* Added units carry the study's own annotations (e.g. KO, eggNOG or Pfam from its assembly pipeline) beside the MGnify Pfam labels; existing units that gain members keep their labels and record the added ones.
+5. *Query and compaction.* The query probes the base and each overlay and runs detection and EM over the union. `compact` folds overlays into a new base when they grow large or many (a partitioned rebuild of only the affected components).
+
+**Constraints on earlier phases** (keep extension possible; do not build for it):
+
+- Keep per-unit build rules local to the unit (*t\_g*, floor, *p\_in*), with only *n\_groups* and components global, so an overlay can compute its part alone.
+- Keep unit ids appendable and the unit table separate from the hash tables; record the base release and parameters in `meta.json` so an overlay can check it matches.
+- Let the phase-6 Rust lookup probe more than one table and merge their hits.
+
+**Evaluation.** Reuse the divergence ladder: hold genomes out of the index, add their proteins back as an overlay, and compare against a rebuild that includes them and against the base alone. Also check that adding unrelated proteins changes no base unit's profile.
+
 ## Risks and open questions
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
@@ -686,6 +708,7 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * **Shared k-mers and hierarchy.** EM at protein-cluster level, then aggregation to function, is likely better than EM directly on functions. Untested.
 * **Normalisation.** Which single-copy marker set, and whether to report per-genome copies by default.
 * **Frame filter at high GC.** Keeps \~3 frames at 70% GC; acceptable, but check false positives there specifically.
+* **Reference extension (phase 10).** Overlay approximations (*p\_in* of existing units not updated, *n\_groups* summed across tables) may bias scores for clusters that gain many members; `compact` bounds the drift. Assigning added proteins to MGnify90 clusters by alignment is the costliest part of `extend`.
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
 * **Open:** whether KO/eggNOG labels are worth the annotation run, or Pfam suffices.
 
