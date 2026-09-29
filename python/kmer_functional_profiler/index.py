@@ -39,6 +39,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Final, NamedTuple, Self
 
+import duckdb
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
@@ -590,15 +591,18 @@ def _select_postings(
 
 
 def _unit_pfam(pfam_path: str | Path, members: pl.DataFrame) -> pl.DataFrame:
-    """Members per (``unit``, ``pfam_accession``)."""
-    return (
-        pl.scan_parquet(pfam_path)
-        .select("protein_id", "pfam_accession")
-        .join(members.lazy().select("protein_id", "unit"), on="protein_id")
-        .group_by("unit", "pfam_accession")
-        .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
-        .collect()
-    )
+    """Members per (``unit``, ``pfam_accession``).
+
+    DuckDB, as the full MGnify Pfam table exceeds Polars' 2^32-row limit on one file.
+    """
+    with duckdb.connect() as con:
+        con.register("members", members.select("protein_id", "unit").to_arrow())
+        table = con.execute(
+            "SELECT unit, pfam_accession, count(DISTINCT protein_id)::UINTEGER AS n_members"
+            " FROM read_parquet(?) JOIN members USING (protein_id) GROUP BY ALL",
+            [str(pfam_path)],
+        ).pl()
+    return table.cast({"unit": members["unit"].dtype})
 
 
 def build_index(
