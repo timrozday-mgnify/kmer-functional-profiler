@@ -321,18 +321,22 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
 
 
 def test_presence_doubts_few_and_shared_hits() -> None:
-    # Unit 0: 20 of 30 k-mers hit. Units 1 and 2: one k-mer each, held by 1 and by 40 index
-    # units. Unit 3: 3 k-mers, all shared with unit 0.
-    rows = [(0, h, 1) for h in range(20)] + [(1, 100, 1), (2, 200, 40)]
-    rows += [(3, h, 1) for h in range(3)]
-    kmers = pl.DataFrame(
-        rows, schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32}, orient="row"
+    # 400 units with 5-30 own k-mers, 100 with one unique own k-mer, 20 with one k-mer 40
+    # index units hold, 50 with two. 2000 index units at t_g 0.01 and 3 M reads expect
+    # ~48 background units with one k-mer.
+    rng = np.random.default_rng(0)
+    h = np.array([*rng.integers(5, 30, 400), *[1] * 120, *[2] * 50])
+    holders = np.ones(h.sum(), dtype=np.uint32)
+    holders[np.cumsum(h)[400 + 100 : 400 + 120] - 1] = 40
+    own = pl.DataFrame(
+        {"unit": np.repeat(np.arange(len(h)), h), "hash": np.arange(h.sum()), "holders": holders},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32},
     )
-    m_g = np.full(4, 30)
-    got = dict(presence(kmers, m_g, 30_000.0, 1000).iter_rows())
-    assert got[0] > 0.99
-    assert got[2] < got[1] < 0.5
-    assert got[3] < 0.5
-    # With no background exposure to speak of, one unique k-mer is credible.
-    alone = dict(presence(kmers, m_g, 1e12, 5).iter_rows())
-    assert alone[1] > 0.99 and alone[1] > got[1]
+    t_g = np.full(len(h), 0.01)
+    got = presence(own, t_g, 3_000_000, 2000)["present_prob"].to_numpy()
+    many, unique, shared, two = got[:400], got[400], got[500], got[520]
+    assert many.min() > 0.95
+    assert shared < unique < two < 1
+    # Ten times fewer reads: less background, so one k-mer is more credible.
+    fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
+    assert fewer[400] > unique

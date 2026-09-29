@@ -28,8 +28,7 @@ promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts th
 and ``pin_sum`` (``pin_sum_dense``) sums their ``p_in``: how many of them an average member
 holds, which turns present k-mers into member-equivalents (copies). ``len_cv``
 (``len_cv_dense``) is the coefficient of variation of kept k-mers over the counting
-members: how far one copy's k-mers can stray from ``pin_sum``. ``holder_sum_dense`` sums
-the holder count of each unit's dense k-mers (the query's background exposure).
+members: how far one copy's k-mers can stray from ``pin_sum``.
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
@@ -596,13 +595,6 @@ def write_index(
             pl.col("m_dense").fill_null(0),
             pin_hist_dense=_pin_hist(dense, units.height),
             pin_sum_dense=_pin_sum(dense, units.height),
-            holder_sum_dense=pl.Series(
-                np.bincount(
-                    dense["unit"].to_numpy(),
-                    dense.select(pl.len().over("hash"))["len"].to_numpy(),
-                    minlength=units.height,
-                )
-            ),
         )
         stats["dense_postings"] = dense.height
         stats["dense_bytes"] = tables["dense"].nbytes()

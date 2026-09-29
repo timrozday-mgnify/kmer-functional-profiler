@@ -281,57 +281,69 @@ def fit_present_prior(
     return max(mean * strength, 1.0), max((1 - mean) * strength, 1.0)
 
 
+# Background detections per unit per read (pair) per unit of sampling rate t_g, and the
+# geometric ratio of own k-mers per background detection (a homolog gives a few at once);
+# calibrated on the fmh benchmark (step 18): P(true | own k-mers) within 0.05 on all indexes.
+BACKGROUND: Final = 1e-6
+CLUMP: Final = 0.3
+H_CAP: Final = 20  # hit counts pooled at and above this in the present-unit distribution
+
+
 def presence(
-    kmers: pl.DataFrame,
-    m_g: np.ndarray,
-    exposure: float,
+    own: pl.DataFrame,
+    t_g: np.ndarray,
+    n_reads: int,
     n_index_units: int,
     *,
-    tol: float = 1e-6,
-    max_iter: int = 200,
+    background: float = BACKGROUND,
+    clump: float = CLUMP,
+    max_iter: int = 500,
+    tol: float = 1e-9,
 ) -> pl.DataFrame:
-    """Probability that each unit is present rather than its hits being background.
+    """Probability that each unit gather keeps is present rather than hit by background.
 
-    ``kmers`` has one row per (``unit``, ``hash``) hit with the k-mer's index ``holders``.
-    A k-mer is hit by background (off-target homologs, error k-mers) with probability
-    beta x holders: k-mers many units share are conserved motifs, which unindexed genes
-    carry too. A present unit hits each of its ``m_g`` k-mers with probability p = its
-    hit k-mers / ``m_g``. Per unit, the likelihood ratio of present vs absent compares its
-    hit k-mers (under absence explained by background or by the other detected units
-    holding them) and its unhit ones; with prior probability rho of presence this gives
-    ``present_prob``. So the evidence is the unit's hit k-mers against the background
-    k-mers expected among its ``m_g`` (about h log(h / (m_g beta holders)) - h), and a unit
-    hit on one k-mer, or only on k-mers many units hold, gets a low probability. beta
-    (background k-mers per unit of ``exposure``, the sum of holders over the k-mers where
-    background could be seen) and rho (share of the ``n_index_units`` present) are fitted
-    to the sample by fixed-point iteration, starting from all hit k-mers as background.
+    ``own`` has one row per k-mer gather gave a unit (``unit``, ``hash``, ``holders``), so
+    hits other units explain are not evidence. An absent unit is still detected by
+    background (off-target homologs, error k-mers) with probability 1 - exp(-mu_g), mu_g =
+    ``background`` x ``n_reads`` x ``t_g``, then with h own k-mers ~ Geometric (ratio
+    ``clump``), each hit k-mer's odds scaled by its index ``holders`` (k-mers many units
+    share are conserved motifs, which unindexed genes carry too). A present unit has h
+    drawn from a distribution f fitted to the sample.
+    With A absent units (``n_index_units`` minus the expected present), P(present | h) =
+    w_h / (w_h + A x P(h | absent)), w_h the expected present units with h own k-mers; w
+    and A are fitted by fixed-point iteration, at which w_h is about the units seen with h
+    own k-mers less the background expected to give h.
 
-    A floor of one copy's k-mers at the fitted coverage was tried and dropped: divergent
-    strains keep far fewer k-mers (0.85^11 = 17% at 85% identity), so it flagged them as
-    background. The per-k-mer approximation (presence odds, not exact joint presence of
-    the holders) is fine while beta and each unit's p are small.
+    The background rate is calibrated, not fitted: fitted per sample it is not
+    identifiable (a free f, or a free per-unit hit rate, absorbs any unit with few hits,
+    so fits collapse to no background or to everything being background). Scaling by
+    t_g rather than m_g matches the fmh benchmark, where false positives are small,
+    often floored, KOs.
     """
-    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
-    hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
-    n = len(units)
-    holders = np.zeros(len(hashes))
-    holders[row] = kmers["holders"].to_numpy()
-    m = m_g[units].astype(np.float64)
-    hit = np.bincount(col, minlength=n)
-    p = np.minimum(hit / m, 1 - 1e-9)
-    others = np.bincount(row, weights=p[col], minlength=len(hashes))[row] - p[col]
-    unhit = (m - hit) * np.log1p(-p)
-    exposure = max(exposure, 1.0)
-    beta, rho = len(hashes) / exposure, (n + 1) / (n_index_units + 2)
+    per_unit = (
+        own.group_by("unit")
+        .agg(h=pl.len(), log_holders=pl.col("holders").cast(pl.Float64).log().sum())
+        .sort("unit")
+    )
+    units = per_unit["unit"].to_numpy()
+    h = per_unit["h"].to_numpy().astype(np.float64)
+    mu = background * n_reads * t_g[units]
+    capped = np.minimum(h, H_CAP).astype(np.intp)
+    # P(own hits | absent); units at the cap are never taken for background.
+    absent = np.where(
+        capped < H_CAP,
+        -np.expm1(-mu)
+        * (1 - clump)
+        * clump ** (h - 1)
+        * np.exp(per_unit["log_holders"].to_numpy()),
+        0.0,
+    )
+    prob = np.ones(len(units))
     for _ in range(max_iter):
-        llr = np.bincount(col, np.log1p(p[col] / (beta * holders[row] + others)), n) + unhit
-        prob = 1 / (1 + np.exp(-np.clip(np.log(rho / (1 - rho)) + llr, -700, 700)))
-        # Hit k-mers none of whose holders is present are background.
-        background = np.exp(np.bincount(row, np.log1p(-np.minimum(prob, 1 - 1e-12))[col]))
-        new_beta = (background.sum() + 1) / exposure
-        rho = (prob.sum() + 1) / (n_index_units + 2)
-        done = abs(new_beta - beta) <= tol * beta
-        beta = new_beta
+        w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
+        new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
+        done = np.abs(new - prob).max(initial=0) <= tol
+        prob = new
         if done:
             break
     return pl.DataFrame(
@@ -546,7 +558,8 @@ def profile(
     gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
-    present rather than hit by background; units gather drops get 0.
+    present rather than hit by background, from the tier-2 k-mers gather gave it; units
+    gather drops get 0.
 
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
     ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). ``kmers_out``
@@ -581,12 +594,12 @@ def profile(
         )
 
     empty = np.empty(0, dtype=np.uint64)
-    per_read = pl.concat(
-        [
-            by_read(unit_hits(index.tier2, max_hash_g, b["hash"], b["read"]))
-            for b in [{"hash": empty, "read": empty}, *stream(index.tier2.max_hash)]
-        ]
-    )
+    batches, n_reads = [], 0
+    for b in [{"hash": empty, "read": empty}, *stream(index.tier2.max_hash)]:
+        batches.append(by_read(unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])))
+        if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
+            n_reads = max(n_reads, int(b["read"].max()) + 1)
+    per_read = pl.concat(batches)
     kmer_hits = per_kmer(per_read)
     if kmers_out is not None:
         kmer_hits.write_parquet(kmers_out)
@@ -597,9 +610,14 @@ def profile(
     pin_hist = index.units["pin_hist"].to_numpy()
     pin_sum = index.units["pin_sum"]
     len_cv = index.units["len_cv"].to_numpy()
-    tier2 = index.tier2
-    # Background can land on any tier-2 posting: every hit k-mer has a holder gather keeps.
-    exposure = float(np.diff(tier2.set_offsets.astype(np.int64))[tier2.set_ids].sum())
+    # Each hit k-mer is gather's: the first unit in gather order holding it.
+    own = (
+        kmer_hits.join(assigned.select("unit", "gather_rank"), on="unit")
+        .sort("gather_rank")
+        .unique("hash", keep="first")
+        .select("unit", "hash", "holders")
+    )
+    present_prob = presence(own, index.units["t_g"].to_numpy(), n_reads, index.units.height)
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -620,12 +638,8 @@ def profile(
         pin_hist = index.units["pin_hist_dense"].to_numpy()
         pin_sum = index.units["pin_sum_dense"]
         len_cv = index.units["len_cv_dense"].to_numpy()
-        # Dense k-mers are looked up for detected units only.
-        # ponytail: a k-mer two detected units hold counts twice; exact would need the union
-        exposure = float(index.units["holder_sum_dense"].to_numpy()[keep["unit"].to_numpy()].sum())
     plain = em(detected, m_g).select("unit", coverage_em="coverage")
     inflated = em(detected, m_g, zero_inflated=True)
-    present_prob = presence(detected, m_g, exposure, index.units.height)
     prior = fit_present_prior(inflated)
     shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
         "unit", coverage_zib="coverage", present_zib="present"
@@ -653,7 +667,7 @@ def profile(
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("read").n_unique().cast(pl.UInt64),
         )
-        .join(index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv|holder_sum).*$")), on="unit")
+        .join(index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$")), on="unit")
         .join(assigned, on="unit", how="left")
         .join(plain, on="unit", how="left")
         .join(inflated, on="unit", how="left")
