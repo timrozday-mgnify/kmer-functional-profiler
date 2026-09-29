@@ -335,14 +335,23 @@ def detected(args: argparse.Namespace) -> None:
         kmers = kmers.with_columns(in_genome=pl.lit(None, pl.Boolean))
     else:
         p = meta["params"]
-        genome = _core.hash_dna(
-            [s.encode() for _, s in fasta(args.fna)],
-            p["k"],
-            alphabet=p["alphabet"],
-            frames="all",
-            max_hash=int(kmers["hash"].max()),  # type: ignore[arg-type]
-        )["hash"]
-        kmers = kmers.with_columns(in_genome=pl.col("hash").is_in(np.unique(genome)))
+        wanted = np.unique(kmers["hash"].to_numpy())
+        # Contig by contig, keeping only hit hashes: all genome hashes up to the largest hit
+        # (t_max 0.2 on floored indexes) took ~10 GB at once.
+        found = [np.empty(0, np.uint64)] + [
+            h[np.isin(h, wanted)]
+            for _, seq in fasta(args.fna)
+            for h in [
+                _core.hash_dna(
+                    [seq.encode()],
+                    p["k"],
+                    alphabet=p["alphabet"],
+                    frames="all",
+                    max_hash=int(wanted[-1]),
+                )["hash"]
+            ]
+        ]
+        kmers = kmers.with_columns(in_genome=pl.col("hash").is_in(np.unique(np.concatenate(found))))
     per_unit = kmers.group_by("unit").agg(
         holders_median=pl.col("holders").median(),
         hits_max=pl.col("hits").max(),
