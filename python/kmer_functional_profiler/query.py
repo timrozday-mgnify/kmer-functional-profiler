@@ -17,7 +17,11 @@ hits give.
 """
 
 import heapq
-from collections.abc import Iterable
+import resource
+import sys
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
 from typing import Final
@@ -30,6 +34,59 @@ from scipy.sparse.csgraph import connected_components
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable
+
+DISTINCT_SAMPLE: Final = 256  # distinct sampled k-mers are counted on 1 in this of hash space
+
+
+def peak_rss() -> int:
+    """Peak resident set size of this process so far, in bytes."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024  # Linux reports KiB
+
+
+class Timer:
+    """Wall time, CPU time and peak RSS per query stage, and counts (the query cost study).
+
+    A stage entered once per read batch accumulates its times. ``peak_rss`` is the
+    process's peak at the stage's last exit, so the stage that raises it shows as a step.
+    """
+
+    def __init__(self) -> None:
+        self.stages: dict[str, dict[str, float]] = {}
+        self.counts: dict[str, int] = {}
+
+    @contextmanager
+    def __call__(self, stage: str) -> Iterator[None]:
+        wall, cpu = time.perf_counter(), time.process_time()
+        try:
+            yield
+        finally:
+            s = self.stages.setdefault(stage, {"wall_s": 0.0, "cpu_s": 0.0})
+            s["wall_s"] += time.perf_counter() - wall
+            s["cpu_s"] += time.process_time() - cpu
+            s["peak_rss"] = peak_rss()
+
+    def as_dict(self) -> dict[str, object]:
+        return {"stages": self.stages, "counts": self.counts}
+
+
+def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
+    """Connected components of hit units linked by shared k-mers.
+
+    Returns the number of components, the largest's units and its (unit, hash) pairs.
+    """
+    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
+    _, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    n = len(units)
+    # Bipartite graph: units are nodes 0..n, k-mers follow.
+    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
+    n_comp, label = connected_components(graph, directed=False)
+    if n == 0:
+        return 0, 0, 0
+    per_unit = np.bincount(label[:n])
+    largest = int(per_unit.argmax())
+    n_units = int(per_unit[largest])
+    return int(n_comp), n_units, int((label[col] == largest).sum())
 
 
 def unit_hits(
@@ -522,7 +579,7 @@ def posterior_zi(
     group_id = np.full(n_units, len(units), dtype=np.int64)
     np.minimum.at(group_id, group, np.arange(n_units))  # smallest member index per group
     group_unit = units[group_id[group]]
-    total = [np.stack([np.bincount(group, w, minlength=group.max() + 1) for w in x])[:, group]
+    total = [np.stack([np.bincount(group, w, minlength=n_units) for w in x])[:, group]
              for x in (group_coverage, group_abundance)]  # fmt: skip
     total = [np.where(size > 1, t, x) for t, x in zip(total, (coverage, abundance), strict=True)]
     tails = [(1 - level) / 2, (1 + level) / 2]
@@ -547,6 +604,7 @@ def profile(
     batch_reads: int = 100_000,
     draws: int = 0,
     kmers_out: str | Path | None = None,
+    timer: Timer | None = None,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -573,7 +631,14 @@ def profile(
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
     ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). ``kmers_out``
     writes the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
+
+    ``timer`` records each stage's time and peak RSS and the counts the query's cost
+    hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
+    space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
     """
+    record = timer is not None
+    timer = timer or Timer()
+    counts = timer.counts
     # Format-1 indexes also record tier1_per_unit.
     params = IndexParams(**{f.name: index.meta["params"][f.name] for f in fields(IndexParams)})
 
@@ -603,17 +668,51 @@ def profile(
             hits=pl.col("n").sum(), pin_q=pl.col("pin_q").first(), holders=pl.col("holders").first()
         )
 
+    with timer("keys"):
+        index.tier2.stored_keys  # noqa: B018  (materialised once, on first lookup)
     empty = np.empty(0, dtype=np.uint64)
-    batches, n_reads = [], 0
-    for b in [{"hash": empty, "read": empty}, *stream(index.tier2.max_hash)]:
-        batches.append(by_read(unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])))
+    batches, n_reads, subsample = [], 0, []
+    sampled = hit_kmers = hit_rows = 0
+    reads = iter(stream(index.tier2.max_hash))
+    b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
+    while b is not None:
+        with timer("lookup"):
+            hits = unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])
+        with timer("aggregate"):
+            batches.append(by_read(hits))
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
-    per_read = pl.concat(batches)
-    kmer_hits = per_kmer(per_read)
+        sampled += len(b["hash"])
+        subsample.append(b["hash"][b["hash"] <= index.tier2.max_hash // DISTINCT_SAMPLE])
+        hit_rows += hits.height
+        hit_kmers += round((1 / hits["holders"]).sum()) if hits.height else 0  # rows per hit
+        with timer("hash"):
+            b = next(reads, None)
+    with timer("aggregate"):
+        per_read = pl.concat(batches)
+        kmer_hits = per_kmer(per_read)
+    counts |= {
+        "reads": n_reads,
+        "sampled_kmers": sampled,
+        "distinct_sampled_kmers_est": len(np.unique(np.concatenate(subsample))) * DISTINCT_SAMPLE,
+        "hit_kmers": hit_kmers,
+        "hit_rows": hit_rows,
+        "read_rows": per_read.height,
+        "unit_kmer_pairs": kmer_hits.height,
+        "hit_units": kmer_hits["unit"].n_unique(),
+    }
+    if record:
+        with timer("components"):
+            (
+                counts["components"],
+                counts["largest_component_units"],
+                counts["largest_component_pairs"],
+            ) = components(kmer_hits)
     if kmers_out is not None:
         kmer_hits.write_parquet(kmers_out)
-    assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
+    with timer("gather"):
+        assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
+    counts["detected_units"] = assigned.height
     detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
@@ -627,33 +726,38 @@ def profile(
         .unique("hash", keep="first")
         .select("unit", "hash", "holders")
     )
-    present_prob = presence(own, index.units["t_g"].to_numpy(), n_reads, index.units.height)
+    with timer("presence"):
+        present_prob = presence(own, index.units["t_g"].to_numpy(), n_reads, index.units.height)
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
         max_hash_dense = index.units["max_hash_dense"].to_numpy()
         keep = assigned.select("unit")
-        detected_reads = pl.concat(
-            [
-                by_read(
-                    unit_hits(dense, max_hash_dense, b["hash"], b["read"]).join(
-                        keep, on="unit", how="semi"
+        with timer("dense"):
+            detected_reads = pl.concat(
+                [
+                    by_read(
+                        unit_hits(dense, max_hash_dense, b["hash"], b["read"]).join(
+                            keep, on="unit", how="semi"
+                        )
                     )
-                )
-                for b in [{"hash": empty, "read": empty}, *stream(dense.max_hash)]
-            ]
-        )
-        detected = per_kmer(detected_reads)
+                    for b in [{"hash": empty, "read": empty}, *stream(dense.max_hash)]
+                ]
+            )
+            detected = per_kmer(detected_reads)
         m_g = index.units["m_dense"].to_numpy()
         pin_hist = index.units["pin_hist_dense"].to_numpy()
         pin_sum = index.units["pin_sum_dense"]
         len_cv = index.units["len_cv_dense"].to_numpy()
-    plain = em(detected, m_g).select("unit", coverage_em="coverage")
-    inflated = em(detected, m_g, zero_inflated=True)
-    prior = fit_present_prior(inflated)
-    shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
-        "unit", coverage_zib="coverage", present_zib="present"
-    )
+    with timer("fit_em"):
+        plain = em(detected, m_g).select("unit", coverage_em="coverage")
+    with timer("fit_zi"):
+        inflated = em(detected, m_g, zero_inflated=True)
+    with timer("fit_zib"):
+        prior = fit_present_prior(inflated)
+        shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
+            "unit", coverage_zib="coverage", present_zib="present"
+        )
     # Present k-mers over an average member's kept k-mers: member-equivalents present.
     copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
     inflated = inflated.join(
@@ -666,34 +770,37 @@ def profile(
         copies_zi=copies,
         abundance_zi=pl.col("coverage") * copies,
     )
-    weighted = em_pin(detected, pin_hist).select(
-        "unit", coverage_zip="coverage", present_zip="present"
-    )
+    with timer("fit_zip"):
+        weighted = em_pin(detected, pin_hist).select(
+            "unit", coverage_zip="coverage", present_zip="present"
+        )
     unit_info = index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
     rated = kmer_hits.join(index.units.select("unit", "m_g", "t_g"), on="unit")
-    result = (
-        per_read.group_by("unit")
-        .agg(
-            hits=pl.col("n").sum().cast(pl.UInt64),
-            kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
-            reads=pl.col("read").n_unique().cast(pl.UInt64),
+    with timer("result"):
+        result = (
+            per_read.group_by("unit")
+            .agg(
+                hits=pl.col("n").sum().cast(pl.UInt64),
+                kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
+                reads=pl.col("read").n_unique().cast(pl.UInt64),
+            )
+            .join(unit_info, on="unit")
+            .join(assigned, on="unit", how="left")
+            .join(plain, on="unit", how="left")
+            .join(inflated, on="unit", how="left")
+            .join(shrunk, on="unit", how="left")
+            .join(weighted, on="unit", how="left")
+            .join(present_prob, on="unit", how="left")
         )
-        .join(unit_info, on="unit")
-        .join(assigned, on="unit", how="left")
-        .join(plain, on="unit", how="left")
-        .join(inflated, on="unit", how="left")
-        .join(shrunk, on="unit", how="left")
-        .join(weighted, on="unit", how="left")
-        .join(present_prob, on="unit", how="left")
-    )
     if draws > 0:
         prob = np.zeros(len(m_g))
         prob[present_prob["unit"].to_numpy()] = present_prob["present_prob"].to_numpy()
-        intervals = posterior_zi(
-            detected_reads, m_g, pin_sum.to_numpy(), draws, present_prob=prob, len_cv=len_cv
-        )
+        with timer("posterior"):
+            intervals = posterior_zi(
+                detected_reads, m_g, pin_sum.to_numpy(), draws, present_prob=prob, len_cv=len_cv
+            )
         result = result.join(intervals, on="unit", how="left")
     if dense is not None:
         result = result.join(
@@ -701,16 +808,17 @@ def profile(
             on="unit",
             how="left",
         ).with_columns(pl.col("kmers_dense").fill_null(0))
-    for rule, score in (("wta", WTA_SCORE), ("ufirst", UFIRST_SCORE)):
-        won = (
-            assign_best(rated, score)
-            .group_by("unit")
-            .agg(
-                pl.len().cast(pl.UInt32).alias(f"kmers_{rule}"),
-                pl.col("hits").sum().alias(f"_{rule}"),
+    with timer("baselines"):
+        for rule, score in (("wta", WTA_SCORE), ("ufirst", UFIRST_SCORE)):
+            won = (
+                assign_best(rated, score)
+                .group_by("unit")
+                .agg(
+                    pl.len().cast(pl.UInt32).alias(f"kmers_{rule}"),
+                    pl.col("hits").sum().alias(f"_{rule}"),
+                )
             )
-        )
-        result = result.join(won, on="unit", how="left")
+            result = result.join(won, on="unit", how="left")
     return (
         result.with_columns(
             pl.col("^(coverage|present|copies|abundance)_(em|zi|zib|zip)(_lo|_hi)?$").fill_null(

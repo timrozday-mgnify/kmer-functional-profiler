@@ -26,6 +26,10 @@ UNITS       all units numbered by cluster_rep; tier-2 layout and pack ranges
 PACK_RANGE  per pack range: keys and value sets                            (--ranges jobs)
 DEDUP       per set-hash range: distinct value sets                        (--ranges jobs)
 CONCAT      -> index/
+FETCH_READS one paired ENA run (--query_run)                                (--query true)
+LADDER      nested read subsets of it                                    (--query_ladder)
+QUERY       per subset x index: kmer-functional-profiler query --stats
+QUERY_COST  -> query_cost.tsv
 ```
 
 All members of a selected cluster are extracted, including members from other biomes,
@@ -128,6 +132,29 @@ row. Scaled to the whole release: a ~14 GB Bloom filter (about a minute to fill;
 memory-mapped by every PRESENCE job, so jobs on one node share it), ~140 GB
 of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB).
 
+### Query cost (phase 6, Q1)
+
+Profiles nested read subsets of one real metagenome against each index given, with
+the current query plus stage timers, to find which stages cost time and memory at scale.
+The default run is ERR7746321 (Hadza gut, ~140 bp pairs, 29 Gbp), which LADDER subsets
+to 0.4, 1.2, 4, 12 and 40 M pairs; each subset contains the smaller ones.
+
+```bash
+nextflow run workflows/mgnify-subset -profile test               # builds results-test/1in*/index
+nextflow run workflows/mgnify-subset -profile test,test_query    # a few seconds
+nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
+    --query_indexes 'cost-nested/1in*/index' --outdir query-cost
+```
+
+Compute nodes without internet: run FETCH_READS on the head node
+(`process.withName: 'FETCH_READS' { executor = 'local' }` in a `-c` config), or download
+the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}.{draws}.json`
+(`kmer-functional-profiler query --stats`); `query_cost.tsv` has one row per query:
+the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
+pairs, hit and detected units, component sizes) and `{stage}_wall_s`, `_cpu_s` and
+`_peak_rss` (bytes, the process's peak at the stage's end) per stage. Queries that exceed
+`--query_memory` or 24 h fail without stopping the rest; they are FAILED in `trace.tsv`.
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `--release` | EBI FTP `current_release` | Directory or https prefix holding the release Parquet files |
@@ -148,6 +175,15 @@ of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 
 | `--stats_rate` | `0.001` | Rate of the sampled (hash, cluster) pairs that measure promiscuity |
 | `--cost_samples` | `1,10,100,1000,10000` | Subsets (`cluster_rep % N == 0`) COMBINE predicts |
 | `--cost_args` | `--n-min 4 8 16 --t-cap 0.05 0.2 --t-dense 0 0.02 0.1` | Parameter grid for COMBINE (also `--t-base`, `--max-groups`, `--sets`) |
+| `--query` | `false` | Query cost study (skips extraction unless `--index`, `--stats` or `--build`) |
+| `--query_indexes` | `''` | Index directories (glob), each named by its parent directory |
+| `--query_run` | `ERR7746321` | Paired ENA run to download |
+| `--query_reads` | `''` | `R1,R2` local files instead of `--query_run` |
+| `--query_ladder` | `400000,1200000,4000000,12000000,40000000` | Nested subset sizes, in pairs |
+| `--query_seed` | `1` | Seed of the ladder's shuffle |
+| `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
+| `--query_draws_on` | `1in100` | Index that also gets the posterior |
+| `--query_memory` | `128 GB` | Memory per query |
 | `--venv` | repo `.venv` | Environment created by `setup.sh` |
 
 Resources are set per label in `nextflow.config` (`process_medium` for DuckDB steps and

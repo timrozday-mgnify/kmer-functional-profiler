@@ -1,5 +1,6 @@
 """The MGnify subset extraction on the mini release fixture."""
 
+import gzip
 import subprocess
 import sys
 from pathlib import Path
@@ -131,3 +132,18 @@ def test_buckets_split_whole_clusters_and_subsets_nest(tmp_path: Path) -> None:
     assert set(cost.filter(pl.col("sample") == 1)["units"]) == {clusters.height}
     groups = pl.read_csv(tmp_path / "groups.tsv", separator="\t")
     assert set(groups["sample"]) == {1, 2} and (groups["hashes"] > 0).all()
+
+
+def test_ladder_nests_read_subsets(tmp_path: Path) -> None:
+    data = ROOT / "tests" / "data"
+    reads = ("--r1", str(data / "reads_1.fastq.gz"), "--r2", str(data / "reads_2.fastq.gz"))
+    run(tmp_path, "ladder", *reads, "--pairs", "20", "5", "10")
+
+    def names(n: int, mate: int) -> list[str]:
+        with gzip.open(tmp_path / f"reads.{n}_{mate}.fastq.gz", "rt") as f:
+            return [line.split("/")[0] for line in f.read().splitlines()[::4]]
+
+    for small, large in [(5, 10), (10, 20)]:
+        assert len(names(small, 1)) == small
+        assert set(names(small, 1)) < set(names(large, 1))
+    assert names(20, 1) == names(20, 2)

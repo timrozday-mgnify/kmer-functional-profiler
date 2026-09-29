@@ -1,5 +1,6 @@
 """Query counts against an index built from the fixture proteins."""
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -314,10 +315,21 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     idx = tmp_path / "idx"
     assert runner.invoke(app, ["index", str(members), str(idx), "--k", str(K)]).exit_code == 0
     out = tmp_path / "p.tsv"
-    result = runner.invoke(app, ["query", str(idx), *map(str, READS), "--out", str(out)])
+    stats = tmp_path / "stats.json"
+    args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
+    result = runner.invoke(app, [*args, "--draws", "3"])
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
     assert {"cluster_rep", "hits", "containment", "coverage"} <= set(table.columns)
+    got = json.loads(stats.read_text())
+    assert {"load", "hash", "lookup", "gather", "fit_zi", "posterior", "total"} <= set(
+        got["stages"]
+    )
+    counts = got["counts"]
+    assert counts["hit_units"] == table.height
+    assert counts["hit_rows"] == table["hits"].sum()
+    assert counts["sampled_kmers"] >= counts["hit_kmers"] > 0
+    assert counts["largest_component_units"] <= counts["hit_units"]
 
 
 def test_presence_doubts_few_and_shared_hits() -> None:

@@ -9,7 +9,7 @@ import typer
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import Index, IndexParams, build_index
-from kmer_functional_profiler.query import profile
+from kmer_functional_profiler.query import Timer, profile
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULTS = IndexParams()
@@ -80,16 +80,26 @@ def query(
     kmers: Annotated[
         Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
     ] = None,
+    stats: Annotated[
+        Path | None, typer.Option(help="JSON of time and peak RSS per stage, and hit counts")
+    ] = None,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
-    result = profile(
-        Index.load(index_dir),
-        r1,
-        r2,
-        genetic_code=genetic_code,
-        frames=frames,
-        draws=draws,
-        kmers_out=kmers,
-    )
-    result.write_csv(out, separator="\t")
+    timer = Timer()
+    with timer("total"):
+        with timer("load"):
+            loaded = Index.load(index_dir)
+        result = profile(
+            loaded,
+            r1,
+            r2,
+            genetic_code=genetic_code,
+            frames=frames,
+            draws=draws,
+            kmers_out=kmers,
+            timer=timer if stats else None,
+        )
+        result.write_csv(out, separator="\t")
+    if stats:
+        stats.write_text(json.dumps(timer.as_dict(), indent=2))
     typer.echo(f"{result.height} units hit -> {out}", err=True)
