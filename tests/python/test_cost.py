@@ -43,6 +43,7 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
         (cost["postings"], stats["postings"]),
         (cost["dense"], stats["dense_postings"]),
         (cost["tier2_bytes"], stats["tier2_bytes"]),
+        (cost["tier1_bytes"], stats["tier1_bytes"]),
     ):
         assert abs(predicted / actual - 1) < 0.05, (predicted, actual)  # type: ignore[operator]
     # Dense sets repeat at a different rate, so its bytes are only bounded.
