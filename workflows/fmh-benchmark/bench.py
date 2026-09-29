@@ -217,7 +217,9 @@ def group_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, float
         hi=pl.col("group_abundance_zi_hi").first(),
     )
     return {
-        "fp_grouped": fp.select(pl.col("ambiguity_group").is_in(with_tp.implode()).mean()).item()
+        "fp_grouped": fp.select(
+            pl.col("ambiguity_group").is_in(with_tp.implode()).fill_null(False).mean()
+        ).item()
         if fp.height
         else None,
         "group_cover": groups.select(pl.col("total").is_between("lo", "hi").mean()).item()

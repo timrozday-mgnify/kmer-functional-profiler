@@ -493,6 +493,20 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Simulation* (5 seeds, D = 100, `--twins 0.3`), anti-correlation (step 13) → shared evidence: twin pairs grouped dense 0.10 → **1.0**, s10 0.22 → **1.0**, floor + dense 1/5 0.21 → **1.0**, floor 0.00 → 0.17 (≈8 k-mers per unit leave little shared evidence to count); group intervals holding the true total 0.53 → 0.83 (dense), 0.88 → 0.78 (s10), 0.80 → 0.90 (floor + dense 1/5), – → 0.85 (floor); true positives in a group 3–23%. Per-unit interval coverage unchanged (0.93–0.97 overall; twins both present still 0.70–0.88).
   - *Interpretation:* grouping now finds the pairs the data cannot separate, and group totals are closer to calibrated than members, as intended; group intervals still undercover a little (0.78–0.90), for the same split-approximation reason as twins' member intervals. The 0.5 threshold is a default, not tuned; the fmh run (`fp_grouped`) will show how many real false positives it catches. Result pending on HPC.
 
+* **Phase 4, step 16 — shared-evidence groups on real data (HPC, PR #19 code, D = 100).** Point estimates and intervals unchanged from step 14. Per index, over 10 samples (true positives TP, false positives FP, `kmers_unique` ≥ 1):
+
+  | Index | FPs grouped | TPs grouped | groups / sample | groups of true KOs only | FP median `own_evidence` | group cover |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | kfp\_s1000 | 1.0% | 2.0% | 27 | 99% | 1.0 | 0.58 |
+  | kfp\_s100 | 5.6% | 2.3% | 53 | 91% | 1.0 | 0.57 |
+  | kfp\_s100\_d10 | 5.0% | 1.3% | 34 | 87% | 0.98 | 0.57 |
+  | fmh\_compat | 1.9% | 2.1% | 38 | 98% | 1.0 | 0.36 |
+
+  Of the FPs that are grouped, 84–100% share the group with a true KO (the benchmark's `fp_grouped` reported this conditional share by mistake; see fix below). Groups have a median of 2 KOs (up to 60 on kfp\_s100).
+  - *Interpretation.* The FPs left after gather are mostly not sequence-similarity confusions: their hits sit on k-mers no other detected KO holds (median `own_evidence` 1.0). Gather already removed the similarity-driven FPs in phase 3 (348 → 105 per sample), so what remains looks like independent evidence: chance or error matches, or genes the truth rule does not count (collagen VII was the most persistent in step 3). Groups mostly flag pairs of true KOs present together (paralogous KOs), which is the intended output; their totals are not calibrated (0.57 cover), for the same copies-model-error reason as the members' intervals. The per-unit calibration gap on real data is therefore the copies estimate, not ambiguity.
+  - *Fix:* `fp_grouped` averaged `is_in` over FPs, but FPs without a group gave null and were skipped, so it reported the share of *grouped* FPs that sit with a true KO (0.84–1.0) instead of the share of all FPs grouped with one (≈ 1–5%). Nulls now count as not grouped; regression test added.
+  - *Next options:* model the copies error (spread of member lengths per unit, at build) so KO-level intervals calibrate; examine the ungrouped FPs directly (which KOs, which k-mers, error-rate dependence) to decide whether a background false-hit term is needed; exact joint presence in the posterior split (step 13) only matters for near-identical units, which are rare in this benchmark.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
