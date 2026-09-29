@@ -98,8 +98,8 @@ The single-process INDEX holds every member and k-mer table at once, which does 
 the whole release on one node. `--build true` splits the same build
 (`kmer_functional_profiler.partition`) over the MERGE buckets: everything a unit needs is
 local to its bucket except `n_groups` (units holding a candidate k-mer), which a
-hash-range reduce counts exactly. A Bloom filter of all candidate hashes
-(`--bloom_bits` per hash, ~1% false hits at 10) keeps each bucket's rows for that reduce
+hash-range reduce counts exactly. A blocked Bloom filter of all candidate hashes
+(Rust, one cache line per key; `--bloom_bits` per hash, ~1% false hits at 10) keeps each bucket's rows for that reduce
 to about 1.1 per candidate; GROUPS drops the false hits, so the index equals INDEX's on
 the same members (checked by `tests/python/test_partition.py` and the `test_build`
 profile). Hash ranges are cut at quantiles of the candidate hashes, so they hold about
@@ -118,9 +118,10 @@ postings, and CONCAT joins them, numbering value sets by a hash of their content
 the result is the same as packing at once. No step holds every posting.
 
 At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 s
-(CANDIDATES), 1 s (BLOOM), 20 s (PRESENCE), 1 s (GROUPS), 7 s (POSTINGS), 0.1 s (UNITS),
-1.2 s (PACK_RANGE) and 0.7 s (CONCAT), with presence files of ~11.5 bytes per row.
-Scaled to the whole release: a ~14 GB Bloom filter read by every PRESENCE job, ~140 GB
+(CANDIDATES), 0.2 s (BLOOM), 10 s (PRESENCE), 1 s (GROUPS), 7 s (POSTINGS), 0.1 s
+(UNITS), 1.1 s (PACK_RANGE) and 0.6 s (CONCAT), with presence files of ~11.5 bytes per
+row. Scaled to the whole release: a ~14 GB Bloom filter (about a minute to fill;
+memory-mapped by every PRESENCE job, so jobs on one node share it), ~140 GB
 of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB) plus
 every range's value sets before they are deduplicated (2.5× the distinct sets at 8
 ranges; more at 256).

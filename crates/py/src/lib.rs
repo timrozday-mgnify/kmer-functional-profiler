@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
 use kmer_functional_profiler_core::{self as kfp, DnaScanner, Error, Hits, KmerParams};
-use numpy::{IntoPyArray, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -138,6 +138,32 @@ fn distinct_kmers<'py>(
     Ok(dict)
 }
 
+/// Adds `hashes` to the blocked Bloom filter `bits` in place (length a multiple of 64).
+#[pyfunction]
+fn bloom_insert(
+    py: Python<'_>,
+    mut bits: PyReadwriteArray1<'_, u8>,
+    hashes: PyReadonlyArray1<'_, u64>,
+) -> PyResult<()> {
+    let (bits, hashes) = (bits.as_slice_mut()?, hashes.as_slice()?);
+    py.detach(|| kfp::bloom_insert(bits, hashes))
+        .map_err(to_py_err)
+}
+
+/// Whether each hash may be in the blocked Bloom filter `bits`.
+#[pyfunction]
+fn bloom_contains<'py>(
+    py: Python<'py>,
+    bits: PyReadonlyArray1<'py, u8>,
+    hashes: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let (bits, hashes) = (bits.as_slice()?, hashes.as_slice()?);
+    let found = py
+        .detach(|| kfp::bloom_contains(bits, hashes))
+        .map_err(to_py_err)?;
+    Ok(found.into_pyarray(py))
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -203,6 +229,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hash_dna, m)?)?;
     m.add_function(wrap_pyfunction!(hash_proteins, m)?)?;
     m.add_function(wrap_pyfunction!(distinct_kmers, m)?)?;
+    m.add_function(wrap_pyfunction!(bloom_insert, m)?)?;
+    m.add_function(wrap_pyfunction!(bloom_contains, m)?)?;
+    m.add("BLOOM_BLOCK_BYTES", kfp::BLOCK_BYTES)?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }

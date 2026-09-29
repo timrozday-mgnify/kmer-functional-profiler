@@ -12,6 +12,8 @@ pub enum Error {
     UnknownFrameMode(String),
     #[error("group ids must be non-decreasing and one per sequence")]
     UnsortedGroups,
+    #[error("Bloom filter of {0} bytes is not a non-empty multiple of 64")]
+    BloomSize(usize),
     #[error("mate files have different read counts")]
     MateCountMismatch,
     #[error(transparent)]

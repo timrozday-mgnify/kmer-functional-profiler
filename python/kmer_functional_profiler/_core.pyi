@@ -30,6 +30,11 @@ def distinct_kmers(
     max_hash: int = ...,
 ) -> dict[str, NDArray[np.uint32]]: ...
 
+BLOOM_BLOCK_BYTES: int
+
+def bloom_insert(bits: NDArray[np.uint8], hashes: NDArray[np.uint64]) -> None: ...
+def bloom_contains(bits: NDArray[np.uint8], hashes: NDArray[np.uint64]) -> NDArray[np.bool_]: ...
+
 class FastxHits:
     def __init__(
         self,

@@ -7,7 +7,8 @@ exactly by a hash-partitioned reduce, with a Bloom filter of all candidate hashe
 the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``units``.
 
 1. ``candidates`` (per bucket): pass 1, the unit table and the bucket's candidate hashes.
-2. ``bloom`` (once): a Bloom filter of every bucket's candidate hashes, and ``t_max``.
+2. ``bloom`` (once): a blocked Bloom filter (``_core.bloom_insert``) of every bucket's
+   candidate hashes, and ``t_max``.
 3. ``presence`` (per bucket): (hash, unit) of every k-mer at ``t_max`` that passes the
    filter, with its counting members and whether it is the unit's candidate, split into
    hash ranges.
@@ -31,8 +32,8 @@ from typing import Final
 
 import numpy as np
 import polars as pl
-from numpy.typing import NDArray
 
+from kmer_functional_profiler import _core
 from kmer_functional_profiler.index import (
     PIN_BITS,
     IndexParams,
@@ -52,10 +53,6 @@ from kmer_functional_profiler.index import (
     write_meta,
 )
 
-BLOOM_PROBES: Final = 7
-BLOOM_CHUNK: Final = 1 << 22  # hashes per vectorised probe batch
-MIX: Final = np.uint64(0x9E3779B97F4A7C15)  # odd, so hash * MIX is a bijection
-LOW32: Final = np.uint64(0xFFFFFFFF)
 QUANTILES: Final = 1024  # candidate-hash quantiles recorded for balanced hash ranges
 SAMPLE: Final = 1 << 20  # candidate hashes sampled for them
 UNIT_COLUMNS: Final = ("cluster_rep", "n_members", "n_counting", "n_kmers", "t_g", "max_hash_g")
@@ -76,24 +73,6 @@ FINAL_COLUMNS: Final = (
 def _check(params: IndexParams) -> None:
     if params.t_dense > 0:
         raise ValueError("the partitioned build has no dense tier yet (t_dense must be 0)")
-
-
-def _positions(hashes: NDArray[np.uint64], n_bits: int) -> NDArray[np.uint64]:
-    """Bloom bit positions, (len(hashes), BLOOM_PROBES), by double hashing."""
-    mixed = hashes * MIX  # uint64 arrays wrap
-    h1, h2 = mixed >> np.uint64(32), (mixed & LOW32) | np.uint64(1)
-    probes = np.arange(BLOOM_PROBES, dtype=np.uint64)
-    return (h1[:, None] + probes[None, :] * h2[:, None]) % np.uint64(n_bits)
-
-
-def bloom_contains(bits: NDArray[np.uint8], hashes: NDArray[np.uint64]) -> NDArray[np.bool_]:
-    """Whether each hash may be in the filter (no false negatives)."""
-    hashes = np.asarray(hashes, dtype=np.uint64)
-    out = np.empty(len(hashes), dtype=bool)
-    for i in range(0, len(hashes), BLOOM_CHUNK):
-        pos = _positions(hashes[i : i + BLOOM_CHUNK], len(bits) * 8)
-        out[i : i + BLOOM_CHUNK] = ((bits[pos >> np.uint64(3)] >> (pos & np.uint64(7))) & 1).all(1)
-    return out
 
 
 def _swap(table: pl.DataFrame, ids: pl.DataFrame, old: str, new: str) -> pl.DataFrame:
@@ -138,17 +117,14 @@ def bloom(prefixes: Sequence[str], out: str | Path, bits_per_key: float = 10.0) 
     the filter is at most that much larger than needed.
     """
     n_keys = sum(len(np.load(f"{p}.candidates.npy", mmap_mode="r")) for p in prefixes)
-    bits = np.zeros(max(int(n_keys * bits_per_key) // 8, 1), dtype=np.uint8)
+    block = _core.BLOOM_BLOCK_BYTES
+    n_blocks = max(-(-int(n_keys * bits_per_key) // (8 * block)), 1)
+    bits = np.zeros(n_blocks * block, dtype=np.uint8)
     stride, sample = max(n_keys // SAMPLE, 1), []
     for p in prefixes:
         hashes = np.load(f"{p}.candidates.npy", mmap_mode="r")
         sample.append(np.asarray(hashes[::stride]))
-        # ponytail: numpy probes, ~10^10 keys at full scale want a Rust kernel
-        for i in range(0, len(hashes), BLOOM_CHUNK):
-            pos = _positions(np.asarray(hashes[i : i + BLOOM_CHUNK]), len(bits) * 8).ravel()
-            np.bitwise_or.at(
-                bits, pos >> np.uint64(3), (1 << (pos & np.uint64(7))).astype(np.uint8)
-            )
+        _core.bloom_insert(bits, hashes)
     t_max_hash = max(
         int(
             pl.scan_parquet(f"{p}.units.parquet")
@@ -195,13 +171,13 @@ def presence(
     """
     _check(params)
     meta = json.loads(Path(f"{bloom_prefix}.json").read_text())
-    bits = np.load(f"{bloom_prefix}.npy")
+    bits = np.load(f"{bloom_prefix}.npy", mmap_mode="r")  # shared page cache across jobs
     members, batches, _ = _prepare(members_path, params)
     units = _counting(members, pl.read_parquet(f"{prefix}.units.parquet"))
     rows = []
     for b in batches:
         kmers = _kmers(b, params, meta["quantiles"][-1])  # no candidate lies above it
-        kmers = kmers.filter(bloom_contains(bits, kmers["hash"].to_numpy()))
+        kmers = kmers.filter(_core.bloom_contains(bits, kmers["hash"].to_numpy()))
         rows.append(kmers.group_by("unit", "hash").agg(c=pl.col("counts").sum().cast(pl.UInt32)))
     q = meta["quantiles"]
     cuts = np.array([q[r * (len(q) - 1) // n_ranges] for r in range(1, n_ranges)], np.uint64)

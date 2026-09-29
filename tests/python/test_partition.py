@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from kmer_functional_profiler import partition
+from kmer_functional_profiler import _core, partition
 from kmer_functional_profiler.index import (
     IndexParams,
     PackedPart,
@@ -26,12 +26,13 @@ BUCKETS, RANGES = 3, 4
 def test_bloom_filter() -> None:
     rng = np.random.default_rng(1)
     keys = rng.integers(0, 2**62, 20_000, dtype=np.uint64)
-    bits = np.zeros(20_000 * 10 // 8, dtype=np.uint8)
-    pos = partition._positions(keys, len(bits) * 8).ravel()
-    np.bitwise_or.at(bits, pos >> np.uint64(3), (1 << (pos & np.uint64(7))).astype(np.uint8))
-    assert partition.bloom_contains(bits, keys).all()
+    bits = np.zeros(20_000 * 10 // 8 // 64 * 64, dtype=np.uint8)
+    _core.bloom_insert(bits, keys)
+    assert _core.bloom_contains(bits, keys).all()
     others = rng.integers(0, 2**62, 100_000, dtype=np.uint64)
-    assert partition.bloom_contains(bits, others).mean() < 0.02  # ~0.8% expected
+    assert _core.bloom_contains(bits, others).mean() < 0.02  # ~1% expected
+    with pytest.raises(ValueError, match="multiple of 64"):
+        _core.bloom_insert(np.zeros(65, dtype=np.uint8), keys)
 
 
 def test_packed_table_from_parts_equals_whole() -> None:
