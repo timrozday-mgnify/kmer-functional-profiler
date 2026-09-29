@@ -29,6 +29,12 @@ SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered tru
                  the per-sample tables
 ```
 
+`run.json` in the output directory records what produced it: a one-line description
+(read model, sizes, indexes), all parameters, the code commit and whether the checkout had
+uncommitted changes, the command line and the run's status. Runs with different settings
+(e.g. `--iss_mode perfect`) should use their own `--outdir`: files from an earlier run are
+overwritten or left in place, not removed.
+
 The `fmh_compat` row reproduces fmh-funprofiler's KO calls: its hits equal the overlaps
 `sourmash prefetch` reports (tested in `tests/python/test_compat.py`), and a KO counts as
 detected at one shared hash, as with fmh-funprofiler's default `--threshold-bp 1000` at
