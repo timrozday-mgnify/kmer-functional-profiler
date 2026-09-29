@@ -369,7 +369,8 @@ def detected(args: argparse.Namespace) -> None:
             "index",
             "name",
             "tp",
-            *[c for c in DETECTED_COLUMNS if c in profile.columns],
+            # Every column in every file: detected.tsv stacks them under one header.
+            *[c if c in profile.columns else pl.lit(None).alias(c) for c in DETECTED_COLUMNS],
             "holders_median",
             "hits_max",
             "in_genome",

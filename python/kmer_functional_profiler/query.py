@@ -415,7 +415,12 @@ def posterior_zi(
     ``group_abundance_zi_lo``/``_hi``.
     """
     rng = np.random.default_rng(seed)
-    keyed = hit_reads.group_by("unit", "hash", maintain_order=True).agg("read", "n")
+    # Sorted, so the seeded draws do not depend on row order (Polars group_by does not fix it).
+    keyed = (
+        hit_reads.sort("unit", "hash", "read")
+        .group_by("unit", "hash", maintain_order=True)
+        .agg("read", "n")
+    )
     units, col = np.unique(keyed["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(keyed["hash"].to_numpy(), return_inverse=True)
     n_units, n_rows = len(units), len(hashes)
