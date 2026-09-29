@@ -15,11 +15,11 @@ Rust kernel, keeping only small tables in memory:
 
 Postings are candidates minus promiscuous k-mers (``n_groups > max_groups``); units whose
 ``t_g`` was raised above ``t_base`` keep only their ``n_min`` best-scoring candidates. The
-query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Units
-linked by a shared posting form components. Tier 2 maps each posting hash to its set of
-(unit, quantised ``p_in``); tier 1 maps the best-scoring few hashes per unit to component
-ids. Both are stored as bucketed fingerprints (``PackedTable``) in ``.npy`` files, beside
-Parquet tables for inspection.
+query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Tier 2
+maps each posting hash to its set of (unit, quantised ``p_in``), stored as bucketed
+fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can be hit, so
+only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep`` order;
+``postings.parquet`` (every posting with its score) is written only for inspection.
 
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
 ``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
@@ -42,8 +42,6 @@ from typing import Any, Final, Self
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
-from scipy.sparse import coo_array
-from scipy.sparse.csgraph import connected_components
 
 from kmer_functional_profiler import _core
 
@@ -76,7 +74,6 @@ class IndexParams:
     oversample: float = 4.0
     mask_adapters: bool = True
     max_groups: int = 64
-    tier1_per_unit: int = 4
     fp_bits: int = 16
     t_dense: float = 0.0  # 0: no dense tier
     batch_residues: int = 20_000_000
@@ -202,7 +199,6 @@ class Index:
 
     meta: dict[str, Any]
     units: pl.DataFrame
-    tier1: PackedTable
     tier2: PackedTable
     dense: PackedTable | None = None
 
@@ -213,7 +209,6 @@ class Index:
         return cls(
             meta=meta,
             units=pl.read_parquet(directory / "units.parquet"),
-            tier1=PackedTable.load(directory, "tier1", meta["tier1"]),
             tier2=PackedTable.load(directory, "tier2", meta["tier2"]),
             dense=PackedTable.load(directory, "dense", meta["dense"]) if "dense" in meta else None,
         )
@@ -340,7 +335,6 @@ def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParam
         members.group_by("unit")
         .agg(
             pl.col("cluster_rep").first(),
-            name=pl.col("cluster_rep").first().cast(pl.String),
             n_members=pl.len().cast(pl.UInt32),
             n_full_length=pl.col("full_length").sum().cast(pl.UInt32),
             n_counting=pl.col("counts").sum().cast(pl.UInt32),
@@ -362,6 +356,7 @@ def build_index(
     out_dir: str | Path,
     params: IndexParams | None = None,
     pfam_path: str | Path | None = None,
+    postings_parquet: bool = False,
 ) -> dict[str, object]:
     """Build an index from a members Parquet table into ``out_dir``; return its stats."""
     params = params or IndexParams()
@@ -375,6 +370,7 @@ def build_index(
         n_masked = int((masked != members["sequence"]).sum())
         members = members.with_columns(sequence=masked)
     batches = list(_batches(members, params.batch_residues))
+    members = members.drop("sequence")  # the batches hold the only copy
 
     # Pass 1: distinct k-mers per unit.
     units = _unit_table(members, _n_kmers(batches, params), params)
@@ -427,38 +423,21 @@ def build_index(
         .drop("floored")
     )
     units = units.join(
-        scored.group_by("unit").agg(
-            n_candidates=pl.len().cast(pl.UInt32),
-            n_promiscuous=(pl.col("n_groups") > params.max_groups).sum().cast(pl.UInt32),
-        ),
-        on="unit",
-        how="left",
-        maintain_order="left",
-    ).with_columns(pl.col("n_candidates", "n_promiscuous").fill_null(0))
-    units = units.join(
         _len_cv(batches, params, postings.select("unit", "hash"), members),
         on="unit",
         how="left",
         maintain_order="left",
     )
-    if pfam_path is not None:
-        (
-            pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
-            .join(members.select("protein_id", "unit"), on="protein_id")
-            .group_by("unit", "pfam_accession")
-            .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
-            .sort("unit", "pfam_accession")
-            .write_parquet(out / "unit_pfam.parquet")
-        )
     stats: dict[str, object] = {
         "n_proteins": members.height,
+        "n_clusters": units.height,
         "n_residues": n_residues,
         "n_adapter_masked_proteins": n_masked,
         "n_singletons": int((units["n_members"] == 1).sum()),
         "n_floored": floored["floored"].sum(),
         "candidates_expected": float((units["t_g"] * units["n_kmers"]).sum()),
         "candidates": scored.height,
-        "promiscuous_dropped": int(units["n_promiscuous"].sum()),
+        "promiscuous_dropped": int((scored["n_groups"] > params.max_groups).sum()),
     }
     dense = None
     if params.t_dense > 0:
@@ -496,13 +475,56 @@ def build_index(
             how="left",
             maintain_order="left",
         )
-    return write_index(out, params, units, postings, stats, dense=dense)
+    # Units without a posting can never be hit: drop them and renumber the rest.
+    ids = (
+        postings.select("unit")
+        .unique()
+        .sort("unit")
+        .with_columns(new=pl.int_range(pl.len(), dtype=pl.UInt32))
+    )
+
+    def renumber(table: pl.DataFrame) -> pl.DataFrame:
+        return (
+            table.join(ids, on="unit", maintain_order="left")
+            .with_columns(unit=pl.col("new"))
+            .drop("new")
+        )
+
+    if pfam_path is not None:
+        renumber(
+            pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
+            .join(members.select("protein_id", "unit"), on="protein_id")
+            .group_by("unit", "pfam_accession")
+            .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
+        ).sort("unit", "pfam_accession").write_parquet(out / "unit_pfam.parquet")
+    units = renumber(
+        units.select(
+            "unit",
+            "cluster_rep",
+            "n_members",
+            "n_kmers",
+            "t_g",
+            "max_hash_g",
+            "^len_cv.*$",
+            *(("max_hash_dense",) if dense is not None else ()),
+        )
+    )
+    return write_index(
+        out,
+        params,
+        units,
+        renumber(postings),
+        stats,
+        dense=None if dense is None else renumber(dense),
+        postings_parquet=postings_parquet,
+    )
 
 
 def _pin_hist(postings: pl.DataFrame, n_units: int) -> pl.Series:
     """Per unit, how many kept k-mers sit at each quantised ``p_in`` level."""
-    hist = np.zeros((n_units, 2**PIN_BITS), dtype=np.uint32)
-    np.add.at(hist, (postings["unit"].to_numpy(), postings["pin_q"].to_numpy()), 1)
+    units = postings["unit"].to_numpy()
+    hist = np.zeros((n_units, 2**PIN_BITS), dtype=_smallest(int(np.bincount(units).max(initial=0))))
+    np.add.at(hist, (units, postings["pin_q"].to_numpy()), 1)
     return pl.Series(hist)
 
 
@@ -510,7 +532,7 @@ def _pin_sum(postings: pl.DataFrame, n_units: int) -> pl.Series:
     """Per unit, the sum of ``p_in`` over kept k-mers: the kept k-mers of an average member."""
     return pl.Series(
         np.bincount(postings["unit"].to_numpy(), postings["p_in"].to_numpy(), minlength=n_units)
-    )
+    ).cast(pl.Float32)
 
 
 def write_index(
@@ -521,52 +543,33 @@ def write_index(
     stats: dict[str, object],
     hash_scheme: str = "kfp",
     dense: pl.DataFrame | None = None,
+    postings_parquet: bool = False,
 ) -> dict[str, object]:
-    """Find components, pack tiers and write the index files.
+    """Pack the tiers and write the index files.
 
     ``units`` needs ``unit`` (0..n-1), ``t_g`` and ``max_hash_g``; ``postings`` holds one row
     per kept (hash, unit), each with ``hash <= max_hash_g``: ``p_in``, ``pin_q``,
     ``n_groups`` and ``score``. ``hash_scheme`` tells the query how to hash reads. ``dense``
     (``hash``, ``unit``, ``p_in``, ``pin_q``) becomes the dense table. Returns ``stats``
-    extended with sizes.
+    extended with sizes. ``postings_parquet`` also writes ``postings`` for inspection.
     """
     t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     postings = postings.sort("hash", "unit")
-
-    # Components: link consecutive units sharing a posting hash.
-    edges = postings.select("unit", prev=pl.col("unit").shift(1).over("hash")).drop_nulls()
     n_units = units.height
-    graph = coo_array(
-        (np.ones(edges.height), (edges["prev"].to_numpy(), edges["unit"].to_numpy())),
-        shape=(n_units, n_units),
-    )
-    n_components, component = connected_components(graph, directed=False)
-
     units = units.with_columns(
         pin_hist=_pin_hist(postings, units.height), pin_sum=_pin_sum(postings, units.height)
     )
     # Imported sketches have no members, so no length spread; units without members get 0.
     units = units.with_columns(
-        pl.col(c).fill_null(0.0) if c in units.columns else pl.lit(0.0).alias(c)
+        (pl.col(c) if c in units.columns else pl.lit(0.0)).fill_null(0.0).cast(pl.Float32).alias(c)
         for c in ("len_cv", *(("len_cv_dense",) if dense is not None else ()))
     )
-    per_unit = postings.group_by("unit").agg(
-        m_g=pl.len().cast(pl.UInt32), u_g=(pl.col("n_groups") == 1).sum().cast(pl.UInt32)
-    )
-    units = (
-        units.join(per_unit, on="unit", how="left", maintain_order="left")
-        .with_columns(pl.col("m_g", "u_g").fill_null(0))
-        .with_columns(component=pl.Series(component.astype(np.uint32)))
-    )
-    postings = postings.join(units.select("unit", "component"), on="unit")
-    tier1_rows = (
-        postings.sort(["unit", "score", "hash"], descending=[False, True, False])
-        .group_by("unit", maintain_order=True)
-        .head(params.tier1_per_unit)
-    )
-    postings = postings.join(
-        tier1_rows.select("hash", "unit", tier1=pl.lit(True)), on=["hash", "unit"], how="left"
-    ).with_columns(pl.col("tier1").fill_null(False))
+    units = units.join(
+        postings.group_by("unit").agg(m_g=pl.len().cast(pl.UInt32)),
+        on="unit",
+        how="left",
+        maintain_order="left",
+    ).with_columns(pl.col("m_g").fill_null(0))
 
     tier2 = PackedTable.build(
         postings["hash"].to_numpy(),
@@ -575,14 +578,7 @@ def write_index(
         t_max_hash,
         params.fp_bits,
     )
-    tier1 = PackedTable.build(
-        tier1_rows["hash"].to_numpy(),
-        tier1_rows["component"].cast(pl.UInt64).to_numpy(),
-        t_max_hash,
-        params.fp_bits,
-    )
-
-    tables = {"tier1": tier1, "tier2": tier2}
+    tables = {"tier2": tier2}
     if dense is not None:
         tables["dense"] = PackedTable.build(
             dense["hash"].to_numpy(),
@@ -605,9 +601,8 @@ def write_index(
         stats["dense_bytes"] = tables["dense"].nbytes()
 
     units.write_parquet(out / "units.parquet")
-    postings.write_parquet(out / "postings.parquet")
-
-    component_sizes = np.bincount(component)
+    if postings_parquet:
+        postings.write_parquet(out / "postings.parquet")
     distinct_hashes = postings["hash"].n_unique()
     stats = {
         **stats,
@@ -615,17 +610,13 @@ def write_index(
         "t_max": float(units["t_g"].max()),  # type: ignore[arg-type]
         "postings": postings.height,
         "distinct_hashes": distinct_hashes,
-        "tier1_hashes": tier1_rows["hash"].n_unique(),
         "tier2_keys": len(tier2.fingerprints),
         "tier2_sets": len(tier2.set_offsets) - 1,
-        "tier1_bytes": tier1.nbytes(),
         "tier2_bytes": tier2.nbytes(),
         "tier2_bytes_per_hash": tier2.nbytes() / max(distinct_hashes, 1),
-        "components": n_components,
-        "largest_component": int(component_sizes.max(initial=0)),
     }
     meta = {
-        "format": 1,
+        "format": 2,
         "hash": hash_scheme,
         "params": asdict(params),
         **{name: table.save(out, name) for name, table in tables.items()},

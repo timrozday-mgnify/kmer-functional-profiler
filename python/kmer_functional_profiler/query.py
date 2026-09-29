@@ -18,6 +18,7 @@ hits give.
 
 import heapq
 from collections.abc import Iterable
+from dataclasses import fields
 from pathlib import Path
 from typing import Final
 
@@ -573,7 +574,8 @@ def profile(
     ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). ``kmers_out``
     writes the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
     """
-    params = IndexParams(**index.meta["params"])
+    # Format-1 indexes also record tier1_per_unit.
+    params = IndexParams(**{f.name: index.meta["params"][f.name] for f in fields(IndexParams)})
 
     def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         if index.meta.get("hash") == "sourmash":
@@ -667,6 +669,9 @@ def profile(
     weighted = em_pin(detected, pin_hist).select(
         "unit", coverage_zip="coverage", present_zip="present"
     )
+    unit_info = index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
+    if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
+        unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
     rated = kmer_hits.join(index.units.select("unit", "m_g", "t_g"), on="unit")
     result = (
         per_read.group_by("unit")
@@ -675,7 +680,7 @@ def profile(
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("read").n_unique().cast(pl.UInt64),
         )
-        .join(index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$")), on="unit")
+        .join(unit_info, on="unit")
         .join(assigned, on="unit", how="left")
         .join(plain, on="unit", how="left")
         .join(inflated, on="unit", how="left")

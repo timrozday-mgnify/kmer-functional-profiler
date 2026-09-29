@@ -34,10 +34,10 @@ def index(
     oversample: float = DEFAULTS.oversample,
     mask_adapters: bool = DEFAULTS.mask_adapters,
     max_groups: int = DEFAULTS.max_groups,
-    tier1_per_unit: int = DEFAULTS.tier1_per_unit,
     fp_bits: int = DEFAULTS.fp_bits,
     t_dense: float = DEFAULTS.t_dense,
     batch_residues: int = DEFAULTS.batch_residues,
+    postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
     params = IndexParams(
@@ -49,12 +49,11 @@ def index(
         oversample=oversample,
         mask_adapters=mask_adapters,
         max_groups=max_groups,
-        tier1_per_unit=tier1_per_unit,
         fp_bits=fp_bits,
         t_dense=t_dense,
         batch_residues=batch_residues,
     )
-    typer.echo(json.dumps(build_index(members, out_dir, params, pfam), indent=2))
+    typer.echo(json.dumps(build_index(members, out_dir, params, pfam, postings), indent=2))
 
 
 @app.command()
