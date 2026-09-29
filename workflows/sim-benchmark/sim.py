@@ -279,7 +279,7 @@ def main() -> None:
         build_index(args.out / "members.parquet", args.out / f"index_{config}", CONFIGS[config])
         index = Index.load(args.out / f"index_{config}")
         stats = index.meta["stats"]
-        index_mb = (stats["tier1_bytes"] + stats["tier2_bytes"] + stats.get("dense_bytes", 0)) / 1e6
+        index_mb = (stats["tier2_bytes"] + stats.get("dense_bytes", 0)) / 1e6
         for seed in range(1, args.seeds + 1):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)

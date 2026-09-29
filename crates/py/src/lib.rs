@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
 use kmer_functional_profiler_core::{self as kfp, DnaScanner, Error, Hits, KmerParams};
-use numpy::IntoPyArray;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -115,6 +115,55 @@ fn hash_proteins<'py>(
     Ok(dict)
 }
 
+/// Distinct k-mers per run of proteins sharing a (non-decreasing) group id: columns
+/// `group` and `n_kmers`, one row per run.
+#[pyfunction]
+#[pyo3(signature = (seqs, groups, k, *, alphabet = "protein", max_hash = u64::MAX))]
+fn distinct_kmers<'py>(
+    py: Python<'py>,
+    seqs: Vec<PyBackedBytes>,
+    groups: PyReadonlyArray1<'py, u32>,
+    k: usize,
+    alphabet: &str,
+    max_hash: u64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let params = params(k, alphabet, 11, "all", max_hash)?;
+    let groups = groups.as_slice()?;
+    let (ids, counts) = py
+        .detach(|| kfp::distinct_kmers(&seqs, groups, &params))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("group", ids.into_pyarray(py))?;
+    dict.set_item("n_kmers", counts.into_pyarray(py))?;
+    Ok(dict)
+}
+
+/// Adds `hashes` to the blocked Bloom filter `bits` in place (length a multiple of 64).
+#[pyfunction]
+fn bloom_insert(
+    py: Python<'_>,
+    mut bits: PyReadwriteArray1<'_, u8>,
+    hashes: PyReadonlyArray1<'_, u64>,
+) -> PyResult<()> {
+    let (bits, hashes) = (bits.as_slice_mut()?, hashes.as_slice()?);
+    py.detach(|| kfp::bloom_insert(bits, hashes))
+        .map_err(to_py_err)
+}
+
+/// Whether each hash may be in the blocked Bloom filter `bits`.
+#[pyfunction]
+fn bloom_contains<'py>(
+    py: Python<'py>,
+    bits: PyReadonlyArray1<'py, u8>,
+    hashes: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let (bits, hashes) = (bits.as_slice()?, hashes.as_slice()?);
+    let found = py
+        .detach(|| kfp::bloom_contains(bits, hashes))
+        .map_err(to_py_err)?;
+    Ok(found.into_pyarray(py))
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -179,6 +228,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_hash_py, m)?)?;
     m.add_function(wrap_pyfunction!(hash_dna, m)?)?;
     m.add_function(wrap_pyfunction!(hash_proteins, m)?)?;
+    m.add_function(wrap_pyfunction!(distinct_kmers, m)?)?;
+    m.add_function(wrap_pyfunction!(bloom_insert, m)?)?;
+    m.add_function(wrap_pyfunction!(bloom_contains, m)?)?;
+    m.add("BLOOM_BLOCK_BYTES", kfp::BLOCK_BYTES)?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }

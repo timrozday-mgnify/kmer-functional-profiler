@@ -44,7 +44,9 @@ def kmers(seq: str) -> set[int]:
 @pytest.fixture
 def hand(tmp_path: Path) -> tuple[Index, pl.DataFrame]:
     members = write_members(tmp_path / "members.parquet", HAND)
-    build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=1.0, n_min=1, tier1_per_unit=2))
+    build_index(
+        members, tmp_path / "idx", IndexParams(k=K, t_base=1.0, n_min=1), postings_parquet=True
+    )
     index = Index.load(tmp_path / "idx")
     postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
         index.units.select("unit", "cluster_rep"), on="unit"
@@ -65,20 +67,14 @@ def test_scores_on_hand_built_clusters(hand: tuple[Index, pl.DataFrame]) -> None
     assert (partial_only["p_in"] == 0).all() and (partial_only["score"] == -3).all()
     assert (shared["n_groups"] == 2).all() and (shared["score"] == -1).all()
     assert (rows_for(postings, 10, D)["score"] == -1).all()
-    # The best k-mers of A (tier 1) are core ones, not shared or private.
-    tier1 = set(postings.filter("tier1", pl.col("cluster_rep") == 1)["hash"])
-    assert tier1 <= kmers(X + D) - kmers(D)
 
 
 def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
     index, _ = hand
     units = {row["cluster_rep"]: row for row in index.units.iter_rows(named=True)}
     a, b, s = units[1], units[10], units[20]
-    assert (a["n_members"], a["n_full_length"], a["n_counting"]) == (5, 4, 4)
+    assert a["n_members"] == 5
     assert a["n_kmers"] == len(set().union(*(kmers(r[3]) for r in HAND if r[1] == 1)))
-    assert a["u_g"] == a["m_g"] - len(kmers(D))
-    assert a["component"] == b["component"] != s["component"]
-    assert index.meta["stats"]["components"] == 2  # type: ignore[index]
     # Kept k-mers per counting member: 3 x (X + D), 1 x (X + D + P); their mean is pin_sum.
     held = np.array([len(kmers(X + D))] * 3 + [len(kmers(X + D + P))])
     assert a["pin_sum"] == pytest.approx(held.mean())
@@ -87,12 +83,17 @@ def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
 
 
 def test_promiscuous_kmers_are_dropped(tmp_path: Path) -> None:
-    members = write_members(tmp_path / "members.parquet", HAND)
-    params = IndexParams(k=K, t_base=1.0, n_min=1, max_groups=1)
-    build_index(members, tmp_path / "idx", params)
-    units = Index.load(tmp_path / "idx").units.sort("cluster_rep")
-    assert units["n_promiscuous"].to_list() == [len(kmers(D))] * 2 + [0]
-    assert units["component"].n_unique() == 3
+    # Unit 30 holds only D, shared with A and B, so it has no posting and is not indexed.
+    members = write_members(tmp_path / "members.parquet", [*HAND, (30, 30, True, D)])
+    params = IndexParams(k=K, t_base=1.0, n_min=1, max_groups=2)
+    stats = build_index(members, tmp_path / "idx", params)
+    assert stats["promiscuous_dropped"] == 3 * len(kmers(D))
+    assert (stats["n_clusters"], stats["n_units"]) == (4, 3)
+    units = Index.load(tmp_path / "idx").units
+    assert units["cluster_rep"].to_list() == [1, 10, 20]
+    assert units["unit"].to_list() == [0, 1, 2]
+    a = (kmers(X + D + P) | kmers(Q + X[:10])) - kmers(D)
+    assert units["m_g"].to_list() == [len(a), len(kmers(D + Y) - kmers(D)), len(kmers(S))]
 
 
 def test_tier2_lookup_returns_postings(hand: tuple[Index, pl.DataFrame]) -> None:
@@ -113,7 +114,7 @@ def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
             rows.append((rep * 100 + m, rep * 100, rng.random() < 0.7, mutated))
     members = write_members(tmp_path / "members.parquet", rows)
     params = IndexParams(k=K, t_base=0.02, n_min=8)
-    stats = build_index(members, tmp_path / "a", params)
+    stats = build_index(members, tmp_path / "a", params, postings_parquet=True)
     expected = stats["candidates_expected"]
     assert isinstance(expected, float)
     assert abs(stats["candidates"] - expected) < 5 * expected**0.5  # type: ignore[operator]
@@ -129,7 +130,12 @@ def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
     assert (postings["hash"] <= postings["max_hash_g"]).all()
 
     # Unit-aligned batching does not change the result.
-    build_index(members, tmp_path / "b", IndexParams(k=K, t_base=0.02, n_min=8, batch_residues=900))
+    build_index(
+        members,
+        tmp_path / "b",
+        IndexParams(k=K, t_base=0.02, n_min=8, batch_residues=900),
+        postings_parquet=True,
+    )
     for name in ("postings", "units"):
         a, b = (pl.read_parquet(tmp_path / d / f"{name}.parquet") for d in "ab")
         assert a.equals(b)
@@ -160,7 +166,7 @@ def test_floored_units_keep_best_scoring_kmers(tmp_path: Path) -> None:
     members = write_members(tmp_path / "members.parquet", HAND)
     # Every k-mer is a candidate (t_cap = 1); floored units keep their n_min best.
     params = IndexParams(k=K, t_base=0.001, n_min=5, t_cap=1.0, oversample=1000)
-    build_index(members, tmp_path / "idx", params)
+    build_index(members, tmp_path / "idx", params, postings_parquet=True)
     index = Index.load(tmp_path / "idx")
     units = index.units.sort("cluster_rep")
     assert units["m_g"].to_list()[:2] == [5, 5]
@@ -179,7 +185,7 @@ def test_adapter_peptides_are_masked(tmp_path: Path) -> None:
     for mask in (True, False):
         # At k = 11 no k-mer keeps 6 unmasked adapter residues (the mask width).
         params = IndexParams(k=11, t_base=1.0, n_min=1, mask_adapters=mask)
-        stats = build_index(members, tmp_path / str(mask), params)
+        stats = build_index(members, tmp_path / str(mask), params, postings_parquet=True)
         hashes = set(pl.read_parquet(tmp_path / str(mask) / "postings.parquet")["hash"])
         adapter_kmers = set(reference.protein_kmers(adapter.encode(), 11))
         assert bool(hashes & adapter_kmers) is not mask

@@ -28,8 +28,11 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
     units = Index.load(tmp_path / "idx").units
 
     clusters, pairs = cluster_stats(members, params, rate=0.05)
-    assert clusters.select("cluster_rep", "n_members", "n_kmers").equals(
-        units.select("cluster_rep", "n_members", "n_kmers")
+    # The index keeps only units with a posting.
+    assert (
+        clusters.join(units, on="cluster_rep", how="semi")
+        .select("cluster_rep", "n_members", "n_kmers")
+        .equals(units.select("cluster_rep", "n_members", "n_kmers"))
     )
     assert pairs.height > 0 and pairs["hash"].max() <= 0.05 * 2**64  # type: ignore[operator]
 
@@ -37,13 +40,13 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
     # repeat within a unit, which the build measures.
     sets = stats["tier2_sets"] / stats["postings"]  # type: ignore[operator]
     cost = predict_cost(clusters.lazy(), params, sets=sets)
-    assert cost["units"] == stats["n_units"] and cost["floored"] == stats["n_floored"]
+    assert cost["units"] == stats["n_clusters"] and cost["floored"] == stats["n_floored"]
     assert cost["t_max"] == stats["t_max"]
     for predicted, actual in (
         (cost["postings"], stats["postings"]),
         (cost["dense"], stats["dense_postings"]),
         (cost["tier2_bytes"], stats["tier2_bytes"]),
-        (cost["tier1_bytes"], stats["tier1_bytes"]),
+        (cost["with_postings"], stats["n_units"]),
     ):
         assert abs(predicted / actual - 1) < 0.05, (predicted, actual)  # type: ignore[operator]
     # Dense sets repeat at a different rate, so its bytes are only bounded.

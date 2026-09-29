@@ -104,8 +104,7 @@ def predict_cost(
             kmers=pl.col("n_kmers").cast(pl.Float64).sum(),
             t_max=pl.col("t_g").max(),
             postings=pl.col("m").sum(),
-            tier1=pl.col("m").clip(upper_bound=params.tier1_per_unit).sum(),
-            # tier-1 sets: one per unit with a posting, P = 1 - exp(-m) under Poisson
+            # only units with a posting are indexed, P = 1 - exp(-m) under Poisson
             with_postings=(1 - (-pl.col("m")).exp()).sum(),
             dense=(dense_rate * pl.col("n_kmers") * keep).sum()
             if params.t_dense > 0
@@ -114,11 +113,9 @@ def predict_cost(
         .collect(engine="streaming")
         .row(0, named=True)
     )
-    max_value = (row["units"] << PIN_BITS) | (2**PIN_BITS - 1)
+    max_value = (int(row["with_postings"]) << PIN_BITS) | (2**PIN_BITS - 1)
     n2, n_dense = row["postings"], row["dense"]
     tier2 = packed_bytes(n2, sets * n2, sets * n2, max_value, params.fp_bits)
-    n1 = min(row["tier1"], row["with_postings"])  # tier-1 sets are component ids
-    tier1 = packed_bytes(row["tier1"], n1, n1, row["units"], params.fp_bits)
     dense = (
         packed_bytes(n_dense, sets * n_dense, sets * n_dense, max_value, params.fp_bits)
         if params.t_dense > 0
@@ -126,7 +123,6 @@ def predict_cost(
     )
     return {
         **row,
-        "tier1_bytes": tier1,
         "tier2_bytes": tier2,
         "dense_bytes": dense,
         "tier2_bytes_per_posting": tier2 / max(row["postings"], 1),

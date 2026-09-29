@@ -3,15 +3,17 @@
 //! No PyO3 here, so the final CLI reuses them unchanged.
 
 mod alphabet;
+mod bloom;
 mod error;
 mod fastx;
 mod kmers;
 mod translate;
 
 pub use alphabet::Alphabet;
+pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use error::Error;
 pub use fastx::FastxHits;
-pub use kmers::{DnaScanner, Hits, KmerParams, hash_kmer, max_hash, protein_kmers};
+pub use kmers::{DnaScanner, Hits, KmerParams, distinct_kmers, hash_kmer, max_hash, protein_kmers};
 pub use translate::{FrameMode, GeneticCode, reverse_complement, six_frames, translate};
 
 /// Crate version, re-exported to Python as `_core.__version__`.

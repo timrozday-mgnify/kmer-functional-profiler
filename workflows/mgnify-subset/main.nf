@@ -1,5 +1,6 @@
 // MGnify Proteins subset (whole MGnify90 clusters of one biome) -> members table -> index,
-// and the full-scale cost study (per-cluster statistics -> predicted index size).
+// the full-scale cost study (per-cluster statistics -> predicted index size), and the
+// partitioned index build over the buckets.
 // See README.md.
 
 process MEMBERSHIP {
@@ -160,6 +161,173 @@ process COMBINE {
     "touch clusters.parquet groups.tsv cost.tsv"
 }
 
+// Partitioned build (kmer_functional_profiler.partition): per bucket, per hash range, once.
+process CANDIDATES {
+    tag "bucket ${bucket}"
+    label 'process_medium'
+
+    input:
+    tuple val(bucket), path(members)
+
+    output:
+    tuple val(bucket), path(members), path("${members.baseName}.units.parquet"), path("${members.baseName}.stats.json"), emit: units
+    path "${members.baseName}.candidates.npy", emit: candidates
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py candidates --members ${members} --prefix ${members.baseName} ${params.index_args}
+    """
+
+    stub:
+    "touch ${members.baseName}.units.parquet ${members.baseName}.stats.json ${members.baseName}.candidates.npy"
+}
+
+process BLOOM {
+    label 'process_medium'
+
+    input:
+    path units
+    path candidates
+
+    output:
+    path 'bloom.*'
+
+    script:
+    def prefixes = candidates.collect { f -> f.name.replace('.candidates.npy', '') }.sort().join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py bloom ${prefixes} --bits-per-key ${params.bloom_bits}
+    """
+
+    stub:
+    "touch bloom.npy bloom.json"
+}
+
+process PRESENCE {
+    tag "bucket ${bucket}"
+    label 'process_medium'
+
+    input:
+    tuple val(bucket), path(members), path(units), path(stats)
+    path bloom
+
+    output:
+    path "${members.baseName}.range*.parquet"
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py presence --members ${members} --prefix ${members.baseName} --bucket ${bucket} \
+        --ranges ${params.ranges} ${params.index_args}
+    """
+
+    stub:
+    "for r in \$(seq 0 ${params.ranges - 1}); do touch ${members.baseName}.range\$r.parquet; done"
+}
+
+process GROUPS {
+    tag "range ${range}"
+    label 'process_medium'
+
+    input:
+    tuple val(range), path(presence)
+
+    output:
+    path "range${range}.bucket*.parquet", optional: true
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py groups --prefix range${range} ${presence}
+    """
+
+    stub:
+    "touch range${range}.bucket0.parquet"
+}
+
+process POSTINGS {
+    tag "bucket ${bucket}"
+    label 'process_medium'
+
+    input:
+    tuple val(bucket), path(members), path(units), path(stats), path(groups)
+    path pfam
+
+    output:
+    path "${members.baseName}.{final.parquet,final.json,postings.parquet,pfam.parquet}"
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py postings --members ${members} --prefix ${members.baseName} --pfam ${pfam} \
+        ${params.index_args} ${groups}
+    """
+
+    stub:
+    "touch ${members.baseName}.final.parquet ${members.baseName}.final.json ${members.baseName}.postings.parquet ${members.baseName}.pfam.parquet"
+}
+
+process UNITS {
+    label 'process_high_memory'
+
+    input:
+    path parts
+    path bloom
+
+    output:
+    path 'units'
+
+    script:
+    def prefixes = parts.findAll { f -> f.name.endsWith('.final.json') }
+        .collect { f -> f.name.replace('.final.json', '') }.sort().join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py units ${prefixes} --ranges ${params.ranges} \\
+        --pfam ${params.index_args}
+    """
+
+    stub:
+    "mkdir units && touch units/units.parquet units/pack.json"
+}
+
+process PACK_RANGE {
+    tag "range ${range}"
+    label 'process_medium'
+
+    input:
+    tuple val(range), path(postings), path(units)
+
+    output:
+    tuple val(range), path("part${range}.*")
+
+    script:
+    def prefixes = postings.collect { f -> f.name.replace('.postings.parquet', '') }.sort().join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py pack-range ${prefixes} --range ${range} \\
+        --out part${range} ${params.index_args}
+    """
+
+    stub:
+    "touch part${range}.keys.npy part${range}.json"
+}
+
+process CONCAT {
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    val ranges
+    path parts
+    path units
+
+    output:
+    path 'index'
+
+    script:
+    def prefixes = ranges.collect { r -> "part${r}" }.join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py concat ${prefixes} ${params.index_args}
+    """
+
+    stub:
+    "mkdir index && touch index/meta.json"
+}
+
 workflow {
     // Nested subsets: extract at the densest sample, then keep 1 in N of its clusters.
     def samples = params.sample.toString().tokenize(',').collect { it.trim() as long }.sort()
@@ -168,6 +336,9 @@ workflow {
     }
     if (params.index && ((params.buckets as int) > 1 || !params.pfam)) {
         error "--index needs --buckets 1 and --pfam true"
+    }
+    if (params.build && (samples.size() > 1 || !params.pfam)) {
+        error "--build needs one --sample and --pfam true"
     }
     // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
     def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
@@ -182,5 +353,35 @@ workflow {
     if (params.index) {
         SUBSET(channel.fromList(samples), MERGE.out.members.first(), MERGE.out.pfam.first())
         INDEX(SUBSET.out)
+    }
+    if (params.build) {
+        ch_members = MERGE.out.members.flatten().map { f ->
+            def m = f.name =~ /bucket(\d+)/
+            [m ? m[0][1] as int : 0, f]
+        }
+        CANDIDATES(ch_members)
+        BLOOM(CANDIDATES.out.units.map { t -> t[2] }.collect(), CANDIDATES.out.candidates.collect())
+        PRESENCE(CANDIDATES.out.units, BLOOM.out)
+        ch_ranges = PRESENCE.out.flatten().map { f -> [(f.name =~ /range(\d+)/)[0][1] as int, f] }
+            .groupTuple(size: params.buckets as int)
+        GROUPS(ch_ranges)
+        ch_groups = GROUPS.out.flatten().map { f -> [(f.name =~ /bucket(\d+)/)[0][1] as int, f] }
+            .groupTuple()
+        // Buckets with no candidates get no group files.
+        ch_postings = CANDIDATES.out.units.join(ch_groups, remainder: true)
+            .map { b, members, units, stats, groups -> [b, members, units, stats, groups ?: []] }
+        POSTINGS(ch_postings, MERGE.out.pfam.first())
+        ch_posted = POSTINGS.out.flatten()
+        UNITS(ch_posted.collect(), BLOOM.out)
+        ch_range = channel.of(0..<(params.ranges as int))
+            .combine(ch_posted.filter { f -> f.name.endsWith('.postings.parquet') }.collect().toList())
+            .combine(UNITS.out)
+        PACK_RANGE(ch_range)
+        ch_parts = PACK_RANGE.out.toSortedList { a, b -> a[0] <=> b[0] }
+        CONCAT(
+            ch_parts.map { parts -> parts.collect { p -> p[0] } },
+            ch_parts.map { parts -> parts.collect { p -> p[1] }.flatten() },
+            UNITS.out,
+        )
     }
 }

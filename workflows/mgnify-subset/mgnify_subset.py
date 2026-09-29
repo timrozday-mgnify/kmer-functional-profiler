@@ -20,6 +20,10 @@ One subcommand per pipeline step (``main.nf``):
 - ``combine``: all buckets' statistics -> ``clusters.parquet``, ``groups.tsv`` (sampled
   k-mers per number of clusters holding them) and ``cost.tsv`` (predicted index size per
   1-in-``--sample`` subset and parameter set).
+- ``candidates``, ``bloom``, ``presence``, ``groups``, ``postings``, ``units``,
+  ``pack-range``, ``concat``: the
+  partitioned index build over the buckets (``kmer_functional_profiler.partition``); build
+  options as ``kmer-functional-profiler index``.
 
 ``--release`` is a local directory or an https prefix (DuckDB reads it remotely).
 """
@@ -27,11 +31,12 @@ One subcommand per pipeline step (``main.nf``):
 import argparse
 import itertools
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import duckdb
 import polars as pl
 
+from kmer_functional_profiler import partition
 from kmer_functional_profiler.cost import STATS_RATE, cluster_stats, predict_cost
 from kmer_functional_profiler.index import IndexParams
 
@@ -200,6 +205,33 @@ def combine(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     pl.DataFrame(rows).write_csv("cost.tsv", separator="\t", float_precision=6)
 
 
+def index_params(args: argparse.Namespace) -> IndexParams:
+    return IndexParams(**{f.name: getattr(args, f.name) for f in fields(IndexParams)})
+
+
+def build(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
+    params = index_params(args)
+    match args.step:
+        case "candidates":
+            partition.candidates(args.members, args.prefix, params)
+        case "bloom":
+            partition.bloom(args.prefixes, args.out, args.bits_per_key)
+        case "presence":
+            partition.presence(
+                args.members, args.prefix, args.bloom, args.bucket, args.ranges, params
+            )
+        case "groups":
+            partition.groups(args.paths, args.prefix)
+        case "postings":
+            partition.postings(args.members, args.prefix, args.groups, params, args.pfam)
+        case "units":
+            partition.units(args.prefixes, args.bloom, args.ranges, params, args.out, args.pfam)
+        case "pack-range":
+            partition.pack_range(args.prefixes, args.units, args.range, args.out)
+        case "concat":
+            partition.concat(args.parts, args.units, args.out, params)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--threads", type=int, default=1)
@@ -253,6 +285,50 @@ def main() -> None:
             f"--{name.replace('_', '-')}", type=kind, nargs="+", default=[default]
         )
     combine_p.add_argument("--sets", type=float, default=1.0, help="value sets per posting")
+    build_steps = (
+        "candidates",
+        "bloom",
+        "presence",
+        "groups",
+        "postings",
+        "units",
+        "pack-range",
+        "concat",
+    )
+    for name in build_steps:
+        p = sub.add_parser(name)
+        for f in fields(IndexParams):  # the options of `kmer-functional-profiler index`
+            flag = f"--{f.name.replace('_', '-')}"
+            if isinstance(f.default, bool):
+                p.add_argument(flag, action=argparse.BooleanOptionalAction, default=f.default)
+            else:
+                p.add_argument(flag, type=type(f.default), default=f.default)
+    for name in ("candidates", "presence", "postings"):
+        sub.choices[name].add_argument("--members", required=True)
+        sub.choices[name].add_argument("--prefix", required=True)
+    sub.choices["bloom"].add_argument("prefixes", nargs="+")
+    sub.choices["bloom"].add_argument("--out", default="bloom")
+    sub.choices["bloom"].add_argument("--bits-per-key", type=float, default=10.0)
+    sub.choices["presence"].add_argument("--bloom", default="bloom")
+    sub.choices["presence"].add_argument("--bucket", type=int, required=True)
+    sub.choices["presence"].add_argument("--ranges", type=int, required=True)
+    sub.choices["groups"].add_argument("--prefix", required=True)
+    sub.choices["groups"].add_argument("paths", nargs="+")
+    sub.choices["postings"].add_argument("--pfam")
+    sub.choices["postings"].add_argument("groups", nargs="*")
+    units_p, range_p, concat_p = (sub.choices[n] for n in ("units", "pack-range", "concat"))
+    units_p.add_argument("prefixes", nargs="+")
+    units_p.add_argument("--bloom", default="bloom")
+    units_p.add_argument("--ranges", type=int, required=True)
+    units_p.add_argument("--out", default="units")
+    units_p.add_argument("--pfam", action="store_true")
+    range_p.add_argument("prefixes", nargs="+")
+    range_p.add_argument("--units", default="units")
+    range_p.add_argument("--range", type=int, required=True)
+    range_p.add_argument("--out", required=True)
+    concat_p.add_argument("parts", nargs="+", help="pack-range prefixes, in range order")
+    concat_p.add_argument("--units", default="units")
+    concat_p.add_argument("--out", default="index")
     args = parser.parse_args()
     steps = {
         "membership": membership,
@@ -261,6 +337,7 @@ def main() -> None:
         "subset": subset,
         "stats": stats,
         "combine": combine,
+        **dict.fromkeys(build_steps, build),
     }
     steps[args.step](connect(args), args)
 
