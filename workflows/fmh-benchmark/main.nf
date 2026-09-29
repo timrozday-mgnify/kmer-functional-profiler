@@ -155,7 +155,10 @@ process TRUTH {
 process PROFILE {
     tag "seed ${seed} ${name}"
     label 'process_single'
-    publishDir "${params.outdir}/profiles", mode: 'copy', saveAs: { "seed${seed}_${name}.tsv" }
+    // one saveAs for both outputs: without the per-file branch they overwrite each other
+    publishDir params.outdir, mode: 'copy', saveAs: { f ->
+        f.endsWith('.parquet') ? "kmers/seed${seed}_${name}.parquet" : "profiles/seed${seed}_${name}.tsv"
+    }
 
     input:
     tuple val(seed), path(r1), path(r2), val(name), path(index)
@@ -232,7 +235,13 @@ process SUMMARY {
     "touch summary.tsv scores.tsv"
 }
 
+// Output of a git command in the pipeline's checkout (for run.json).
+def git(List cmd) {
+    return (['git', '-C', projectDir.toString()] + cmd).execute().text.trim()
+}
+
 workflow {
+    main:
     FETCH()
     MEMBERS(FETCH.out.faa, FETCH.out.kos)
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
@@ -258,4 +267,29 @@ workflow {
     )
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
     SUMMARY(SCORE.out.score.collect())
+
+    onComplete:
+    // run.json: what produced the results in outdir (reads, indexes, code, status)
+    def reads = params.iss_mode == 'perfect' ? 'error-free (iss perfect)' : "iss ${params.iss_model} (${params.iss_mode})"
+    def info = [
+        description: "${params.replicates} metagenomes x ${params.n_genomes} KEGG genomes, " +
+            "${params.n_reads} reads, ${reads}; ${params.indexes.size()} indexes + fmh_compat; draws ${params.draws}",
+        success: workflow.success,
+        exit_status: workflow.exitStatus,
+        start: workflow.start.toString(),
+        complete: workflow.complete.toString(),
+        duration: workflow.duration.toString(),
+        command_line: workflow.commandLine,
+        profile: workflow.profile,
+        resume: workflow.resume,
+        session_id: workflow.sessionId.toString(),
+        run_name: workflow.runName,
+        nextflow: workflow.nextflow.version.toString(),
+        code: [commit: git(['rev-parse', 'HEAD']), branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
+               uncommitted_changes: !git(['status', '--porcelain']).isEmpty()],
+        params: params,
+    ]
+    def out = file(params.outdir)
+    out.mkdirs()
+    out.resolve('run.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(info)) + '\n'
 }

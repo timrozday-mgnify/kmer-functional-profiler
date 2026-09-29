@@ -25,8 +25,15 @@ SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered tru
                  kmers_wta, kmers_ufirst after winner-take-all, uniqueness-first)
                  and --min_hits value; abundance of the detected KOs against truth depth
                  (spearman_tp, l1) -> summary.tsv (mean, sd),
-                 scores.tsv; profiles/ and truth/ keep the per-sample tables
+                 scores.tsv; profiles/, kmers/ (tier-2 hits per KO and k-mer) and truth/ keep
+                 the per-sample tables
 ```
+
+`run.json` in the output directory records what produced it: a one-line description
+(read model, sizes, indexes), all parameters, the code commit and whether the checkout had
+uncommitted changes, the command line and the run's status. Runs with different settings
+(e.g. `--iss_mode perfect`) should use their own `--outdir`: files from an earlier run are
+overwritten or left in place, not removed.
 
 The `fmh_compat` row reproduces fmh-funprofiler's KO calls: its hits equal the overlaps
 `sourmash prefetch` reports (tested in `tests/python/test_compat.py`), and a KO counts as

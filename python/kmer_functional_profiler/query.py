@@ -352,6 +352,9 @@ def presence(
     )
 
 
+# Floor of the copies error (sd on the log scale), calibrated on the fmh benchmark (step 18):
+# brings abundance_zi intervals to 95% at kfp_s100.
+COPIES_ERROR: Final = 0.2
 MH_STEPS: Final = 5  # Metropolis steps on coverage per sweep
 PI_GRID: Final = (np.arange(512) + 0.5) / 512  # present-fraction grid for exact draws
 
@@ -370,7 +373,7 @@ def posterior_zi(
     *,
     present_prob: np.ndarray | None = None,
     len_cv: np.ndarray | None = None,
-    copies_error: float = 0.0,
+    copies_error: float = COPIES_ERROR,
     sweeps: int = 10,
     level: float = 0.95,
     shared_evidence: float = 0.5,
