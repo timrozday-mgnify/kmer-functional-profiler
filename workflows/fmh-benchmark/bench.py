@@ -20,12 +20,14 @@
   frames (``in_genome``; null for sourmash-hashed indexes). A false positive's k-mers that
   are in the genomes come from real sequence (another gene or KO); the rest from read errors.
 - ``summary``: mean and sd of the scores per index, count and threshold.
+- ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
 import argparse
 import itertools
 import json
 import random
+import sys
 from collections.abc import Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -394,7 +396,35 @@ def summary(args: argparse.Namespace) -> None:
     scores.sort([*keys, "sample"], nulls_last=True).write_csv("scores.tsv", separator="\t")
 
 
+def iss(argv: list[str]) -> None:
+    """Run ``iss`` with ``argv``, patching two flaws of its perfect model (iss 2.0.1).
+
+    It never sets ``store_mutations``, so ``generate --mode perfect`` fails with an
+    AttributeError that iss prints as usage, exiting 0 without output; and its reads are
+    125 bp, not the 151 of the NovaSeq model, which would confound the error comparison.
+    """
+    import iss.app
+    from iss.error_models.perfect import PerfectErrorModel
+
+    init = PerfectErrorModel.__init__
+
+    def patched(self: PerfectErrorModel, *args: object, **kwargs: object) -> None:
+        init(self, *args, **kwargs)
+        self.store_mutations = False
+        self.read_length = 151
+        for name in ("subst_choices_for", "subst_choices_rev", "ins_for", "ins_rev",
+                     "del_for", "del_rev"):  # fmt: skip
+            setattr(self, name, getattr(self, name)[:1] * self.read_length)
+
+    PerfectErrorModel.__init__ = patched  # type: ignore[method-assign]
+    sys.argv = ["iss", *argv]
+    iss.app.main()
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["iss"]:  # iss parses its own arguments
+        iss(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="step", required=True)
     p = sub.add_parser("members")
