@@ -261,9 +261,9 @@ def load_members(path: str | Path) -> pl.DataFrame:
 
 def _batches(members: pl.DataFrame, batch_residues: int) -> Iterator[pl.DataFrame]:
     """Row batches of about ``batch_residues`` residues that never split a unit."""
-    batch = members.with_columns(cum=pl.col("sequence").str.len_bytes().cum_sum()).select(
-        batch=pl.col("cum").first().over("unit") // batch_residues
-    )
+    batch = members.with_columns(
+        cum=pl.col("sequence").str.len_bytes().cast(pl.UInt64).cum_sum()
+    ).select(batch=pl.col("cum").first().over("unit") // batch_residues)
     yield from members.with_columns(batch["batch"]).partition_by(
         "batch", maintain_order=True, include_key=False
     )
@@ -368,7 +368,7 @@ def build_index(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     members = load_members(members_path)
-    n_residues = int(members["sequence"].str.len_bytes().sum())
+    n_residues = int(members["sequence"].str.len_bytes().cast(pl.UInt64).sum())
     n_masked = 0
     if params.mask_adapters:
         masked = members.select(mask_adapters(pl.col("sequence")))["sequence"]

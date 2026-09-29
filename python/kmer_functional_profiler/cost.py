@@ -41,7 +41,7 @@ def cluster_stats(
         pl.col("cluster_rep").first(),
         n_members=pl.len().cast(pl.UInt32),
         n_full_length=pl.col("full_length").sum().cast(pl.UInt32),
-        sum_len=pl.col("sequence").str.len_bytes().sum().cast(pl.UInt64),
+        sum_len=pl.col("sequence").str.len_bytes().cast(pl.UInt64).sum(),
         max_len=pl.col("sequence").str.len_bytes().max().cast(pl.UInt32),
     )
     if params.mask_adapters:
@@ -105,6 +105,8 @@ def predict_cost(
             t_max=pl.col("t_g").max(),
             postings=pl.col("m").sum(),
             tier1=pl.col("m").clip(upper_bound=params.tier1_per_unit).sum(),
+            # tier-1 sets: one per unit with a posting, P = 1 - exp(-m) under Poisson
+            with_postings=(1 - (-pl.col("m")).exp()).sum(),
             dense=(dense_rate * pl.col("n_kmers") * keep).sum()
             if params.t_dense > 0
             else pl.lit(0.0),
@@ -115,7 +117,7 @@ def predict_cost(
     max_value = (row["units"] << PIN_BITS) | (2**PIN_BITS - 1)
     n2, n_dense = row["postings"], row["dense"]
     tier2 = packed_bytes(n2, sets * n2, sets * n2, max_value, params.fp_bits)
-    n1 = min(row["tier1"], row["units"])  # tier-1 sets are component ids
+    n1 = min(row["tier1"], row["with_postings"])  # tier-1 sets are component ids
     tier1 = packed_bytes(row["tier1"], n1, n1, row["units"], params.fp_bits)
     dense = (
         packed_bytes(n_dense, sets * n_dense, sets * n_dense, max_value, params.fp_bits)
