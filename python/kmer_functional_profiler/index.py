@@ -33,7 +33,7 @@ The query probes it only for the units the sparse tier detects, to fit abundance
 """
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
@@ -175,6 +175,50 @@ class PackedPart(NamedTuple):
         return cls(*(np.load(f"{prefix}.{f}.npy", mmap_mode="r") for f in cls._fields))
 
 
+class SetSlice(NamedTuple):
+    """Distinct value sets of one set-hash range, in hash order (``dedup_sets``), and the
+    map from each part's local sets in that range to them."""
+
+    offsets: NDArray[np.int64]
+    values: NDArray[np.uint64]
+    maps: NDArray[np.int64]  # every part's local sets in the range, part after part
+    map_offsets: NDArray[np.int64]  # (parts + 1): each part's run in ``maps``
+
+    def save(self, prefix: str) -> None:
+        for field in self._fields:
+            np.save(f"{prefix}.{field}.npy", getattr(self, field))
+
+    @classmethod
+    def load(cls, prefix: str) -> Self:
+        return cls(*(np.load(f"{prefix}.{f}.npy", mmap_mode="r") for f in cls._fields))
+
+
+def dedup_sets(parts: Sequence[PackedPart], lo: int, hi: int | None) -> SetSlice:
+    """Distinct sets of ``parts`` whose first hash word lies in [``lo``, ``hi``) (``hi``
+    None: to the end). Parts keep their sets in hash order, so each contributes one run."""
+    runs = []
+    for part in parts:
+        first_word = part.set_hashes[:, 0]
+        a = int(np.searchsorted(first_word, np.uint64(lo)))
+        b = len(first_word) if hi is None else int(np.searchsorted(first_word, np.uint64(hi)))
+        runs.append((part, a, b))
+    hashes = np.concatenate([np.zeros((0, 2), np.uint64), *(p.set_hashes[a:b] for p, a, b in runs)])
+    offsets, values, base = [], [], 0
+    for part, a, b in runs:
+        run = np.asarray(part.set_offsets[a : b + 1], dtype=np.int64)
+        offsets.append(run[:-1] - run[0] + base)
+        values.append(np.asarray(part.set_values[run[0] : run[-1]]))
+        base += int(run[-1] - run[0])
+    ids, first = _dense_ids(hashes)
+    set_offsets, set_values = _gather(
+        np.concatenate([np.zeros(0, np.int64), *offsets, [base]]).astype(np.int64),
+        np.concatenate([np.zeros(0, np.uint64), *values]),
+        first,
+    )
+    map_offsets = np.concatenate([[0], np.cumsum([b - a for _, a, b in runs])]).astype(np.int64)
+    return SetSlice(set_offsets, set_values, ids, map_offsets)
+
+
 @dataclass(frozen=True)
 class PackedTable:
     """Hash -> value set, storing only ``fp_bits`` fingerprint bits per key.
@@ -210,38 +254,56 @@ class PackedTable:
         return cls.concat(layout, [PackedPart.build(hashes, values, layout)])
 
     @classmethod
-    def concat(cls, layout: dict[str, int], parts: list[PackedPart]) -> Self:
-        """Join parts built under ``layout`` over consecutive, disjoint key ranges."""
+    def concat(
+        cls,
+        layout: dict[str, int],
+        parts: Sequence[PackedPart],
+        slices: Sequence[SetSlice] | None = None,
+    ) -> Self:
+        """Join parts built under ``layout`` over consecutive, disjoint key ranges.
+
+        ``slices`` are the parts' sets deduplicated over consecutive set-hash ranges
+        covering all hashes (``dedup_sets``, which can run as separate jobs); without them
+        all sets are deduplicated here.
+        """
         fp_bits, bucket_bits = layout["fp_bits"], layout["bucket_bits"]
-        set_base = np.cumsum([0] + [len(p.set_hashes) for p in parts])
-        value_base = np.cumsum([0] + [len(p.set_values) for p in parts])
-        # ponytail: every part's sets in memory at once; about the index's own size
-        ids, first = _dense_ids(
-            np.concatenate([np.zeros((0, 2), np.uint64), *(p.set_hashes for p in parts)])
-        )
-        all_offsets = np.concatenate(
+        slices = slices if slices is not None else [dedup_sets(parts, 0, None)]
+        set_base = np.cumsum([0] + [len(s.offsets) - 1 for s in slices])
+        value_base = np.cumsum([0] + [len(s.values) for s in slices])
+        set_offsets = np.concatenate(
             [
                 *(
-                    np.asarray(p.set_offsets[:-1]) + b
-                    for p, b in zip(parts, value_base[:-1], strict=True)
+                    np.asarray(s.offsets[:-1]) + b
+                    for s, b in zip(slices, value_base[:-1], strict=True)
                 ),
                 [value_base[-1]],
             ]
         ).astype(np.int64)
-        all_values = np.concatenate([np.zeros(0, np.uint64), *(p.set_values for p in parts)])
-        set_offsets, set_values = _gather(all_offsets, all_values, first)
+        set_values = np.concatenate([np.zeros(0, np.uint64), *(s.values for s in slices)])
 
         n_keys = sum(len(p.keys) for p in parts)
         fingerprints = np.empty(n_keys, dtype=_smallest(2**fp_bits - 1))
-        set_ids = np.empty(n_keys, dtype=_smallest(len(first)))
+        set_ids = np.empty(n_keys, dtype=_smallest(int(set_base[-1])))
         counts = np.zeros(2**bucket_bits, dtype=np.int64)
         at, last = 0, -1
-        for part, base in zip(parts, set_base[:-1], strict=True):
+        for i, part in enumerate(parts):
             keys = np.asarray(part.keys)
             if len(keys) and int(keys[0]) <= last:
                 raise ValueError("parts must cover increasing, disjoint key ranges")
+            # Local sets are in hash order, so the slices' runs follow each other.
+            to_global = np.concatenate(
+                [
+                    np.zeros(0, np.int64),
+                    *(
+                        b + np.asarray(s.maps[s.map_offsets[i] : s.map_offsets[i + 1]])
+                        for s, b in zip(slices, set_base[:-1], strict=True)
+                    ),
+                ]
+            )
+            if len(to_global) != len(part.set_hashes):
+                raise ValueError("set slices do not cover every set of every part")
             fingerprints[at : at + len(keys)] = keys & np.uint64(2**fp_bits - 1)
-            set_ids[at : at + len(keys)] = ids[base + np.asarray(part.set_ids)]
+            set_ids[at : at + len(keys)] = to_global[np.asarray(part.set_ids)]
             buckets, n = np.unique(keys >> np.uint64(fp_bits), return_counts=True)
             counts[buckets.astype(np.int64)] += n
             at, last = at + len(keys), int(keys[-1]) if len(keys) else last

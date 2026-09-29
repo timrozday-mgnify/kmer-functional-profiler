@@ -21,7 +21,7 @@ One subcommand per pipeline step (``main.nf``):
   k-mers per number of clusters holding them) and ``cost.tsv`` (predicted index size per
   1-in-``--sample`` subset and parameter set).
 - ``candidates``, ``bloom``, ``presence``, ``groups``, ``postings``, ``units``,
-  ``pack-range``, ``concat``: the
+  ``pack-range``, ``dedup``, ``concat``: the
   partitioned index build over the buckets (``kmer_functional_profiler.partition``); build
   options as ``kmer-functional-profiler index``.
 
@@ -228,8 +228,10 @@ def build(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
             partition.units(args.prefixes, args.bloom, args.ranges, params, args.out, args.pfam)
         case "pack-range":
             partition.pack_range(args.prefixes, args.units, args.range, args.out)
+        case "dedup":
+            partition.dedup(args.parts, args.range, args.ranges, args.out)
         case "concat":
-            partition.concat(args.parts, args.units, args.out, params)
+            partition.concat(args.parts, args.sets, args.units, args.out, params)
 
 
 def main() -> None:
@@ -293,6 +295,7 @@ def main() -> None:
         "postings",
         "units",
         "pack-range",
+        "dedup",
         "concat",
     )
     for name in build_steps:
@@ -326,7 +329,13 @@ def main() -> None:
     range_p.add_argument("--units", default="units")
     range_p.add_argument("--range", type=int, required=True)
     range_p.add_argument("--out", required=True)
+    dedup_p = sub.choices["dedup"]
+    dedup_p.add_argument("parts", nargs="+", help="pack-range prefixes")
+    dedup_p.add_argument("--range", type=int, required=True)
+    dedup_p.add_argument("--ranges", type=int, required=True)
+    dedup_p.add_argument("--out", required=True)
     concat_p.add_argument("parts", nargs="+", help="pack-range prefixes, in range order")
+    concat_p.add_argument("--sets", nargs="+", required=True, help="dedup prefixes, in order")
     concat_p.add_argument("--units", default="units")
     concat_p.add_argument("--out", default="index")
     args = parser.parse_args()
