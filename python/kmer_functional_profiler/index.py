@@ -312,6 +312,29 @@ def _len_cv(
     )
 
 
+def _t_g(params: IndexParams) -> pl.Expr:
+    """Per-unit sampling rate from ``n_members`` and ``n_kmers``: floored for non-singletons."""
+    raised = pl.min_horizontal(
+        pl.lit(params.t_cap), params.oversample * params.n_min / pl.col("n_kmers")
+    )
+    return (
+        pl.when(pl.col("n_members") > 1)
+        .then(pl.max_horizontal(pl.lit(params.t_base), raised))
+        .otherwise(pl.lit(params.t_base))
+        .clip(upper_bound=1.0)
+    )
+
+
+def _n_kmers(batches: list[pl.DataFrame], params: IndexParams) -> pl.DataFrame:
+    """Distinct k-mers per unit (all k-mers hashed, only counts kept)."""
+    return pl.concat(
+        [
+            _kmers(b, params, U64_MAX).unique(["unit", "hash"]).group_by("unit").len("n_kmers")
+            for b in batches
+        ]
+    )
+
+
 def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParams) -> pl.DataFrame:
     units = (
         members.group_by("unit")
@@ -325,19 +348,7 @@ def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParam
         .join(n_kmers, on="unit", how="left")
         .with_columns(pl.col("n_kmers").fill_null(0).cast(pl.UInt32))
         .sort("unit")
-        .with_columns(
-            t_g=pl.when(pl.col("n_members") > 1)
-            .then(
-                pl.max_horizontal(
-                    pl.lit(params.t_base),
-                    pl.min_horizontal(
-                        pl.lit(params.t_cap), params.oversample * params.n_min / pl.col("n_kmers")
-                    ),
-                )
-            )
-            .otherwise(pl.lit(params.t_base))
-            .clip(upper_bound=1.0)
-        )
+        .with_columns(t_g=_t_g(params))
     )
     # Exact Rust threshold rule, evaluated once per distinct t_g.
     thresholds = units.select(pl.col("t_g").unique()).with_columns(
@@ -365,14 +376,8 @@ def build_index(
         members = members.with_columns(sequence=masked)
     batches = list(_batches(members, params.batch_residues))
 
-    # Pass 1: distinct k-mers per unit (all k-mers hashed, only counts kept).
-    n_kmers = pl.concat(
-        [
-            _kmers(b, params, U64_MAX).unique(["unit", "hash"]).group_by("unit").len("n_kmers")
-            for b in batches
-        ]
-    )
-    units = _unit_table(members, n_kmers, params)
+    # Pass 1: distinct k-mers per unit.
+    units = _unit_table(members, _n_kmers(batches, params), params)
     t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     thresholds = units.select("unit", "max_hash_g")
 

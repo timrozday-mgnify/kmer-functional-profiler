@@ -1,8 +1,12 @@
-// MGnify Proteins subset (whole MGnify90 clusters of one biome) -> members table -> index.
+// MGnify Proteins subset (whole MGnify90 clusters of one biome) -> members table -> index,
+// and the full-scale cost study (per-cluster statistics -> predicted index size).
 // See README.md.
 
 process MEMBERSHIP {
     label 'process_medium'
+
+    input:
+    val sample
 
     output:
     path 'membership.parquet', emit: membership
@@ -10,7 +14,8 @@ process MEMBERSHIP {
     script:
     """
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
-        membership --release '${params.release}' --biome '${params.biome}' --sample ${params.sample}
+        membership --release '${params.release}' --biome '${params.biome}' --sample ${sample} \\
+        --max-protein-id ${params.max_protein_id}
     """
 
     stub:
@@ -32,7 +37,8 @@ process EXTRACT {
     """
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
         extract --release '${params.release}' --membership ${membership} \\
-        --lo ${lo} --hi ${hi} --prefix shard${shard}
+        --lo ${lo} --hi ${hi} --prefix shard${shard} --buckets ${params.buckets} \\
+        ${params.pfam ? '--pfam' : '--no-pfam'}
     """
 
     stub:
@@ -40,35 +46,61 @@ process EXTRACT {
 }
 
 process MERGE {
+    tag "bucket ${bucket}"
     label 'process_medium'
-    publishDir params.outdir, mode: 'copy'
+    publishDir params.outdir, mode: params.publish_mode
 
     input:
-    path membership
+    val bucket
     path parts
 
     output:
-    path 'members.parquet', emit: members
-    path 'pfam.parquet', emit: pfam
+    path 'members*.parquet', emit: members
+    path 'pfam.parquet', emit: pfam, optional: true
 
     script:
     def prefixes = parts.collect { it.name.tokenize('.')[0] }.unique().sort().join(' ')
+    def members = (params.buckets as int) > 1 ? "members.bucket${bucket}.parquet" : 'members.parquet'
+    def pfam = params.pfam && bucket == 0 ? '--pfam pfam.parquet' : ''
     """
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
-        merge --membership ${membership} ${prefixes}
+        merge --bucket ${bucket} --members ${members} ${pfam} ${prefixes}
     """
 
     stub:
     "touch members.parquet pfam.parquet"
 }
 
-process INDEX {
-    label 'process_high_memory'
-    publishDir params.outdir, mode: 'copy'
+process SUBSET {
+    tag "1 in ${sample}"
+    label 'process_medium'
 
     input:
+    val sample
     path members
     path pfam
+
+    output:
+    tuple val(sample), path("members.1in${sample}.parquet"), path("pfam.1in${sample}.parquet")
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
+        subset --members ${members} --pfam ${pfam} --sample ${sample} \\
+        --out-members members.1in${sample}.parquet --out-pfam pfam.1in${sample}.parquet
+    """
+
+    stub:
+    "touch members.1in${sample}.parquet pfam.1in${sample}.parquet"
+}
+
+process INDEX {
+    tag "1 in ${sample}"
+    label 'process_high_memory'
+    publishDir path: { "${params.outdir}/1in${sample}" }, mode: 'copy'
+
+    input:
+    tuple val(sample), path(members), path(pfam)
 
     output:
     path 'index', emit: index
@@ -82,14 +114,72 @@ process INDEX {
     "mkdir index && touch index/meta.json"
 }
 
+process STATS {
+    tag "${members.baseName}"
+    label 'process_medium'
+
+    input:
+    path members
+
+    output:
+    path "${members.baseName}.*.parquet", emit: stats
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py stats --members ${members} \\
+        --prefix ${members.baseName} --rate ${params.stats_rate} ${params.stats_args}
+    """
+
+    stub:
+    "touch ${members.baseName}.clusters.parquet ${members.baseName}.pairs.parquet"
+}
+
+process COMBINE {
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path stats
+
+    output:
+    path 'clusters.parquet'
+    path 'groups.tsv'
+    path 'cost.tsv', emit: cost
+
+    script:
+    def prefixes = stats.collect { it.name.replace('.clusters.parquet', '').replace('.pairs.parquet', '') }
+        .unique().sort().join(' ')
+    def samples = params.cost_samples.toString().tokenize(',').join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py combine ${prefixes} --sample ${samples} \\
+        ${params.stats_args} ${params.cost_args}
+    """
+
+    stub:
+    "touch clusters.parquet groups.tsv cost.tsv"
+}
+
 workflow {
-    MEMBERSHIP()
-    // Even protein_id ranges; MERGE fails if max_protein_id leaves members out.
+    // Nested subsets: extract at the densest sample, then keep 1 in N of its clusters.
+    def samples = params.sample.toString().tokenize(',').collect { it.trim() as long }.sort()
+    if (samples.any { it % samples[0] != 0 }) {
+        error "--sample ${params.sample}: every sample must be a multiple of the smallest"
+    }
+    if (params.index && ((params.buckets as int) > 1 || !params.pfam)) {
+        error "--index needs --buckets 1 and --pfam true"
+    }
+    MEMBERSHIP(samples[0])
+    // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
     def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
     ch_shards = channel.of(0..<(params.shards as int)).map { i -> [i, i * width, (i + 1) * width] }
     EXTRACT(ch_shards, MEMBERSHIP.out.membership)
-    MERGE(MEMBERSHIP.out.membership, EXTRACT.out.parts.flatten().collect())
+    MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())
+    if (params.stats) {
+        STATS(MERGE.out.members)
+        COMBINE(STATS.out.stats.flatten().collect())
+    }
     if (params.index) {
-        INDEX(MERGE.out.members, MERGE.out.pfam)
+        SUBSET(channel.fromList(samples), MERGE.out.members.first(), MERGE.out.pfam.first())
+        INDEX(SUBSET.out)
     }
 }
