@@ -154,7 +154,7 @@ At the sketch densities planned, most reads carry zero or one hit, so read-level
 
 Pfam totals do not depend on how hits are split between clusters that carry the same Pfam label, so most errors in the within-component split do not reach the level most users will report.
 
-**Evaluation:** all four rules run on the same hit table, so implement gather, winner-take-all and uniqueness-first as cheap baselines in phase 4 and compare against EM in phase 5.
+**Evaluation:** all four rules run on the same hit table, so implement gather, winner-take-all and uniqueness-first as cheap baselines in phase 4 and compare against EM in the phase-7 ablations.
 
 ## Homologous groups and k-mer weighting
 
@@ -241,22 +241,22 @@ Prototype the algorithm in Python, with stable hot loops in Rust from day one vi
 | Component | Language during development | Why |
 | --- | --- | --- |
 | FASTQ streaming, translation, stop-filter frames, amino-acid k-mer packing, hashing, threshold filter | Rust from phase 1 (PyO3 module) | Hot, well-specified, unlikely to change. Pure Python would make every experiment on real data too slow. |
-| Index lookup (sorted hashes, fingerprints) | Rust once the layout settles (end of phase 3) | Memory and speed matter on MGnify-scale subsets. |
-| Index build: clustering tables, p\_in/p\_out scoring, floors, tiers | Python (polars, DuckDB) | Where most design changes happen. |
+| Index lookup (sorted hashes, fingerprints) | Rust once the layout settles (end of phase 3); memory-mapped in phase 6 | Memory and speed matter on MGnify-scale subsets. |
+| Index build: clustering tables, p\_in/p\_out scoring, floors, tiers | Python (polars, DuckDB) through phase 5; Rust or a partitioned build in phase 6 | Where most design changes happen, but the Python build cannot hold the full release in memory, so it is the component that blocks full-scale work. |
 | Assignment, EM, zero-inflated negative-binomial model, dispersion test | Python (numpy, scipy) | Statistical design still open; easiest to iterate and inspect. |
 | Evaluation, plots, ablations | Python + Nextflow | Stays Python permanently. |
-| Final CLI and full pipeline | Rust (phase 6) | Release product. |
+| Final CLI and full pipeline | Rust (phase 8) | Release product. |
 
 **Rules for the split**
 
 - The Rust kernels expose batch APIs that return numpy arrays (e.g. read index, frame, hash per kept k-mer), never per-k-mer Python calls.
 - Every Rust kernel has a slow pure-Python twin under `reference/`, used only in tests; property tests check they agree.
-- Before porting (end of phase 5), write a short algorithm spec: parameters, formulas, file formats. The port implements the spec; the Python outputs on fixtures become golden files.
+- Before porting (end of phase 7), write a short algorithm spec: parameters, formulas, file formats. The port implements the spec; the Python outputs on fixtures become golden files.
 - A Python component moves to Rust early only if profiling shows it blocks experiments, and its interface has not changed for a phase.
 
 ## Implementation plan
 
-Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype with Rust kernels, phase 6 is the Rust port. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
+Ten phases, each with a go/no-go gate; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, and phase 8 ports the rest to Rust. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
 
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
@@ -265,9 +265,11 @@ Eight phases, each with a go/no-go gate; phases 1–5 are the Python prototype w
 | 2. Index prototype (built; gate needs a real subset) | Build from a MGnify biome subset (DuckDB/Parquet): member k-mers per 90% group, p\_in/p\_out scores, per-cluster floor (non-singletons), connected components, tier 1/tier 2, fingerprints; stored as Parquet + numpy. | Python | Sizes match the analytical estimates; scoring behaves on hand-checked clusters. |
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
 | 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence, copies-scaled abundance, posterior intervals, ambiguity groups, presence probability, copies error calibrated on real data; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
-| 5. Evaluation and freeze (in progress: tool benchmark with DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3.9 and 4 built, results pending on HPC; see Progress log) | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND; ablations; divergence ladder. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen; spec reviewed. |
-| 6. Rust port and full-scale tuning | Index build, query, model and CLI in Rust, implementing the spec. Differential tests against the Python golden outputs (exact for counts, tolerance for EM). Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale, then the full build. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding, memory-mapped lookup; re-run the fmh and simulation benchmarks at each candidate to choose defaults on cost vs accuracy. Expect many iterations and some accuracy given up for cost. | Rust | All golden tests pass; ≥ 10x Python end to end; MGnify-scale index builds on one node at a chosen cost/accuracy point, with the accuracy given up versus phase 5 recorded. |
-| 7. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 5 results. |
+| 5. Tool benchmarks (in progress: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3.9 and 4 built, results pending on HPC; see Progress log) | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND on the fmh benchmark, with CPU time and peak memory per tool. | Python + Nextflow | Every tool scored with the same truth and metrics; our accuracy and cost relative to each recorded. |
+| 6. Full-scale method | Make the method run on all of MGnify Proteins at a reasonable compute cost, before any ablation. Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale. Scalable build: index build and lookup in Rust (ported ahead of the spec, as the rules above allow for a component that blocks experiments) or a hash-partitioned Nextflow build; memory-mapped lookup. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding; re-run the fmh and simulation benchmarks at each candidate to choose defaults on cost vs accuracy. Then the full build and a query of the fmh-benchmark metagenomes against it. Expect many iterations and some accuracy given up for cost. | Rust + Python + Nextflow | Full MGnify index builds on one HPC node at a chosen cost/accuracy point (build time, index size, query memory and time recorded), with the accuracy given up versus phases 4–5 recorded. |
+| 7. Ablations and freeze | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k; divergence ladder. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen at full-scale cost; spec reviewed. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
+| 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
+| 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -282,6 +284,7 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Full-scale runs:** anything over the whole release (subset extraction, index build) ships as a Nextflow pipeline with README and setup scripts for HPC; local work uses samples only.
 
 * **Decided (2026-09-28): full-scale check in phase 6, not phase 4.** No test or benchmark so far uses the full MGnify release: unit tests use fixtures, the simulation 300 synthetic units from 100 MGnify seed proteins, the fmh benchmark KEGG KO indexes (tier 2 72 MB, dense tier 1.09 GB at 1/10), and the only real MGnify build is the pre-fix gut 1-in-10,000 subset (213,645 proteins, about 4×10⁻⁵ of the release). The Python build holds the members table and k-mer tables in memory, so a full-release build needs the Rust port (or a partitioned build) anyway. Phase 6 therefore carries the full-scale cost study and tuning (see the phase table). Expect a lot of tuning there to bring cost down, and some compromises on accuracy; defaults chosen in phase 5 are provisional until phase 6 has priced them, and the phase-4/5 accuracy numbers are the reference that any cost saving is measured against.
+* **Decided (2026-09-29): full-scale method before ablations; phases re-ordered.** Supersedes the phase-6 placement above. Ablations measured on the prototype at small scale could pick defaults that the full-scale cost tuning then overturns, so the full-scale method now comes first. Phase 5 keeps only the tool benchmarks; the new phase 6 (full-scale method) takes the cost study, scalable build, tuning and full build from the old phase 6; ablations, divergence ladder, spec and golden outputs move to phase 7 and run against the phase-6 method; the Rust port of query, model and CLI becomes phase 8 and release phase 9. The index build and lookup move to Rust (or a partitioned build) in phase 6, ahead of the spec, because they block full-scale work; phase 8 brings them in line with the spec.
 
 ### Phase 1
 
@@ -629,16 +632,16 @@ rust-toolchain.toml   # pinned stable
 .cargo/config.toml    # target-cpu=x86-64-v3 for release
 crates/core/          # kernels: fastx, translation, k-mers, hashing, samplers, lookup
 crates/py/            # PyO3 bindings over core -> <name>._core
-crates/cli/           # phase 6: final Rust binary (index, query, model)
+crates/cli/           # phase 8: final Rust binary (index, query, model)
 python/<name>/        # prototype: index build, query, model, typer CLI
 python/<name>/reference/  # slow pure-Python twins of the kernels (test oracles)
 tests/python/  tests/data/  tests/golden/   # golden outputs from the prototype
 scripts/              # fixture generation, data download
 eval/                 # Nextflow benchmarks, notebooks
-docs/spec.md          # algorithm spec, written at end of phase 5
+docs/spec.md          # algorithm spec, written at end of phase 7
 ```
 
-Keeping `crates/core` free of PyO3 means phase 6 reuses the kernels unchanged; only `crates/py` knows about Python.
+Keeping `crates/core` free of PyO3 means phases 6 and 8 reuse the kernels unchanged; only `crates/py` knows about Python.
 
 **Pre-commit** (the `pre-commit` framework, or its Rust port `prek`):
 
@@ -653,18 +656,18 @@ Keeping `crates/core` free of PyO3 means phase 6 reuses the kernels unchanged; o
 - `ci.yml` on push and pull request, three jobs:
   - **rust**: fmt, clippy with `-D warnings`, `cargo nextest`, `cargo doc`, MSRV build, `cargo deny`.
   - **python**: `astral-sh/setup-uv`, `uv sync` (builds the extension in release mode), ruff, mypy, pytest with hypothesis, on Python 3.11–3.13.
-  - **parity**: Rust kernels vs `reference/` twins on fixtures and the CI community; from phase 6, the Rust CLI vs `tests/golden/`.
+  - **parity**: Rust kernels vs `reference/` twins on fixtures and the CI community; from phase 8, the Rust CLI vs `tests/golden/`.
   - Matrix: ubuntu-latest and macos-latest (arm64, covers NEON). Coverage from `pytest-cov` and `cargo-llvm-cov` to Codecov.
 - Use `dtolnay/rust-toolchain`, `Swatinem/rust-cache`, and `taiki-e/install-action` for nextest, cargo-deny and llvm-cov.
 - `bench.yml`: manual or weekly `pytest-benchmark` and criterion runs; not a merge gate.
-- `release.yml` (phase 7): `cargo-dist` binaries on tags, optional wheels via `PyO3/maturin-action`; bioconda recipe after the first tagged release.
+- `release.yml` (phase 9): `cargo-dist` binaries on tags, optional wheels via `PyO3/maturin-action`; bioconda recipe after the first tagged release.
 - Dependabot for Cargo, uv and Actions; branch protection on `main` requiring `ci.yml`.
 
 ## Risks and open questions
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
 
-- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Deferred to phase 6 (see Progress log): the Python prototype cannot build the full release on one node, so full-scale storage and compute are measured and tuned there.
+- **MGnify scale.** A floor on all 1.66×10^9 clusters would need \~160 GB of index; on the 0.45×10^9 non-singletons, \~45 GB. Phase 6 (see Progress log): the Python prototype cannot build the full release on one node, so full-scale storage and compute are measured and tuned there, before the phase-7 ablations.
 - **Component size.** Promiscuous k-mers can chain clusters into one giant component, which makes the EM serial. Measure component sizes on the development subset in phase 2 and tune the N-clusters cut-off.
 
 * **Marginal novelty.** Setting sourmash to scaled = 100 may recover most of the completeness gap at modest cost. Run that baseline in phase 3 before building phase 4.
