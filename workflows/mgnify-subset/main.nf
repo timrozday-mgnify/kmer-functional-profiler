@@ -1,6 +1,6 @@
 // MGnify Proteins subset (whole MGnify90 clusters of one biome) -> members table -> index,
-// the full-scale cost study (per-cluster statistics -> predicted index size), and the
-// partitioned index build over the buckets.
+// the full-scale cost study (per-cluster statistics -> predicted index size), the
+// partitioned index build over the buckets, and the query cost study (--query).
 // See README.md.
 
 process MEMBERSHIP {
@@ -354,6 +354,87 @@ process CONCAT {
     "mkdir index && touch index/meta.json"
 }
 
+// Query cost (phase 6, Q1): nested read subsets of one run x indexes.
+process FETCH_READS {
+    tag "${run}"
+
+    input:
+    val run
+
+    output:
+    tuple path("${run}_1.fastq.gz"), path("${run}_2.fastq.gz")
+
+    script:
+    """
+    read -r _ urls md5s < <(curl -fsS --retry 5 \\
+        'https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=fastq_ftp,fastq_md5&format=tsv' \\
+        | tail -n 1)
+    for url in \${urls//;/ }; do curl -fsSL --retry 5 -C - -O "https://\$url"; done
+    paste -d ' ' <(tr ';' '\\n' <<< "\$md5s") <(tr ';' '\\n' <<< "\$urls" | xargs -n 1 basename | sed 's/^/ /') \\
+        | md5sum -c -
+    """
+
+    stub:
+    "touch ${run}_1.fastq.gz ${run}_2.fastq.gz"
+}
+
+process LADDER {
+    input:
+    tuple path(r1), path(r2)
+
+    output:
+    path 'reads.*.fastq.gz'
+
+    script:
+    def pairs = params.query_ladder.toString().tokenize(',').join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py ladder --r1 ${r1} --r2 ${r2} \\
+        --pairs ${pairs} --seed ${params.query_seed}
+    """
+
+    stub:
+    params.query_ladder.toString().tokenize(',').collect { n -> "touch reads.${n}_1.fastq.gz reads.${n}_2.fastq.gz" }.join('\n')
+}
+
+process QUERY {
+    tag "${pairs} pairs, ${name}, draws ${draws}"
+    publishDir "${params.outdir}/query", mode: 'copy', pattern: '*.json'
+
+    input:
+    tuple val(pairs), path(r1), path(r2), val(name), path(index), val(draws)
+
+    output:
+    path "${name}.${pairs}.${draws}.json"
+
+    script:
+    """
+    export POLARS_MAX_THREADS=${task.cpus} OMP_NUM_THREADS=${task.cpus} OPENBLAS_NUM_THREADS=${task.cpus}
+    ${params.kfp} query ${index} ${r1} ${r2} --draws ${draws} --out profile.tsv \\
+        --stats ${name}.${pairs}.${draws}.json
+    """
+
+    stub:
+    "touch ${name}.${pairs}.${draws}.json"
+}
+
+process QUERY_COST {
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path stats
+
+    output:
+    path 'query_cost.tsv'
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py query-cost ${stats}
+    """
+
+    stub:
+    "touch query_cost.tsv"
+}
+
 workflow {
     // Nested subsets: extract at the densest sample, then keep 1 in N of its clusters.
     def samples = params.sample.toString().tokenize(',').collect { it.trim() as long }.sort()
@@ -366,12 +447,14 @@ workflow {
     if (params.build && (samples.size() > 1 || !params.pfam)) {
         error "--build needs one --sample and --pfam true"
     }
-    // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
-    def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
-    MEMBERSHIP(samples[0], width)
-    ch_shards = channel.of(0..<(params.shards as int)).map { i -> [i, i * width, (i + 1) * width] }
-    EXTRACT(ch_shards, MEMBERSHIP.out.membership)
-    MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())
+    if (params.index || params.stats || params.build) {
+        // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
+        def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
+        MEMBERSHIP(samples[0], width)
+        ch_shards = channel.of(0..<(params.shards as int)).map { i -> [i, i * width, (i + 1) * width] }
+        EXTRACT(ch_shards, MEMBERSHIP.out.membership)
+        MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())
+    }
     if (params.stats) {
         STATS(MERGE.out.members)
         COMBINE(STATS.out.stats.flatten().collect())
@@ -409,5 +492,27 @@ workflow {
         // Set dedup reduce: one job per set-hash range, so CONCAT holds only distinct sets.
         DEDUP(channel.of(0..<(params.ranges as int)), ch_part_ids, ch_part_files)
         CONCAT(ch_part_ids, ch_part_files, DEDUP.out.flatten().collect(), UNITS.out)
+    }
+    if (params.query) {
+        if (!params.query_indexes) {
+            error "--query needs --query_indexes, e.g. 'cost-nested/1in*/index'"
+        }
+        ch_run = params.query_reads
+            ? channel.of(params.query_reads.toString().tokenize(',').collect { f -> file(f, checkIfExists: true) })
+            : FETCH_READS(params.query_run)
+        ch_reads = LADDER(ch_run).flatten()
+            .map { f -> [(f.name =~ /reads\.(\d+)_/)[0][1] as long, f] }
+            .groupTuple(size: 2)
+            .map { n, fs -> [n] + fs.sort { f -> f.name } }
+        // Index name: its parent directory (1inN).
+        ch_indexes = channel.fromPath(params.query_indexes, type: 'dir', checkIfExists: true)
+            .map { d -> [d.parent.name, d] }
+        ch_cells = ch_reads.combine(ch_indexes)
+        // draws 0 everywhere; posterior draws on one index column only.
+        ch_query = ch_cells.map { c -> c + [0] }
+            .mix(ch_cells.filter { c -> params.query_draws > 0 && c[3] == params.query_draws_on }
+                .map { c -> c + [params.query_draws] })
+        QUERY(ch_query)
+        QUERY_COST(QUERY.out.collect())
     }
 }

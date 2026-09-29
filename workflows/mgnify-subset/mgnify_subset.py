@@ -24,16 +24,24 @@ One subcommand per pipeline step (``main.nf``):
   ``pack-range``, ``dedup``, ``concat``: the
   partitioned index build over the buckets (``kmer_functional_profiler.partition``); build
   options as ``kmer-functional-profiler index``.
+- ``ladder``: nested read subsets of a paired run (``--pairs`` sizes): the pairs ranked
+  below n in one shuffle seeded by ``--seed``, so each subset holds the smaller ones.
+- ``query-cost``: ``kmer-functional-profiler query --stats`` files named
+  ``{index}.{pairs}.{draws}.json`` -> ``query_cost.tsv``, one row per query.
 
 ``--release`` is a local directory or an https prefix (DuckDB reads it remotely).
 """
 
 import argparse
 import itertools
+import json
+import subprocess
 import sys
 from dataclasses import fields, replace
+from pathlib import Path
 
 import duckdb
+import numpy as np
 import polars as pl
 
 from kmer_functional_profiler import partition
@@ -234,6 +242,56 @@ def build(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
             partition.concat(args.parts, args.sets, args.units, args.out, params)
 
 
+def ladder(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
+    sizes = sorted(args.pairs)
+    count = subprocess.Popen(["gzip", "-dc", args.r1], stdout=subprocess.PIPE)
+    n_pairs = int(subprocess.run(["wc", "-l"], stdin=count.stdout, capture_output=True).stdout) // 4
+    if sizes[-1] > n_pairs:
+        sys.exit(f"--pairs {sizes[-1]}: the run has {n_pairs} pairs")
+    rank = np.random.default_rng(args.seed).permutation(n_pairs)
+    # First subset each pair is in (it is in every larger one too); len(sizes) = none.
+    first = np.searchsorted(sizes, rank, side="right").astype(np.uint8).tobytes()
+    del rank
+    reads = [
+        subprocess.Popen(["gzip", "-dc", r], stdout=subprocess.PIPE) for r in (args.r1, args.r2)
+    ]
+    outs = [
+        [
+            subprocess.Popen(
+                f"gzip -1 > reads.{n}_{mate}.fastq.gz", shell=True, stdin=subprocess.PIPE
+            )
+            for n in sizes
+        ]
+        for mate in (1, 2)
+    ]
+    mates = [zip(*[r.stdout] * 4, strict=False) for r in reads]  # type: ignore[list-item]
+    # strict: the mates must have as many reads.
+    for i, pair in enumerate(zip(*mates, strict=True)):
+        if first[i] < len(sizes):
+            r1, r2 = (b"".join(lines) for lines in pair)
+            for j in range(first[i], len(sizes)):
+                outs[0][j].stdin.write(r1)  # type: ignore[union-attr]
+                outs[1][j].stdin.write(r2)  # type: ignore[union-attr]
+    for proc in [count, *reads, *outs[0], *outs[1]]:
+        if proc.stdin:
+            proc.stdin.close()
+        if proc.wait():
+            sys.exit(f"{proc.args} failed")
+
+
+def query_cost(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
+    rows = []
+    for path in map(Path, args.paths):
+        index, pairs, draws = path.name.removesuffix(".json").split(".")
+        stats = json.loads(path.read_text())
+        row = {"index": index, "pairs": int(pairs), "draws": int(draws), **stats["counts"]}
+        for stage, cost in stats["stages"].items():
+            row |= {f"{stage}_{k}": v for k, v in cost.items()}
+        rows.append(row)
+    table = pl.DataFrame(rows, infer_schema_length=None).sort("index", "pairs", "draws")
+    table.write_csv("query_cost.tsv", separator="\t", float_precision=3)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--threads", type=int, default=1)
@@ -338,6 +396,13 @@ def main() -> None:
     concat_p.add_argument("--sets", nargs="+", required=True, help="dedup prefixes, in order")
     concat_p.add_argument("--units", default="units")
     concat_p.add_argument("--out", default="index")
+    p = sub.add_parser("ladder")
+    p.add_argument("--r1", required=True)
+    p.add_argument("--r2", required=True)
+    p.add_argument("--pairs", type=int, nargs="+", required=True, help="subset sizes")
+    p.add_argument("--seed", type=int, default=1)
+    p = sub.add_parser("query-cost")
+    p.add_argument("paths", nargs="+")
     args = parser.parse_args()
     steps = {
         "membership": membership,
@@ -347,6 +412,8 @@ def main() -> None:
         "stats": stats,
         "combine": combine,
         **dict.fromkeys(build_steps, build),
+        "ladder": ladder,
+        "query-cost": query_cost,
     }
     steps[args.step](connect(args), args)
 
