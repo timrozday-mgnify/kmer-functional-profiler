@@ -113,3 +113,58 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     empty.write_csv(tmp_path / "score2.tsv", separator="\t")
     run(tmp_path, "summary", "score.tsv", "score2.tsv")
     assert pl.read_csv(tmp_path / "summary.tsv", separator="\t")["n_samples"].to_list() == [2] * 3
+
+
+def test_tool_profile_and_cost(tmp_path: Path) -> None:
+    kos = tmp_path / "kos.csv"
+    kos.write_text(",gene_id,ko_id\n0,g1,ko:K00001\n1,g2,ko:K00002\n2,g2,ko:K00003\n")
+
+    def profile(tool: str, files: dict[str, str], *extra: str) -> dict[str, tuple[int, float]]:
+        raw = tmp_path / tool
+        raw.mkdir()
+        for name, text in files.items():
+            (raw / name).write_text(text)
+        run(tmp_path, "tool-profile", "--tool", tool, "--raw", str(raw), "--kos", str(kos),
+            "--out", f"{tool}.tsv", *extra)  # fmt: skip
+        out = pl.read_csv(tmp_path / f"{tool}.tsv", separator="\t")
+        return {n: (e, a) for n, e, a in out.iter_rows()}
+
+    # DIAMOND: mates of one pair count once; a gene with two KOs counts for both
+    hits = "p1/1\tg1|x\t50\t100\t90\np1/2\tg1|x\t50\t100\t90\np2/1\tg2|y\t30\t60\t50\n"
+    assert profile("diamond", {"hits.tsv": hits}) == {
+        "ko:K00001": (1, 1.0), "ko:K00002": (1, 0.5), "ko:K00003": (1, 0.5)}  # fmt: skip
+
+    # fmh-funprofiler: shared hashes = intersect_bp / scaled; its own abundance
+    prefetch = "match_name,intersect_bp,f_match_query\nko:K00001,3000,0.1\nko:K00002,1000,0.3\n"
+    ko = "ko_id,abundance\nko:K00001,0.25\nko:K00002,0.75\n"
+    assert profile("fmh_funprofiler", {"prefetch.csv": prefetch, "ko.csv": ko}) == {
+        "ko:K00001": (3, 0.25), "ko:K00002": (1, 0.75)}  # fmt: skip
+
+    # kMermaid: read pairs, and reads / mean member length
+    pl.DataFrame(
+        {
+            "protein_id": ["a", "b", "c"],
+            "cluster_rep": ["ko:K00001", "ko:K00001", "ko:K00002"],
+            "sequence": ["M" * 100, "M" * 300, "M" * 50],
+        }  # fmt: skip
+    ).write_parquet(tmp_path / "members.parquet")
+    reads = (
+        "seq_name\tcluster_rep\tprot_name\tscore\np1/1\tko:K00001\tx\t5\np1/2\tko:K00001\tx\t4\n"
+    )
+    assert profile("kmermaid", {"kmermaid.tsv": reads}, "--members", "members.parquet") == {
+        "ko:K00001": (1, 2 / 200)}  # fmt: skip
+
+    # HUMAnN: unstratified KO rows only, KEGG's "ko:" prefix added
+    table = ("# Gene Family\treads_Abundance-RPKs\nUNMAPPED\t10\nUNGROUPED\t5\nK00001\t2.5\n"
+             "K00001|g__Escherichia.s__Escherichia_coli\t2.5\nK00002\t0\n")  # fmt: skip
+    assert profile("humann", {"ko.tsv": table}) == {"ko:K00001": (1, 2.5)}
+
+    trace = ("task_id\tname\tstatus\trealtime\t%cpu\tpeak_rss\n"
+             "1\tPROFILE (seed 1 kfp_s100)\tCOMPLETED\t3600000\t100\t2000000000\n"
+             "2\tPROFILE (seed 2 kfp_s100)\tCACHED\t7200000\t50\t1000000000\n"
+             "3\tDIAMOND (seed 1)\tFAILED\t10\t100\t1\n")  # fmt: skip
+    (tmp_path / "trace.tsv").write_text(trace)
+    run(tmp_path, "cost", "trace.tsv")
+    cost = pl.read_csv(tmp_path / "cost.tsv", separator="\t").row(0, named=True)
+    assert (cost["what"], cost["tasks"], cost["hours_mean"], cost["cpu_hours_mean"],
+            cost["peak_rss_gb"]) == ("kfp_s100", 2, 1.5, 1.0, 2.0)  # fmt: skip

@@ -2,8 +2,9 @@
 
 KO detection by kmer-functional-profiler indexes against fmh-funprofiler's KO sketches on
 simulated metagenomes, following the fmh-funprofiler paper (Bioinformatics 2024) but with
-InSilicoSeq instead of CAMISIM. This is the phase-3 gate: completeness and purity at equal
-density.
+InSilicoSeq instead of CAMISIM. This was the phase-3 gate (completeness and purity at equal
+density); from phase 5 it also runs other tools on the same metagenomes (`--tools`, see
+[Other tools](#other-tools)) and scores them the same way.
 
 ```text
 FETCH            Zenodo 10055954 (CC-BY): KEGG genomes (9.1 GB zip), KEGG proteins (3.2 GB),
@@ -20,6 +21,9 @@ PROFILE          kmer-functional-profiler query, every metagenome x every index
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
+DIAMOND_DB, DIAMOND, FMH_FUNPROFILER, KMERMAID_MODEL, KMERMAID, HUMANN_DB, HUMANN
+                 other tools (--tools), in containers; databases built once into --db_dir
+TOOL_PROFILE     each tool's output as a profile (name, evidence, abundance) -> profiles/
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,
                  base-weighted completeness per count (kmers_hit; kmers_unique after gather;
                  kmers_wta, kmers_ufirst after winner-take-all, uniqueness-first)
@@ -44,25 +48,61 @@ here, because the simulator differs.
 
 ## Setup
 
-Needs Java 17+, Nextflow, [uv](https://docs.astral.sh/uv/) and a Rust toolchain.
+Needs Java 17+, Nextflow, [uv](https://docs.astral.sh/uv/) and a Rust toolchain; for the
+other tools, Docker (local) or Singularity/Apptainer (HPC).
 
 ```bash
-bash workflows/setup.sh   # .venv with the package, InSilicoSeq and mappy
+bash workflows/setup.sh                            # .venv with the package, InSilicoSeq and mappy
+bash workflows/fmh-benchmark/containers/build.sh   # kMermaid image (docker)
 ```
+
+Our steps run on the host in `.venv`; only the tool steps use containers (public
+biocontainers for DIAMOND, fmh-funprofiler and HUMAnN; the kMermaid image is built here,
+since kMermaid has no package).
 
 ## Run
 
-Test profile (tiny fake inputs in `tests/data/mini_fmh`, under a minute):
+Test profile (tiny fake inputs in `tests/data/mini_fmh`, a few minutes; DIAMOND,
+fmh-funprofiler and kMermaid, not HUMAnN, whose databases are ~45 GB):
 
 ```bash
-nextflow run workflows/fmh-benchmark -profile test
+nextflow run workflows/fmh-benchmark -profile test,docker
 ```
 
-Full run on Slurm (about 13 GB download on first run, kept in `--data_dir`):
+With Docker Desktop, run from a directory it shares (e.g. under your home; not `/tmp`).
+Without containers, `--tools ''` runs our indexes only, as before phase 5.
 
-```bash
-nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benchmark-data
-```
+### HPC
+
+1. Environment and images (login node, internet):
+
+   ```bash
+   bash workflows/setup.sh
+   bash workflows/fmh-benchmark/containers/pull.sh /shared/singularity-cache
+   ```
+
+   The kMermaid image: on a machine with Docker, `bash workflows/fmh-benchmark/containers/build.sh --sif`
+   writes `kfp-kmermaid.sif` (or `kfp-kmermaid.tar`, to convert on the cluster with
+   `singularity build kfp-kmermaid.sif docker-archive://kfp-kmermaid.tar`); copy it to shared
+   storage. Or push it to a registry with `build.sh --push <registry>`.
+2. Site config: `cp workflows/fmh-benchmark/hpc.example.config workflows/fmh-benchmark/hpc.config`
+   and fill in the paths (data, results, Singularity cache, kMermaid image), partition and
+   account. If compute nodes have no internet, uncomment the line that runs FETCH and
+   HUMANN_DB on the head job's node.
+3. Run the head job:
+
+   ```bash
+   sbatch workflows/fmh-benchmark/run_hpc.sh
+   ```
+
+   Extra arguments go to Nextflow, e.g. `sbatch workflows/fmh-benchmark/run_hpc.sh --tools diamond,fmh_funprofiler`.
+   With `-resume` (always on in `run_hpc.sh`) an earlier run's indexes, samples and truth
+   are reused if `data_dir` and the work directory are the same.
+4. Cost per tool: `.venv/bin/python workflows/fmh-benchmark/bench.py cost <outdir>/trace.tsv`
+   writes `cost.tsv` (tasks, mean wall and CPU hours, peak RSS per step and index/tool).
+
+First run downloads: ~13 GB of Zenodo inputs into `--data_dir`, ~45 GB of HUMAnN
+databases (ChocoPhlAn, UniRef90, utility mapping, MetaPhlAn) into `--db_dir`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -77,6 +117,13 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
+| `--tools` | `diamond,fmh_funprofiler,kmermaid,humann` | Other tools to run and score; `''` for none |
+| `--db_dir` | `--data_dir` | Where tool databases are built once (DIAMOND, kMermaid model, HUMAnN) |
+| `--sketch_scaled` | `1000` | Scaled of `--sketches`, for fmh-funprofiler |
+| `--diamond_args` | `''` | Extra `diamond blastx` options, e.g. `--sensitive` |
+| `--kmermaid_max_members` | `50` | Proteins sampled per KO to train kMermaid |
+| `--kmermaid_container` | `kfp-kmermaid:edcb4ed` | kMermaid image: docker tag, `.sif` path or `docker://` URI |
+| `--metaphlan_index` | `mpa_vJun23_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN (MetaPhlAn 4.1.1 in the HUMAnN 3.9 image) |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
@@ -113,6 +160,37 @@ median `holders` (index KOs holding the k-mer), `hits_max` (most hits on one k-m
 `fmh_compat`, which hashes with sourmash). A false positive's k-mers that are in the
 genomes are real sequence (another gene or KO); those that are not come from read errors.
 Rerunning with `--iss_mode perfect` shows how many false positives errors cause.
+
+## Other tools
+
+Each tool profiles the same 10 metagenomes and is scored against the same truth; its rows
+in `summary.tsv` have `count` = `evidence` and `abundance` = `abundance`, on the tool's own
+scale (Spearman and L1 only need proportionality to depth).
+
+| Tool | Reference | Detection (`evidence`) | Abundance |
+| --- | --- | --- | --- |
+| `diamond` (DIAMOND 2.2.8 blastx, `-k 1`, default sensitivity) | The KEGG proteins our indexes are built from | Read pairs whose best hit is a gene of the KO | Σ aligned / subject length over those reads (as truth depth) |
+| `fmh_funprofiler` (fmh-funprofiler 1.1.1, `funcprofiler`) | Its KO sketches (`--sketches`, scaled 1000, k = 11) | Hashes shared with the KO (`intersect_bp` / scaled), `--threshold_bp` = scaled | Its output (normalised `f_match_query`) |
+| `kmermaid` (kMermaid at `edcb4ed`) | Retrained with KOs as clusters, `--kmermaid_max_members` random proteins per KO | Read pairs assigned to the KO (score ≥ 3) | Reads / mean member length |
+| `humann` (HUMAnN 3.9, MetaPhlAn 4.1.1) | Its own ChocoPhlAn + UniRef90 databases; UniRef90 families regrouped to KOs with its mapping | 1 for every KO it reports (no read counts; `min_hits` 2 repeats 1) | Unstratified RPK |
+
+Why each one:
+
+- **DIAMOND** is the alignment baseline on the same reference: the accuracy a translated
+  search reaches on exactly our KO units, and what it costs.
+- **fmh-funprofiler** runs the released tool (sourmash sketch translate + prefetch) for its
+  cost; its calls should equal `fmh_compat`'s `kmers_hit` rows (they do on the test profile).
+- **kMermaid** ships a model of RefSeq protein clusters without KO labels, so it is retrained
+  on the KO units with its own training code (`kmermaid_kfp.py`), as its README allows. The
+  per-KO cap keeps the model near the size of the shipped one (~55 proteins per cluster);
+  uncapped KEGG KOs would not fit in memory as its Python dicts.
+- **HUMAnN** is the de facto standard, on its own databases. The sample genomes' proteins
+  are in UniRef90, so it has no divergence handicap, but its KO calls go through the
+  UniRef90 → KO mapping rather than KEGG's gene → KO table the truth uses, so part of any
+  gap is annotation, not detection.
+
+Threads differ (DIAMOND 8, HUMAnN 16, the others 1); compare CPU hours in `cost.tsv`, not
+wall time.
 
 ## Results (10 metagenomes, InSilicoSeq novaseq)
 

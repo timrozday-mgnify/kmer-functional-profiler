@@ -19,7 +19,11 @@
   median holders, most hits on one k-mer, and the share found in the sample genomes' six
   frames (``in_genome``; null for sourmash-hashed indexes). A false positive's k-mers that
   are in the genomes come from real sequence (another gene or KO); the rest from read errors.
+- ``tool-profile``: another tool's output (DIAMOND, fmh-funprofiler, kMermaid, HUMAnN) as
+  a profile SCORE reads: ``name``, ``evidence`` (the tool's detection count) and ``abundance``.
 - ``summary``: mean and sd of the scores per index, count and threshold.
+- ``cost``: wall time, CPU time and peak memory per step and index or tool, from the raw
+  Nextflow trace.
 - ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
@@ -113,6 +117,7 @@ RULES = (
     ("kmers_unique", "abundance_zi"),
     ("kmers_wta", "coverage_wta"),
     ("kmers_ufirst", "coverage_ufirst"),
+    ("evidence", "abundance"),  # other tools (tool_profile)
 )
 _BIN = 1000  # bp; overlap candidates are only compared within a shared bin
 
@@ -379,6 +384,104 @@ def detected(args: argparse.Namespace) -> None:
     )
 
 
+def _read_pair(col: str) -> pl.Expr:
+    """Read-pair name: iss mates end in /1 and /2."""
+    return pl.col(col).str.replace(r"/[12]$", "")
+
+
+def tool_profile(args: argparse.Namespace) -> None:
+    """One tool's raw output -> ``name``, ``evidence``, ``abundance`` (see each branch).
+
+    Abundances are on each tool's own scale; SCORE uses ranks (Spearman) and relative
+    abundances (L1), so only proportionality to depth matters.
+    """
+    raw = Path(args.raw)
+    if args.tool == "diamond":
+        # best hit per read (-k 1); a gene with several KOs counts for each. Evidence: read
+        # pairs; abundance: aligned / subject length summed over reads, as truth depth is.
+        hits = pl.read_csv(raw / "hits.tsv", separator="\t", has_header=False,
+                           new_columns=["read", "gene", "length", "slen", "bitscore"])  # fmt: skip
+        out = (
+            hits.with_columns(
+                pair=_read_pair("read"), gene_id=pl.col("gene").str.split("|").list.first()
+            )
+            .join(read_kos(args.kos), on="gene_id")
+            .group_by(name="ko_id")
+            .agg(
+                evidence=pl.col("pair").n_unique(),
+                abundance=(pl.col("length") / pl.col("slen")).sum(),
+            )
+        )
+    elif args.tool == "fmh_funprofiler":
+        # evidence: shared hashes (sourmash reports intersect_bp = hashes x scaled);
+        # abundance: funcprofiler's own output (normalised f_match_query)
+        prefetch = pl.read_csv(raw / "prefetch.csv", infer_schema_length=None)
+        out = prefetch.select(
+            name="match_name", evidence=(pl.col("intersect_bp") // args.scaled)
+        ).join(pl.read_csv(raw / "ko.csv").rename({"ko_id": "name"}), on="name")
+    elif args.tool == "kmermaid":
+        # one cluster (KO) per read; evidence: read pairs; abundance: reads / mean member
+        # length (aa), i.e. proportional to depth
+        reads = pl.read_csv(raw / "kmermaid.tsv", separator="\t", quote_char=None)
+        lengths = (
+            pl.scan_parquet(args.members)
+            .group_by(name="cluster_rep")
+            .agg(length=pl.col("sequence").str.len_chars().mean())
+            .collect()
+        )
+        out = (
+            reads.group_by(name="cluster_rep")
+            .agg(evidence=_read_pair("seq_name").n_unique(), n=pl.len())
+            .join(lengths, on="name")
+            .select("name", "evidence", abundance=pl.col("n") / pl.col("length"))
+        )
+    elif args.tool == "humann":
+        # unstratified KO rows of the regrouped gene families (RPK). HUMAnN reports no read
+        # counts, so every reported KO has evidence 1 (min_hits > 1 scores the same calls).
+        table = pl.read_csv(raw / "ko.tsv", separator="\t", quote_char=None)
+        # (KO ids as "K00001", KEGG's as "ko:K00001"; UNMAPPED and UNGROUPED do not match)
+        out = (
+            table.rename(dict(zip(table.columns, ["name", "abundance"], strict=True)))
+            .filter(~pl.col("name").str.contains("|", literal=True), pl.col("abundance") > 0)
+            .with_columns(
+                name="ko:" + pl.col("name").str.extract(r"^(K\d{5})$"), evidence=pl.lit(1)
+            )
+            .drop_nulls("name")
+        )
+    else:
+        raise ValueError(f"unknown tool {args.tool}")
+    out.select("name", "evidence", "abundance").sort("name").write_csv(args.out, separator="\t")
+
+
+def cost(args: argparse.Namespace) -> None:
+    """Per step and index/tool: tasks, mean wall and CPU hours, max peak RSS (GB).
+
+    Needs the raw trace (``trace.raw = true``: ms and bytes). PROFILE tasks are split by
+    index (the tag's last word); every other step is its own row.
+    """
+    trace = pl.read_csv(args.trace, separator="\t", null_values=["-"], infer_schema_length=None)
+    step = pl.col("name").str.extract(r"^(\S+)")
+    tag = pl.col("name").str.extract(r"\((.*)\)$")
+    (
+        trace.filter(pl.col("status").is_in(["COMPLETED", "CACHED"]))  # cached: first run's metrics
+        .with_columns(
+            step=step,
+            what=pl.when(step == "PROFILE").then(tag.str.extract(r"(\S+)$")).otherwise(step),
+            hours=pl.col("realtime") / 3.6e6,
+            cpu_hours=pl.col("realtime") / 3.6e6 * pl.col("%cpu") / 100,
+        )
+        .group_by("step", "what")
+        .agg(
+            tasks=pl.len(),
+            hours_mean=pl.col("hours").mean(),
+            cpu_hours_mean=pl.col("cpu_hours").mean(),
+            peak_rss_gb=pl.col("peak_rss").max() / 1e9,
+        )
+        .sort("step", "what")
+        .write_csv(args.out, separator="\t", float_precision=4)
+    )
+
+
 def summary(args: argparse.Namespace) -> None:
     keys = ["index", "count", "abundance", "min_hits"]
     # A metric that is empty in one file (e.g. group_cover when no group formed) reads as
@@ -459,12 +562,24 @@ def main() -> None:
     for name in ("truth", "profile", "kmers", "index-dir", "fna", "sample", "index"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--out", default="detected.tsv")
+    p = sub.add_parser("tool-profile")
+    p.add_argument("--tool", required=True,
+                   choices=["diamond", "fmh_funprofiler", "kmermaid", "humann"])  # fmt: skip
+    p.add_argument("--raw", required=True, help="directory with the tool's output files")
+    p.add_argument("--kos", help="gene -> KO table (diamond)")
+    p.add_argument("--members", help="members.parquet (kmermaid)")
+    p.add_argument("--scaled", type=int, default=1000, help="sketch scaled (fmh_funprofiler)")
+    p.add_argument("--out", default="profile.tsv")
+    p = sub.add_parser("cost")
+    p.add_argument("trace")
+    p.add_argument("--out", default="cost.tsv")
     p = sub.add_parser("summary")
     p.add_argument("scores", nargs="+")
     p.add_argument("--out", default="summary.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
-             "detected": detected, "summary": summary}  # fmt: skip
+             "detected": detected, "summary": summary, "tool-profile": tool_profile,
+             "cost": cost}  # fmt: skip
     steps[args.step](args)
 
 
