@@ -92,6 +92,20 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     zi = scores.filter(abundance="abundance_zi", min_hits=1).row(0, named=True)
     assert zi["ci_cover"] == 1.0
     assert zi["ci_width"] == pytest.approx(math.log(4))
+    # Two false positives, one grouped with a true KO: fp_grouped counts the ungrouped one too.
+    first = exact["name"][0]
+    grouped = pl.concat(
+        [exact, *(exact.head(1).with_columns(name=pl.lit(p)) for p in ("ko:FP1", "ko:FP2"))]
+    ).with_columns(
+        ambiguity_group=pl.when(pl.col("name").is_in([first, "ko:FP1"])).then(pl.lit(1)),
+        group_abundance_zi_lo=pl.lit(0.0),
+        group_abundance_zi_hi=pl.lit(1e9),
+    )
+    grouped.write_csv(tmp_path / "g.tsv", separator="\t")
+    run(tmp_path, "score", "--truth", "truth.csv", "--profile", "g.tsv", "--sample", "s",
+        "--index", "i", "--out", "g_score.tsv")  # fmt: skip
+    g = pl.read_csv(tmp_path / "g_score.tsv", separator="\t")
+    assert g.filter(abundance="abundance_zi", min_hits=1)["fp_grouped"].item() == 0.5
     # A score file where a metric is empty (read as String) still stacks with the others.
     empty = pl.read_csv(tmp_path / "score.tsv", separator="\t").with_columns(
         pl.lit(None, dtype=pl.Float64).alias("l1"), sample=pl.lit("t")
