@@ -118,8 +118,9 @@ process SIMULATE {
     tuple val(seed), path('reads_R1.fastq.gz'), path('reads_R2.fastq.gz'), emit: reads
 
     script:
+    // bench.py iss patches the perfect model's bugs in iss 2.0.1
     """
-    ${params.venv}/bin/iss generate --genomes ${fna} ${params.iss_mode == 'perfect' ? '--mode perfect' : "--model ${params.iss_model}"} \\
+    ${params.iss_mode == 'perfect' ? "${params.bench} iss generate --mode perfect" : "${params.venv}/bin/iss generate --model ${params.iss_model}"} --genomes ${fna} \\
         --n_reads ${params.n_reads} --abundance lognormal --seed ${seed} \\
         --cpus ${task.cpus} --compress --output reads
     """
