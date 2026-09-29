@@ -14,18 +14,27 @@
   threshold. Each count is paired with its abundance estimates (``RULES``), scored on the detected
   KOs against ``depth``: Spearman over true positives and L1 between relative abundances,
   and the calibration of posterior intervals where the profile has them.
+- ``detected``: one row per KO gather keeps (``kmers_unique`` >= 1), true or false, with
+  its evidence (``present_prob``, ``own_evidence``, ...) and its tier-2 hit k-mers summarised:
+  median holders, most hits on one k-mer, and the share found in the sample genomes' six
+  frames (``in_genome``; null for sourmash-hashed indexes). A false positive's k-mers that
+  are in the genomes come from real sequence (another gene or KO); the rest from read errors.
 - ``summary``: mean and sd of the scores per index, count and threshold.
 """
 
 import argparse
 import itertools
+import json
 import random
 from collections.abc import Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 import mappy
+import numpy as np
 import polars as pl
+
+from kmer_functional_profiler import _core
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
                   "end_position": pl.Int64}  # fmt: skip
@@ -228,6 +237,19 @@ def group_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, float
     }
 
 
+def presence_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, float | None]:
+    """Mean ``present_prob`` of true (``prob_tp``) and false (``prob_fp``) positives, and the
+    share of each below 0.5 (``flag_tp``, ``flag_fp``)."""
+    if "present_prob" not in detected.columns:
+        return dict.fromkeys(("prob_tp", "prob_fp", "flag_tp", "flag_fp"))
+    d = detected.select("present_prob", tp=pl.col("name").is_in(truth["ko_id"].implode()))
+    out: dict[str, float | None] = {}
+    for name, part in (("tp", d.filter("tp")), ("fp", d.filter(~pl.col("tp")))):
+        out[f"prob_{name}"] = part["present_prob"].mean() if part.height else None  # type: ignore[assignment]
+        out[f"flag_{name}"] = (part["present_prob"] < 0.5).mean() if part.height else None
+    return out
+
+
 def interval_scores(tp: pl.DataFrame) -> dict[str, float | None]:
     if "lo" not in tp.columns or tp.height == 0:
         return {"ci_cover": None, "ci_width": None}
@@ -288,9 +310,61 @@ def score(args: argparse.Namespace) -> None:
                     if abundance == "abundance_zi"
                     else {"fp_grouped": None, "group_cover": None}
                 ),
+                **(
+                    presence_scores(truth, detected)
+                    if abundance == "abundance_zi"
+                    else dict.fromkeys(("prob_tp", "prob_fp", "flag_tp", "flag_fp"))
+                ),
             }
         )
     pl.DataFrame(rows).write_csv(args.out, separator="\t")
+
+
+DETECTED_COLUMNS = ("kmers_unique", "kmers_hit", "hits", "m_g", "n_members", "present_prob",
+                    "own_evidence", "ambiguity_group", "abundance_zi")  # fmt: skip
+
+
+def detected(args: argparse.Namespace) -> None:
+    truth = pl.read_csv(args.truth)
+    profile = pl.read_csv(args.profile, separator="\t").filter(pl.col("kmers_unique") >= 1)
+    kmers = pl.read_parquet(args.kmers).join(profile.select("unit"), on="unit", how="semi")
+    meta = json.loads((Path(args.index_dir) / "meta.json").read_text())
+    if meta["hash"] == "sourmash" or kmers.height == 0:
+        kmers = kmers.with_columns(in_genome=pl.lit(None, pl.Boolean))
+    else:
+        p = meta["params"]
+        genome = _core.hash_dna(
+            [s.encode() for _, s in fasta(args.fna)],
+            p["k"],
+            alphabet=p["alphabet"],
+            frames="all",
+            max_hash=int(kmers["hash"].max()),  # type: ignore[arg-type]
+        )["hash"]
+        kmers = kmers.with_columns(in_genome=pl.col("hash").is_in(np.unique(genome)))
+    per_unit = kmers.group_by("unit").agg(
+        holders_median=pl.col("holders").median(),
+        hits_max=pl.col("hits").max(),
+        in_genome=pl.col("in_genome").mean(),
+    )
+    (
+        profile.join(per_unit, on="unit", how="left")
+        .with_columns(
+            sample=pl.lit(args.sample),
+            index=pl.lit(args.index),
+            tp=pl.col("name").is_in(truth["ko_id"].implode()),
+        )
+        .select(
+            "sample",
+            "index",
+            "name",
+            "tp",
+            *[c for c in DETECTED_COLUMNS if c in profile.columns],
+            "holders_median",
+            "hits_max",
+            "in_genome",
+        )
+        .write_csv(args.out, separator="\t")
+    )
 
 
 def summary(args: argparse.Namespace) -> None:
@@ -341,13 +415,17 @@ def main() -> None:
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--min-hits", type=int, nargs="+", default=[1])
     p.add_argument("--out", default="score.tsv")
+    p = sub.add_parser("detected")
+    for name in ("truth", "profile", "kmers", "index-dir", "fna", "sample", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--out", default="detected.tsv")
     p = sub.add_parser("summary")
     p.add_argument("scores", nargs="+")
     p.add_argument("--out", default="summary.tsv")
     args = parser.parse_args()
-    {"members": members, "sample": sample, "truth": truth, "score": score, "summary": summary}[
-        args.step
-    ](args)
+    steps = {"members": members, "sample": sample, "truth": truth, "score": score,
+             "detected": detected, "summary": summary}  # fmt: skip
+    steps[args.step](args)
 
 
 if __name__ == "__main__":

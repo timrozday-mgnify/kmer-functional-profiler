@@ -78,10 +78,19 @@ def query(
     draws: Annotated[
         int, typer.Option(help="Posterior draws for 95% intervals and ambiguity groups")
     ] = 0,
+    kmers: Annotated[
+        Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
+    ] = None,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     result = profile(
-        Index.load(index_dir), r1, r2, genetic_code=genetic_code, frames=frames, draws=draws
+        Index.load(index_dir),
+        r1,
+        r2,
+        genetic_code=genetic_code,
+        frames=frames,
+        draws=draws,
+        kmers_out=kmers,
     )
     result.write_csv(out, separator="\t")
     typer.echo(f"{result.height} units hit -> {out}", err=True)

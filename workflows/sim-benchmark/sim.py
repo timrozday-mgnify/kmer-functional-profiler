@@ -23,8 +23,9 @@ the true depth:
 - ``bias_<identity>``: median estimate / depth of true positives at that strain identity,
   over the median at 100%; 1 = divergence costs nothing.
 
-``index_mb`` is the size of the index's lookup tables. With ``--draws`` D, the
-``gather_zi`` rows add interval calibration (:func:`calibration`). Writes ``scores.tsv`` (per
+``index_mb`` is the size of the index's lookup tables. The ``gather_zi`` rows add how
+``present_prob`` separates true from false positives (:func:`presence_scores`) and, with
+``--draws`` D, interval calibration (:func:`calibration`). Writes ``scores.tsv`` (per
 seed) and ``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds per seed.
 """
 
@@ -185,6 +186,19 @@ def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> d
     }
 
 
+def presence_scores(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, float]:
+    """``present_prob`` of the units gather keeps: mean over true (``prob_tp``) and false
+    (``prob_fp``) positives, and the share of each below 0.5 (``flag_tp``, ``flag_fp``)."""
+    d = result.filter(pl.col("kmers_unique") >= 1).select(
+        "present_prob", tp=pl.col("unit").is_in(truth["unit"].implode())
+    )
+    out = {}
+    for name, part in (("tp", d.filter("tp")), ("fp", d.filter(~pl.col("tp")))):
+        out[f"prob_{name}"] = part["present_prob"].mean()
+        out[f"flag_{name}"] = (part["present_prob"] < 0.5).mean()
+    return out  # type: ignore[return-value]
+
+
 def calibration(truth: pl.DataFrame, result: pl.DataFrame, units: pl.DataFrame) -> dict[str, float]:
     """How well ``coverage_zi``'s posterior intervals and ambiguity groups hold the truth.
 
@@ -275,7 +289,12 @@ def main() -> None:
             for rule, (count, abundance) in RULES.items():
                 found = result.filter(pl.col(count) >= 1).select("unit", estimate=abundance)
                 extra = (
-                    calibration(truth, result, units) if args.draws and rule == "gather_zi" else {}
+                    {
+                        **presence_scores(truth, result),
+                        **(calibration(truth, result, units) if args.draws else {}),
+                    }
+                    if rule == "gather_zi"
+                    else {}
                 )
                 rows.append({"config": config, "rule": rule, "seed": seed, "index_mb": index_mb,
                              **score(truth, found, families), **extra})  # fmt: skip

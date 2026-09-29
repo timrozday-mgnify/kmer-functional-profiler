@@ -19,6 +19,7 @@ from kmer_functional_profiler.query import (
     fit_present_prior,
     gather,
     posterior_zi,
+    presence,
     profile,
 )
 
@@ -147,7 +148,7 @@ def test_shared_evidence_groups_lopsided_pair() -> None:
         rows = [x for x in rows if x[1] not in own_of_1 or x[2] % 10 == 0]  # 1 stray hit
         schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
         hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
-        got = posterior_zi(hit_reads, np.array([25, 5, 12]), np.array([25.0, 5.0, 12.0]), 30)
+        got = posterior_zi(hit_reads, np.array([25, 5, 12]), np.array([25.0, 5.0, 12.0]), 200)
         return (
             dict(got.select("unit", "ambiguity_group").iter_rows()),
             dict(got.select("unit", "own_evidence").iter_rows()),
@@ -317,3 +318,21 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
     assert {"cluster_rep", "hits", "containment", "coverage"} <= set(table.columns)
+
+
+def test_presence_doubts_few_and_shared_hits() -> None:
+    # Unit 0: 20 of 30 k-mers hit. Units 1 and 2: one k-mer each, held by 1 and by 40 index
+    # units. Unit 3: 3 k-mers, all shared with unit 0.
+    rows = [(0, h, 1) for h in range(20)] + [(1, 100, 1), (2, 200, 40)]
+    rows += [(3, h, 1) for h in range(3)]
+    kmers = pl.DataFrame(
+        rows, schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32}, orient="row"
+    )
+    m_g = np.full(4, 30)
+    got = dict(presence(kmers, m_g, 30_000.0, 1000).iter_rows())
+    assert got[0] > 0.99
+    assert got[2] < got[1] < 0.5
+    assert got[3] < 0.5
+    # With no background exposure to speak of, one unique k-mer is credible.
+    alone = dict(presence(kmers, m_g, 1e12, 5).iter_rows())
+    assert alone[1] > 0.99 and alone[1] > got[1]

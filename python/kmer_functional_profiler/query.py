@@ -34,10 +34,11 @@ from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedT
 def unit_hits(
     table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray, reads: np.ndarray
 ) -> pl.DataFrame:
-    """Expand sampled query hashes to (unit, hash, read, pin_q) hits through ``table``.
+    """Expand sampled query hashes to (unit, hash, read, pin_q, holders) hits through ``table``.
 
     A hit counts for a unit only if the hash passes that unit's ``max_hash_g``; ``pin_q`` is
-    the k-mer's quantised ``p_in`` in that unit.
+    the k-mer's quantised ``p_in`` in that unit and ``holders`` the number of index units
+    it counts for.
     """
     set_ids = table.lookup(hashes)
     found = set_ids >= 0
@@ -49,10 +50,18 @@ def unit_hits(
     values = table.set_values[np.repeat(starts, lengths) + within]
     units = (values >> np.uint64(PIN_BITS)).astype(np.uint32)
     pin_q = (values & np.uint64(2**PIN_BITS - 1)).astype(np.uint8)
-    hashes, reads = np.repeat(hashes, lengths), np.repeat(reads, lengths)
-    keep = hashes <= max_hash_g[units]
+    hit = np.repeat(np.arange(len(hashes)), lengths)
+    keep = hashes[hit] <= max_hash_g[units]
+    holders = np.bincount(hit[keep], minlength=len(hashes)).astype(np.uint32)
+    hit = hit[keep]
     return pl.DataFrame(
-        {"unit": units[keep], "hash": hashes[keep], "read": reads[keep], "pin_q": pin_q[keep]}
+        {
+            "unit": units[keep],
+            "hash": hashes[hit],
+            "read": reads[hit],
+            "pin_q": pin_q[keep],
+            "holders": holders[hit],
+        }
     )
 
 
@@ -272,6 +281,65 @@ def fit_present_prior(
     return max(mean * strength, 1.0), max((1 - mean) * strength, 1.0)
 
 
+def presence(
+    kmers: pl.DataFrame,
+    m_g: np.ndarray,
+    exposure: float,
+    n_index_units: int,
+    *,
+    tol: float = 1e-6,
+    max_iter: int = 200,
+) -> pl.DataFrame:
+    """Probability that each unit is present rather than its hits being background.
+
+    ``kmers`` has one row per (``unit``, ``hash``) hit with the k-mer's index ``holders``.
+    A k-mer is hit by background (off-target homologs, error k-mers) with probability
+    beta x holders: k-mers many units share are conserved motifs, which unindexed genes
+    carry too. A present unit hits each of its ``m_g`` k-mers with probability p = its
+    hit k-mers / ``m_g``. Per unit, the likelihood ratio of present vs absent compares its
+    hit k-mers (under absence explained by background or by the other detected units
+    holding them) and its unhit ones; with prior probability rho of presence this gives
+    ``present_prob``. So the evidence is the unit's hit k-mers against the background
+    k-mers expected among its ``m_g`` (about h log(h / (m_g beta holders)) - h), and a unit
+    hit on one k-mer, or only on k-mers many units hold, gets a low probability. beta
+    (background k-mers per unit of ``exposure``, the sum of holders over the k-mers where
+    background could be seen) and rho (share of the ``n_index_units`` present) are fitted
+    to the sample by fixed-point iteration, starting from all hit k-mers as background.
+
+    A floor of one copy's k-mers at the fitted coverage was tried and dropped: divergent
+    strains keep far fewer k-mers (0.85^11 = 17% at 85% identity), so it flagged them as
+    background. The per-k-mer approximation (presence odds, not exact joint presence of
+    the holders) is fine while beta and each unit's p are small.
+    """
+    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
+    hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    n = len(units)
+    holders = np.zeros(len(hashes))
+    holders[row] = kmers["holders"].to_numpy()
+    m = m_g[units].astype(np.float64)
+    hit = np.bincount(col, minlength=n)
+    p = np.minimum(hit / m, 1 - 1e-9)
+    others = np.bincount(row, weights=p[col], minlength=len(hashes))[row] - p[col]
+    unhit = (m - hit) * np.log1p(-p)
+    exposure = max(exposure, 1.0)
+    beta, rho = len(hashes) / exposure, (n + 1) / (n_index_units + 2)
+    for _ in range(max_iter):
+        llr = np.bincount(col, np.log1p(p[col] / (beta * holders[row] + others)), n) + unhit
+        prob = 1 / (1 + np.exp(-np.clip(np.log(rho / (1 - rho)) + llr, -700, 700)))
+        # Hit k-mers none of whose holders is present are background.
+        background = np.exp(np.bincount(row, np.log1p(-np.minimum(prob, 1 - 1e-12))[col]))
+        new_beta = (background.sum() + 1) / exposure
+        rho = (prob.sum() + 1) / (n_index_units + 2)
+        done = abs(new_beta - beta) <= tol * beta
+        beta = new_beta
+        if done:
+            break
+    return pl.DataFrame(
+        {"unit": units, "present_prob": prob},
+        schema={"unit": pl.UInt32, "present_prob": pl.Float64},
+    )
+
+
 MH_STEPS: Final = 5  # Metropolis steps on coverage per sweep
 PI_GRID: Final = (np.arange(512) + 0.5) / 512  # present-fraction grid for exact draws
 
@@ -288,6 +356,9 @@ def posterior_zi(
     pin_sum: np.ndarray,
     draws: int,
     *,
+    present_prob: np.ndarray | None = None,
+    len_cv: np.ndarray | None = None,
+    copies_error: float = 0.0,
     sweeps: int = 10,
     level: float = 0.95,
     shared_evidence: float = 0.5,
@@ -310,7 +381,12 @@ def posterior_zi(
        Gamma(1, 0.01) prior); and draws the present fraction exactly on a grid from hit
        k-mers ~ Binomial(m, pi (1 - e^-lambda)), plus the present unhit k-mers for copies.
 
-    A unit given no hits in a draw is absent in it (coverage and abundance 0). Where units
+    A unit given no hits in a draw is absent in it (coverage and abundance 0), and so is one
+    dropped with probability 1 - ``present_prob[unit]`` (:func:`presence`), so weak or
+    background-like evidence widens intervals down to 0. Copies (present k-mers over
+    ``pin_sum``) assume an average member; each draw scales them by exp(N(0, s^2)), s^2 =
+    log(1 + ``len_cv[unit]``^2 / copies) + ``copies_error``^2, the spread of the mean
+    kept k-mers of that many members plus a calibrated floor. Where units
     cannot be told apart, their shared counts move between them across draws, so their
     intervals widen. Ambiguity groups come from shared evidence: over all draws, a unit is
     linked to another when at least ``shared_evidence`` of the hits allocated to it lie on
@@ -340,8 +416,10 @@ def posterior_zi(
     position = np.arange(len(row_s)) - starts[row_s]
     holders = np.bincount(row_s, minlength=n_rows)
     m = m_g[units].astype(np.float64)
+    keep_prob = np.ones(n_units) if present_prob is None else present_prob[units]
+    cv2 = np.zeros(n_units) if len_cv is None else len_cv[units] ** 2
     coverage = np.zeros((draws, n_units))
-    abundance = np.zeros_like(coverage)
+    abundance, group_coverage, group_abundance = (np.zeros_like(coverage) for _ in range(3))
     evidence = np.zeros(len(row_s))  # hits allocated per (k-mer, unit) entry, all draws
     for b in range(draws):
         weight = rng.poisson(1.0, len(reads))[read_of]
@@ -387,8 +465,15 @@ def posterior_zi(
             pi = PI_GRID[np.minimum(pick, len(PI_GRID) - 1)]
         unhit_odds = pi * (1 - seen) / (1 - pi * seen)
         present = hit + rng.binomial(np.maximum(m - hit, 0).astype(np.int64), unhit_odds)
+        copies = present / pin_sum[units]
+        sd = np.sqrt(np.log1p(cv2 / np.maximum(copies, 1.0)) + copies_error**2)
+        scaled = lam * copies * np.exp(rng.normal(0.0, sd))
+        # Group totals keep a dropped member's share: under absence its hits go to others.
+        group_coverage[b] = np.where(alive, lam, 0.0)
+        group_abundance[b] = np.where(alive, scaled, 0.0)
+        alive &= rng.random(n_units) < keep_prob
         coverage[b] = np.where(alive, lam, 0.0)
-        abundance[b] = np.where(alive, lam * present / pin_sum[units], 0.0)
+        abundance[b] = np.where(alive, scaled, 0.0)
         evidence += given
 
     # Ambiguity groups: link a unit to another holder of its hit k-mers when most of its
@@ -417,7 +502,8 @@ def posterior_zi(
     np.minimum.at(group_id, group, np.arange(n_units))  # smallest member index per group
     group_unit = units[group_id[group]]
     total = [np.stack([np.bincount(group, w, minlength=group.max() + 1) for w in x])[:, group]
-             for x in (coverage, abundance)]  # fmt: skip
+             for x in (group_coverage, group_abundance)]  # fmt: skip
+    total = [np.where(size > 1, t, x) for t, x in zip(total, (coverage, abundance), strict=True)]
     tails = [(1 - level) / 2, (1 + level) / 2]
     columns = {"unit": units.astype(np.uint32)}
     for name, x in (("coverage_zi", coverage), ("abundance_zi", abundance),
@@ -439,6 +525,7 @@ def profile(
     frames: str = "stopfree",
     batch_reads: int = 100_000,
     draws: int = 0,
+    kmers_out: str | Path | None = None,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -458,8 +545,12 @@ def profile(
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
     gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
 
+    ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
+    present rather than hit by background; units gather drops get 0.
+
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
-    ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`).
+    ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). ``kmers_out``
+    writes the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
     """
     params = IndexParams(**index.meta["params"])
 
@@ -480,11 +571,13 @@ def profile(
     max_hash_g = index.units["max_hash_g"].to_numpy()
 
     def by_read(hits: pl.DataFrame) -> pl.DataFrame:
-        return hits.group_by("unit", "hash", "read").agg(n=pl.len(), pin_q=pl.col("pin_q").first())
+        return hits.group_by("unit", "hash", "read").agg(
+            n=pl.len(), pin_q=pl.col("pin_q").first(), holders=pl.col("holders").first()
+        )
 
     def per_kmer(per_read: pl.DataFrame) -> pl.DataFrame:
         return per_read.group_by("unit", "hash").agg(
-            hits=pl.col("n").sum(), pin_q=pl.col("pin_q").first()
+            hits=pl.col("n").sum(), pin_q=pl.col("pin_q").first(), holders=pl.col("holders").first()
         )
 
     empty = np.empty(0, dtype=np.uint64)
@@ -495,12 +588,18 @@ def profile(
         ]
     )
     kmer_hits = per_kmer(per_read)
+    if kmers_out is not None:
+        kmer_hits.write_parquet(kmers_out)
     assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
     detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
     pin_hist = index.units["pin_hist"].to_numpy()
     pin_sum = index.units["pin_sum"]
+    len_cv = index.units["len_cv"].to_numpy()
+    tier2 = index.tier2
+    # Background can land on any tier-2 posting: every hit k-mer has a holder gather keeps.
+    exposure = float(np.diff(tier2.set_offsets.astype(np.int64))[tier2.set_ids].sum())
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -520,8 +619,13 @@ def profile(
         m_g = index.units["m_dense"].to_numpy()
         pin_hist = index.units["pin_hist_dense"].to_numpy()
         pin_sum = index.units["pin_sum_dense"]
+        len_cv = index.units["len_cv_dense"].to_numpy()
+        # Dense k-mers are looked up for detected units only.
+        # ponytail: a k-mer two detected units hold counts twice; exact would need the union
+        exposure = float(index.units["holder_sum_dense"].to_numpy()[keep["unit"].to_numpy()].sum())
     plain = em(detected, m_g).select("unit", coverage_em="coverage")
     inflated = em(detected, m_g, zero_inflated=True)
+    present_prob = presence(detected, m_g, exposure, index.units.height)
     prior = fit_present_prior(inflated)
     shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
         "unit", coverage_zib="coverage", present_zib="present"
@@ -549,15 +653,20 @@ def profile(
             kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
             reads=pl.col("read").n_unique().cast(pl.UInt64),
         )
-        .join(index.units.select(pl.exclude("^pin_(hist|sum).*$")), on="unit")
+        .join(index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv|holder_sum).*$")), on="unit")
         .join(assigned, on="unit", how="left")
         .join(plain, on="unit", how="left")
         .join(inflated, on="unit", how="left")
         .join(shrunk, on="unit", how="left")
         .join(weighted, on="unit", how="left")
+        .join(present_prob, on="unit", how="left")
     )
     if draws > 0:
-        intervals = posterior_zi(detected_reads, m_g, pin_sum.to_numpy(), draws)
+        prob = np.zeros(len(m_g))
+        prob[present_prob["unit"].to_numpy()] = present_prob["present_prob"].to_numpy()
+        intervals = posterior_zi(
+            detected_reads, m_g, pin_sum.to_numpy(), draws, present_prob=prob, len_cv=len_cv
+        )
         result = result.join(intervals, on="unit", how="left")
     if dense is not None:
         result = result.join(
@@ -580,6 +689,7 @@ def profile(
             pl.col("^(coverage|present|copies|abundance)_(em|zi|zib|zip)(_lo|_hi)?$").fill_null(
                 0.0
             ),
+            pl.col("present_prob").fill_null(0.0),
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
             kmers_unique=pl.col("kmers_unique").fill_null(0),
