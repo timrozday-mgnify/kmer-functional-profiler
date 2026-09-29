@@ -155,7 +155,10 @@ process TRUTH {
 process PROFILE {
     tag "seed ${seed} ${name}"
     label 'process_single'
-    publishDir "${params.outdir}/profiles", mode: 'copy', saveAs: { "seed${seed}_${name}.tsv" }
+    // one saveAs for both outputs: without the per-file branch they overwrite each other
+    publishDir params.outdir, mode: 'copy', saveAs: { f ->
+        f.endsWith('.parquet') ? "kmers/seed${seed}_${name}.parquet" : "profiles/seed${seed}_${name}.tsv"
+    }
 
     input:
     tuple val(seed), path(r1), path(r2), val(name), path(index)
