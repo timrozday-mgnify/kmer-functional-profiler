@@ -340,3 +340,16 @@ def test_presence_doubts_few_and_shared_hits() -> None:
     # Ten times fewer reads: less background, so one k-mer is more credible.
     fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
     assert fewer[400] > unique
+
+
+def test_posterior_draws_ignore_input_order() -> None:
+    # Seeded draws must not depend on row order, which Polars group_by does not fix.
+    rows = [(u, h, h * 10 + r, 1 + r % 2) for u in (0, 1) for h in range(u * 3, u * 3 + 8)
+            for r in range(3)]  # fmt: skip
+    schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
+    hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
+    m_g, pin_sum = np.array([10, 10]), np.array([10.0, 10.0])
+    got = posterior_zi(hit_reads, m_g, pin_sum, 20)
+    assert got.equals(
+        posterior_zi(hit_reads.sample(fraction=1.0, shuffle=True, seed=1), m_g, pin_sum, 20)
+    )
