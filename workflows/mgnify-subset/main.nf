@@ -7,19 +7,20 @@ process MEMBERSHIP {
 
     input:
     val sample
+    val width
 
     output:
-    path 'membership.parquet', emit: membership
+    path 'membership', emit: membership
 
     script:
     """
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
         membership --release '${params.release}' --biome '${params.biome}' --sample ${sample} \\
-        --max-protein-id ${params.max_protein_id}
+        --max-protein-id ${params.max_protein_id} --shard-width ${width}
     """
 
     stub:
-    "touch membership.parquet"
+    "mkdir membership"
 }
 
 process EXTRACT {
@@ -168,9 +169,9 @@ workflow {
     if (params.index && ((params.buckets as int) > 1 || !params.pfam)) {
         error "--index needs --buckets 1 and --pfam true"
     }
-    MEMBERSHIP(samples[0])
     // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
     def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
+    MEMBERSHIP(samples[0], width)
     ch_shards = channel.of(0..<(params.shards as int)).map { i -> [i, i * width, (i + 1) * width] }
     EXTRACT(ch_shards, MEMBERSHIP.out.membership)
     MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())

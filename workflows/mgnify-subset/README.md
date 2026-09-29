@@ -7,7 +7,8 @@ statistics of the whole release and the index size they predict. Meant for HPC: 
 release is about 1.3 TB of Parquet.
 
 ```text
-MEMBERSHIP  mgy_clusters (biome filter, 1-in-N sample) + mgy_cluster_seqs -> membership.parquet
+MEMBERSHIP  mgy_clusters (biome filter, 1-in-N sample) + mgy_cluster_seqs -> membership/ (one
+            directory per protein_id range)
 EXTRACT     per protein_id range: mgy_protein_sequences, mgy_proteins_pfam  (--shards jobs)
 MERGE       per cluster bucket -> members[.bucketB].parquet (protein_id, cluster_rep,
             full_length, sequence), pfam.parquet                          (--buckets jobs)
