@@ -241,7 +241,6 @@ def git(List cmd) {
 }
 
 workflow {
-    main:
     FETCH()
     MEMBERS(FETCH.out.faa, FETCH.out.kos)
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
@@ -268,28 +267,34 @@ workflow {
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
     SUMMARY(SCORE.out.score.collect())
 
-    onComplete:
-    // run.json: what produced the results in outdir (reads, indexes, code, status)
+    // run.json: what produced the results in outdir (reads, indexes, code, status). params and
+    // workflow are read here: inside the handler, names resolve against the workflow metadata.
+    def run_params = params
+    def wf = workflow
     def reads = params.iss_mode == 'perfect' ? 'error-free (iss perfect)' : "iss ${params.iss_model} (${params.iss_mode})"
-    def info = [
-        description: "${params.replicates} metagenomes x ${params.n_genomes} KEGG genomes, " +
-            "${params.n_reads} reads, ${reads}; ${params.indexes.size()} indexes + fmh_compat; draws ${params.draws}",
-        success: workflow.success,
-        exit_status: workflow.exitStatus,
-        start: workflow.start.toString(),
-        complete: workflow.complete.toString(),
-        duration: workflow.duration.toString(),
-        command_line: workflow.commandLine,
-        profile: workflow.profile,
-        resume: workflow.resume,
-        session_id: workflow.sessionId.toString(),
-        run_name: workflow.runName,
-        nextflow: workflow.nextflow.version.toString(),
-        code: [commit: git(['rev-parse', 'HEAD']), branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
-               uncommitted_changes: !git(['status', '--porcelain']).isEmpty()],
-        params: params,
-    ]
+    def description = "${params.replicates} metagenomes x ${params.n_genomes} KEGG genomes, " +
+        "${params.n_reads} reads, ${reads}; ${params.indexes.size()} indexes + fmh_compat; draws ${params.draws}"
+    def code = [commit: git(['rev-parse', 'HEAD']), branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
+                uncommitted_changes: !git(['status', '--porcelain']).isEmpty()]
     def out = file(params.outdir)
-    out.mkdirs()
-    out.resolve('run.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(info)) + '\n'
+    wf.onComplete {
+        def info = [
+            description: description,
+            success: wf.success,
+            exit_status: wf.exitStatus,
+            start: wf.start.toString(),
+            complete: wf.complete.toString(),
+            duration: wf.duration.toString(),
+            command_line: wf.commandLine,
+            profile: wf.profile,
+            resume: wf.resume,
+            session_id: wf.sessionId.toString(),
+            run_name: wf.runName,
+            nextflow: wf.nextflow.version.toString(),
+            code: code,
+            params: run_params,
+        ]
+        out.mkdirs()
+        out.resolve('run.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(info)) + '\n'
+    }
 }
