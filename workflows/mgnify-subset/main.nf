@@ -306,6 +306,29 @@ process PACK_RANGE {
     "touch part${range}.keys.npy part${range}.json"
 }
 
+process DEDUP {
+    tag "sets ${range}"
+    label 'process_medium'
+
+    input:
+    val range
+    val ranges
+    path parts
+
+    output:
+    path "sets${range}.*"
+
+    script:
+    def prefixes = ranges.collect { r -> "part${r}" }.join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py dedup ${prefixes} --range ${range} \\
+        --ranges ${params.ranges} --out sets${range} ${params.index_args}
+    """
+
+    stub:
+    "touch sets${range}.offsets.npy"
+}
+
 process CONCAT {
     label 'process_high_memory'
     publishDir params.outdir, mode: 'copy'
@@ -313,6 +336,7 @@ process CONCAT {
     input:
     val ranges
     path parts
+    path sets
     path units
 
     output:
@@ -320,8 +344,10 @@ process CONCAT {
 
     script:
     def prefixes = ranges.collect { r -> "part${r}" }.join(' ')
+    def sets_ = (0..<(params.ranges as int)).collect { s -> "sets${s}" }.join(' ')
     """
-    ${params.python} ${projectDir}/mgnify_subset.py concat ${prefixes} ${params.index_args}
+    ${params.python} ${projectDir}/mgnify_subset.py concat ${prefixes} --sets ${sets_} \\
+        ${params.index_args}
     """
 
     stub:
@@ -378,10 +404,10 @@ workflow {
             .combine(UNITS.out)
         PACK_RANGE(ch_range)
         ch_parts = PACK_RANGE.out.toSortedList { a, b -> a[0] <=> b[0] }
-        CONCAT(
-            ch_parts.map { parts -> parts.collect { p -> p[0] } },
-            ch_parts.map { parts -> parts.collect { p -> p[1] }.flatten() },
-            UNITS.out,
-        )
+        ch_part_ids = ch_parts.map { parts -> parts.collect { p -> p[0] } }
+        ch_part_files = ch_parts.map { parts -> parts.collect { p -> p[1] }.flatten() }
+        // Set dedup reduce: one job per set-hash range, so CONCAT holds only distinct sets.
+        DEDUP(channel.of(0..<(params.ranges as int)), ch_part_ids, ch_part_files)
+        CONCAT(ch_part_ids, ch_part_files, DEDUP.out.flatten().collect(), UNITS.out)
     }
 }

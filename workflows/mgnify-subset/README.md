@@ -24,6 +24,7 @@ GROUPS      per hash range: n_groups; candidate rows by bucket              (--r
 POSTINGS    per bucket: score, promiscuity cut, floor, per-unit columns, Pfam
 UNITS       all units numbered by cluster_rep; tier-2 layout and pack ranges
 PACK_RANGE  per pack range: keys and value sets                            (--ranges jobs)
+DEDUP       per set-hash range: distinct value sets                        (--ranges jobs)
 CONCAT      -> index/
 ```
 
@@ -114,17 +115,18 @@ nextflow run workflows/mgnify-subset -profile slurm --biome root --sample 1 \
 
 Tier 2 is packed in hash ranges too: UNITS fixes the table layout from the total
 postings and cuts pack ranges at key boundaries, each PACK_RANGE packs its range's
-postings, and CONCAT joins them, numbering value sets by a hash of their content so
-the result is the same as packing at once. No step holds every posting.
+postings, DEDUP removes duplicate value sets across ranges (split by a hash of the
+sets' content), and CONCAT joins the parts and sets; sets are numbered in hash order, so
+the result is the same as packing at once. No step holds every posting, and CONCAT
+holds only the distinct sets.
 
 At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 s
 (CANDIDATES), 0.2 s (BLOOM), 10 s (PRESENCE), 1 s (GROUPS), 7 s (POSTINGS), 0.1 s
-(UNITS), 1.1 s (PACK_RANGE) and 0.6 s (CONCAT), with presence files of ~11.5 bytes per
+(UNITS), 1.2 s (PACK_RANGE), 0.7 s (DEDUP) and 0.2 s (CONCAT), with presence files of
+~11.5 bytes per
 row. Scaled to the whole release: a ~14 GB Bloom filter (about a minute to fill;
 memory-mapped by every PRESENCE job, so jobs on one node share it), ~140 GB
-of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB) plus
-every range's value sets before they are deduplicated (2.5× the distinct sets at 8
-ranges; more at 256).
+of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB).
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |

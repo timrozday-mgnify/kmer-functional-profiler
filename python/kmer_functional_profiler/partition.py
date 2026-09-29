@@ -19,7 +19,8 @@ the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``uni
 6. ``units`` (once): the unit table, numbered in ``cluster_rep`` order, and the tier-2
    layout, with pack ranges cut at key boundaries.
 7. ``pack_range`` (per pack range): that range's postings -> keys and value sets.
-8. ``concat`` (once): the parts -> tier 2 and ``meta.json``.
+8. ``dedup`` (per set-hash range): every part's value sets in that range, deduplicated.
+9. ``concat`` (once): the parts and deduplicated sets -> tier 2 and ``meta.json``.
 
 The result equals ``build_index`` on the concatenated members. No dense tier yet.
 """
@@ -39,6 +40,7 @@ from kmer_functional_profiler.index import (
     IndexParams,
     PackedPart,
     PackedTable,
+    SetSlice,
     _kmers,
     _len_cv,
     _n_kmers,
@@ -47,6 +49,7 @@ from kmer_functional_profiler.index import (
     _smallest,
     _unit_pfam,
     _unit_table,
+    dedup_sets,
     key_shift,
     packed_layout,
     unit_columns,
@@ -340,18 +343,35 @@ def pack_range(prefixes: Sequence[str], units_dir: str | Path, part: int, out_pr
     Path(f"{out_prefix}.json").write_text(json.dumps(counts) + "\n")
 
 
+def dedup(part_prefixes: Sequence[str], index: int, n_ranges: int, out_prefix: str) -> None:
+    """Stage 8: the parts' value sets whose first hash word lies in set-hash range
+    ``index`` of ``n_ranges`` (equal widths; the hashes are uniform) -> ``SetSlice`` files
+    at ``out_prefix``."""
+    lo = index * 2**64 // n_ranges
+    hi = None if index == n_ranges - 1 else (index + 1) * 2**64 // n_ranges
+    dedup_sets([PackedPart.load(p) for p in part_prefixes], lo, hi).save(out_prefix)
+
+
 def concat(
-    part_prefixes: Sequence[str], units_dir: str | Path, out_dir: str | Path, params: IndexParams
+    part_prefixes: Sequence[str],
+    set_prefixes: Sequence[str],
+    units_dir: str | Path,
+    out_dir: str | Path,
+    params: IndexParams,
 ) -> dict[str, object]:
-    """Stage 8: pack range parts (in range order) -> tier 2, the unit tables and
-    ``meta.json`` in ``out_dir``; returns the stats."""
+    """Stage 9: pack range parts and set slices (each in range order) -> tier 2, the unit
+    tables and ``meta.json`` in ``out_dir``; returns the stats."""
     units_dir, out = Path(units_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     meta = json.loads((units_dir / "pack.json").read_text())
     counts = [json.loads(Path(f"{p}.json").read_text()) for p in part_prefixes]
     if sum(c["postings"] for c in counts) != meta["stats"]["postings"]:
         raise ValueError("pack ranges do not hold every posting")
-    tier2 = PackedTable.concat(meta["layout"], [PackedPart.load(p) for p in part_prefixes])
+    tier2 = PackedTable.concat(
+        meta["layout"],
+        [PackedPart.load(p) for p in part_prefixes],
+        [SetSlice.load(p) for p in set_prefixes],
+    )
     for name in ("units.parquet", "unit_pfam.parquet"):
         if (units_dir / name).exists() and units_dir.resolve() != out.resolve():
             shutil.copyfile(units_dir / name, out / name)

@@ -15,6 +15,7 @@ from kmer_functional_profiler.index import (
     PackedPart,
     PackedTable,
     build_index,
+    dedup_sets,
     key_shift,
     packed_layout,
 )
@@ -49,10 +50,13 @@ def test_packed_table_from_parts_equals_whole() -> None:
     for lo, hi in itertools.pairwise(cuts):
         in_range = (hashes >= np.uint64(lo)) & (hashes < hi) if hi < 2**64 else hashes >= lo
         parts.append(PackedPart.build(hashes[in_range], values[in_range], layout))
-    joined = PackedTable.concat(layout, parts)
-    for field in ("offsets", "fingerprints", "set_ids", "set_offsets", "set_values"):
-        a, b = getattr(whole, field), getattr(joined, field)
-        assert a.dtype == b.dtype and np.array_equal(a, b), field
+    # Sets deduplicated in three set-hash ranges as well as all at once.
+    slices = [dedup_sets(parts, lo, hi) for lo, hi in ((0, 2**62), (2**62, 2**63), (2**63, None))]
+    for joined in (PackedTable.concat(layout, parts), PackedTable.concat(layout, parts, slices)):
+        for field in ("offsets", "fingerprints", "set_ids", "set_offsets", "set_values"):
+            a, b = getattr(whole, field), getattr(joined, field)
+            assert a.dtype == b.dtype and np.array_equal(a, b), field
+    assert all(len(s.offsets) > 1 for s in slices)  # each range holds sets
     assert len(whole.set_offsets) - 1 < len(whole.fingerprints)  # keys share sets
 
 
@@ -106,7 +110,10 @@ def test_partitioned_build_equals_single(tmp_path: Path) -> None:
     parts = [str(d / f"part{r}") for r in range(RANGES)]
     for r, part in enumerate(parts):
         partition.pack_range(prefixes, d / "units", r, part)
-    stats = partition.concat(parts, d / "units", tmp_path / "parted", params)
+    set_slices = [str(d / f"sets{s}") for s in range(RANGES)]
+    for s, prefix in enumerate(set_slices):
+        partition.dedup(parts, s, RANGES, prefix)
+    stats = partition.concat(parts, set_slices, d / "units", tmp_path / "parted", params)
 
     assert stats.keys() == single.keys()
     for key, value in single.items():
