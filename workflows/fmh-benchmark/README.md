@@ -21,8 +21,8 @@ PROFILE          kmer-functional-profiler query, every metagenome x every index
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
-DIAMOND_DB, DIAMOND, FMH_FUNPROFILER, KMERMAID_MODEL, KMERMAID, HUMANN_DB, HUMANN,
-HUMANN4_DB, HUMANN4
+DIAMOND_DB, DIAMOND, FMH_FUNPROFILER, KMERMAID_MODEL, KMERMAID, HUMANN_DB, METAPHLAN_DB,
+HUMANN, HUMANN4
                  other tools (--tools), in containers; databases built once into --db_dir
 TOOL_PROFILE     each tool's output as a profile (name, evidence, abundance) -> profiles/
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,

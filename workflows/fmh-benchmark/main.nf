@@ -342,25 +342,43 @@ process KMERMAID {
 }
 
 process HUMANN_DB {
+    tag "${tool} ${db}"
     label 'process_medium'
-    storeDir "${params.db_dir}/humann"
-    container params.humann3_container  // MetaPhlAn 4.1.1, DIAMOND 2.0.15, bowtie2 2.5.5
+    storeDir "${params.db_dir}/${tool}"  // one database per task: a failed download loses only it
+    container "${image}"
+
+    input:
+    tuple val(tool), val(image), val(db), val(build)
 
     output:
-    tuple path('chocophlan'), path('uniref'), path('utility_mapping'), path('metaphlan'), emit: db
+    tuple val(tool), val(db), path(db), emit: db
 
     script:
-    // ~45 GB: ChocoPhlAn full, UniRef90 (DIAMOND), utility mapping, MetaPhlAn bowtie2 index
+    "humann_databases --download ${db} ${build} . --update-config no"
+
+    stub:
+    "mkdir ${db}"
+}
+
+process METAPHLAN_DB {
+    tag "${tool}"
+    label 'process_medium'
+    storeDir "${params.db_dir}/${tool}"
+    container "${image}"
+
+    input:
+    tuple val(tool), val(image), val(index)
+
+    output:
+    tuple val(tool), path('metaphlan'), emit: db
+
+    script:
     """
-    humann_databases --download chocophlan full . --update-config no
-    humann_databases --download uniref uniref90_diamond . --update-config no
-    humann_databases --download utility_mapping full . --update-config no
-    metaphlan --install --index ${params.metaphlan_index} --bowtie2db metaphlan \\
-        --nproc ${task.cpus}
+    metaphlan --install --index ${index} --bowtie2db metaphlan --nproc ${task.cpus}
     """
 
     stub:
-    "mkdir chocophlan uniref utility_mapping metaphlan"
+    "mkdir metaphlan"
 }
 
 process HUMANN {
@@ -392,30 +410,6 @@ process HUMANN {
 
     stub:
     "mkdir raw && touch raw/ko.tsv"
-}
-
-process HUMANN4_DB {
-    label 'process_medium'
-    storeDir "${params.db_dir}/humann4"
-    container params.humann4_container
-
-    output:
-    tuple path('chocophlan'), path('uniref'), path('utility_mapping'), path('metaphlan'), emit: db
-
-    script:
-    // ~70 GB: HUMAnN 4 alpha's ChocoPhlAn (45 GB compressed), its EC-filtered UniRef90 (the
-    // only translated-search database it distributes), utility mapping, and the MetaPhlAn
-    // database it checks for
-    """
-    humann_databases --download chocophlan full . --update-config no
-    humann_databases --download uniref uniref90_ec_filtered_diamond . --update-config no
-    humann_databases --download utility_mapping full . --update-config no
-    metaphlan --install --index ${params.humann4_metaphlan_index} --bowtie2db metaphlan \\
-        --nproc ${task.cpus}
-    """
-
-    stub:
-    "mkdir chocophlan uniref utility_mapping metaphlan"
 }
 
 process HUMANN4 {
@@ -543,12 +537,28 @@ workflow {
         KMERMAID(SIMULATE.out.reads, KMERMAID_MODEL(MEMBERS.out.members).model)
         ch_raw = ch_raw.mix(KMERMAID.out.raw)
     }
+    // HUMAnN 3.9 (~45 GB) and 4 alpha (~70 GB): ChocoPhlAn full, a UniRef90 DIAMOND database
+    // (4 distributes only the EC-filtered one), utility mapping, and the MetaPhlAn index each uses
+    def humann = [
+        humann:  [params.humann3_container, 'uniref90_diamond', params.metaphlan_index],
+        humann4: [params.humann4_container, 'uniref90_ec_filtered_diamond', params.humann4_metaphlan_index],
+    ].findAll { tool, _cfg -> tool in tools }
+    def dbs = ['chocophlan', 'uniref', 'utility_mapping']
+    HUMANN_DB(channel.fromList(humann.collectMany { tool, cfg ->
+        [[tool, cfg[0], 'chocophlan', 'full'], [tool, cfg[0], 'uniref', cfg[1]], [tool, cfg[0], 'utility_mapping', 'full']]
+    }))
+    METAPHLAN_DB(channel.fromList(humann.collect { tool, cfg -> [tool, cfg[0], cfg[2]] }))
+    // tool -> [chocophlan, uniref, utility_mapping, metaphlan], as HUMANN and HUMANN4 take them
+    def ch_humann_db = HUMANN_DB.out.db
+        .groupTuple(size: dbs.size())
+        .join(METAPHLAN_DB.out.db)
+        .map { tool, names, paths, mpa -> [tool] + dbs.collect { db -> paths[names.indexOf(db)] } + [mpa] }
     if ('humann' in tools) {
-        HUMANN(SIMULATE.out.reads, HUMANN_DB().db)
+        HUMANN(SIMULATE.out.reads, ch_humann_db.filter { it[0] == 'humann' }.map { it.drop(1) }.first())
         ch_raw = ch_raw.mix(HUMANN.out.raw)
     }
     if ('humann4' in tools) {
-        HUMANN4(SIMULATE.out.reads, HUMANN4_DB().db)
+        HUMANN4(SIMULATE.out.reads, ch_humann_db.filter { it[0] == 'humann4' }.map { it.drop(1) }.first())
         ch_raw = ch_raw.mix(HUMANN4.out.raw)
     }
     TOOL_PROFILE(ch_raw, FETCH.out.kos, MEMBERS.out.members, file("${projectDir}/bench.py"))
