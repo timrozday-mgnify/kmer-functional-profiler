@@ -1,5 +1,6 @@
 // fmh-funprofiler benchmark: KO detection by kmer-functional-profiler indexes and by the
-// fmh-funprofiler KO sketches (compat mode) on InSilicoSeq metagenomes. See README.md.
+// fmh-funprofiler KO sketches (compat mode) on InSilicoSeq metagenomes, and by other tools
+// (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN). See README.md.
 
 
 process FETCH {
@@ -217,6 +218,205 @@ process DETECTED {
     "touch detected.tsv"
 }
 
+// ---- Other tools (--tools). Each writes its raw output to raw/; TOOL_PROFILE turns it into
+// a profile SCORE reads. Tools run in pinned containers
+// (-profile docker or singularity); kMermaid's image is built by containers/build.sh.
+
+process DIAMOND_DB {
+    label 'process_medium'
+    storeDir "${params.db_dir}/diamond"
+    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
+
+    input:
+    path faa
+
+    output:
+    path 'kegg.dmnd', emit: db
+
+    script:
+    "diamond makedb --in ${faa} --db kegg --threads ${task.cpus}"
+
+    stub:
+    "touch kegg.dmnd"
+}
+
+process DIAMOND {
+    tag "seed ${seed}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
+
+    input:
+    tuple val(seed), path(r1), path(r2)
+    path db
+
+    output:
+    tuple val(seed), val('diamond'), path('raw'), emit: raw
+
+    script:
+    // best hit per read (-k 1) against the KEGG proteins the KO indexes are built from
+    """
+    mkdir raw
+    cat ${r1} ${r2} > reads.fastq.gz
+    diamond blastx --db ${db} --query reads.fastq.gz --out raw/hits.tsv --threads ${task.cpus} \\
+        --max-target-seqs 1 --outfmt 6 qseqid sseqid length slen bitscore ${params.diamond_args}
+    rm reads.fastq.gz
+    """
+
+    stub:
+    "mkdir raw && touch raw/hits.tsv"
+}
+
+process FMH_FUNPROFILER {
+    tag "seed ${seed}"
+    label 'process_single'
+    container 'quay.io/biocontainers/fmh-funprofiler:1.1.1--pyh106432d_0'
+
+    input:
+    tuple val(seed), path(r1), path(r2)
+    path sketches
+
+    output:
+    tuple val(seed), val('fmh_funprofiler'), path('raw'), emit: raw
+
+    script:
+    // the released tool as its README runs it, on one FASTQ per sample. --threshold_bp =
+    // scaled is one shared hash, its default (1000) at scaled 1000
+    """
+    mkdir raw
+    cat ${r1} ${r2} > reads.fastq.gz
+    funcprofiler reads.fastq.gz ${sketches} ${params.ksize} ${params.sketch_scaled} raw/ko.csv \\
+        -p raw/prefetch.csv -t ${params.sketch_scaled}
+    rm reads.fastq.gz reads.fastq.gz_sketch_*.sig.zip
+    """
+
+    stub:
+    "mkdir raw && touch raw/ko.csv raw/prefetch.csv"
+}
+
+process KMERMAID_MODEL {
+    label 'process_high_memory'
+    storeDir "${params.db_dir}/kmermaid_max${params.kmermaid_max_members}"
+    container params.kmermaid_container
+
+    input:
+    path members
+
+    output:
+    path 'kmermaid_model', emit: model
+
+    script:
+    """
+    kmermaid_kfp.py train --members ${members} \\
+        --max-members ${params.kmermaid_max_members} > train.log
+    """
+
+    stub:
+    "mkdir kmermaid_model"
+}
+
+process KMERMAID {
+    tag "seed ${seed}"
+    label 'process_kmermaid'
+    container params.kmermaid_container
+
+    input:
+    tuple val(seed), path(r1), path(r2)
+    path model
+
+    output:
+    tuple val(seed), val('kmermaid'), path('raw'), emit: raw
+
+    script:
+    // single-threaded Python; mates are classified separately, as kMermaid takes one file
+    """
+    mkdir raw
+    zcat ${r1} ${r2} > reads.fastq
+    kmermaid_kfp.py classify --model ${model} --reads reads.fastq \\
+        --out raw/kmermaid.tsv
+    rm reads.fastq
+    """
+
+    stub:
+    "mkdir raw && touch raw/kmermaid.tsv"
+}
+
+process HUMANN_DB {
+    label 'process_medium'
+    storeDir "${params.db_dir}/humann"
+    container 'quay.io/biocontainers/humann:3.9--py312hdfd78af_0'  // MetaPhlAn 4.1.1, DIAMOND 2.0.15
+
+    output:
+    tuple path('chocophlan'), path('uniref'), path('utility_mapping'), path('metaphlan'), emit: db
+
+    script:
+    // ~45 GB: ChocoPhlAn full, UniRef90 (DIAMOND), utility mapping, MetaPhlAn bowtie2 index
+    """
+    humann_databases --download chocophlan full . --update-config no
+    humann_databases --download uniref uniref90_diamond . --update-config no
+    humann_databases --download utility_mapping full . --update-config no
+    metaphlan --install --index ${params.metaphlan_index} --bowtie2db metaphlan \\
+        --nproc ${task.cpus}
+    """
+
+    stub:
+    "mkdir chocophlan uniref utility_mapping metaphlan"
+}
+
+process HUMANN {
+    tag "seed ${seed}"
+    label 'process_humann'
+    container 'quay.io/biocontainers/humann:3.9--py312hdfd78af_0'  // MetaPhlAn 4.1.1, DIAMOND 2.0.15
+
+    input:
+    tuple val(seed), path(r1), path(r2)
+    tuple path(chocophlan), path(uniref), path(utility), path(mpa)
+
+    output:
+    tuple val(seed), val('humann'), path('raw'), emit: raw
+
+    script:
+    // HUMAnN takes unpaired reads: both mates in one file, as its docs advise. UniRef90
+    // families are regrouped to KOs with HUMAnN's own UniRef90 -> KO mapping.
+    """
+    mkdir raw
+    cat ${r1} ${r2} > reads.fastq.gz
+    humann --input reads.fastq.gz --output out --threads ${task.cpus} \\
+        --nucleotide-database ${chocophlan} --protein-database ${uniref} \\
+        --metaphlan-options "--bowtie2db ${mpa} --index ${params.metaphlan_index} --nproc ${task.cpus}"
+    humann_regroup_table --input out/reads_genefamilies.tsv \\
+        --custom ${utility}/map_ko_uniref90.txt.gz --output raw/ko.tsv
+    cp out/reads_genefamilies.tsv raw/
+    rm -r reads.fastq.gz out/reads_humann_temp
+    """
+
+    stub:
+    "mkdir raw && touch raw/ko.tsv"
+}
+
+process TOOL_PROFILE {
+    tag "seed ${seed} ${tool}"
+    label 'process_single'
+    publishDir "${params.outdir}/profiles", mode: 'copy', saveAs: { "seed${seed}_${tool}.tsv" }
+
+    input:
+    tuple val(seed), val(tool), path(raw)
+    path kos
+    path members
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    tuple val(seed), val(tool), path('profile.tsv'), emit: profile
+
+    script:
+    """
+    ${params.bench} tool-profile --tool ${tool} --raw ${raw} --kos ${kos} --members ${members} \\
+        --scaled ${params.sketch_scaled}
+    """
+
+    stub:
+    "touch profile.tsv"
+}
+
 process SUMMARY {
     label 'process_single'
     publishDir params.outdir, mode: 'copy'
@@ -256,7 +456,6 @@ workflow {
 
     PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_code)
     ch_scored = PROFILE.out.profile.combine(TRUTH.out.truth, by: 0)  // seed, name, profile, kmers, truth
-    SCORE(ch_scored.map { seed, name, profile, _kmers, truth -> [seed, name, profile, truth] }, file("${projectDir}/bench.py"))
     DETECTED(
         ch_scored
             .combine(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] }, by: 0)
@@ -265,6 +464,37 @@ workflow {
         file("${projectDir}/bench.py"),
     )
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
+
+    def tools = params.tools ? params.tools.toString().tokenize(',')*.trim() : []
+    def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann']
+    if (unknown) {
+        error "Unknown --tools: ${unknown.join(', ')}"
+    }
+    def ch_raw = channel.empty()
+    if ('diamond' in tools) {
+        DIAMOND(SIMULATE.out.reads, DIAMOND_DB(FETCH.out.faa).db)
+        ch_raw = ch_raw.mix(DIAMOND.out.raw)
+    }
+    if ('fmh_funprofiler' in tools) {
+        FMH_FUNPROFILER(SIMULATE.out.reads, FETCH.out.sketches)
+        ch_raw = ch_raw.mix(FMH_FUNPROFILER.out.raw)
+    }
+    if ('kmermaid' in tools) {
+        KMERMAID(SIMULATE.out.reads, KMERMAID_MODEL(MEMBERS.out.members).model)
+        ch_raw = ch_raw.mix(KMERMAID.out.raw)
+    }
+    if ('humann' in tools) {
+        HUMANN(SIMULATE.out.reads, HUMANN_DB().db)
+        ch_raw = ch_raw.mix(HUMANN.out.raw)
+    }
+    TOOL_PROFILE(ch_raw, FETCH.out.kos, MEMBERS.out.members, file("${projectDir}/bench.py"))
+
+    SCORE(
+        ch_scored
+            .map { seed, name, profile, _kmers, truth -> [seed, name, profile, truth] }
+            .mix(TOOL_PROFILE.out.profile.combine(TRUTH.out.truth, by: 0)),
+        file("${projectDir}/bench.py"),
+    )
     SUMMARY(SCORE.out.score.collect())
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and
