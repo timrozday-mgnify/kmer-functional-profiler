@@ -21,7 +21,8 @@ PROFILE          kmer-functional-profiler query, every metagenome x every index
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
-DIAMOND_DB, DIAMOND, FMH_FUNPROFILER, KMERMAID_MODEL, KMERMAID, HUMANN_DB, HUMANN
+DIAMOND_DB, DIAMOND, FMH_FUNPROFILER, KMERMAID_MODEL, KMERMAID, HUMANN_DB, HUMANN,
+HUMANN4_DB, HUMANN4
                  other tools (--tools), in containers; databases built once into --db_dir
 TOOL_PROFILE     each tool's output as a profile (name, evidence, abundance) -> profiles/
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,
@@ -53,17 +54,22 @@ other tools, Docker (local) or Singularity/Apptainer (HPC).
 
 ```bash
 bash workflows/setup.sh                            # .venv with the package, InSilicoSeq and mappy
-bash workflows/fmh-benchmark/containers/build.sh   # kMermaid image (docker)
+bash workflows/fmh-benchmark/containers/build.sh   # kMermaid, HUMAnN 3.9, HUMAnN 4 images (docker)
 ```
 
-Our steps run on the host in `.venv`; only the tool steps use containers (public
-biocontainers for DIAMOND, fmh-funprofiler and HUMAnN; the kMermaid image is built here,
-since kMermaid has no package).
+Our steps run on the host in `.venv`; only the tool steps use containers: public
+biocontainers for DIAMOND and fmh-funprofiler, and three images built here. kMermaid has
+no package. HUMAnN 3.9's biocontainer resolves bowtie2 2.2.3, whose `bowtie2-build` has no
+`--threads`, so HUMAnN fails at its index build; `containers/humann3` adds bowtie2 2.5.5.
+HUMAnN 4 (4.0.0.alpha.2) is only on GitHub; `containers/humann4` installs it at a fixed
+commit on top of that image, which already has the MetaPhlAn (4.1.1) and DIAMOND (2.0.15)
+versions it pins.
 
 ## Run
 
 Test profile (tiny fake inputs in `tests/data/mini_fmh`, a few minutes; DIAMOND,
-fmh-funprofiler and kMermaid, not HUMAnN, whose databases are ~45 GB):
+fmh-funprofiler and kMermaid, not HUMAnN, whose databases are ~45 GB for 3.9 and ~70 GB
+for 4; `-stub --tools humann,humann4` checks their wiring):
 
 ```bash
 nextflow run workflows/fmh-benchmark -profile test,docker
@@ -81,14 +87,15 @@ Without containers, `--tools ''` runs our indexes only, as before phase 5.
    bash workflows/fmh-benchmark/containers/pull.sh /shared/singularity-cache
    ```
 
-   The kMermaid image: on a machine with Docker, `bash workflows/fmh-benchmark/containers/build.sh --sif`
-   writes `kfp-kmermaid.sif` (or `kfp-kmermaid.tar`, to convert on the cluster with
-   `singularity build kfp-kmermaid.sif docker-archive://kfp-kmermaid.tar`); copy it to shared
-   storage. Or push it to a registry with `build.sh --push <registry>`.
+   The built images: on a machine with Docker, `bash workflows/fmh-benchmark/containers/build.sh --sif`
+   writes `kfp-kmermaid.sif`, `kfp-humann3.sif` and `kfp-humann4.sif` (or `.tar` files,
+   without Singularity there, to convert on the cluster with
+   `singularity build kfp-<name>.sif docker-archive://kfp-<name>.tar`); copy them to shared
+   storage. Or push them to a registry with `build.sh --push <registry>`.
 2. Site config: `cp workflows/fmh-benchmark/hpc.example.config workflows/fmh-benchmark/hpc.config`
-   and fill in the paths (data, results, Singularity cache, kMermaid image), partition and
-   account. If compute nodes have no internet, uncomment the line that runs FETCH and
-   HUMANN_DB on the head job's node.
+   and fill in the paths (data, results, Singularity cache, the three built images),
+   partition and account. If compute nodes have no internet, uncomment the line that runs
+   FETCH and the HUMAnN database downloads on the head job's node.
 3. Run the head job:
 
    ```bash
@@ -101,8 +108,10 @@ Without containers, `--tools ''` runs our indexes only, as before phase 5.
 4. Cost per tool: `.venv/bin/python workflows/fmh-benchmark/bench.py cost <outdir>/trace.tsv`
    writes `cost.tsv` (tasks, mean wall and CPU hours, peak RSS per step and index/tool).
 
-First run downloads: ~13 GB of Zenodo inputs into `--data_dir`, ~45 GB of HUMAnN
-databases (ChocoPhlAn, UniRef90, utility mapping, MetaPhlAn) into `--db_dir`.
+First run downloads: ~13 GB of Zenodo inputs into `--data_dir`; into `--db_dir`, ~45 GB of
+HUMAnN 3.9 databases (ChocoPhlAn, UniRef90, utility mapping, MetaPhlAn vJun23) and ~70 GB
+of HUMAnN 4 ones (ChocoPhlAn v4 alpha, 45 GB compressed; EC-filtered UniRef90; utility
+mapping; MetaPhlAn vOct22_202403).
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -117,13 +126,16 @@ databases (ChocoPhlAn, UniRef90, utility mapping, MetaPhlAn) into `--db_dir`.
 | `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
-| `--tools` | `diamond,fmh_funprofiler,kmermaid,humann` | Other tools to run and score; `''` for none |
+| `--tools` | `diamond,fmh_funprofiler,kmermaid,humann,humann4` | Other tools to run and score; `''` for none |
 | `--db_dir` | `--data_dir` | Where tool databases are built once (DIAMOND, kMermaid model, HUMAnN) |
 | `--sketch_scaled` | `1000` | Scaled of `--sketches`, for fmh-funprofiler |
 | `--diamond_args` | `''` | Extra `diamond blastx` options, e.g. `--sensitive` |
 | `--kmermaid_max_members` | `50` | Proteins sampled per KO to train kMermaid |
 | `--kmermaid_container` | `kfp-kmermaid:edcb4ed` | kMermaid image: docker tag, `.sif` path or `docker://` URI |
-| `--metaphlan_index` | `mpa_vJun23_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN (MetaPhlAn 4.1.1 in the HUMAnN 3.9 image) |
+| `--humann3_container` | `kfp-humann3:3.9-bt2.5.5` | HUMAnN 3.9 image, as above |
+| `--humann4_container` | `kfp-humann4:e07b3a3` | HUMAnN 4 image, as above |
+| `--metaphlan_index` | `mpa_vJun23_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN 3.9 (MetaPhlAn 4.1.1) |
+| `--humann4_metaphlan_index` | `mpa_vOct22_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN 4 (the one it checks for) |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
@@ -173,6 +185,7 @@ scale (Spearman and L1 only need proportionality to depth).
 | `fmh_funprofiler` (fmh-funprofiler 1.1.1, `funcprofiler`) | Its KO sketches (`--sketches`, scaled 1000, k = 11) | Hashes shared with the KO (`intersect_bp` / scaled), `--threshold_bp` = scaled | Its output (normalised `f_match_query`) |
 | `kmermaid` (kMermaid at `edcb4ed`) | Retrained with KOs as clusters, `--kmermaid_max_members` random proteins per KO | Read pairs assigned to the KO (score ≥ 3) | Reads / mean member length |
 | `humann` (HUMAnN 3.9, MetaPhlAn 4.1.1) | Its own ChocoPhlAn + UniRef90 databases; UniRef90 families regrouped to KOs with its mapping | 1 for every KO it reports (no read counts; `min_hits` 2 repeats 1) | Unstratified RPK |
+| `humann4` (HUMAnN 4.0.0.alpha.2 at `e07b3a3`, MetaPhlAn 4.1.1) | Its v4 alpha ChocoPhlAn + EC-filtered UniRef90 (the only protein database it distributes); regrouped as above | As `humann` | Unstratified adjusted CPM |
 
 Why each one:
 
@@ -188,6 +201,13 @@ Why each one:
   are in UniRef90, so it has no divergence handicap, but its KO calls go through the
   UniRef90 → KO mapping rather than KEGG's gene → KO table the truth uses, so part of any
   gap is annotation, not detection.
+- **HUMAnN 4** is the current development release (alpha, GitHub only), run as distributed:
+  its translated search covers only UniRef90 families with an EC number, so KOs without
+  one are found only through the nucleotide search against the pangenomes of species
+  MetaPhlAn detects. MetaPhlAn runs as a separate command before HUMAnN, whose output goes
+  in with `--taxonomic-profile`. Run from inside HUMAnN 4 alpha.2, it would fail: HUMAnN
+  looks for its database tag (`vOct22_CHOCOPhlAnSGB_202403`) in `metaphlan --version`, and
+  MetaPhlAn 4.1.1 does not print one.
 
 Threads differ (DIAMOND 8, HUMAnN 16, the others 1); compare CPU hours in `cost.tsv`, not
 wall time.

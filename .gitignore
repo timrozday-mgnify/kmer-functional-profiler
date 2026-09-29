@@ -14,3 +14,5 @@ __pycache__/
 work/
 results*/
 workflows/fmh-benchmark/hpc.config
+kfp-*.tar
+kfp-*.sif

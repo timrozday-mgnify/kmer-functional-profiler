@@ -158,6 +158,9 @@ def test_tool_profile_and_cost(tmp_path: Path) -> None:
     table = ("# Gene Family\treads_Abundance-RPKs\nUNMAPPED\t10\nUNGROUPED\t5\nK00001\t2.5\n"
              "K00001|g__Escherichia.s__Escherichia_coli\t2.5\nK00002\t0\n")  # fmt: skip
     assert profile("humann", {"ko.tsv": table}) == {"ko:K00001": (1, 2.5)}
+    table4 = ("# Gene Family HUMAnN v4.0.0.alpha.2 Adjusted CPMs\treads\nREADS_UNMAPPED\t10\n"
+              "UNGROUPED\t5\nK00002\t7\nK00002|s__Bacteroides_ovatus.t__SGB1871\t7\n")  # fmt: skip
+    assert profile("humann4", {"ko.tsv": table4}) == {"ko:K00002": (1, 7.0)}
 
     trace = ("task_id\tname\tstatus\trealtime\t%cpu\tpeak_rss\n"
              "1\tPROFILE (seed 1 kfp_s100)\tCOMPLETED\t3600000\t100\t2000000000\n"

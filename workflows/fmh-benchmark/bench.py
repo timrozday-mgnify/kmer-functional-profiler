@@ -19,7 +19,7 @@
   median holders, most hits on one k-mer, and the share found in the sample genomes' six
   frames (``in_genome``; null for sourmash-hashed indexes). A false positive's k-mers that
   are in the genomes come from real sequence (another gene or KO); the rest from read errors.
-- ``tool-profile``: another tool's output (DIAMOND, fmh-funprofiler, kMermaid, HUMAnN) as
+- ``tool-profile``: another tool's output (DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3/4) as
   a profile SCORE reads: ``name``, ``evidence`` (the tool's detection count) and ``abundance``.
 - ``summary``: mean and sd of the scores per index, count and threshold.
 - ``cost``: wall time, CPU time and peak memory per step and index or tool, from the raw
@@ -435,9 +435,10 @@ def tool_profile(args: argparse.Namespace) -> None:
             .join(lengths, on="name")
             .select("name", "evidence", abundance=pl.col("n") / pl.col("length"))
         )
-    elif args.tool == "humann":
-        # unstratified KO rows of the regrouped gene families (RPK). HUMAnN reports no read
-        # counts, so every reported KO has evidence 1 (min_hits > 1 scores the same calls).
+    elif args.tool in ("humann", "humann4"):
+        # unstratified KO rows of the regrouped gene families (RPK in 3.9, adjusted CPM in 4).
+        # HUMAnN reports no read counts, so every reported KO has evidence 1 (min_hits > 1
+        # scores the same calls).
         table = pl.read_csv(raw / "ko.tsv", separator="\t", quote_char=None)
         # (KO ids as "K00001", KEGG's as "ko:K00001"; UNMAPPED and UNGROUPED do not match)
         out = (
@@ -563,8 +564,8 @@ def main() -> None:
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--out", default="detected.tsv")
     p = sub.add_parser("tool-profile")
-    p.add_argument("--tool", required=True,
-                   choices=["diamond", "fmh_funprofiler", "kmermaid", "humann"])  # fmt: skip
+    tools = ["diamond", "fmh_funprofiler", "kmermaid", "humann", "humann4"]
+    p.add_argument("--tool", required=True, choices=tools)
     p.add_argument("--raw", required=True, help="directory with the tool's output files")
     p.add_argument("--kos", help="gene -> KO table (diamond)")
     p.add_argument("--members", help="members.parquet (kmermaid)")

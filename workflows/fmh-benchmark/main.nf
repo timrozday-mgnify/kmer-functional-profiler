@@ -1,6 +1,6 @@
 // fmh-funprofiler benchmark: KO detection by kmer-functional-profiler indexes and by the
 // fmh-funprofiler KO sketches (compat mode) on InSilicoSeq metagenomes, and by other tools
-// (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN). See README.md.
+// (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4). See README.md.
 
 
 process FETCH {
@@ -220,7 +220,8 @@ process DETECTED {
 
 // ---- Other tools (--tools). Each writes its raw output to raw/; TOOL_PROFILE turns it into
 // a profile SCORE reads. Tools run in pinned containers
-// (-profile docker or singularity); kMermaid's image is built by containers/build.sh.
+// (-profile docker or singularity); the kMermaid and HUMAnN images are built by
+// containers/build.sh.
 
 process DIAMOND_DB {
     label 'process_medium'
@@ -343,7 +344,7 @@ process KMERMAID {
 process HUMANN_DB {
     label 'process_medium'
     storeDir "${params.db_dir}/humann"
-    container 'quay.io/biocontainers/humann:3.9--py312hdfd78af_0'  // MetaPhlAn 4.1.1, DIAMOND 2.0.15
+    container params.humann3_container  // MetaPhlAn 4.1.1, DIAMOND 2.0.15, bowtie2 2.5.5
 
     output:
     tuple path('chocophlan'), path('uniref'), path('utility_mapping'), path('metaphlan'), emit: db
@@ -365,7 +366,7 @@ process HUMANN_DB {
 process HUMANN {
     tag "seed ${seed}"
     label 'process_humann'
-    container 'quay.io/biocontainers/humann:3.9--py312hdfd78af_0'  // MetaPhlAn 4.1.1, DIAMOND 2.0.15
+    container params.humann3_container  // MetaPhlAn 4.1.1, DIAMOND 2.0.15, bowtie2 2.5.5
 
     input:
     tuple val(seed), path(r1), path(r2)
@@ -387,6 +388,65 @@ process HUMANN {
         --custom ${utility}/map_ko_uniref90.txt.gz --output raw/ko.tsv
     cp out/reads_genefamilies.tsv raw/
     rm -r reads.fastq.gz out/reads_humann_temp
+    """
+
+    stub:
+    "mkdir raw && touch raw/ko.tsv"
+}
+
+process HUMANN4_DB {
+    label 'process_medium'
+    storeDir "${params.db_dir}/humann4"
+    container params.humann4_container
+
+    output:
+    tuple path('chocophlan'), path('uniref'), path('utility_mapping'), path('metaphlan'), emit: db
+
+    script:
+    // ~70 GB: HUMAnN 4 alpha's ChocoPhlAn (45 GB compressed), its EC-filtered UniRef90 (the
+    // only translated-search database it distributes), utility mapping, and the MetaPhlAn
+    // database it checks for
+    """
+    humann_databases --download chocophlan full . --update-config no
+    humann_databases --download uniref uniref90_ec_filtered_diamond . --update-config no
+    humann_databases --download utility_mapping full . --update-config no
+    metaphlan --install --index ${params.humann4_metaphlan_index} --bowtie2db metaphlan \\
+        --nproc ${task.cpus}
+    """
+
+    stub:
+    "mkdir chocophlan uniref utility_mapping metaphlan"
+}
+
+process HUMANN4 {
+    tag "seed ${seed}"
+    label 'process_humann'
+    container params.humann4_container
+
+    input:
+    tuple val(seed), path(r1), path(r2)
+    tuple path(chocophlan), path(uniref), path(utility), path(mpa)
+
+    output:
+    tuple val(seed), val('humann4'), path('raw'), emit: raw
+
+    script:
+    // MetaPhlAn runs first, as HUMAnN would (same -t), and its profile goes in with
+    // --taxonomic-profile: HUMAnN 4 alpha.2 otherwise looks for its database tag in
+    // `metaphlan --version`, which MetaPhlAn 4.1.1 does not print, and exits.
+    """
+    mkdir raw
+    cat ${r1} ${r2} > reads.fastq.gz
+    metaphlan reads.fastq.gz --input_type fastq --bowtie2db ${mpa} \\
+        --index ${params.humann4_metaphlan_index} --nproc ${task.cpus} -t rel_ab_w_read_stats \\
+        --bowtie2out metaphlan.bowtie2.bz2 -o raw/metaphlan.tsv
+    humann --input reads.fastq.gz --output out --threads ${task.cpus} \\
+        --taxonomic-profile raw/metaphlan.tsv \\
+        --nucleotide-database ${chocophlan} --protein-database ${uniref}
+    humann_regroup_table --input out/reads_2_genefamilies.tsv \\
+        --custom ${utility}/map_ko_uniref90.txt.gz --output raw/ko.tsv
+    cp out/reads_2_genefamilies.tsv raw/
+    rm -r reads.fastq.gz metaphlan.bowtie2.bz2 out/reads_humann_temp
     """
 
     stub:
@@ -466,7 +526,7 @@ workflow {
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
 
     def tools = params.tools ? params.tools.toString().tokenize(',')*.trim() : []
-    def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann']
+    def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann', 'humann4']
     if (unknown) {
         error "Unknown --tools: ${unknown.join(', ')}"
     }
@@ -486,6 +546,10 @@ workflow {
     if ('humann' in tools) {
         HUMANN(SIMULATE.out.reads, HUMANN_DB().db)
         ch_raw = ch_raw.mix(HUMANN.out.raw)
+    }
+    if ('humann4' in tools) {
+        HUMANN4(SIMULATE.out.reads, HUMANN4_DB().db)
+        ch_raw = ch_raw.mix(HUMANN4.out.raw)
     }
     TOOL_PROFILE(ch_raw, FETCH.out.kos, MEMBERS.out.members, file("${projectDir}/bench.py"))
 
