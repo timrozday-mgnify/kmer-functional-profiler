@@ -79,6 +79,11 @@ def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
     assert a["u_g"] == a["m_g"] - len(kmers(D))
     assert a["component"] == b["component"] != s["component"]
     assert index.meta["stats"]["components"] == 2  # type: ignore[index]
+    # Kept k-mers per counting member: 3 x (X + D), 1 x (X + D + P); their mean is pin_sum.
+    held = np.array([len(kmers(X + D))] * 3 + [len(kmers(X + D + P))])
+    assert a["pin_sum"] == pytest.approx(held.mean())
+    assert a["len_cv"] == pytest.approx(held.std() / held.mean())
+    assert b["len_cv"] == s["len_cv"] == 0
 
 
 def test_promiscuous_kmers_are_dropped(tmp_path: Path) -> None:

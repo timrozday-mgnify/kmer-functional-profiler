@@ -119,7 +119,7 @@ process SIMULATE {
 
     script:
     """
-    ${params.venv}/bin/iss generate --genomes ${fna} --model ${params.iss_model} \\
+    ${params.venv}/bin/iss generate --genomes ${fna} ${params.iss_mode == 'perfect' ? '--mode perfect' : "--model ${params.iss_model}"} \\
         --n_reads ${params.n_reads} --abundance lognormal --seed ${seed} \\
         --cpus ${task.cpus} --compress --output reads
     """
@@ -161,13 +161,13 @@ process PROFILE {
     path code, stageAs: 'code/*'  // query sources: only here so -resume reruns on changes
 
     output:
-    tuple val(seed), val(name), path('profile.tsv'), emit: profile
+    tuple val(seed), val(name), path('profile.tsv'), path('kmers.parquet'), emit: profile
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --draws ${params.draws}"
+    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --draws ${params.draws} --kmers kmers.parquet"
 
     stub:
-    "touch profile.tsv"
+    "touch profile.tsv kmers.parquet"
 }
 
 process SCORE {
@@ -189,6 +189,28 @@ process SCORE {
 
     stub:
     "touch score.tsv"
+}
+
+process DETECTED {
+    tag "seed ${seed} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/detected", mode: 'copy', saveAs: { "seed${seed}_${name}.tsv" }
+
+    input:
+    tuple val(name), val(seed), path(profile), path(kmers), path(truth), path(fna), path(index)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'detected.tsv', emit: detected
+
+    script:
+    """
+    ${params.bench} detected --truth ${truth} --profile ${profile} --kmers ${kmers} \\
+        --index-dir ${index} --fna ${fna} --sample seed${seed} --index ${name}
+    """
+
+    stub:
+    "touch detected.tsv"
 }
 
 process SUMMARY {
@@ -224,6 +246,15 @@ workflow {
     TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, file("${projectDir}/bench.py"))
 
     PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_code)
-    SCORE(PROFILE.out.profile.combine(TRUTH.out.truth, by: 0), file("${projectDir}/bench.py"))
+    ch_scored = PROFILE.out.profile.combine(TRUTH.out.truth, by: 0)  // seed, name, profile, kmers, truth
+    SCORE(ch_scored.map { seed, name, profile, _kmers, truth -> [seed, name, profile, truth] }, file("${projectDir}/bench.py"))
+    DETECTED(
+        ch_scored
+            .combine(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] }, by: 0)
+            .map { seed, name, profile, kmers, truth, fna -> [name, seed, profile, kmers, truth, fna] }
+            .combine(ch_indexes, by: 0),
+        file("${projectDir}/bench.py"),
+    )
+    DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
     SUMMARY(SCORE.out.score.collect())
 }

@@ -26,7 +26,10 @@ With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``
 promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
 ``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level,
 and ``pin_sum`` (``pin_sum_dense``) sums their ``p_in``: how many of them an average member
-holds, which turns present k-mers into member-equivalents (copies).
+holds, which turns present k-mers into member-equivalents (copies). ``len_cv``
+(``len_cv_dense``) is the coefficient of variation of kept k-mers over the counting
+members: how far one copy's k-mers can stray from ``pin_sum``. ``holder_sum_dense`` sums
+the holder count of each unit's dense k-mers (the query's background exposure).
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
@@ -286,6 +289,30 @@ def _kmers(batch: pl.DataFrame, params: IndexParams, max_hash: int) -> pl.DataFr
     ).unique(["member", "hash"])
 
 
+def _len_cv(
+    batches: list[pl.DataFrame], params: IndexParams, kept: pl.DataFrame, members: pl.DataFrame
+) -> pl.DataFrame:
+    """Per unit, CV over counting members of how many ``kept`` (unit, hash) each holds."""
+    max_hash = int(kept["hash"].max() or 0)  # type: ignore[arg-type]
+    per_member = pl.concat(
+        [
+            _kmers(b.filter("counts"), params, max_hash)
+            .join(kept, on=["unit", "hash"], how="semi")
+            .group_by("member")
+            .len("kept")
+            for b in batches
+        ]
+    )
+    n = pl.col("kept").fill_null(0)
+    return (
+        members.filter("counts")
+        .select("unit", "member")
+        .join(per_member, on="member", how="left")
+        .group_by("unit")
+        .agg(len_cv=(n.std(ddof=0) / n.mean()).fill_nan(0.0))
+    )
+
+
 def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParams) -> pl.DataFrame:
     units = (
         members.group_by("unit")
@@ -404,6 +431,12 @@ def build_index(
         how="left",
         maintain_order="left",
     ).with_columns(pl.col("n_candidates", "n_promiscuous").fill_null(0))
+    units = units.join(
+        _len_cv(batches, params, postings.select("unit", "hash"), members),
+        on="unit",
+        how="left",
+        maintain_order="left",
+    )
     if pfam_path is not None:
         (
             pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
@@ -450,6 +483,14 @@ def build_index(
                 "p_in",
                 pin_q=(pl.col("p_in") * (2**PIN_BITS - 1)).round().cast(pl.UInt64),
             )
+        )
+        units = units.join(
+            _len_cv(batches, params, dense.select("unit", "hash"), members).rename(
+                {"len_cv": "len_cv_dense"}
+            ),
+            on="unit",
+            how="left",
+            maintain_order="left",
         )
     return write_index(out, params, units, postings, stats, dense=dense)
 
@@ -499,6 +540,11 @@ def write_index(
 
     units = units.with_columns(
         pin_hist=_pin_hist(postings, units.height), pin_sum=_pin_sum(postings, units.height)
+    )
+    # Imported sketches have no members, so no length spread; units without members get 0.
+    units = units.with_columns(
+        pl.col(c).fill_null(0.0) if c in units.columns else pl.lit(0.0).alias(c)
+        for c in ("len_cv", *(("len_cv_dense",) if dense is not None else ()))
     )
     per_unit = postings.group_by("unit").agg(
         m_g=pl.len().cast(pl.UInt32), u_g=(pl.col("n_groups") == 1).sum().cast(pl.UInt32)
@@ -550,6 +596,13 @@ def write_index(
             pl.col("m_dense").fill_null(0),
             pin_hist_dense=_pin_hist(dense, units.height),
             pin_sum_dense=_pin_sum(dense, units.height),
+            holder_sum_dense=pl.Series(
+                np.bincount(
+                    dense["unit"].to_numpy(),
+                    dense.select(pl.len().over("hash"))["len"].to_numpy(),
+                    minlength=units.height,
+                )
+            ),
         )
         stats["dense_postings"] = dense.height
         stats["dense_bytes"] = tables["dense"].nbytes()

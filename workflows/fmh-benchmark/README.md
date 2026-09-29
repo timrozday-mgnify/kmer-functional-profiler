@@ -12,11 +12,14 @@ MEMBERS          proteins grouped by KO -> members.parquet
 INDEX            kmer-functional-profiler index, one per --indexes entry
 IMPORT_SKETCHES  the KO sketches as a sourmash-compatible index ("fmh_compat")
 SAMPLE           --n_genomes random genomes per replicate (seed = replicate number)
-SIMULATE         iss generate, lognormal abundances
+SIMULATE         iss generate, lognormal abundances (--iss_mode perfect: no read errors)
 TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a read
                  overlaps one of its genes (the paper's rule, on CAMISIM's alignments); its
                  depth is aligned bases / gene length, summed over its genes
 PROFILE          kmer-functional-profiler query, every metagenome x every index
+DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
+                 come from (holders, hits, in the sample genomes or not) -> detected/,
+                 detected.tsv (all samples)
 SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered true KOs,
                  base-weighted completeness per count (kmers_hit; kmers_unique after gather;
                  kmers_wta, kmers_ufirst after winner-take-all, uniqueness-first)
@@ -63,6 +66,7 @@ nextflow run workflows/fmh-benchmark -profile slurm --data_dir /path/to/fmh-benc
 | `--replicates` | `10` | Metagenomes (seeds 1..N) |
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
+| `--iss_mode` | `kde` | `perfect`: error-free reads, to see which false positives come from read errors |
 | `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
@@ -91,7 +95,17 @@ exact, 2 is disjoint). With `--draws` > 0, `ci_cover` is the share of true
 positives whose posterior interval holds truth depth (on the estimate's scale) and
 `ci_width` the median log(hi / lo); for `abundance_zi`, `fp_grouped` is the share of false
 positives placed in an ambiguity group (shared-evidence) with a true KO, and `group_cover`
-the share of groups whose interval holds the members' true total.
+the share of groups whose interval holds the members' true total. Also for `abundance_zi`,
+`prob_tp` / `prob_fp` are the mean `present_prob` of true and false positives and
+`flag_tp` / `flag_fp` the share of each below 0.5.
+
+`detected.tsv` has one row per KO gather keeps per sample and index: `tp`, its counts,
+`present_prob`, `own_evidence`, `ambiguity_group`, and over its tier-2 hit k-mers the
+median `holders` (index KOs holding the k-mer), `hits_max` (most hits on one k-mer) and
+`in_genome` (share present in the six-frame translation of the sample genomes; null for
+`fmh_compat`, which hashes with sourmash). A false positive's k-mers that are in the
+genomes are real sequence (another gene or KO); those that are not come from read errors.
+Rerunning with `--iss_mode perfect` shows how many false positives errors cause.
 
 ## Results (10 metagenomes, InSilicoSeq novaseq)
 
