@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "workflows" / "mgnify-subset" / "mgnify_subset.py"
 RELEASE = ROOT / "tests" / "data" / "mini_release"
 GUT = "root:Host-associated:Human:Digestive system"
-SHARD = ("--release", str(RELEASE), "--membership", "membership.parquet")
+SHARD = ("--release", str(RELEASE), "--membership", "membership")
 
 
 def run(cwd: Path, *args: str) -> None:
@@ -18,7 +18,7 @@ def run(cwd: Path, *args: str) -> None:
 
 
 def test_extracts_whole_gut_clusters(tmp_path: Path) -> None:
-    run(tmp_path, "membership", "--release", str(RELEASE), "--biome", GUT)
+    run(tmp_path, "membership", "--release", str(RELEASE), "--biome", GUT, "--shard-width", "300")
     for i, (lo, hi) in enumerate([(0, 400), (400, 1000)]):
         run(tmp_path, "extract", *SHARD, "--lo", str(lo), "--hi", str(hi), "--prefix", f"s{i}")
     run(tmp_path, "merge", "--pfam", "pfam.parquet", "s0", "s1")
