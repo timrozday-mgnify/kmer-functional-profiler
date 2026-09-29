@@ -3,9 +3,10 @@
 One subcommand per pipeline step (``main.nf``):
 
 - ``membership``: clusters with a member in ``--biome`` (substring of the members' biome
-  lineages), keeping 1 in ``--sample`` by ``cluster_rep``, -> ``membership.parquet``
-  (``cluster_rep``, ``protein_id``), sorted by ``protein_id`` so each range below reads
-  only its row groups. Fails if a member lies at or above ``--max-protein-id``.
+  lineages), keeping 1 in ``--sample`` by ``cluster_rep``, -> ``membership/``
+  (``cluster_rep``, ``protein_id``), split into ``--shard-width`` ranges of ``protein_id``
+  so each range below reads only its own files; a partitioned write, not a sort, since the
+  whole release has 5.7 B members. Fails if a member lies at or above ``--max-protein-id``.
 - ``extract``: sequences (and Pfam hits, unless ``--no-pfam``) of the members in one
   ``protein_id`` range, with their ``cluster_rep`` and ``bucket`` (a hash of
   ``cluster_rep`` modulo ``--buckets``). Fails if any member has no sequence.
@@ -34,37 +35,55 @@ import polars as pl
 from kmer_functional_profiler.cost import STATS_RATE, cluster_stats, predict_cost
 from kmer_functional_profiler.index import IndexParams
 
+MEMORY_FRACTION = 0.75  # of the task's memory given to DuckDB
+
 
 def connect(args: argparse.Namespace) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.execute(f"SET threads = {args.threads}")
-    con.execute(f"SET memory_limit = '{args.memory}'")
+    # DuckDB's limit leaves out some allocations, and Python needs room too.
+    gb = float(args.memory.removesuffix("GB"))
+    con.execute(f"SET memory_limit = '{gb * MEMORY_FRACTION:.1f}GB'")
     con.execute("SET temp_directory = 'duckdb_tmp'")
     con.execute("SET preserve_insertion_order = false")
     return con
 
 
 def membership(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
-    con.sql(
+    where = "cluster_rep % $sample = 0"
+    if args.biome != "root":  # every cluster is under root: skip the 1.66 B-row join
+        where += f"""
+            AND cluster_rep IN (
+                SELECT cluster_rep FROM read_parquet('{args.release}/mgy_clusters.parquet')
+                WHERE contains(cluster_members_biomes, $biome) AND cluster_rep % $sample = 0
+            )"""
+    params: dict[str, object] = {"sample": args.sample}
+    if args.biome != "root":
+        params["biome"] = args.biome
+    con.execute(
         f"""
-        SELECT cluster_rep, cluster_member AS protein_id
-        FROM read_parquet('{args.release}/mgy_cluster_seqs.parquet')
-        WHERE cluster_rep IN (
-            SELECT cluster_rep FROM read_parquet('{args.release}/mgy_clusters.parquet')
-            WHERE contains(cluster_members_biomes, $biome) AND cluster_rep % $sample = 0
-        )
-        ORDER BY protein_id
+        COPY (
+            SELECT cluster_rep, cluster_member AS protein_id,
+                cluster_member // {args.shard_width} AS shard
+            FROM read_parquet('{args.release}/mgy_cluster_seqs.parquet')
+            WHERE {where}
+        ) TO '{args.out}' (FORMAT parquet, PARTITION_BY (shard), OVERWRITE_OR_IGNORE)
         """,
-        params={"biome": args.biome, "sample": args.sample},
-    ).write_parquet(args.out)
-    top = con.sql(f"SELECT max(protein_id) FROM read_parquet('{args.out}')").fetchone()
+        params,
+    )
+    top = con.sql(f"SELECT max(protein_id) FROM {read_membership(args.out)}").fetchone()
     if top and top[0] is not None and top[0] >= args.max_protein_id:
         sys.exit(f"member {top[0]} is at or above --max-protein-id {args.max_protein_id}")
 
 
+def read_membership(path: str) -> str:
+    """Membership files; each holds one ``protein_id`` range, so range filters skip the rest."""
+    return f"read_parquet('{path}/**/*.parquet', hive_partitioning = false)"
+
+
 def extract(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     where = "protein_id >= $lo AND protein_id < $hi"
-    ids = f"SELECT * FROM read_parquet('{args.membership}') WHERE {where}"
+    ids = f"SELECT cluster_rep, protein_id FROM {read_membership(args.membership)} WHERE {where}"
     params = {"lo": args.lo, "hi": args.hi}
     release = args.release
     con.execute(
@@ -191,7 +210,8 @@ def main() -> None:
     p.add_argument("--biome", default="root")
     p.add_argument("--sample", type=int, default=1)
     p.add_argument("--max-protein-id", type=int, default=11_200_000_000)
-    p.add_argument("--out", default="membership.parquet")
+    p.add_argument("--shard-width", type=int, default=2**62, help="protein_ids per file")
+    p.add_argument("--out", default="membership")
     p = sub.add_parser("extract")
     p.add_argument("--release", required=True)
     p.add_argument("--membership", required=True)
