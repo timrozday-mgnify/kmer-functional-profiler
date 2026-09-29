@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
 use kmer_functional_profiler_core::{self as kfp, DnaScanner, Error, Hits, KmerParams};
-use numpy::IntoPyArray;
+use numpy::{IntoPyArray, PyReadonlyArray1};
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -115,6 +115,29 @@ fn hash_proteins<'py>(
     Ok(dict)
 }
 
+/// Distinct k-mers per run of proteins sharing a (non-decreasing) group id: columns
+/// `group` and `n_kmers`, one row per run.
+#[pyfunction]
+#[pyo3(signature = (seqs, groups, k, *, alphabet = "protein", max_hash = u64::MAX))]
+fn distinct_kmers<'py>(
+    py: Python<'py>,
+    seqs: Vec<PyBackedBytes>,
+    groups: PyReadonlyArray1<'py, u32>,
+    k: usize,
+    alphabet: &str,
+    max_hash: u64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let params = params(k, alphabet, 11, "all", max_hash)?;
+    let groups = groups.as_slice()?;
+    let (ids, counts) = py
+        .detach(|| kfp::distinct_kmers(&seqs, groups, &params))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("group", ids.into_pyarray(py))?;
+    dict.set_item("n_kmers", counts.into_pyarray(py))?;
+    Ok(dict)
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -179,6 +202,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_hash_py, m)?)?;
     m.add_function(wrap_pyfunction!(hash_dna, m)?)?;
     m.add_function(wrap_pyfunction!(hash_proteins, m)?)?;
+    m.add_function(wrap_pyfunction!(distinct_kmers, m)?)?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }

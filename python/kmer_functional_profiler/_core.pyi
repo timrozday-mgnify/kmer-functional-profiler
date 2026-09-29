@@ -21,6 +21,14 @@ def hash_dna(
 def hash_proteins(
     seqs: Sequence[bytes], k: int, *, alphabet: str = "protein", max_hash: int = ...
 ) -> dict[str, NDArray[np.uint64]]: ...
+def distinct_kmers(
+    seqs: Sequence[bytes],
+    groups: NDArray[np.uint32],
+    k: int,
+    *,
+    alphabet: str = "protein",
+    max_hash: int = ...,
+) -> dict[str, NDArray[np.uint32]]: ...
 
 class FastxHits:
     def __init__(

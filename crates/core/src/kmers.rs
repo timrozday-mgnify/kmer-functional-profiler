@@ -123,6 +123,73 @@ pub fn protein_kmers(protein: &[u8], params: &KmerParams, mut emit: impl FnMut(u
     }
 }
 
+/// Distinct k-mers (hash <= `max_hash`) of each run of proteins sharing a group id.
+///
+/// `groups` holds one id per protein and must be non-decreasing, so each group is one run.
+/// Returns the group id and count of every run. Runs are split over the available threads.
+pub fn distinct_kmers<S: AsRef<[u8]> + Sync>(
+    proteins: &[S],
+    groups: &[u32],
+    params: &KmerParams,
+) -> Result<(Vec<u32>, Vec<u32>), Error> {
+    if proteins.len() != groups.len() || groups.windows(2).any(|w| w[0] > w[1]) {
+        return Err(Error::UnsortedGroups);
+    }
+    // Run starts, then contiguous slices of runs with about equal residues per thread.
+    let mut starts: Vec<usize> = (0..groups.len())
+        .filter(|&i| i == 0 || groups[i] != groups[i - 1])
+        .collect();
+    starts.push(groups.len());
+    let residues: usize = proteins.iter().map(|p| p.as_ref().len()).sum();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per_slice = residues / threads + 1;
+    let (mut cuts, mut acc) = (vec![0], 0);
+    for r in 0..starts.len() - 1 {
+        acc += proteins[starts[r]..starts[r + 1]]
+            .iter()
+            .map(|p| p.as_ref().len())
+            .sum::<usize>();
+        if acc >= per_slice {
+            cuts.push(r + 1);
+            acc = 0;
+        }
+    }
+    if cuts.last() != Some(&(starts.len() - 1)) {
+        cuts.push(starts.len() - 1);
+    }
+    let count = |runs: std::ops::Range<usize>| -> Vec<u32> {
+        let mut buf = Vec::new();
+        runs.map(|r| {
+            buf.clear();
+            for p in &proteins[starts[r]..starts[r + 1]] {
+                protein_kmers(p.as_ref(), params, |h| buf.push(h));
+            }
+            buf.sort_unstable();
+            buf.dedup();
+            u32::try_from(buf.len()).unwrap_or(u32::MAX)
+        })
+        .collect()
+    };
+    let counts = std::thread::scope(|scope| {
+        let handles: Vec<_> = cuts
+            .windows(2)
+            .map(|w| {
+                let runs = w[0]..w[1];
+                scope.spawn(move || count(runs))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("counting thread panicked"))
+            .collect()
+    });
+    let ids = starts[..starts.len() - 1]
+        .iter()
+        .map(|&i| groups[i])
+        .collect();
+    Ok((ids, counts))
+}
+
 /// Sampled k-mer hits as parallel columns, one row per kept k-mer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hits {
@@ -201,6 +268,22 @@ mod tests {
         let mut n = 0;
         protein_kmers(b"MKVLAAGIVL*MKVLAX", &params, |_| n += 1);
         assert_eq!(n, 6 + 1);
+    }
+
+    #[test]
+    fn distinct_kmers_per_run() {
+        let params = KmerParams::new(3, Alphabet::Protein).unwrap();
+        // Group 1: MKVL + MKVA share MKV -> {MKV, KVL, KVA}; group 4: none; group 7: AAAA -> {AAA}.
+        let proteins = ["MKVL", "MKVA", "MK", "AAAA"];
+        let (ids, counts) = distinct_kmers(&proteins, &[1, 1, 4, 7], &params).unwrap();
+        assert_eq!((ids, counts), (vec![1, 4, 7], vec![3, 0, 1]));
+        assert!(distinct_kmers(&proteins, &[1, 4, 1, 7], &params).is_err());
+        assert!(distinct_kmers(&proteins, &[1, 4], &params).is_err());
+        let empty: [&str; 0] = [];
+        assert_eq!(
+            distinct_kmers(&empty, &[], &params).unwrap(),
+            (vec![], vec![])
+        );
     }
 
     #[test]

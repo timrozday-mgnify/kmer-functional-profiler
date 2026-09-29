@@ -321,10 +321,17 @@ def _t_g(params: IndexParams) -> pl.Expr:
 
 
 def _n_kmers(batches: list[pl.DataFrame], params: IndexParams) -> pl.DataFrame:
-    """Distinct k-mers per unit (all k-mers hashed, only counts kept)."""
+    """Distinct k-mers per unit (all k-mers hashed, only counts kept; units are contiguous)."""
     return pl.concat(
         [
-            _kmers(b, params, U64_MAX).unique(["unit", "hash"]).group_by("unit").len("n_kmers")
+            pl.DataFrame(
+                _core.distinct_kmers(
+                    b["sequence"].cast(pl.Binary).to_list(),
+                    b["unit"].to_numpy(),
+                    params.k,
+                    alphabet=params.alphabet,
+                )
+            ).rename({"group": "unit"})
             for b in batches
         ]
     )

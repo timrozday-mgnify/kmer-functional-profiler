@@ -10,6 +10,8 @@ pub enum Error {
     UnknownGeneticCode(u8),
     #[error("unknown frame mode {0:?} (expected stopfree or all)")]
     UnknownFrameMode(String),
+    #[error("group ids must be non-decreasing and one per sequence")]
+    UnsortedGroups,
     #[error("mate files have different read counts")]
     MateCountMismatch,
     #[error(transparent)]
