@@ -20,7 +20,8 @@ One subcommand per pipeline step (``main.nf``):
 - ``combine``: all buckets' statistics -> ``clusters.parquet``, ``groups.tsv`` (sampled
   k-mers per number of clusters holding them) and ``cost.tsv`` (predicted index size per
   1-in-``--sample`` subset and parameter set).
-- ``candidates``, ``bloom``, ``presence``, ``groups``, ``postings``, ``pack``: the
+- ``candidates``, ``bloom``, ``presence``, ``groups``, ``postings``, ``units``,
+  ``pack-range``, ``concat``: the
   partitioned index build over the buckets (``kmer_functional_profiler.partition``); build
   options as ``kmer-functional-profiler index``.
 
@@ -223,8 +224,12 @@ def build(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
             partition.groups(args.paths, args.prefix)
         case "postings":
             partition.postings(args.members, args.prefix, args.groups, params, args.pfam)
-        case "pack":
-            partition.pack(args.prefixes, args.out, params, pfam=args.pfam)
+        case "units":
+            partition.units(args.prefixes, args.bloom, args.ranges, params, args.out, args.pfam)
+        case "pack-range":
+            partition.pack_range(args.prefixes, args.units, args.range, args.out)
+        case "concat":
+            partition.concat(args.parts, args.units, args.out, params)
 
 
 def main() -> None:
@@ -280,7 +285,16 @@ def main() -> None:
             f"--{name.replace('_', '-')}", type=kind, nargs="+", default=[default]
         )
     combine_p.add_argument("--sets", type=float, default=1.0, help="value sets per posting")
-    build_steps = ("candidates", "bloom", "presence", "groups", "postings", "pack")
+    build_steps = (
+        "candidates",
+        "bloom",
+        "presence",
+        "groups",
+        "postings",
+        "units",
+        "pack-range",
+        "concat",
+    )
     for name in build_steps:
         p = sub.add_parser(name)
         for f in fields(IndexParams):  # the options of `kmer-functional-profiler index`
@@ -302,9 +316,19 @@ def main() -> None:
     sub.choices["groups"].add_argument("paths", nargs="+")
     sub.choices["postings"].add_argument("--pfam")
     sub.choices["postings"].add_argument("groups", nargs="*")
-    sub.choices["pack"].add_argument("prefixes", nargs="+")
-    sub.choices["pack"].add_argument("--out", default="index")
-    sub.choices["pack"].add_argument("--pfam", action="store_true")
+    units_p, range_p, concat_p = (sub.choices[n] for n in ("units", "pack-range", "concat"))
+    units_p.add_argument("prefixes", nargs="+")
+    units_p.add_argument("--bloom", default="bloom")
+    units_p.add_argument("--ranges", type=int, required=True)
+    units_p.add_argument("--out", default="units")
+    units_p.add_argument("--pfam", action="store_true")
+    range_p.add_argument("prefixes", nargs="+")
+    range_p.add_argument("--units", default="units")
+    range_p.add_argument("--range", type=int, required=True)
+    range_p.add_argument("--out", required=True)
+    concat_p.add_argument("parts", nargs="+", help="pack-range prefixes, in range order")
+    concat_p.add_argument("--units", default="units")
+    concat_p.add_argument("--out", default="index")
     args = parser.parse_args()
     steps = {
         "membership": membership,

@@ -1,5 +1,6 @@
 """Partitioned build: equal to the single-process build; Bloom filter has no false negatives."""
 
+import itertools
 import json
 import random
 from pathlib import Path
@@ -9,7 +10,14 @@ import polars as pl
 import pytest
 
 from kmer_functional_profiler import partition
-from kmer_functional_profiler.index import IndexParams, build_index
+from kmer_functional_profiler.index import (
+    IndexParams,
+    PackedPart,
+    PackedTable,
+    build_index,
+    key_shift,
+    packed_layout,
+)
 
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 BUCKETS, RANGES = 3, 4
@@ -24,6 +32,27 @@ def test_bloom_filter() -> None:
     assert partition.bloom_contains(bits, keys).all()
     others = rng.integers(0, 2**62, 100_000, dtype=np.uint64)
     assert partition.bloom_contains(bits, others).mean() < 0.02  # ~0.8% expected
+
+
+def test_packed_table_from_parts_equals_whole() -> None:
+    rng = np.random.default_rng(2)
+    max_hash = 2**40 - 1
+    hashes = rng.integers(0, max_hash, 3000, dtype=np.uint64)
+    values = rng.integers(0, 50, 3000, dtype=np.uint64)  # repeated values -> shared sets
+    # 4 fingerprint bits: many keys collide and pool their values.
+    whole = PackedTable.build(hashes, values, max_hash, 4)
+    layout = packed_layout(max_hash, 4, len(hashes))
+    shift = key_shift(layout)
+    cuts = [0, *(int(c) >> shift << shift for c in np.quantile(hashes, [0.3, 0.6])), 2**64]
+    parts = []
+    for lo, hi in itertools.pairwise(cuts):
+        in_range = (hashes >= np.uint64(lo)) & (hashes < hi) if hi < 2**64 else hashes >= lo
+        parts.append(PackedPart.build(hashes[in_range], values[in_range], layout))
+    joined = PackedTable.concat(layout, parts)
+    for field in ("offsets", "fingerprints", "set_ids", "set_offsets", "set_values"):
+        a, b = getattr(whole, field), getattr(joined, field)
+        assert a.dtype == b.dtype and np.array_equal(a, b), field
+    assert len(whole.set_offsets) - 1 < len(whole.fingerprints)  # keys share sets
 
 
 def test_partitioned_build_equals_single(tmp_path: Path) -> None:
@@ -72,12 +101,16 @@ def test_partitioned_build_equals_single(tmp_path: Path) -> None:
             params,
             tmp_path / "pfam.parquet",
         )
-    stats = partition.pack(prefixes, tmp_path / "parted", params, pfam=True, postings_parquet=True)
+    partition.units(prefixes, str(d / "bloom"), RANGES, params, d / "units", pfam=True)
+    parts = [str(d / f"part{r}") for r in range(RANGES)]
+    for r, part in enumerate(parts):
+        partition.pack_range(prefixes, d / "units", r, part)
+    stats = partition.concat(parts, d / "units", tmp_path / "parted", params)
 
     assert stats.keys() == single.keys()
     for key, value in single.items():
         assert stats[key] == pytest.approx(value), key
-    for name in ("units", "postings", "unit_pfam"):
+    for name in ("units", "unit_pfam"):
         a, b = (pl.read_parquet(tmp_path / x / f"{name}.parquet") for x in ("single", "parted"))
         assert a.equals(b), name
     for npy in (tmp_path / "single").glob("*.npy"):

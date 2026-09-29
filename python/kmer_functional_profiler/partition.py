@@ -4,7 +4,7 @@ Members come in buckets that each hold whole clusters (``workflows/mgnify-subset
 Everything a unit needs is local to its bucket except ``n_groups``, the number of units
 holding a candidate k-mer, which feeds the score and the promiscuity cut. That is counted
 exactly by a hash-partitioned reduce, with a Bloom filter of all candidate hashes to keep
-the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``pack``.
+the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``units``.
 
 1. ``candidates`` (per bucket): pass 1, the unit table and the bucket's candidate hashes.
 2. ``bloom`` (once): a Bloom filter of every bucket's candidate hashes, and ``t_max``.
@@ -14,13 +14,17 @@ the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``pac
 4. ``groups`` (per hash range): ``n_groups`` per hash; keeps candidate rows only (which
    drops the filter's false positives) and splits them by bucket.
 5. ``postings`` (per bucket): score, promiscuity cut and floor, as ``build_index``;
-   ``len_cv`` and Pfam labels.
-6. ``pack`` (once): all buckets' units and postings -> the index, as ``build_index``.
+   the per-unit columns (``len_cv``, ``pin_hist``, ...) and Pfam labels.
+6. ``units`` (once): the unit table, numbered in ``cluster_rep`` order, and the tier-2
+   layout, with pack ranges cut at key boundaries.
+7. ``pack_range`` (per pack range): that range's postings -> keys and value sets.
+8. ``concat`` (once): the parts -> tier 2 and ``meta.json``.
 
 The result equals ``build_index`` on the concatenated members. No dense tier yet.
 """
 
 import json
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
@@ -30,15 +34,22 @@ import polars as pl
 from numpy.typing import NDArray
 
 from kmer_functional_profiler.index import (
+    PIN_BITS,
     IndexParams,
+    PackedPart,
+    PackedTable,
     _kmers,
     _len_cv,
     _n_kmers,
     _prepare,
     _select_postings,
+    _smallest,
     _unit_pfam,
     _unit_table,
-    finish_index,
+    key_shift,
+    packed_layout,
+    unit_columns,
+    write_meta,
 )
 
 BLOOM_PROBES: Final = 7
@@ -48,6 +59,18 @@ LOW32: Final = np.uint64(0xFFFFFFFF)
 QUANTILES: Final = 1024  # candidate-hash quantiles recorded for balanced hash ranges
 SAMPLE: Final = 1 << 20  # candidate hashes sampled for them
 UNIT_COLUMNS: Final = ("cluster_rep", "n_members", "n_counting", "n_kmers", "t_g", "max_hash_g")
+# The index's unit table, as build_index writes it (with ``unit`` first).
+FINAL_COLUMNS: Final = (
+    "cluster_rep",
+    "n_members",
+    "n_kmers",
+    "t_g",
+    "max_hash_g",
+    "len_cv",
+    "pin_hist",
+    "pin_sum",
+    "m_g",
+)
 
 
 def _check(params: IndexParams) -> None:
@@ -225,9 +248,10 @@ def postings(
     params: IndexParams,
     pfam_path: str | Path | None = None,
 ) -> None:
-    """Stage 5: ``{prefix}.postings.parquet``, ``.final.parquet`` (units with ``len_cv``),
-    ``.pfam.parquet`` (with ``pfam_path``) and ``.final.json`` (stage-1 stats and this
-    stage's; inputs stay unchanged, as Nextflow stages them as links)."""
+    """Stage 5: ``{prefix}.postings.parquet`` (sorted by hash), ``.final.parquet`` (units
+    with a posting and their index columns), ``.pfam.parquet`` (with ``pfam_path``) and
+    ``.final.json`` (stage-1 stats and this stage's; inputs stay unchanged, as Nextflow
+    stages them as links)."""
     _check(params)
     members, batches, _ = _prepare(members_path, params)
     units = _counting(members, pl.read_parquet(f"{prefix}.units.parquet"))
@@ -252,8 +276,10 @@ def postings(
         maintain_order="left",
     )
     rep = units.select("unit", "cluster_rep")
-    _swap(kept, rep, "unit", "cluster_rep").write_parquet(f"{prefix}.postings.parquet")
-    units.drop("unit").write_parquet(f"{prefix}.final.parquet")
+    _swap(kept, rep, "unit", "cluster_rep").sort("hash").write_parquet(f"{prefix}.postings.parquet")
+    unit_columns(units, kept).filter(pl.col("m_g") > 0).select(FINAL_COLUMNS).write_parquet(
+        f"{prefix}.final.parquet"
+    )
     if pfam_path is not None:
         _swap(_unit_pfam(pfam_path, members), rep, "unit", "cluster_rep").write_parquet(
             f"{prefix}.pfam.parquet"
@@ -262,37 +288,96 @@ def postings(
     Path(f"{prefix}.final.json").write_text(json.dumps(stats) + "\n")
 
 
-def pack(
+def units(
     prefixes: Sequence[str],
-    out_dir: str | Path,
+    bloom_prefix: str,
+    n_ranges: int,
     params: IndexParams,
+    out_dir: str | Path,
     pfam: bool = False,
-    postings_parquet: bool = False,
-) -> dict[str, object]:
-    """Stage 6: every bucket's units and postings -> the index in ``out_dir``."""
+) -> None:
+    """Stage 6: ``units.parquet``, ``unit_pfam.parquet`` (with ``pfam``) and ``pack.json``
+    (tier-2 layout, pack range bounds, stats) in ``out_dir``.
+
+    Pack ranges are cut at the candidate-hash quantiles, rounded down to key boundaries so
+    that hashes sharing a key never fall in two ranges.
+    """
     _check(params)
-    # ponytail: one process holds all postings; pack by hash range if this outgrows a node
-    units = (
-        pl.concat([pl.read_parquet(f"{p}.final.parquet") for p in prefixes], how="vertical_relaxed")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    finals = [f"{p}.final.parquet" for p in prefixes]
+    max_m = pl.scan_parquet(finals).select(pl.col("m_g").max()).collect().item() or 0
+    hist = pl.Array(pl.Series(np.zeros(0, _smallest(max_m))).dtype, 2**PIN_BITS)
+    table = (
+        pl.concat([pl.read_parquet(f).with_columns(pl.col("pin_hist").cast(hist)) for f in finals])
         .sort("cluster_rep")
-        .with_columns(unit=pl.int_range(pl.len(), dtype=pl.UInt32))
+        .select(pl.int_range(pl.len(), dtype=pl.UInt32).alias("unit"), pl.all())
     )
-    rep = units.select("cluster_rep", "unit")
-
-    def by_unit(name: str) -> pl.DataFrame:
-        table = pl.concat([pl.read_parquet(f"{p}.{name}.parquet") for p in prefixes])
-        return _swap(table, rep, "cluster_rep", "unit")
-
+    table.write_parquet(out / "units.parquet")
+    rep = table.select("cluster_rep", "unit")
+    if pfam:
+        pfams = pl.concat([pl.read_parquet(f"{p}.pfam.parquet") for p in prefixes])
+        _swap(pfams, rep, "cluster_rep", "unit").sort("unit", "pfam_accession").write_parquet(
+            out / "unit_pfam.parquet"
+        )
     stats: dict[str, object] = {}
     for p in prefixes:
         for key, value in json.loads(Path(f"{p}.final.json").read_text()).items():
             stats[key] = stats.get(key, 0) + value
-    return finish_index(
-        out_dir,
-        params,
-        units,
-        by_unit("postings"),
-        stats,
-        unit_pfam=by_unit("pfam") if pfam else None,
-        postings_parquet=postings_parquet,
+    n_postings = int(table["m_g"].sum())
+    stats |= {
+        "n_units": table.height,
+        "t_max": float(table["t_g"].max() or 0.0),  # type: ignore[arg-type]
+        "postings": n_postings,
+    }
+    layout = packed_layout(int(table["max_hash_g"].max() or 0), params.fp_bits, n_postings)  # type: ignore[arg-type]
+    shift = key_shift(layout)
+    q = json.loads(Path(f"{bloom_prefix}.json").read_text())["quantiles"]
+    cuts = [q[r * (len(q) - 1) // n_ranges] >> shift << shift for r in range(1, n_ranges)]
+    meta = {"layout": layout, "bounds": [0, *cuts, 2**64], "stats": stats}
+    (out / "pack.json").write_text(json.dumps(meta) + "\n")
+
+
+def pack_range(prefixes: Sequence[str], units_dir: str | Path, part: int, out_prefix: str) -> None:
+    """Stage 7: postings with hash in pack range ``part`` -> ``PackedPart`` files at
+    ``out_prefix`` and ``{out_prefix}.json`` (postings and distinct hashes)."""
+    meta = json.loads((Path(units_dir) / "pack.json").read_text())
+    lo, hi = meta["bounds"][part], meta["bounds"][part + 1]
+    in_range = pl.col("hash") >= lo
+    if hi < 2**64:
+        in_range &= pl.col("hash") < hi
+    rows = (
+        pl.scan_parquet([f"{p}.postings.parquet" for p in prefixes])
+        .filter(in_range)
+        .select("hash", "cluster_rep", "pin_q")
+        .join(
+            pl.scan_parquet(Path(units_dir) / "units.parquet").select("cluster_rep", "unit"),
+            on="cluster_rep",
+        )
+        .collect()
     )
+    values = (rows["unit"].cast(pl.UInt64).to_numpy() << np.uint64(PIN_BITS)) | rows[
+        "pin_q"
+    ].to_numpy()
+    PackedPart.build(rows["hash"].to_numpy(), values, meta["layout"]).save(out_prefix)
+    counts = {"postings": rows.height, "distinct_hashes": rows["hash"].n_unique()}
+    Path(f"{out_prefix}.json").write_text(json.dumps(counts) + "\n")
+
+
+def concat(
+    part_prefixes: Sequence[str], units_dir: str | Path, out_dir: str | Path, params: IndexParams
+) -> dict[str, object]:
+    """Stage 8: pack range parts (in range order) -> tier 2, the unit tables and
+    ``meta.json`` in ``out_dir``; returns the stats."""
+    units_dir, out = Path(units_dir), Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    meta = json.loads((units_dir / "pack.json").read_text())
+    counts = [json.loads(Path(f"{p}.json").read_text()) for p in part_prefixes]
+    if sum(c["postings"] for c in counts) != meta["stats"]["postings"]:
+        raise ValueError("pack ranges do not hold every posting")
+    tier2 = PackedTable.concat(meta["layout"], [PackedPart.load(p) for p in part_prefixes])
+    for name in ("units.parquet", "unit_pfam.parquet"):
+        if (units_dir / name).exists() and units_dir.resolve() != out.resolve():
+            shutil.copyfile(units_dir / name, out / name)
+    stats = meta["stats"] | {"distinct_hashes": sum(c["distinct_hashes"] for c in counts)}
+    return write_meta(out, params, {"tier2": tier2}, stats)

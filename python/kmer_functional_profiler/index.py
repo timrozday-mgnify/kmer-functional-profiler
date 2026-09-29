@@ -37,7 +37,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Final, Self
+from typing import Any, Final, NamedTuple, Self
 
 import numpy as np
 import polars as pl
@@ -49,6 +49,7 @@ U64_MAX: Final = 2**64 - 1
 PIN_BITS: Final = 4  # tier-2 values are unit << PIN_BITS | quantised p_in
 PACKED_FIELDS: Final = ("offsets", "fingerprints", "set_ids", "set_offsets", "set_values")
 KEYS_PER_BUCKET_BITS: Final = 2  # ~4 keys per offsets bucket
+SET_SEEDS: Final = (0x243F6A8885A308D3, 0x13198A2E03707344)  # two 64-bit set-content hashes
 # Constant parts of Illumina TruSeq and Nextera adapters and the P5/P7 flow-cell ends. Their
 # translations recur in MGnify proteins predicted from reads with adapter read-through.
 ADAPTERS: Final = (
@@ -79,6 +80,101 @@ class IndexParams:
     batch_residues: int = 20_000_000
 
 
+def _mix(x: NDArray[np.uint64]) -> NDArray[np.uint64]:
+    """splitmix64 finaliser, elementwise (uint64 arrays wrap)."""
+    x = x ^ (x >> np.uint64(30))
+    x = x * np.uint64(0xBF58476D1CE4E5B9)
+    x = x ^ (x >> np.uint64(27))
+    x = x * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def _set_hashes(offsets: NDArray[np.int64], values: NDArray[np.uint64]) -> NDArray[np.uint64]:
+    """Two 64-bit content hashes per (non-empty) CSR set, independent of value order."""
+    lengths = np.diff(offsets).astype(np.uint64)
+    out = np.empty((len(lengths), 2), dtype=np.uint64)
+    for i, seed in enumerate(SET_SEEDS):
+        summed = (
+            np.add.reduceat(_mix(values ^ np.uint64(seed)), offsets[:-1])
+            if len(lengths)
+            else lengths
+        )
+        out[:, i] = _mix(summed + lengths * np.uint64(seed))
+    return out
+
+
+def _dense_ids(hashes: NDArray[np.uint64]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Ids of distinct rows of ``hashes`` (n, 2), numbered in row order; and each id's first
+    row."""
+    order = np.lexsort((hashes[:, 1], hashes[:, 0]))
+    ordered = hashes[order]
+    new = np.ones(len(order), dtype=bool)
+    new[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
+    ids = np.empty(len(order), dtype=np.int64)
+    ids[order] = np.cumsum(new) - 1
+    return ids, order[new]
+
+
+def _gather(
+    offsets: NDArray[np.int64], values: NDArray[np.uint64], rows: NDArray[np.int64]
+) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
+    """CSR ``rows`` of (``offsets``, ``values``), as a new CSR pair."""
+    lengths = offsets[rows + 1] - offsets[rows]
+    out = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+    index = np.arange(out[-1]) - np.repeat(out[:-1] - offsets[rows], lengths)
+    return out, values[index]
+
+
+def packed_layout(max_hash: int, fp_bits: int, n_rows: int) -> dict[str, int]:
+    """Layout of a ``PackedTable`` of ``n_rows`` (hash, value) rows, hashes <= ``max_hash``."""
+    lead = 64 - max_hash.bit_length()
+    fp_bits = min(fp_bits, 64 - lead)
+    bucket_bits = min(max((n_rows - 1).bit_length() - KEYS_PER_BUCKET_BITS, 1), 64 - lead - fp_bits)
+    return {"max_hash": max_hash, "lead_bits": lead, "bucket_bits": bucket_bits, "fp_bits": fp_bits}
+
+
+def key_shift(layout: dict[str, int]) -> int:
+    """Hash bits below the stored key (bucket + fingerprint bits)."""
+    return 64 - layout["lead_bits"] - layout["bucket_bits"] - layout["fp_bits"]
+
+
+class PackedPart(NamedTuple):
+    """Keys of one hash range and their value sets, deduplicated within the range."""
+
+    keys: NDArray[np.uint64]  # sorted, distinct
+    set_ids: NDArray[np.int64]  # local set of each key
+    set_offsets: NDArray[np.int64]
+    set_values: NDArray[np.uint64]
+    set_hashes: NDArray[np.uint64]  # (sets, 2), from _set_hashes
+
+    @classmethod
+    def build(
+        cls, hashes: NDArray[np.uint64], values: NDArray[np.uint64], layout: dict[str, int]
+    ) -> Self:
+        """Key (hash, value) rows under ``layout``; colliding hashes pool their values."""
+        pairs = (
+            pl.DataFrame({"key": hashes >> np.uint64(key_shift(layout)), "value": values})
+            .unique()
+            .sort("key", "value")
+        )
+        key, value = pairs["key"].to_numpy(), pairs["value"].to_numpy()
+        new = np.ones(len(key), dtype=bool)
+        new[1:] = key[1:] != key[:-1]
+        key_offsets = np.append(np.flatnonzero(new), len(key)).astype(np.int64)
+        hashed = _set_hashes(key_offsets, value)
+        set_ids, first = _dense_ids(hashed)
+        set_offsets, set_values = _gather(key_offsets, value, first)
+        return cls(key[new], set_ids, set_offsets, set_values, hashed[first])
+
+    def save(self, prefix: str) -> None:
+        for field in self._fields:
+            np.save(f"{prefix}.{field}.npy", getattr(self, field))
+
+    @classmethod
+    def load(cls, prefix: str) -> Self:
+        return cls(*(np.load(f"{prefix}.{f}.npy", mmap_mode="r") for f in cls._fields))
+
+
 @dataclass(frozen=True)
 class PackedTable:
     """Hash -> value set, storing only ``fp_bits`` fingerprint bits per key.
@@ -86,7 +182,9 @@ class PackedTable:
     Hashes are at most ``max_hash``, so their top ``lead_bits`` are zero. The next
     ``bucket_bits`` address ``offsets`` directly and the next ``fp_bits`` are stored.
     Keys whose fingerprints collide share the union of their value sets. Each distinct
-    value set is stored once (``set_offsets``/``set_values`` in CSR form).
+    value set is stored once (``set_offsets``/``set_values`` in CSR form), numbered in
+    order of a 128-bit hash of its content, so a table packed in hash ranges
+    (``PackedPart``) and concatenated is identical to one packed at once.
     """
 
     max_hash: int
@@ -108,42 +206,51 @@ class PackedTable:
         cls, hashes: NDArray[np.uint64], values: NDArray[np.uint64], max_hash: int, fp_bits: int
     ) -> Self:
         """Pack (hash, value) pairs; every hash must be at most ``max_hash``."""
-        lead = 64 - max_hash.bit_length()
-        fp_bits = min(fp_bits, 64 - lead)
-        n_keys = len(np.unique(hashes))
-        bucket_bits = min(
-            max((n_keys - 1).bit_length() - KEYS_PER_BUCKET_BITS, 1), 64 - lead - fp_bits
+        layout = packed_layout(max_hash, fp_bits, len(hashes))
+        return cls.concat(layout, [PackedPart.build(hashes, values, layout)])
+
+    @classmethod
+    def concat(cls, layout: dict[str, int], parts: list[PackedPart]) -> Self:
+        """Join parts built under ``layout`` over consecutive, disjoint key ranges."""
+        fp_bits, bucket_bits = layout["fp_bits"], layout["bucket_bits"]
+        set_base = np.cumsum([0] + [len(p.set_hashes) for p in parts])
+        value_base = np.cumsum([0] + [len(p.set_values) for p in parts])
+        # ponytail: every part's sets in memory at once; about the index's own size
+        ids, first = _dense_ids(
+            np.concatenate([np.zeros((0, 2), np.uint64), *(p.set_hashes for p in parts)])
         )
-        shift = 64 - lead - bucket_bits - fp_bits
-        keyed = (
-            pl.DataFrame({"key": hashes >> np.uint64(shift), "value": values})
-            .unique()
-            .group_by("key")
-            .agg(pl.col("value").sort())
-            .sort("key")
-            # ponytail: string-keyed set dedup; hash the lists if this is slow at scale
-            .with_columns(
-                name=pl.col("value").list.eval(pl.element().cast(pl.String)).list.join(",")
-            )
-            .with_columns(set_id=(pl.col("name").rank("dense") - 1).cast(pl.UInt32))
-        )
-        sets = keyed.unique("set_id").sort("set_id")
-        keys = keyed["key"].to_numpy()
-        lengths = sets["value"].list.len().to_numpy()
-        set_values = sets["value"].explode(empty_as_null=False).to_numpy()
+        all_offsets = np.concatenate(
+            [
+                *(
+                    np.asarray(p.set_offsets[:-1]) + b
+                    for p, b in zip(parts, value_base[:-1], strict=True)
+                ),
+                [value_base[-1]],
+            ]
+        ).astype(np.int64)
+        all_values = np.concatenate([np.zeros(0, np.uint64), *(p.set_values for p in parts)])
+        set_offsets, set_values = _gather(all_offsets, all_values, first)
+
+        n_keys = sum(len(p.keys) for p in parts)
+        fingerprints = np.empty(n_keys, dtype=_smallest(2**fp_bits - 1))
+        set_ids = np.empty(n_keys, dtype=_smallest(len(first)))
+        counts = np.zeros(2**bucket_bits, dtype=np.int64)
+        at, last = 0, -1
+        for part, base in zip(parts, set_base[:-1], strict=True):
+            keys = np.asarray(part.keys)
+            if len(keys) and int(keys[0]) <= last:
+                raise ValueError("parts must cover increasing, disjoint key ranges")
+            fingerprints[at : at + len(keys)] = keys & np.uint64(2**fp_bits - 1)
+            set_ids[at : at + len(keys)] = ids[base + np.asarray(part.set_ids)]
+            buckets, n = np.unique(keys >> np.uint64(fp_bits), return_counts=True)
+            counts[buckets.astype(np.int64)] += n
+            at, last = at + len(keys), int(keys[-1]) if len(keys) else last
         return cls(
-            max_hash=max_hash,
-            lead_bits=lead,
-            bucket_bits=bucket_bits,
-            fp_bits=fp_bits,
-            offsets=np.searchsorted(
-                keys >> np.uint64(fp_bits), np.arange(2**bucket_bits + 1, dtype=np.uint64)
-            ).astype(_smallest(len(keys))),
-            fingerprints=(keys & np.uint64(2**fp_bits - 1)).astype(_smallest(2**fp_bits - 1)),
-            set_ids=keyed["set_id"].to_numpy().astype(_smallest(sets.height)),
-            set_offsets=np.concatenate([[0], np.cumsum(lengths)]).astype(
-                _smallest(len(set_values))
-            ),
+            **layout,
+            offsets=np.concatenate([[0], np.cumsum(counts)]).astype(_smallest(n_keys)),
+            fingerprints=fingerprints,
+            set_ids=set_ids,
+            set_offsets=set_offsets.astype(_smallest(len(set_values))),
             set_values=set_values.astype(_smallest(int(set_values.max(initial=0)))),
         )
 
@@ -592,6 +699,54 @@ def _pin_sum(postings: pl.DataFrame, n_units: int) -> pl.Series:
     ).cast(pl.Float32)
 
 
+def unit_columns(units: pl.DataFrame, postings: pl.DataFrame) -> pl.DataFrame:
+    """Add ``pin_hist``, ``pin_sum``, ``m_g`` and a filled f32 ``len_cv`` to ``units``
+    (``unit`` 0..n-1) from their ``postings``."""
+    units = units.with_columns(
+        pin_hist=_pin_hist(postings, units.height), pin_sum=_pin_sum(postings, units.height)
+    )
+    # Imported sketches have no members, so no length spread; units without members get 0.
+    units = units.with_columns(
+        (pl.col("len_cv") if "len_cv" in units.columns else pl.lit(0.0))
+        .fill_null(0.0)
+        .cast(pl.Float32)
+        .alias("len_cv")
+    )
+    return units.join(
+        postings.group_by("unit").agg(m_g=pl.len().cast(pl.UInt32)),
+        on="unit",
+        how="left",
+        maintain_order="left",
+    ).with_columns(pl.col("m_g").fill_null(0))
+
+
+def write_meta(
+    out: Path,
+    params: IndexParams,
+    tables: dict[str, PackedTable],
+    stats: dict[str, object],
+    hash_scheme: str = "kfp",
+) -> dict[str, object]:
+    """Save the tables and ``meta.json``; ``stats`` gains the tier-2 sizes. Returns it."""
+    tier2 = tables["tier2"]
+    stats = {
+        **stats,
+        "tier2_keys": len(tier2.fingerprints),
+        "tier2_sets": len(tier2.set_offsets) - 1,
+        "tier2_bytes": tier2.nbytes(),
+        "tier2_bytes_per_hash": tier2.nbytes() / max(stats["distinct_hashes"], 1),  # type: ignore[call-overload]
+    }
+    meta = {
+        "format": 2,
+        "hash": hash_scheme,
+        "params": asdict(params),
+        **{name: table.save(out, name) for name, table in tables.items()},
+        "stats": stats,
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return stats
+
+
 def write_index(
     out: Path,
     params: IndexParams,
@@ -613,20 +768,7 @@ def write_index(
     t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
     postings = postings.sort("hash", "unit")
     n_units = units.height
-    units = units.with_columns(
-        pin_hist=_pin_hist(postings, units.height), pin_sum=_pin_sum(postings, units.height)
-    )
-    # Imported sketches have no members, so no length spread; units without members get 0.
-    units = units.with_columns(
-        (pl.col(c) if c in units.columns else pl.lit(0.0)).fill_null(0.0).cast(pl.Float32).alias(c)
-        for c in ("len_cv", *(("len_cv_dense",) if dense is not None else ()))
-    )
-    units = units.join(
-        postings.group_by("unit").agg(m_g=pl.len().cast(pl.UInt32)),
-        on="unit",
-        how="left",
-        maintain_order="left",
-    ).with_columns(pl.col("m_g").fill_null(0))
+    units = unit_columns(units, postings)
 
     tier2 = PackedTable.build(
         postings["hash"].to_numpy(),
@@ -651,6 +793,7 @@ def write_index(
             maintain_order="left",
         ).with_columns(
             pl.col("m_dense").fill_null(0),
+            pl.col("len_cv_dense").fill_null(0.0).cast(pl.Float32),
             pin_hist_dense=_pin_hist(dense, units.height),
             pin_sum_dense=_pin_sum(dense, units.height),
         )
@@ -660,24 +803,11 @@ def write_index(
     units.write_parquet(out / "units.parquet")
     if postings_parquet:
         postings.write_parquet(out / "postings.parquet")
-    distinct_hashes = postings["hash"].n_unique()
     stats = {
         **stats,
         "n_units": n_units,
         "t_max": float(units["t_g"].max()),  # type: ignore[arg-type]
         "postings": postings.height,
-        "distinct_hashes": distinct_hashes,
-        "tier2_keys": len(tier2.fingerprints),
-        "tier2_sets": len(tier2.set_offsets) - 1,
-        "tier2_bytes": tier2.nbytes(),
-        "tier2_bytes_per_hash": tier2.nbytes() / max(distinct_hashes, 1),
+        "distinct_hashes": postings["hash"].n_unique(),
     }
-    meta = {
-        "format": 2,
-        "hash": hash_scheme,
-        "params": asdict(params),
-        **{name: table.save(out, name) for name, table in tables.items()},
-        "stats": stats,
-    }
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    return stats
+    return write_meta(out, params, tables, stats, hash_scheme)

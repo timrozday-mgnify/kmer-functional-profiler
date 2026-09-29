@@ -21,8 +21,10 @@ CANDIDATES  per bucket: unit table, candidate hashes                       (--bu
 BLOOM       all candidate hashes -> Bloom filter, t_max, hash quantiles
 PRESENCE    per bucket: (hash, cluster) at t_max passing the filter, by hash range
 GROUPS      per hash range: n_groups; candidate rows by bucket              (--ranges jobs)
-POSTINGS    per bucket: score, promiscuity cut, floor, len_cv, Pfam
-PACK        -> index/
+POSTINGS    per bucket: score, promiscuity cut, floor, per-unit columns, Pfam
+UNITS       all units numbered by cluster_rep; tier-2 layout and pack ranges
+PACK_RANGE  per pack range: keys and value sets                            (--ranges jobs)
+CONCAT      -> index/
 ```
 
 All members of a selected cluster are extracted, including members from other biomes,
@@ -110,12 +112,18 @@ nextflow run workflows/mgnify-subset -profile slurm --biome root --sample 1 \
     --publish_mode link --outdir full-build
 ```
 
+Tier 2 is packed in hash ranges too: UNITS fixes the table layout from the total
+postings and cuts pack ranges at key boundaries, each PACK_RANGE packs its range's
+postings, and CONCAT joins them, numbering value sets by a hash of their content so
+the result is the same as packing at once. No step holds every posting.
+
 At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 s
-(CANDIDATES), 1 s (BLOOM), 19 s (PRESENCE), 1 s (GROUPS), 6 s (POSTINGS) and 2 s (PACK),
-with presence files of ~11.5 bytes per row. Scaled to the whole release: a ~14 GB Bloom
-filter read by every PRESENCE job and ~140 GB of presence files. PACK still holds every
-posting in one process (~3.4×10⁹ at full scale), so it is the step that has to be split
-next.
+(CANDIDATES), 1 s (BLOOM), 20 s (PRESENCE), 1 s (GROUPS), 7 s (POSTINGS), 0.1 s (UNITS),
+1.2 s (PACK_RANGE) and 0.7 s (CONCAT), with presence files of ~11.5 bytes per row.
+Scaled to the whole release: a ~14 GB Bloom filter read by every PRESENCE job, ~140 GB
+of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB) plus
+every range's value sets before they are deduplicated (2.5× the distinct sets at 8
+ranges; more at 256).
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -130,7 +138,7 @@ next.
 | `--index` | `true` | Build an index per sample, under `1inN/index/` |
 | `--index_args` | `''` | Extra `kmer-functional-profiler index` options, e.g. `'--t-base 0.001 --n-min 8'`; also used by `--build` |
 | `--build` | `false` | Partitioned index build over the buckets, under `index/` (one `--sample`, `--pfam true`) |
-| `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce |
+| `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce and tier-2 packing |
 | `--bloom_bits` | `10` | Bloom filter bits per candidate hash |
 | `--stats` | `false` | Per-cluster statistics and predicted index sizes |
 | `--stats_args` | `''` | `--k`, `--alphabet` for STATS and COMBINE |
@@ -141,6 +149,6 @@ next.
 
 Resources are set per label in `nextflow.config` (`process_medium` for DuckDB steps and
 STATS and the partitioned build's per-bucket and per-range steps, `process_high_memory`
-for INDEX, COMBINE and PACK); override them with `-c my.config`.
+for INDEX, COMBINE, UNITS and CONCAT); override them with `-c my.config`.
 The index build holds the members table and the sampled k-mer tables in memory; the
 nested run measures how its peak memory grows with the subset.

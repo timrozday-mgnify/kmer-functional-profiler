@@ -263,21 +263,65 @@ process POSTINGS {
     "touch ${members.baseName}.final.parquet ${members.baseName}.final.json ${members.baseName}.postings.parquet ${members.baseName}.pfam.parquet"
 }
 
-process PACK {
+process UNITS {
     label 'process_high_memory'
-    publishDir params.outdir, mode: 'copy'
 
     input:
     path parts
+    path bloom
 
     output:
-    path 'index'
+    path 'units'
 
     script:
     def prefixes = parts.findAll { f -> f.name.endsWith('.final.json') }
         .collect { f -> f.name.replace('.final.json', '') }.sort().join(' ')
     """
-    ${params.python} ${projectDir}/mgnify_subset.py pack ${prefixes} --pfam ${params.index_args}
+    ${params.python} ${projectDir}/mgnify_subset.py units ${prefixes} --ranges ${params.ranges} \\
+        --pfam ${params.index_args}
+    """
+
+    stub:
+    "mkdir units && touch units/units.parquet units/pack.json"
+}
+
+process PACK_RANGE {
+    tag "range ${range}"
+    label 'process_medium'
+
+    input:
+    tuple val(range), path(postings), path(units)
+
+    output:
+    tuple val(range), path("part${range}.*")
+
+    script:
+    def prefixes = postings.collect { f -> f.name.replace('.postings.parquet', '') }.sort().join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py pack-range ${prefixes} --range ${range} \\
+        --out part${range} ${params.index_args}
+    """
+
+    stub:
+    "touch part${range}.keys.npy part${range}.json"
+}
+
+process CONCAT {
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    val ranges
+    path parts
+    path units
+
+    output:
+    path 'index'
+
+    script:
+    def prefixes = ranges.collect { r -> "part${r}" }.join(' ')
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py concat ${prefixes} ${params.index_args}
     """
 
     stub:
@@ -327,6 +371,17 @@ workflow {
         ch_postings = CANDIDATES.out.units.join(ch_groups, remainder: true)
             .map { b, members, units, stats, groups -> [b, members, units, stats, groups ?: []] }
         POSTINGS(ch_postings, MERGE.out.pfam.first())
-        PACK(POSTINGS.out.flatten().collect())
+        ch_posted = POSTINGS.out.flatten()
+        UNITS(ch_posted.collect(), BLOOM.out)
+        ch_range = channel.of(0..<(params.ranges as int))
+            .combine(ch_posted.filter { f -> f.name.endsWith('.postings.parquet') }.collect().toList())
+            .combine(UNITS.out)
+        PACK_RANGE(ch_range)
+        ch_parts = PACK_RANGE.out.toSortedList { a, b -> a[0] <=> b[0] }
+        CONCAT(
+            ch_parts.map { parts -> parts.collect { p -> p[0] } },
+            ch_parts.map { parts -> parts.collect { p -> p[1] }.flatten() },
+            UNITS.out,
+        )
     }
 }
