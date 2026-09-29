@@ -2,8 +2,9 @@
 
 Extracts whole MGnify90 clusters that have a member in a chosen biome from a MGnify
 Proteins release, writes them as the index's input table, and optionally builds the
-index for one or more nested subsets. It also runs the phase-6 cost study: per-cluster
-statistics of the whole release and the index size they predict. Meant for HPC: the
+index for one or more nested subsets. It also runs the phase-6 cost study (per-cluster
+statistics of the whole release and the index size they predict) and the partitioned
+index build over cluster buckets. Meant for HPC: the
 release is about 1.3 TB of Parquet.
 
 ```text
@@ -16,6 +17,12 @@ SUBSET      per sample N: clusters with cluster_rep % N == 0             (--samp
 INDEX       kmer-functional-profiler index -> 1inN/index/               (--index false to skip)
 STATS       per bucket: n_kmers, lengths per cluster; (hash, cluster) pairs at --stats_rate
 COMBINE     -> clusters.parquet, groups.tsv, cost.tsv                     (--stats true)
+CANDIDATES  per bucket: unit table, candidate hashes                       (--build true)
+BLOOM       all candidate hashes -> Bloom filter, t_max, hash quantiles
+PRESENCE    per bucket: (hash, cluster) at t_max passing the filter, by hash range
+GROUPS      per hash range: n_groups; candidate rows by bucket              (--ranges jobs)
+POSTINGS    per bucket: score, promiscuity cut, floor, len_cv, Pfam
+PACK        -> index/
 ```
 
 All members of a selected cluster are extracted, including members from other biomes,
@@ -83,6 +90,33 @@ Predicted sizes assume one key per posting (an upper bound) and `--sets` value s
 per posting (default 1, also an upper bound); the nested builds give the real ratio
 (`tier2_sets / postings` in `meta.json`) to re-run COMBINE with.
 
+### Partitioned build (phase 6)
+
+The single-process INDEX holds every member and k-mer table at once, which does not fit
+the whole release on one node. `--build true` splits the same build
+(`kmer_functional_profiler.partition`) over the MERGE buckets: everything a unit needs is
+local to its bucket except `n_groups` (units holding a candidate k-mer), which a
+hash-range reduce counts exactly. A Bloom filter of all candidate hashes
+(`--bloom_bits` per hash, ~1% false hits at 10) keeps each bucket's rows for that reduce
+to about 1.1 per candidate; GROUPS drops the false hits, so the index equals INDEX's on
+the same members (checked by `tests/python/test_partition.py` and the `test_build`
+profile). Hash ranges are cut at quantiles of the candidate hashes, so they hold about
+equal numbers of candidates. No dense tier yet (`--t-dense` must be 0).
+
+```bash
+nextflow run workflows/mgnify-subset -profile test,test_build   # two buckets, a few seconds
+nextflow run workflows/mgnify-subset -profile slurm --biome root --sample 1 \
+    --shards 256 --buckets 256 --ranges 256 --index false --build true \
+    --publish_mode link --outdir full-build
+```
+
+At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 s
+(CANDIDATES), 1 s (BLOOM), 19 s (PRESENCE), 1 s (GROUPS), 6 s (POSTINGS) and 2 s (PACK),
+with presence files of ~11.5 bytes per row. Scaled to the whole release: a ~14 GB Bloom
+filter read by every PRESENCE job and ~140 GB of presence files. PACK still holds every
+posting in one process (~3.4×10⁹ at full scale), so it is the step that has to be split
+next.
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `--release` | EBI FTP `current_release` | Directory or https prefix holding the release Parquet files |
@@ -94,7 +128,10 @@ per posting (default 1, also an upper bound); the nested builds give the real ra
 | `--pfam` | `true` | Extract Pfam hits (needed by `--index`) |
 | `--publish_mode` | `copy` | How members tables are published; `link` at full scale |
 | `--index` | `true` | Build an index per sample, under `1inN/index/` |
-| `--index_args` | `''` | Extra `kmer-functional-profiler index` options, e.g. `'--t-base 0.001 --n-min 8'` |
+| `--index_args` | `''` | Extra `kmer-functional-profiler index` options, e.g. `'--t-base 0.001 --n-min 8'`; also used by `--build` |
+| `--build` | `false` | Partitioned index build over the buckets, under `index/` (one `--sample`, `--pfam true`) |
+| `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce |
+| `--bloom_bits` | `10` | Bloom filter bits per candidate hash |
 | `--stats` | `false` | Per-cluster statistics and predicted index sizes |
 | `--stats_args` | `''` | `--k`, `--alphabet` for STATS and COMBINE |
 | `--stats_rate` | `0.001` | Rate of the sampled (hash, cluster) pairs that measure promiscuity |
@@ -103,6 +140,7 @@ per posting (default 1, also an upper bound); the nested builds give the real ra
 | `--venv` | repo `.venv` | Environment created by `setup.sh` |
 
 Resources are set per label in `nextflow.config` (`process_medium` for DuckDB steps and
-STATS, `process_high_memory` for INDEX and COMBINE); override them with `-c my.config`.
+STATS and the partitioned build's per-bucket and per-range steps, `process_high_memory`
+for INDEX, COMBINE and PACK); override them with `-c my.config`.
 The index build holds the members table and the sampled k-mer tables in memory; the
 nested run measures how its peak memory grows with the subset.

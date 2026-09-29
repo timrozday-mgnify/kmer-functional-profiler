@@ -358,17 +358,11 @@ def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParam
     return units.join(thresholds, on="t_g", maintain_order="left")
 
 
-def build_index(
-    members_path: str | Path,
-    out_dir: str | Path,
-    params: IndexParams | None = None,
-    pfam_path: str | Path | None = None,
-    postings_parquet: bool = False,
-) -> dict[str, object]:
-    """Build an index from a members Parquet table into ``out_dir``; return its stats."""
-    params = params or IndexParams()
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def _prepare(
+    members_path: str | Path, params: IndexParams
+) -> tuple[pl.DataFrame, list[pl.DataFrame], dict[str, object]]:
+    """Load, mask and batch members; the returned members lose their sequences (the batches
+    hold the only copy)."""
     members = load_members(members_path)
     n_residues = int(members["sequence"].str.len_bytes().cast(pl.UInt64).sum())
     n_masked = 0
@@ -377,39 +371,25 @@ def build_index(
         n_masked = int((masked != members["sequence"]).sum())
         members = members.with_columns(sequence=masked)
     batches = list(_batches(members, params.batch_residues))
-    members = members.drop("sequence")  # the batches hold the only copy
+    stats: dict[str, object] = {
+        "n_proteins": members.height,
+        "n_residues": n_residues,
+        "n_adapter_masked_proteins": n_masked,
+    }
+    return members.drop("sequence"), batches, stats
 
-    # Pass 1: distinct k-mers per unit.
-    units = _unit_table(members, _n_kmers(batches, params), params)
-    t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
-    thresholds = units.select("unit", "max_hash_g")
 
-    # Pass 2: candidate hashes; pass 3: presence of candidates in every unit.
-    candidates = pl.concat(
-        [
-            _kmers(b, params, t_max_hash)
-            .join(thresholds, on="unit")
-            .filter(pl.col("hash") <= pl.col("max_hash_g"))
-            .select("hash")
-            .unique()
-            for b in batches
-        ]
-    ).unique()
-    presence = (
-        pl.concat(
-            [
-                _kmers(b, params, t_max_hash)
-                .join(candidates, on="hash", how="semi")
-                .group_by("unit", "hash")
-                .agg(c=pl.col("counts").sum())
-                for b in batches
-            ]
-        )
-        .with_columns(n_groups=pl.len().over("hash").cast(pl.UInt32))
-        .join(units.select("unit", "n_counting", "max_hash_g"), on="unit")
-    )
+def _select_postings(
+    presence: pl.DataFrame, units: pl.DataFrame, params: IndexParams
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, object]]:
+    """Score candidates and keep postings; return (scored, postings, stats).
+
+    ``presence`` has ``hash``, ``unit``, ``c`` (counting members holding it) and
+    ``n_groups`` (units holding it at ``t_max``) for at least every candidate (unit, hash).
+    """
     scored = (
-        presence.filter(pl.col("hash") <= pl.col("max_hash_g"))
+        presence.join(units.select("unit", "n_counting", "max_hash_g"), on="unit")
+        .filter(pl.col("hash") <= pl.col("max_hash_g"))
         .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
         .with_columns(
             # k-mers seen only in partial members get half a member's weight in the score
@@ -429,23 +409,73 @@ def build_index(
         .filter(~pl.col("floored") | (pl.int_range(pl.len()).over("unit") < params.n_min))
         .drop("floored")
     )
+    stats: dict[str, object] = {
+        "n_clusters": units.height,
+        "n_singletons": int((units["n_members"] == 1).sum()),
+        "n_floored": int(floored["floored"].sum()),
+        "candidates_expected": float((units["t_g"] * units["n_kmers"]).sum()),
+        "candidates": scored.height,
+        "promiscuous_dropped": int((scored["n_groups"] > params.max_groups).sum()),
+    }
+    return scored, postings, stats
+
+
+def _unit_pfam(pfam_path: str | Path, members: pl.DataFrame) -> pl.DataFrame:
+    """Members per (``unit``, ``pfam_accession``)."""
+    return (
+        pl.scan_parquet(pfam_path)
+        .select("protein_id", "pfam_accession")
+        .join(members.lazy().select("protein_id", "unit"), on="protein_id")
+        .group_by("unit", "pfam_accession")
+        .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
+        .collect()
+    )
+
+
+def build_index(
+    members_path: str | Path,
+    out_dir: str | Path,
+    params: IndexParams | None = None,
+    pfam_path: str | Path | None = None,
+    postings_parquet: bool = False,
+) -> dict[str, object]:
+    """Build an index from a members Parquet table into ``out_dir``; return its stats."""
+    params = params or IndexParams()
+    members, batches, stats = _prepare(members_path, params)
+
+    # Pass 1: distinct k-mers per unit.
+    units = _unit_table(members, _n_kmers(batches, params), params)
+    t_max_hash = int(units["max_hash_g"].max())  # type: ignore[arg-type]
+    thresholds = units.select("unit", "max_hash_g")
+
+    # Pass 2: candidate hashes; pass 3: presence of candidates in every unit.
+    candidates = pl.concat(
+        [
+            _kmers(b, params, t_max_hash)
+            .join(thresholds, on="unit")
+            .filter(pl.col("hash") <= pl.col("max_hash_g"))
+            .select("hash")
+            .unique()
+            for b in batches
+        ]
+    ).unique()
+    presence = pl.concat(
+        [
+            _kmers(b, params, t_max_hash)
+            .join(candidates, on="hash", how="semi")
+            .group_by("unit", "hash")
+            .agg(c=pl.col("counts").sum())
+            for b in batches
+        ]
+    ).with_columns(n_groups=pl.len().over("hash").cast(pl.UInt32))
+    _, postings, posting_stats = _select_postings(presence, units, params)
+    stats |= posting_stats
     units = units.join(
         _len_cv(batches, params, postings.select("unit", "hash"), members),
         on="unit",
         how="left",
         maintain_order="left",
     )
-    stats: dict[str, object] = {
-        "n_proteins": members.height,
-        "n_clusters": units.height,
-        "n_residues": n_residues,
-        "n_adapter_masked_proteins": n_masked,
-        "n_singletons": int((units["n_members"] == 1).sum()),
-        "n_floored": floored["floored"].sum(),
-        "candidates_expected": float((units["t_g"] * units["n_kmers"]).sum()),
-        "candidates": scored.height,
-        "promiscuous_dropped": int((scored["n_groups"] > params.max_groups).sum()),
-    }
     dense = None
     if params.t_dense > 0:
         # Pass 4: every unit's k-mers at max(t_dense, t_g), so the dense set of each unit
@@ -482,7 +512,32 @@ def build_index(
             how="left",
             maintain_order="left",
         )
-    # Units without a posting can never be hit: drop them and renumber the rest.
+    return finish_index(
+        out_dir,
+        params,
+        units,
+        postings,
+        stats,
+        unit_pfam=None if pfam_path is None else _unit_pfam(pfam_path, members),
+        dense=dense,
+        postings_parquet=postings_parquet,
+    )
+
+
+def finish_index(
+    out_dir: str | Path,
+    params: IndexParams,
+    units: pl.DataFrame,
+    postings: pl.DataFrame,
+    stats: dict[str, object],
+    unit_pfam: pl.DataFrame | None = None,
+    dense: pl.DataFrame | None = None,
+    postings_parquet: bool = False,
+) -> dict[str, object]:
+    """Drop units without a posting (they can never be hit), renumber the rest in ``unit``
+    order and write the index."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
     ids = (
         postings.select("unit")
         .unique()
@@ -497,13 +552,8 @@ def build_index(
             .drop("new")
         )
 
-    if pfam_path is not None:
-        renumber(
-            pl.read_parquet(pfam_path, columns=["protein_id", "pfam_accession"])
-            .join(members.select("protein_id", "unit"), on="protein_id")
-            .group_by("unit", "pfam_accession")
-            .agg(n_members=pl.col("protein_id").n_unique().cast(pl.UInt32))
-        ).sort("unit", "pfam_accession").write_parquet(out / "unit_pfam.parquet")
+    if unit_pfam is not None:
+        renumber(unit_pfam).sort("unit", "pfam_accession").write_parquet(out / "unit_pfam.parquet")
     units = renumber(
         units.select(
             "unit",

@@ -1,0 +1,86 @@
+"""Partitioned build: equal to the single-process build; Bloom filter has no false negatives."""
+
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import pytest
+
+from kmer_functional_profiler import partition
+from kmer_functional_profiler.index import IndexParams, build_index
+
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+BUCKETS, RANGES = 3, 4
+
+
+def test_bloom_filter() -> None:
+    rng = np.random.default_rng(1)
+    keys = rng.integers(0, 2**62, 20_000, dtype=np.uint64)
+    bits = np.zeros(20_000 * 10 // 8, dtype=np.uint8)
+    pos = partition._positions(keys, len(bits) * 8).ravel()
+    np.bitwise_or.at(bits, pos >> np.uint64(3), (1 << (pos & np.uint64(7))).astype(np.uint8))
+    assert partition.bloom_contains(bits, keys).all()
+    others = rng.integers(0, 2**62, 100_000, dtype=np.uint64)
+    assert partition.bloom_contains(bits, others).mean() < 0.02  # ~0.8% expected
+
+
+def test_partitioned_build_equals_single(tmp_path: Path) -> None:
+    rng = random.Random(3)
+    rows, pfam = [], []
+    for rep in range(1, 300):
+        base = "".join(rng.choices(AMINO_ACIDS, k=rng.randint(20, 300)))
+        for m in range(rng.choice([1, 1, 2, 3, 8])):
+            seq = "".join(rng.choice(AMINO_ACIDS) if rng.random() < 0.05 else a for a in base)
+            rows.append((rep * 100 + m, rep * 100, rng.random() < 0.7, seq))
+            pfam += [(rep * 100 + m, f"PF{rep % 7:05d}")] * (rng.random() < 0.5)
+    members = pl.DataFrame(
+        rows, schema=["protein_id", "cluster_rep", "full_length", "sequence"], orient="row"
+    )
+    members.write_parquet(tmp_path / "members.parquet")
+    pl.DataFrame(pfam, schema=["protein_id", "pfam_accession"], orient="row").write_parquet(
+        tmp_path / "pfam.parquet"
+    )
+    # k = 4 shares many k-mers across buckets, so n_groups and the promiscuity cut matter.
+    params = IndexParams(k=4, t_base=0.05, n_min=4, t_cap=0.5, max_groups=3)
+    single = build_index(
+        tmp_path / "members.parquet", tmp_path / "single", params, tmp_path / "pfam.parquet", True
+    )
+    assert single["promiscuous_dropped"] > 0  # type: ignore[operator]
+
+    d = tmp_path / "parts"
+    d.mkdir()
+    prefixes = [str(d / f"b{b}") for b in range(BUCKETS)]
+    for b, prefix in enumerate(prefixes):
+        members.filter(pl.col("cluster_rep") % BUCKETS == b).write_parquet(
+            f"{prefix}.members.parquet"
+        )
+        partition.candidates(f"{prefix}.members.parquet", prefix, params)
+    # A small filter, so many rows are false positives that groups must drop.
+    partition.bloom(prefixes, d / "bloom", bits_per_key=2)
+    for b, prefix in enumerate(prefixes):
+        partition.presence(f"{prefix}.members.parquet", prefix, str(d / "bloom"), b, RANGES, params)
+    for r in range(RANGES):
+        partition.groups([f"{p}.range{r}.parquet" for p in prefixes], str(d / f"range{r}"))
+    for b, prefix in enumerate(prefixes):
+        found = [d / f"range{r}.bucket{b}.parquet" for r in range(RANGES)]
+        partition.postings(
+            f"{prefix}.members.parquet",
+            prefix,
+            [p for p in found if p.exists()],
+            params,
+            tmp_path / "pfam.parquet",
+        )
+    stats = partition.pack(prefixes, tmp_path / "parted", params, pfam=True, postings_parquet=True)
+
+    assert stats.keys() == single.keys()
+    for key, value in single.items():
+        assert stats[key] == pytest.approx(value), key
+    for name in ("units", "postings", "unit_pfam"):
+        a, b = (pl.read_parquet(tmp_path / x / f"{name}.parquet") for x in ("single", "parted"))
+        assert a.equals(b), name
+    for npy in (tmp_path / "single").glob("*.npy"):
+        assert np.array_equal(np.load(npy), np.load(tmp_path / "parted" / npy.name)), npy.name
+    meta = [json.loads((tmp_path / x / "meta.json").read_text()) for x in ("single", "parted")]
+    assert meta[0]["tier2"] == meta[1]["tier2"]
