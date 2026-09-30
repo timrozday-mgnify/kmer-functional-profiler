@@ -188,7 +188,7 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--query_memory` | `128 GB` | Memory per query |
 | `--query_scratch` | `${TMPDIR:-/tmp}` | Node-local directory to copy the index's query files to before each query (removed after; `false` queries it in place). If the copy fails, the query uses the index in place |
 | `--query_in_memory` | `false` | Read the tier-2 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |
-| `--query_scratch_in_memory` | `false` | Keep the posterior's draw matrices in memory instead of an unlinked scratch file in `$TMPDIR` (written when over 256 MB: ~4 × 8 B × draws × detected units, ~25 GB at 100 draws on 40 M pairs). For nodes without usable local disk; raise `--query_memory` by that much |
+| `--query_low_memory` | `false` | Trade time for memory where results are unchanged: with draws, the reads are hashed a second time for the detected units' k-mers instead of keeping per-read rows of every hit unit (~2 GB at 40 M pairs, one more read pass). For memory-capped runs; on HPC raising `--query_memory` is cheaper |
 | `--query_preload` | `true` | Read tier 2 into the page cache before each query, so lookups are not random reads from a network filesystem (time logged to `.command.err`) |
 | `--venv` | repo `.venv` | Environment created by `setup.sh` |
 

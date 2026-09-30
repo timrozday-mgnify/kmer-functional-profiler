@@ -58,6 +58,21 @@ def members(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
+@pytest.fixture(scope="module")
+def shared(members: Path) -> Path:
+    """The fixture proteins plus a copy of each, every 20th residue changed, as a cluster of
+    its own: units share k-mers, so components have two units."""
+    path = members.parent / "shared" / "members.parquet"
+    path.parent.mkdir(exist_ok=True)
+    seqs = list(proteins().values())
+    copies = ["".join("W" if i % 20 == 10 else c for i, c in enumerate(q)) for q in seqs]
+    rows = [(i, i, True, q) for i, q in enumerate(seqs + copies)]
+    pl.DataFrame(
+        rows, schema=["protein_id", "cluster_rep", "full_length", "sequence"], orient="row"
+    ).write_parquet(path)
+    return path
+
+
 def build(members: Path, **params: object) -> Index:
     out = members.parent / "_".join(f"{k}{v}" for k, v in params.items())
     build_index(members, out, IndexParams(k=K, **params))  # type: ignore[arg-type]
@@ -474,23 +489,54 @@ def test_posterior_draws_ignore_input_order() -> None:
     )
 
 
-def test_posterior_scratch_file_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Draws kept in a scratch file and quantiles taken one unit at a time give the same frame;
-    # unit 1 lives on k-mers it shares with unit 0 (a group), unit 2 is alone.
+def test_low_memory_rereads_to_the_same_profile(shared: Path) -> None:
+    index = build(shared, t_base=0.2, n_min=0)
+    timer = Timer()
+    got = profile(index, *READS, draws=5, batch_reads=7, low_memory=True, timer=timer)
+    assert got.equals(profile(index, *READS, draws=5, batch_reads=7))
+    assert "reread" in timer.stages and timer.counts["read_rows"] == 0
+
+
+def test_read_weights_are_poisson_and_keyed_by_read() -> None:
+    reads = np.arange(200_000, dtype=np.uint64)
+    w = query._poisson1(3, 7, reads)
+    assert abs(w.mean() - 1) < 0.01 and abs(w.var() - 1) < 0.02
+    assert (query._poisson1(3, 7, reads[::-1]) == w[::-1]).all()  # a read's own weight
+    assert not (query._poisson1(3, 8, reads) == w).all()  # a new draw, new weights
+
+
+def test_posterior_component_alone_or_batched(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One component per batch: units 0 and 1 (sharing k-mers) get the same intervals whether
+    # or not unit 2, hit by the same reads on k-mers of its own, is queried with them.
+    monkeypatch.setattr(query, "POSTERIOR_BATCH_BYTES", 1)
     kmer_units = [(h, [0]) for h in range(6)] + [(h, [0, 1]) for h in (6, 7)]
     kmer_units += [(h, [2]) for h in range(10, 14)]
-    rows = [(u, h, h * 10 + r, 1 + r % 2) for h, us in kmer_units for u in us for r in range(3)]
+    rows = [(u, h, r, 1 + r % 2) for h, us in kmer_units for u in us for r in range(h % 3, 9, 2)]
     schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
     hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
     m_g, pin_sum = np.array([10, 5, 8]), np.array([10.0, 5.0, 8.0])
-    in_memory = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30)
-    assert in_memory["group_size"].max() == 2
-    monkeypatch.setattr(query, "SCRATCH_BYTES", 16)
-    assert isinstance(query._scratch((2, 3)), np.memmap)
-    assert not isinstance(query._scratch((2, 3), in_memory=True), np.memmap)
-    assert posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30).equals(in_memory)
-    got = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30, scratch_in_memory=True)
-    assert got.equals(in_memory)
+    both = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30)
+    alone = posterior_zi(*by_hash(hit_reads.filter(pl.col("unit") < 2)), m_g, pin_sum, 30)
+    assert both["group_size"].max() == 2
+    assert both.filter(pl.col("unit") < 2).equals(alone)
+
+
+def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One component per batch: every fit gives what it gives on all units at once.
+    indexes = [build(shared, t_base=0.2, n_min=0), build(shared, t_base=0.2, n_min=0, t_dense=1.0)]
+    timer = Timer()
+    profile(indexes[0], *READS, timer=timer)
+    assert timer.counts["components"] < timer.counts["hit_units"]
+    whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
+    monkeypatch.setattr(query, "MAX_BATCH_PAIRS", 1)
+    for index, expected in zip(indexes, whole, strict=True):
+        assert profile(index, *READS, all_estimators=True, draws=3).equals(expected)
+    pairs = pl.DataFrame(
+        {"unit": [0, 1, 1, 2, 3, 4], "hash": [10, 10, 11, 12, 11, 13]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64},
+    )
+    batches = [sorted(b["unit"].unique().to_list()) for b in query.component_batches(pairs)]
+    assert sorted(batches) == [[0, 1, 3], [2], [4]]
 
 
 def test_unit_columns_match_parquet(members: Path, tmp_path: Path) -> None:
