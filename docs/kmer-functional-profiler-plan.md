@@ -854,6 +854,12 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Checked:* a test with a faked `RssAnon` that spikes only between stage start and end (the sampler catches it), and the no-`/proc` case; both suites.
   - *Limit:* a spike shorter than 50 ms can be missed. `peak_rss` stays the hard bound (what Slurm's cgroup limit counts, with page cache charged but reclaimable).
 
+* **Phase 6, step 23 — `unit-columns` without memory-mapped writes.** `unit-columns` on `full-build` (index on `/hps`) segfaulted on the HPC.
+  - *Diagnosis:* `faulthandler` put the main thread in native code inside the call that fills the `open_memmap` `.npy` (no Python frame below it). The same slice reader into an in-memory array had worked in the query's fallback, reading the node-local copy, so the memory-mapped write to `/hps` is the suspect. Not confirmed by a native backtrace.
+  - *Second problem:* `open_memmap` creates each file full-size and zero-filled before writing, so an interrupted run leaves columns that load as valid zeros, and the query would use them.
+  - *Fixed:* `write_unit_columns` appends each slice to a plain file (`.npy` v2 header, then `tofile`) under `units.<column>.npy.partial`, renamed when complete.
+  - *Checked:* the slice test (3-row slices) loads identical arrays and leaves no `.partial`; both suites. Any `units.*.npy` from the crashed run must be deleted before re-running.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

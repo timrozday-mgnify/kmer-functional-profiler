@@ -363,17 +363,22 @@ def _is_numeric(dtype: pl.DataType) -> bool:
 COLUMN_SLICE = 2**26
 
 
-def _read_column(path: Path, name: str, out: np.ndarray | None = None) -> np.ndarray:
-    """Read one numeric column of a parquet file in ``COLUMN_SLICE``-row slices, into
-    ``out`` if given (e.g. a memory-mapped ``.npy``); fixed-size arrays come out 2-D."""
+def _column_slices(path: Path, name: str, n: int) -> Iterator[np.ndarray]:
+    """One numeric column of a parquet file of ``n`` rows, in ``COLUMN_SLICE``-row slices;
+    fixed-size arrays come out 2-D."""
     lazy = pl.scan_parquet(path).select(name)
-    if out is None:
-        dtype, shape = _column_shape(path, name)
-        out = np.empty(shape, dtype)
-    for start in range(0, len(out), COLUMN_SLICE):
-        out[start : start + COLUMN_SLICE] = (
-            lazy.slice(start, COLUMN_SLICE).collect()[name].to_numpy()
-        )
+    for start in range(0, n, COLUMN_SLICE):
+        yield lazy.slice(start, COLUMN_SLICE).collect()[name].to_numpy()
+
+
+def _read_column(path: Path, name: str) -> np.ndarray:
+    """Read one numeric column of a parquet file into memory, a slice at a time."""
+    dtype, shape = _column_shape(path, name)
+    out = np.empty(shape, dtype)
+    for start, part in zip(
+        range(0, shape[0], COLUMN_SLICE), _column_slices(path, name, shape[0]), strict=True
+    ):
+        out[start : start + len(part)] = part
     return out
 
 
@@ -386,16 +391,24 @@ def _column_shape(path: Path, name: str) -> tuple[np.dtype[Any], tuple[int, ...]
 
 def write_unit_columns(directory: str | Path) -> None:
     """Write each numeric column of ``units.parquet`` but ``unit`` (the row number) as
-    ``units.<column>.npy`` (fixed-size arrays as 2-D), a slice in memory at a time."""
+    ``units.<column>.npy`` (fixed-size arrays as 2-D), a slice in memory at a time.
+
+    Slices are appended to a plain file (no memory-mapped writes: they crashed on the HPC's
+    network file system) under a temporary name, renamed when complete, so an interrupted
+    run never leaves a column that reads as valid.
+    """
     path = Path(directory) / "units.parquet"
     for name, dtype in pl.read_parquet_schema(path).items():
         if name != "unit" and _is_numeric(dtype):
             dt, shape = _column_shape(path, name)
-            npy = np.lib.format.open_memmap(
-                path.with_name(f"units.{name}.npy"), mode="w+", dtype=dt, shape=shape
-            )
-            _read_column(path, name, npy)
-            npy.flush()
+            npy = path.with_name(f"units.{name}.npy")
+            partial = npy.with_suffix(".npy.partial")
+            header = {"descr": np.lib.format.dtype_to_descr(dt), "fortran_order": False}
+            with partial.open("wb") as f:
+                np.lib.format.write_array_header_2_0(f, header | {"shape": shape})
+                for part in _column_slices(path, name, shape[0]):
+                    np.ascontiguousarray(part, dtype=dt).tofile(f)
+            partial.replace(npy)
 
 
 class UnitTable:
