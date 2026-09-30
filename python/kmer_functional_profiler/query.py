@@ -693,19 +693,12 @@ def posterior_zi(
     parts = component_batches(
         pairs.select("unit", "hash"), max(1, POSTERIOR_BATCH_BYTES // per_pair)
     )
-    batch_of_hash = pl.concat(
-        [
-            p.select("hash").unique().with_columns(batch=pl.lit(i, pl.UInt32))
-            for i, p in enumerate(parts)
-        ]
-    )
-    by_batch = hash_reads.join(batch_of_hash, on="hash").sort("batch")
-    ends = np.cumsum(np.bincount(by_batch["batch"].to_numpy(), minlength=len(parts)))
     return pl.concat(
         [
             _posterior_batch(
                 part,
-                by_batch.slice(int(lo), int(hi - lo)),
+                # This batch's k-mers' rows: a scan per batch, no copy of all rows.
+                hash_reads.join(part.select("hash").unique(), on="hash", how="semi"),
                 m_g,
                 pin_sum,
                 draws,
@@ -717,7 +710,7 @@ def posterior_zi(
                 shared_evidence=shared_evidence,
                 seed=seed,
             )
-            for part, lo, hi in zip(parts, np.r_[0, ends[:-1]], ends, strict=True)
+            for part in parts
         ]
     ).sort("unit")
 
