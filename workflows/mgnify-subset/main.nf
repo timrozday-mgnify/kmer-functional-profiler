@@ -409,6 +409,11 @@ process QUERY {
     script:
     """
     export POLARS_MAX_THREADS=${task.cpus} OMP_NUM_THREADS=${task.cpus} OPENBLAS_NUM_THREADS=${task.cpus}
+    if ${params.query_preload}; then  # page cache is per node, so not a task of its own
+        start=\$SECONDS
+        cat ${index}/tier2.*.npy > /dev/null
+        echo "preload: \$(du -chL ${index}/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
+    fi
     ${params.kfp} query ${index} ${r1} ${r2} --draws ${draws} --out profile.tsv \\
         --stats ${name}.${pairs}.${draws}.json
     """

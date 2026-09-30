@@ -304,7 +304,11 @@ PIN_P: Final = np.clip(
 
 
 def em_pin(
-    kmers: pl.DataFrame, pin_hist: np.ndarray, *, tol: float = 1e-6, max_iter: int = 1000
+    kmers: pl.DataFrame,
+    pin_hist: np.ndarray | pl.Series,
+    *,
+    tol: float = 1e-6,
+    max_iter: int = 1000,
 ) -> pl.DataFrame:
     """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
 
@@ -317,12 +321,13 @@ def em_pin(
     s_g is capped so presence stays <= 1.
 
     ``kmers`` has ``unit``, ``hash``, ``hits`` and ``pin_q``; ``pin_hist[unit]`` counts the
-    unit's kept k-mers per level (its sum is ``m_g``). Coverage is attributed hits over
-    expected present k-mers (hit ones by their share, unhit ones by their posterior
-    presence), and s_g is expected present k-mers over the sum of p_in. Like :func:`em`, a
-    hit k-mer counts as present for a unit by its share of the hits. Returns ``unit``,
-    ``coverage`` and ``present`` (expected fraction of kept k-mers present); units
-    explained away get coverage 0.
+    unit's kept k-mers per level (its sum is ``m_g``); a Series (the unit table's column) is
+    read for the hit units only, as a full index's column exceeds numpy conversion's 2**32
+    values. Coverage is attributed hits over expected present k-mers (hit ones by their
+    share, unhit ones by their posterior presence), and s_g is expected present k-mers over
+    the sum of p_in. Like :func:`em`, a hit k-mer counts as present for a unit by its share
+    of the hits. Returns ``unit``, ``coverage`` and ``present`` (expected fraction of kept
+    k-mers present); units explained away get coverage 0.
     """
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
@@ -330,7 +335,7 @@ def em_pin(
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
     n = len(units)
-    hist = pin_hist[units].astype(np.float64)
+    hist = np.asarray(pin_hist[units], dtype=np.float64)
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
     for _ in range(max_iter):
@@ -752,7 +757,7 @@ def profile(
     detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
-    pin_hist = index.units["pin_hist"].to_numpy()
+    pin_hist = index.units["pin_hist"]
     pin_sum = index.units["pin_sum"]
     len_cv = index.units["len_cv"].to_numpy()
     # Each hit k-mer is gather's: the first unit in gather order holding it.
@@ -782,7 +787,7 @@ def profile(
             )
             detected = per_kmer(detected_reads)
         m_g = index.units["m_dense"].to_numpy()
-        pin_hist = index.units["pin_hist_dense"].to_numpy()
+        pin_hist = index.units["pin_hist_dense"]
         pin_sum = index.units["pin_sum_dense"]
         len_cv = index.units["len_cv_dense"].to_numpy()
     with timer("fit_em"):
