@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from os import PathLike
-from typing import Self
+from typing import Protocol, Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -34,6 +34,32 @@ BLOOM_BLOCK_BYTES: int
 
 def bloom_insert(bits: NDArray[np.uint8], hashes: NDArray[np.uint64]) -> None: ...
 def bloom_contains(bits: NDArray[np.uint8], hashes: NDArray[np.uint64]) -> NDArray[np.bool_]: ...
+
+class _Packed(Protocol):  # index.PackedTable
+    @property
+    def max_hash(self) -> int: ...
+    @property
+    def shift(self) -> int: ...
+    @property
+    def fp_bits(self) -> int: ...
+    @property
+    def offsets(self) -> NDArray[np.unsignedinteger]: ...
+    @property
+    def fingerprints(self) -> NDArray[np.unsignedinteger]: ...
+    @property
+    def set_ids(self) -> NDArray[np.unsignedinteger]: ...
+    @property
+    def set_offsets(self) -> NDArray[np.unsignedinteger]: ...
+    @property
+    def set_values(self) -> NDArray[np.unsignedinteger]: ...
+
+def packed_lookup(table: _Packed, hashes: NDArray[np.uint64]) -> NDArray[np.int64]: ...
+def unit_hits(
+    table: _Packed,
+    max_hash_g: NDArray[np.uint64],
+    hashes: NDArray[np.uint64],
+    reads: NDArray[np.uint64],
+) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.uint8]]: ...
 
 class FastxHits:
     def __init__(

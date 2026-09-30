@@ -35,7 +35,6 @@ The query probes it only for the units the sparse tier detects, to fit abundance
 import json
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
-from functools import cached_property
 from pathlib import Path
 from typing import Any, Final, NamedTuple, Self
 
@@ -318,32 +317,16 @@ class PackedTable:
         )
 
     def lookup(self, hashes: NDArray[np.uint64]) -> NDArray[np.int64]:
-        """Set id per hash, or -1 (false hits at ~keys per bucket * 2**-fp_bits per lookup)."""
-        hashes = np.asarray(hashes, dtype=np.uint64)
-        stored = self.stored_keys
-        if not len(stored):
-            return np.full(len(hashes), -1, dtype=np.int64)
-        keys = hashes >> np.uint64(self.shift)
-        i = np.minimum(np.searchsorted(stored, keys), len(stored) - 1)
-        hit = (stored[i] == keys) & (hashes <= np.uint64(self.max_hash))
-        return np.where(hit, self.set_ids[i].astype(np.int64), -1)
+        """Set id per hash, or -1 (false hits at ~keys per bucket * 2**-fp_bits per lookup).
+
+        Reads the arrays in place (``_core.packed_lookup``), so memory-mapped tables stay
+        on disk but for the buckets and sets touched.
+        """
+        return _core.packed_lookup(self, np.asarray(hashes, dtype=np.uint64))
 
     def values(self, set_id: int) -> NDArray[np.uint64]:
         """Values of one set."""
         return self.set_values[self.set_offsets[set_id] : self.set_offsets[set_id + 1]]
-
-    @cached_property
-    def stored_keys(self) -> NDArray[np.uint64]:
-        """Full sorted keys (bucket and fingerprint), materialised once for ``lookup``."""
-        # ponytail: 8 bytes per key in RAM; the Rust lookup will walk offsets directly.
-        # Shifted and filled in place: no second key-sized temporary (3.4e9 keys = 27 GB each).
-        keys = np.repeat(
-            np.arange(len(self.offsets) - 1, dtype=np.uint64),
-            np.diff(self.offsets).astype(np.int64),
-        )
-        keys <<= np.uint64(self.fp_bits)
-        keys |= self.fingerprints  # buffered cast, no uint64 copy of the fingerprints
-        return keys
 
     def save(self, directory: Path, name: str) -> dict[str, int]:
         """Write one ``.npy`` per array; return the scalar layout for ``meta.json``."""

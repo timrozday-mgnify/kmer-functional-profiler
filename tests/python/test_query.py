@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from kmer_functional_profiler import _core, reference
 from kmer_functional_profiler.cli import app
-from kmer_functional_profiler.index import Index, IndexParams, build_index
+from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
 from kmer_functional_profiler.query import (
     UFIRST_SCORE,
     WTA_SCORE,
@@ -23,6 +23,7 @@ from kmer_functional_profiler.query import (
     posterior_zi,
     presence,
     profile,
+    unit_hits,
 )
 
 DATA = Path(__file__).resolve().parents[1] / "data"
@@ -309,6 +310,66 @@ def test_present_prior_shrinks_thin_units() -> None:
         shrunk = em(kmers, np.array([m]), zero_inflated=True, prior=(a, b)).row(0, named=True)
         assert (abs(shrunk["present"] - free["present"]) > 0.05) == moved
         assert abs(shrunk["present"] - 0.3) <= abs(free["present"] - 0.3) + 1e-9
+
+
+def reference_lookup(table: PackedTable, hashes: np.ndarray) -> np.ndarray:
+    """The numpy lookup the Rust kernel replaced: materialised sorted keys, searchsorted."""
+    keys = np.repeat(np.arange(len(table.offsets) - 1, dtype=np.uint64), np.diff(table.offsets))
+    keys = keys << np.uint64(table.fp_bits) | table.fingerprints.astype(np.uint64)
+    query = hashes >> np.uint64(table.shift)
+    i = np.minimum(np.searchsorted(keys, query), len(keys) - 1)
+    found = (keys[i] == query) & (hashes <= np.uint64(table.max_hash))
+    return np.where(found, table.set_ids[i].astype(np.int64), -1)
+
+
+def reference_unit_hits(
+    table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray, reads: np.ndarray
+) -> pl.DataFrame:
+    """The numpy set expansion and ``max_hash_g`` check the Rust kernel replaced."""
+    set_ids = reference_lookup(table, hashes)
+    found = set_ids >= 0
+    hashes, reads, set_ids = hashes[found], reads[found], set_ids[found]
+    starts = table.set_offsets[set_ids].astype(np.int64)
+    lengths = table.set_offsets[set_ids + 1].astype(np.int64) - starts
+    within = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+    values = table.set_values[np.repeat(starts, lengths) + within].astype(np.uint64)
+    units = (values >> np.uint64(PIN_BITS)).astype(np.uint32)
+    pin_q = (values & np.uint64(2**PIN_BITS - 1)).astype(np.uint8)
+    hit = np.repeat(np.arange(len(hashes)), lengths)
+    keep = hashes[hit] <= max_hash_g[units]
+    holders = np.bincount(hit[keep], minlength=len(hashes)).astype(np.uint32)
+    hit = hit[keep]
+    return pl.DataFrame(
+        {
+            "unit": units[keep],
+            "hash": hashes[hit],
+            "read": reads[hit],
+            "pin_q": pin_q[keep],
+            "holders": holders[hit],
+        }
+    )
+
+
+def test_unit_hits_matches_numpy_reference(tmp_path: Path) -> None:
+    # 4-bit fingerprints: many keys share a bucket and fingerprint, so sets are unions.
+    rng = np.random.default_rng(5)
+    max_hash, n_units = 2**58 - 1, 300
+    hashes = rng.integers(0, max_hash, 20_000, dtype=np.uint64)
+    units = rng.integers(0, n_units, len(hashes), dtype=np.uint64)
+    values = units << np.uint64(PIN_BITS) | rng.integers(0, 16, len(hashes), dtype=np.uint64)
+    table = PackedTable.build(hashes, values, max_hash, 4)
+    max_hash_g = rng.integers(0, max_hash, n_units, dtype=np.uint64)
+    query = np.concatenate([hashes[::3], rng.integers(0, 2**59, 5000, dtype=np.uint64)])
+    reads = np.arange(len(query), dtype=np.uint64)
+    want = reference_unit_hits(table, max_hash_g, query, reads)
+    assert want.height > 1000 and (want["holders"] > 1).any()
+    assert unit_hits(table, max_hash_g, query, reads).equals(want)
+    # Memory-mapped, as a loaded index reads it.
+    layout = table.save(tmp_path, "t")
+    mapped = PackedTable.load(tmp_path, "t", layout)
+    assert isinstance(mapped.set_values, np.memmap)
+    assert unit_hits(mapped, max_hash_g, query, reads).equals(want)
+    assert np.array_equal(table.lookup(query), reference_lookup(table, query))
 
 
 def test_cli_query(members: Path, tmp_path: Path) -> None:

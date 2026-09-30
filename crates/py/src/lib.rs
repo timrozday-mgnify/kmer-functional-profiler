@@ -3,12 +3,14 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
-use kmer_functional_profiler_core::{self as kfp, DnaScanner, Error, Hits, KmerParams};
+use kmer_functional_profiler_core::{
+    self as kfp, Column, DnaScanner, Error, Hits, KmerParams, PackedTable,
+};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyAny, PyBytes, PyDict};
 
 fn to_py_err(e: Error) -> PyErr {
     match e {
@@ -164,6 +166,128 @@ fn bloom_contains<'py>(
     Ok(found.into_pyarray(py))
 }
 
+/// A borrowed 1-d unsigned numpy array of any width (memory-mapped `.npy` files included).
+enum Borrowed<'py> {
+    U8(PyReadonlyArray1<'py, u8>),
+    U16(PyReadonlyArray1<'py, u16>),
+    U32(PyReadonlyArray1<'py, u32>),
+    U64(PyReadonlyArray1<'py, u64>),
+}
+
+impl<'py> Borrowed<'py> {
+    fn new(array: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(a) = array.extract() {
+            return Ok(Self::U8(a));
+        }
+        if let Ok(a) = array.extract() {
+            return Ok(Self::U16(a));
+        }
+        if let Ok(a) = array.extract() {
+            return Ok(Self::U32(a));
+        }
+        Ok(Self::U64(array.extract().map_err(|_| {
+            PyValueError::new_err("expected a 1-d unsigned integer array")
+        })?))
+    }
+
+    fn column(&self) -> PyResult<Column<'_>> {
+        Ok(match self {
+            Self::U8(a) => Column::U8(a.as_slice()?),
+            Self::U16(a) => Column::U16(a.as_slice()?),
+            Self::U32(a) => Column::U32(a.as_slice()?),
+            Self::U64(a) => Column::U64(a.as_slice()?),
+        })
+    }
+}
+
+/// The arrays of a Python `PackedTable`, borrowed in place, and its layout.
+struct Packed<'py> {
+    arrays: [Borrowed<'py>; 5],
+    max_hash: u64,
+    shift: u32,
+    fp_bits: u32,
+}
+
+impl<'py> Packed<'py> {
+    fn new(table: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let array = |name: &str| Borrowed::new(&table.getattr(name)?);
+        Ok(Self {
+            arrays: [
+                array("offsets")?,
+                array("fingerprints")?,
+                array("set_ids")?,
+                array("set_offsets")?,
+                array("set_values")?,
+            ],
+            max_hash: table.getattr("max_hash")?.extract()?,
+            shift: table.getattr("shift")?.extract()?,
+            fp_bits: table.getattr("fp_bits")?.extract()?,
+        })
+    }
+
+    fn table(&self) -> PyResult<PackedTable<'_>> {
+        let [offsets, fingerprints, set_ids, set_offsets, set_values] = &self.arrays;
+        Ok(PackedTable {
+            max_hash: self.max_hash,
+            shift: self.shift,
+            fp_bits: self.fp_bits,
+            offsets: offsets.column()?,
+            fingerprints: fingerprints.column()?,
+            set_ids: set_ids.column()?,
+            set_offsets: set_offsets.column()?,
+            set_values: set_values.column()?,
+        })
+    }
+}
+
+/// Value-set id per hash in a `PackedTable`, or -1.
+#[pyfunction]
+fn packed_lookup<'py>(
+    py: Python<'py>,
+    table: &Bound<'py, PyAny>,
+    hashes: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let packed = Packed::new(table)?;
+    let (table, hashes) = (packed.table()?, hashes.as_slice()?);
+    #[allow(clippy::cast_possible_wrap)] // set ids are far below 2^63
+    let ids: Vec<i64> = py.detach(|| {
+        hashes
+            .iter()
+            .map(|&h| table.lookup(h).map_or(-1, |s| s as i64))
+            .collect()
+    });
+    Ok(ids.into_pyarray(py))
+}
+
+/// Unit hits of sampled hashes through a `PackedTable`: columns `unit`, `hash`, `read`,
+/// `pin_q` and `holders`, one row per (hash occurrence, unit passing its `max_hash_g`).
+#[pyfunction]
+fn unit_hits<'py>(
+    py: Python<'py>,
+    table: &Bound<'py, PyAny>,
+    max_hash_g: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    reads: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let packed = Packed::new(table)?;
+    let table = packed.table()?;
+    let (max_hash_g, hashes, reads) = (
+        max_hash_g.as_slice()?,
+        hashes.as_slice()?,
+        reads.as_slice()?,
+    );
+    let hits = py
+        .detach(|| kfp::unit_hits(&table, max_hash_g, hashes, reads))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("unit", hits.unit.into_pyarray(py))?;
+    dict.set_item("hash", hits.hash.into_pyarray(py))?;
+    dict.set_item("read", hits.read.into_pyarray(py))?;
+    dict.set_item("pin_q", hits.pin_q.into_pyarray(py))?;
+    dict.set_item("holders", hits.holders.into_pyarray(py))?;
+    Ok(dict)
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -232,6 +356,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bloom_insert, m)?)?;
     m.add_function(wrap_pyfunction!(bloom_contains, m)?)?;
     m.add("BLOOM_BLOCK_BYTES", kfp::BLOCK_BYTES)?;
+    m.add_function(wrap_pyfunction!(packed_lookup, m)?)?;
+    m.add_function(wrap_pyfunction!(unit_hits, m)?)?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }

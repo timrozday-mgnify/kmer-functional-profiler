@@ -132,30 +132,17 @@ def unit_hits(
 
     A hit counts for a unit only if the hash passes that unit's ``max_hash_g``; ``pin_q`` is
     the k-mer's quantised ``p_in`` in that unit and ``holders`` the number of index units
-    it counts for.
+    it counts for. Rows follow the input order, then each set's order. The table's arrays
+    are read in place (``_core.unit_hits``): one bucket and one set per hash, no keys.
     """
-    set_ids = table.lookup(hashes)
-    found = set_ids >= 0
-    hashes, reads, set_ids = hashes[found], reads[found], set_ids[found]
-    starts = table.set_offsets[set_ids].astype(np.int64)
-    lengths = table.set_offsets[set_ids + 1].astype(np.int64) - starts
-    # Positions of every set member, hit by hit.
-    within = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
-    values = table.set_values[np.repeat(starts, lengths) + within]
-    units = (values >> np.uint64(PIN_BITS)).astype(np.uint32)
-    pin_q = (values & np.uint64(2**PIN_BITS - 1)).astype(np.uint8)
-    hit = np.repeat(np.arange(len(hashes)), lengths)
-    keep = hashes[hit] <= max_hash_g[units]
-    holders = np.bincount(hit[keep], minlength=len(hashes)).astype(np.uint32)
-    hit = hit[keep]
+    u64 = np.uint64
     return pl.DataFrame(
-        {
-            "unit": units[keep],
-            "hash": hashes[hit],
-            "read": reads[hit],
-            "pin_q": pin_q[keep],
-            "holders": holders[hit],
-        }
+        _core.unit_hits(
+            table,
+            np.asarray(max_hash_g, dtype=u64),
+            np.asarray(hashes, dtype=u64),
+            np.asarray(reads, dtype=u64),
+        )
     )
 
 
@@ -708,8 +695,6 @@ def profile(
             hits=pl.col("n").sum(), pin_q=pl.col("pin_q").first(), holders=pl.col("holders").first()
         )
 
-    with timer("keys"):
-        index.tier2.stored_keys  # noqa: B018  (materialised once, on first lookup)
     empty = np.empty(0, dtype=np.uint64)
     batches, n_reads, subsample = [], 0, []
     sampled = hit_kmers = hit_rows = 0
