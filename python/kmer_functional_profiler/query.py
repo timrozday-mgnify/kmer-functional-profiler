@@ -323,13 +323,13 @@ def em_pin(
     n = len(units)
     hist = pin_hist[units].astype(np.float64)
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
+    cell = col * hist.shape[1] + level  # (unit, level) cell of each pair in hist.ravel()
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
     for _ in range(max_iter):
         weight = lam[col] * scale[col] * PIN_P[level]
         share = _div(weight, np.bincount(row, weights=weight, minlength=len(hashes))[row])
         attributed = np.bincount(col, weights=share * hits[row], minlength=n)
-        hit = np.zeros_like(hist)
-        np.add.at(hit, (col, level), share)
+        hit = np.bincount(cell, weights=share, minlength=hist.size).reshape(hist.shape)
         seen = -np.expm1(-lam)[:, None]  # chance a present k-mer is hit
         pi = scale[:, None] * PIN_P
         odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
