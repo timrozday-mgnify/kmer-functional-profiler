@@ -100,6 +100,13 @@ def query(
             "faults during lookup, at the cost of their full size in RSS"
         ),
     ] = False,
+    scratch_in_memory: Annotated[
+        bool,
+        typer.Option(
+            help="Keep the posterior's draws in memory instead of a scratch file in TMPDIR "
+            "(~4 x 8 bytes x draws x detected units; for nodes without local disk)"
+        ),
+    ] = False,
     all_estimators: Annotated[
         bool,
         typer.Option(
@@ -123,6 +130,7 @@ def query(
             kmers_out=kmers,
             timer=timer if stats else None,
             all_estimators=all_estimators,
+            scratch_in_memory=scratch_in_memory,
         )
         result.write_csv(out, separator="\t")
     timer.write()
