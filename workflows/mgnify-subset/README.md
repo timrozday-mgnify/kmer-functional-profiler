@@ -184,6 +184,8 @@ pairs, hit and detected units, component sizes) and `{stage}_wall_s`, `_cpu_s` a
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
 | `--query_draws_on` | `1in100` | Index that also gets the posterior |
 | `--query_memory` | `128 GB` | Memory per query |
+| `--query_scratch` | `${TMPDIR:-/tmp}` | Node-local directory to copy the index's query files to before each query (removed after; `false` queries it in place). If the copy fails, the query uses the index in place |
+| `--query_in_memory` | `false` | Read the tier-2 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |
 | `--query_preload` | `true` | Read tier 2 into the page cache before each query, so lookups are not random reads from a network filesystem (time logged to `.command.err`) |
 | `--venv` | repo `.venv` | Environment created by `setup.sh` |
 
