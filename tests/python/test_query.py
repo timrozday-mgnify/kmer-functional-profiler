@@ -497,6 +497,7 @@ def test_unit_columns_read_in_slices(
     write_unit_columns(tmp_path)
     for n, a in want.items():
         assert np.array_equal(np.load(tmp_path / f"units.{n}.npy"), a)
+    assert not list(tmp_path.glob("*.partial"))
 
 
 def test_em_fits_components_independently() -> None:
