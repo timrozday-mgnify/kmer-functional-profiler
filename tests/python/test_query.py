@@ -1,6 +1,7 @@
 """Query counts against an index built from the fixture proteins."""
 
 import json
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +63,7 @@ def build(members: Path, **params: object) -> Index:
 
 def test_dense_counts_match_direct_intersection(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
-    result = profile(index, *READS)
+    result = profile(index, *READS, all_estimators=True)
     hits = list(_core.FastxHits(*READS, k=K))
     hashes = [h for b in hits for h in b["hash"].tolist()]
     reads = [r for b in hits for r in b["read"].tolist()]
@@ -108,7 +109,8 @@ def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
     assert both.dense is not None and dense.dense is None
     assert (both.units["m_dense"] == dense.units["m_g"]).all()
     assert both.units["m_g"].sum() < both.units["m_dense"].sum()
-    got, want = profile(both, *READS), profile(dense, *READS)
+    got = profile(both, *READS, all_estimators=True)
+    want = profile(dense, *READS, all_estimators=True)
     cols = ["unit", "coverage_em", "coverage_zi"]
     joined = got.filter(pl.col("kmers_unique") > 0).select(*cols, "kmers_dense")
     joined = joined.join(want.select(cols), on="unit", suffix="_want")
@@ -127,7 +129,8 @@ def test_copies_count_member_equivalents(tmp_path: Path) -> None:
     schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
     pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
     build_index(path, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
-    result = profile(Index.load(tmp_path / "idx"), *READS).filter(pl.col("present_zi") == 1)
+    result = profile(Index.load(tmp_path / "idx"), *READS, all_estimators=True)
+    result = result.filter(pl.col("present_zi") == 1)
     assert result.height > 0
     assert result["copies_zi"].to_list() == pytest.approx([2.0] * result.height)
     assert (result["abundance_zi"] == 2 * result["coverage_zi"]).all()
@@ -135,8 +138,8 @@ def test_copies_count_member_equivalents(tmp_path: Path) -> None:
 
 def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
-    plain = profile(index, *READS)
-    got = profile(index, *READS, draws=60)
+    plain = profile(index, *READS, all_estimators=True)
+    got = profile(index, *READS, draws=60, all_estimators=True)
     assert "coverage_zi_lo" not in plain.columns
     # intervals and groups change nothing else
     assert got.drop("^.*_(lo|hi)$", "ambiguity_group", "group_size", "own_evidence").equals(plain)
@@ -145,7 +148,7 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
     inside = found["coverage_zi"].is_between(found["coverage_zi_lo"], found["coverage_zi_hi"])
     assert inside.mean() >= 0.9  # type: ignore[operator]
-    assert got.equals(profile(index, *READS, draws=60))  # seeded
+    assert got.equals(profile(index, *READS, draws=60, all_estimators=True))  # seeded
 
 
 def test_shared_evidence_groups_lopsided_pair() -> None:
@@ -493,7 +496,7 @@ def test_unit_columns_read_in_slices(
         assert np.array_equal(np.load(tmp_path / f"units.{n}.npy"), a)
 
 
-def test_pin_presence_fits_components_independently() -> None:
+def test_em_fits_components_independently() -> None:
     # Components share no k-mer, so fitting them together gives each one's own fit: a
     # slow component (few hits, many kept k-mers) no longer holds a fast one to its pace.
     rng = np.random.default_rng(3)
@@ -510,9 +513,23 @@ def test_pin_presence_fits_components_independently() -> None:
     kmers = kmers.with_columns(pl.col("hits").max().over("hash"))
     hist = rng.integers(0, 4, (n, 16)).astype(np.float64) + 1
     shifted = kmers.with_columns(unit=pl.col("unit") + n, hash=pl.col("hash") + 1000)
-    both = em_pin(pl.concat([kmers, shifted.head(50)]), np.vstack([hist, hist]))
-    alone = em_pin(kmers, hist)
-    got = both.filter(pl.col("unit") < n)
-    assert got["unit"].equals(alone["unit"])
-    for col in ("coverage", "present"):
-        assert got[col].to_list() == pytest.approx(alone[col].to_list(), rel=1e-12)
+    together = pl.concat([kmers, shifted.head(50)])
+    m_g = hist.sum(axis=1)
+    for fit, a, b in (
+        (em_pin, (together, np.vstack([hist, hist])), (kmers, hist)),
+        (em, (together, np.r_[m_g, m_g]), (kmers, m_g)),
+        (partial(em, zero_inflated=True), (together, np.r_[m_g, m_g]), (kmers, m_g)),
+    ):
+        got, alone = fit(*a).filter(pl.col("unit") < n), fit(*b)
+        assert got["unit"].equals(alone["unit"])
+        for col in ("coverage", "present"):
+            assert got[col].to_list() == pytest.approx(alone[col].to_list(), rel=1e-12)
+
+
+def test_default_fits_em_only(members: Path) -> None:
+    # The benchmark estimators are opt-in and leave the shipped columns unchanged.
+    index = build(members, t_base=1.0, fp_bits=64)
+    default, full = profile(index, *READS), profile(index, *READS, all_estimators=True)
+    assert not any(c.endswith(("_zi", "_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
+    assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta"} <= set(full.columns)
+    assert default.equals(full.select(default.columns))

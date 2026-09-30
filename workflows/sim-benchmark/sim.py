@@ -283,7 +283,7 @@ def main() -> None:
         for seed in range(1, args.seeds + 1):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)
-            result = profile(index, reads, draws=args.draws).with_columns(
+            result = profile(index, reads, draws=args.draws, all_estimators=True).with_columns(
                 unit=pl.col("cluster_rep").cast(pl.Int64)
             )
             for rule, (count, abundance) in RULES.items():

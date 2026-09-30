@@ -169,7 +169,7 @@ process PROFILE {
     tuple val(seed), val(name), path('profile.tsv'), path('kmers.parquet'), emit: profile
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --draws ${params.draws} --kmers kmers.parquet"
+    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --draws ${params.draws} --kmers kmers.parquet --all-estimators"
 
     stub:
     "touch profile.tsv kmers.parquet"

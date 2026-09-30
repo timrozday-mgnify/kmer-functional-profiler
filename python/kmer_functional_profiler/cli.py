@@ -100,6 +100,13 @@ def query(
             "faults during lookup, at the cost of their full size in RSS"
         ),
     ] = False,
+    all_estimators: Annotated[
+        bool,
+        typer.Option(
+            help="Also fit the benchmark estimators (zero-inflated, empirical-Bayes, p_in-"
+            "weighted EM; winner-take-all, uniqueness-first); coverage_em is the default"
+        ),
+    ] = False,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     timer = Timer(stats, log=stats is not None)
@@ -115,6 +122,7 @@ def query(
             draws=draws,
             kmers_out=kmers,
             timer=timer if stats else None,
+            all_estimators=all_estimators,
         )
         result.write_csv(out, separator="\t")
     timer.write()
