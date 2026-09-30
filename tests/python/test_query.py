@@ -332,6 +332,12 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert counts["sampled_kmers"] >= counts["hit_kmers"] > 0
     assert counts["largest_component_units"] <= counts["hit_units"]
     assert got["running"] == ""
+    # Tiers read into memory give the same profile as memory-mapped ones.
+    mapped, loaded = tmp_path / "mapped.tsv", tmp_path / "loaded.tsv"
+    base = ["query", str(idx), *map(str, READS), "--out"]
+    assert runner.invoke(app, [*base, str(mapped)]).exit_code == 0
+    assert runner.invoke(app, [*base, str(loaded), "--in-memory"]).exit_code == 0
+    assert pl.read_csv(loaded, separator="\t").equals(pl.read_csv(mapped, separator="\t"))
 
 
 def test_timer_writes_stats_mid_stage(tmp_path: Path) -> None:

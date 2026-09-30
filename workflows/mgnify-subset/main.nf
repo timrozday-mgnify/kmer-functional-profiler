@@ -407,15 +407,29 @@ process QUERY {
     path "${name}.${pairs}.${draws}.json"
 
     script:
+    def scratch_dir = params.query_scratch.toString() in ['', 'true', 'false'] ? '' : params.query_scratch  // CLI passes strings
     """
     export POLARS_MAX_THREADS=${task.cpus} OMP_NUM_THREADS=${task.cpus} OPENBLAS_NUM_THREADS=${task.cpus}
+    # Node-local copy of what the query reads: page-cache misses then cost a local read, not
+    # a network one. Falls back to the index in place if the copy fails (e.g. disk full).
+    idx=${index}
+    if [ -n "${scratch_dir}" ] && scratch=\$(mktemp -d "${scratch_dir}/kfp-index.XXXXXX"); then
+        trap 'rm -rf "\$scratch"' EXIT
+        start=\$SECONDS
+        if (cd -P ${index} && cp meta.json units.parquet tier2.*.npy \$(ls dense.*.npy 2>/dev/null) "\$scratch"); then
+            idx=\$scratch
+            echo "index copied to \$scratch: \$(du -sh "\$scratch" | cut -f1) in \$((SECONDS - start)) s" >&2
+        else
+            echo "index copy to \$scratch failed; querying ${index} in place" >&2
+        fi
+    fi
     if ${params.query_preload}; then  # page cache is per node, so not a task of its own
         start=\$SECONDS
-        cat ${index}/tier2.*.npy > /dev/null
-        echo "preload: \$(du -chL ${index}/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
+        cat \$idx/tier2.*.npy > /dev/null
+        echo "preload: \$(du -chL \$idx/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
     fi
-    ${params.kfp} query ${index} ${r1} ${r2} --draws ${draws} --out profile.tsv \\
-        --stats ${name}.${pairs}.${draws}.json
+    ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out profile.tsv \\
+        --stats ${name}.${pairs}.${draws}.json${params.query_in_memory ? ' --in-memory' : ''}
     """
 
     stub:
