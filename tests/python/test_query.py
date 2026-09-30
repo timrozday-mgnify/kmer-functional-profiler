@@ -465,6 +465,21 @@ def test_posterior_draws_ignore_input_order() -> None:
     )
 
 
+def test_posterior_scratch_file_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Draws kept in a scratch file and quantiles taken one unit at a time give the same frame;
+    # unit 1 lives on k-mers it shares with unit 0 (a group), unit 2 is alone.
+    kmer_units = [(h, [0]) for h in range(6)] + [(h, [0, 1]) for h in (6, 7)]
+    kmer_units += [(h, [2]) for h in range(10, 14)]
+    rows = [(u, h, h * 10 + r, 1 + r % 2) for h, us in kmer_units for u in us for r in range(3)]
+    schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
+    hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
+    m_g, pin_sum = np.array([10, 5, 8]), np.array([10.0, 5.0, 8.0])
+    in_memory = posterior_zi(hit_reads, m_g, pin_sum, 30)
+    assert in_memory["group_size"].max() == 2
+    monkeypatch.setattr(query, "SCRATCH_BYTES", 16)
+    assert posterior_zi(hit_reads, m_g, pin_sum, 30).equals(in_memory)
+
+
 def test_unit_columns_match_parquet(members: Path, tmp_path: Path) -> None:
     # Memory-mapped unit columns give the parquet's rows and the same profile as an index
     # written before them (columns read from units.parquet).
@@ -558,7 +573,7 @@ def test_timer_keeps_the_sampled_anonymous_peak(monkeypatch: pytest.MonkeyPatch)
     with timer("stage"):
         time.sleep(0.3)
     assert timer.stages["stage"]["peak_anon"] == 100
-    monkeypatch.setattr(query, "anon_rss", lambda: None)  # no /proc (macOS)
+    monkeypatch.setattr(query, "anon_rss", lambda: None)  # neither /proc nor macOS
     timer = Timer()
     with timer("stage"):
         pass
