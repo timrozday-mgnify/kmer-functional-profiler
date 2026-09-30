@@ -328,6 +328,11 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     )
     counts = got["counts"]
     assert counts["hit_units"] == table.height
+    # Units are renumbered for the model; the output carries the index's ids again.
+    units = pl.read_parquet(idx / "units.parquet").select("unit", "cluster_rep")
+    joined = table.join(units, on="unit", suffix="_index")
+    assert joined.height == table.height
+    assert (joined["cluster_rep"] == joined["cluster_rep_index"]).all()
     assert counts["hit_rows"] == table["hits"].sum()
     assert counts["sampled_kmers"] >= counts["hit_kmers"] > 0
     assert counts["largest_component_units"] <= counts["hit_units"]

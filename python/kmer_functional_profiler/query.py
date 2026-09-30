@@ -305,7 +305,7 @@ PIN_P: Final = np.clip(
 
 def em_pin(
     kmers: pl.DataFrame,
-    pin_hist: np.ndarray | pl.DataFrame,
+    pin_hist: np.ndarray,
     *,
     tol: float = 1e-6,
     max_iter: int = 1000,
@@ -321,9 +321,7 @@ def em_pin(
     s_g is capped so presence stays <= 1.
 
     ``kmers`` has ``unit``, ``hash``, ``hits`` and ``pin_q``; ``pin_hist[unit]`` counts the
-    unit's kept k-mers per level (its sum is ``m_g``); or a table of ``unit`` and
-    ``pin_hist`` sorted by unit and holding every unit of ``kmers`` (the hit units' rows of
-    the unit table, whose full column is too large to convert). Coverage is attributed hits
+    unit's kept k-mers per level (its sum is ``m_g``). Coverage is attributed hits
     over expected present k-mers (hit ones by their share, unhit ones by their posterior
     presence), and s_g is expected present k-mers over the sum of p_in. Like :func:`em`, a
     hit k-mer counts as present for a unit by its share of the hits. Returns ``unit``,
@@ -336,11 +334,7 @@ def em_pin(
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
     n = len(units)
-    if isinstance(pin_hist, pl.DataFrame):
-        rows = np.searchsorted(pin_hist["unit"].to_numpy(), units)
-        hist = pin_hist["pin_hist"].to_numpy()[rows].astype(np.float64)
-    else:
-        hist = pin_hist[units].astype(np.float64)
+    hist = pin_hist[units].astype(np.float64)
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
     for _ in range(max_iter):
@@ -761,15 +755,28 @@ def profile(
             ) = components(kmer_hits)
     if kmers_out is not None:
         kmer_hits.write_parquet(kmers_out)
+    # From here units are numbered 0.. in the hit units' order (``index`` keeps the index's
+    # ids), so per-unit arrays come from their rows only: a full column is ~4 GB per 8 bytes.
+    ids = hit_info.select(
+        pl.col("unit").cast(per_read.schema["unit"]),
+        index=pl.int_range(pl.len(), dtype=pl.UInt32),
+    )
+
+    def renumber(df: pl.DataFrame) -> pl.DataFrame:
+        return df.join(ids, on="unit").drop("unit").rename({"index": "unit"})
+
+    per_read, kmer_hits = renumber(per_read), renumber(kmer_hits)
+    hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
+    t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
-        assigned = gather(kmer_hits.select("unit", "hash"), index.units["t_g"].to_numpy())
+        assigned = gather(kmer_hits.select("unit", "hash"), t_g)
     counts["detected_units"] = assigned.height
     detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
-    m_g = index.units["m_g"].to_numpy()
-    pin_hist = hit_info.select("unit", "pin_hist")
-    pin_sum = index.units["pin_sum"]
-    len_cv = index.units["len_cv"].to_numpy()
+    m_g = hit_info["m_g"].to_numpy()
+    pin_hist = hit_info["pin_hist"].to_numpy()
+    pin_sum = hit_info["pin_sum"]
+    len_cv = hit_info["len_cv"].to_numpy()
     # Each hit k-mer is gather's: the first unit in gather order holding it.
     own = (
         kmer_hits.join(assigned.select("unit", "gather_rank"), on="unit")
@@ -778,17 +785,17 @@ def profile(
         .select("unit", "hash", "holders")
     )
     with timer("presence"):
-        present_prob = presence(own, index.units["t_g"].to_numpy(), n_reads, index.units.height)
+        present_prob = presence(own, t_g, n_reads, index.units.height)
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
         max_hash_dense = index.units["max_hash_dense"].to_numpy()
-        keep = assigned.select("unit")
+        keep = assigned.select("unit")  # detected units are hit units, so renumber keeps all
         with timer("dense"):
             detected_reads = pl.concat(
                 [
                     by_read(
-                        unit_hits(dense, max_hash_dense, b["hash"], b["read"]).join(
+                        renumber(unit_hits(dense, max_hash_dense, b["hash"], b["read"])).join(
                             keep, on="unit", how="semi"
                         )
                     )
@@ -796,10 +803,10 @@ def profile(
                 ]
             )
             detected = per_kmer(detected_reads)
-        m_g = index.units["m_dense"].to_numpy()
-        pin_hist = hit_info.select("unit", pin_hist="pin_hist_dense")
-        pin_sum = index.units["pin_sum_dense"]
-        len_cv = index.units["len_cv_dense"].to_numpy()
+        m_g = hit_info["m_dense"].to_numpy()
+        pin_hist = hit_info["pin_hist_dense"].to_numpy()
+        pin_sum = hit_info["pin_sum_dense"]
+        len_cv = hit_info["len_cv_dense"].to_numpy()
     with timer("fit_em"):
         plain = em(detected, m_g).select("unit", coverage_em="coverage")
     with timer("fit_zi"):
@@ -885,5 +892,7 @@ def profile(
             coverage_ufirst=pl.col("_ufirst").fill_null(0) / pl.col("m_g"),
         )
         .drop("_wta", "_ufirst")
+        .with_columns(unit=pl.col("index"))  # back to the index's unit ids
+        .drop("index")
         .sort("unit")
     )
