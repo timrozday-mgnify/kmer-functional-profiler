@@ -491,3 +491,28 @@ def test_unit_columns_read_in_slices(
     write_unit_columns(tmp_path)
     for n, a in want.items():
         assert np.array_equal(np.load(tmp_path / f"units.{n}.npy"), a)
+
+
+def test_pin_presence_fits_components_independently() -> None:
+    # Components share no k-mer, so fitting them together gives each one's own fit: a
+    # slow component (few hits, many kept k-mers) no longer holds a fast one to its pace.
+    rng = np.random.default_rng(3)
+    n, pairs = 60, 400
+    kmers = pl.DataFrame(
+        {
+            "unit": rng.integers(0, n, pairs),
+            "hash": rng.integers(0, 300, pairs),
+            "hits": rng.integers(1, 6, pairs),
+            "pin_q": rng.integers(0, 16, pairs),
+        },
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32, "pin_q": pl.UInt8},
+    ).unique(["unit", "hash"], keep="first", maintain_order=True)
+    kmers = kmers.with_columns(pl.col("hits").max().over("hash"))
+    hist = rng.integers(0, 4, (n, 16)).astype(np.float64) + 1
+    shifted = kmers.with_columns(unit=pl.col("unit") + n, hash=pl.col("hash") + 1000)
+    both = em_pin(pl.concat([kmers, shifted.head(50)]), np.vstack([hist, hist]))
+    alone = em_pin(kmers, hist)
+    got = both.filter(pl.col("unit") < n)
+    assert got["unit"].equals(alone["unit"])
+    for col in ("coverage", "present"):
+        assert got[col].to_list() == pytest.approx(alone[col].to_list(), rel=1e-12)

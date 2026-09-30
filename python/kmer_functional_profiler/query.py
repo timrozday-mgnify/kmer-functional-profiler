@@ -114,15 +114,29 @@ def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     _, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
     n = len(units)
-    # Bipartite graph: units are nodes 0..n, k-mers follow.
-    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
-    n_comp, label = connected_components(graph, directed=False)
     if n == 0:
         return 0, 0, 0
-    per_unit = np.bincount(label[:n])
+    label = _unit_components(col, row, n)
+    per_unit = np.bincount(label)
     largest = int(per_unit.argmax())
     n_units = int(per_unit[largest])
-    return int(n_comp), n_units, int((label[col] == largest).sum())
+    return len(per_unit), n_units, int((label[col] == largest).sum())
+
+
+def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
+    """Component label of each of ``n`` units, linked by pairs (unit ``col``, k-mer ``row``)."""
+    # Bipartite graph: units are nodes 0..n, k-mers follow.
+    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
+    label: np.ndarray = connected_components(graph, directed=False)[1][:n]
+    return label
+
+
+def _ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenated ``arange(start, start + length)`` for each pair."""
+    ends = np.cumsum(lengths)
+    total = int(ends[-1]) if len(ends) else 0
+    out: np.ndarray = np.arange(total) + np.repeat(starts - ends + lengths, lengths)
+    return out
 
 
 def unit_hits(
@@ -322,26 +336,62 @@ def em_pin(
     hits[row] = kmers["hits"].to_numpy()
     n = len(units)
     hist = pin_hist[units].astype(np.float64)
+    levels = hist.shape[1]
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
-    cell = col * hist.shape[1] + level  # (unit, level) cell of each pair in hist.ravel()
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
-    for _ in range(max_iter):
-        weight = lam[col] * scale[col] * PIN_P[level]
-        share = _div(weight, np.bincount(row, weights=weight, minlength=len(hashes))[row])
-        attributed = np.bincount(col, weights=share * hits[row], minlength=n)
-        hit = np.bincount(cell, weights=share, minlength=hist.size).reshape(hist.shape)
-        seen = -np.expm1(-lam)[:, None]  # chance a present k-mer is hit
-        pi = scale[:, None] * PIN_P
-        odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
-        present = hit.sum(axis=1) + (np.maximum(hist - hit, 0) * odds).sum(axis=1)
-        new = _div(attributed, present)
-        new_scale = np.clip(_div(present, expected), 0.0, 1 / PIN_P[-1])
-        done = np.abs(new - lam).max(initial=0) <= tol * new.max(initial=0) and np.allclose(
-            new_scale, scale, rtol=0, atol=tol
+    attributed = np.zeros(n)
+    # Components share no k-mer, so each is its own fit and stops at its own convergence;
+    # an iteration only touches components still moving (most converge in a few dozen, a
+    # few run to max_iter). Units are grouped by component; pairs by unit.
+    label = _unit_components(col, row, n)
+    active = np.argsort(label, kind="stable")
+    seg = np.diff(np.flatnonzero(np.r_[True, np.diff(label[active]) != 0, True]))
+    by_unit = np.argsort(col, kind="stable")
+    pair_start = np.r_[0, np.cumsum(np.bincount(col, minlength=n))]
+    local = np.empty(n, dtype=np.intp)
+    it = 0
+    while len(active) and it < max_iter:
+        # Compact to the active components' units, pairs and k-mers.
+        pairs = by_unit[_ranges(pair_start[active], np.diff(pair_start)[active])]
+        local[active] = np.arange(len(active))
+        c = local[col[pairs]]
+        kmer, r = np.unique(row[pairs], return_inverse=True)
+        h, lv = hits[kmer], level[pairs]
+        cell = c * levels + lv
+        hs, ex, starts = hist[active], expected[active], np.r_[0, np.cumsum(seg)[:-1]]
+        la, sc, done = lam[active], scale[active], np.zeros(len(active), dtype=bool)
+        while it < max_iter and done.sum() * 2 <= len(active):
+            it += 1
+            weight = la[c] * sc[c] * PIN_P[lv]
+            share = _div(weight, np.bincount(r, weights=weight, minlength=len(kmer))[r])
+            att = np.bincount(c, weights=share * h[r], minlength=len(active))
+            hit = np.bincount(cell, weights=share, minlength=hs.size).reshape(hs.shape)
+            seen = -np.expm1(-la)[:, None]  # chance a present k-mer is hit
+            pi = sc[:, None] * PIN_P
+            odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
+            present = hit.sum(axis=1) + (np.maximum(hs - hit, 0) * odds).sum(axis=1)
+            new = _div(att, present)
+            new_scale = np.clip(_div(present, ex), 0.0, 1 / PIN_P[-1])
+            converged = (
+                np.maximum.reduceat(np.abs(new - la), starts)
+                <= tol * np.maximum.reduceat(new, starts)
+            ) & (np.maximum.reduceat(np.abs(new_scale - sc), starts) <= tol)
+            la, sc = new, new_scale
+            now = np.repeat(converged, seg) & ~done
+            lam[active[now]], scale[active[now]], attributed[active[now]] = (
+                la[now],
+                sc[now],
+                att[now],
+            )
+            done |= now
+        rest = ~done  # at max_iter, units still moving keep their last values
+        lam[active[rest]], scale[active[rest]], attributed[active[rest]] = (
+            la[rest],
+            sc[rest],
+            att[rest],
         )
-        lam, scale = new, new_scale
-        if done:
-            break
+        moving = ~done[starts]
+        active, seg = active[np.repeat(moving, seg)], seg[moving]
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
         {"unit": units, "coverage": lam, "present": scale * expected / m},
