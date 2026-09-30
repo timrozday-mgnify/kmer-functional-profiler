@@ -429,7 +429,7 @@ process QUERY {
         echo "preload: \$(du -chL \$idx/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
     fi
     ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out profile.tsv \\
-        --stats ${name}.${pairs}.${draws}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_scratch_in_memory ? ' --scratch-in-memory' : ''}
+        --stats ${name}.${pairs}.${draws}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''}
     """
 
     stub:
