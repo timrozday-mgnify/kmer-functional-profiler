@@ -60,6 +60,9 @@ def unit_hits(
     hashes: NDArray[np.uint64],
     reads: NDArray[np.uint64],
 ) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.uint8]]: ...
+def gather(
+    units: NDArray[np.uint32], hashes: NDArray[np.uint64], t_g: NDArray[np.float64]
+) -> dict[str, NDArray[np.uint32]]: ...
 
 class FastxHits:
     def __init__(

@@ -288,6 +288,24 @@ fn unit_hits<'py>(
     Ok(dict)
 }
 
+/// Greedy gather over (unit, hash) pairs: the units taken, in order, and their k-mers.
+#[pyfunction]
+fn gather<'py>(
+    py: Python<'py>,
+    units: PyReadonlyArray1<'py, u32>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    t_g: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (units, hashes, t_g) = (units.as_slice()?, hashes.as_slice()?, t_g.as_slice()?);
+    let got = py
+        .detach(|| kfp::gather(units, hashes, t_g))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("unit", got.unit.into_pyarray(py))?;
+    dict.set_item("kmers_unique", got.kmers_unique.into_pyarray(py))?;
+    Ok(dict)
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -358,6 +376,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BLOOM_BLOCK_BYTES", kfp::BLOCK_BYTES)?;
     m.add_function(wrap_pyfunction!(packed_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(unit_hits, m)?)?;
+    m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }
