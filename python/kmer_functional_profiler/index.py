@@ -358,14 +358,44 @@ def _is_numeric(dtype: pl.DataType) -> bool:
     return dtype.is_numeric() or (isinstance(dtype, pl.Array) and dtype.inner.is_numeric())
 
 
+# Rows per read of a unit column: a whole Array column (e.g. 16 levels x 5.3e8 units of
+# pin_hist) exceeds Polars' 2**32 values per array, so columns are read in slices.
+COLUMN_SLICE = 2**26
+
+
+def _read_column(path: Path, name: str, out: np.ndarray | None = None) -> np.ndarray:
+    """Read one numeric column of a parquet file in ``COLUMN_SLICE``-row slices, into
+    ``out`` if given (e.g. a memory-mapped ``.npy``); fixed-size arrays come out 2-D."""
+    lazy = pl.scan_parquet(path).select(name)
+    if out is None:
+        dtype, shape = _column_shape(path, name)
+        out = np.empty(shape, dtype)
+    for start in range(0, len(out), COLUMN_SLICE):
+        out[start : start + COLUMN_SLICE] = (
+            lazy.slice(start, COLUMN_SLICE).collect()[name].to_numpy()
+        )
+    return out
+
+
+def _column_shape(path: Path, name: str) -> tuple[np.dtype[Any], tuple[int, ...]]:
+    """numpy dtype and shape of one column of a parquet file."""
+    empty = pl.Series(dtype=pl.read_parquet_schema(path)[name]).to_numpy()
+    n = pl.scan_parquet(path).select(pl.len()).collect().item()
+    return empty.dtype, (n, *empty.shape[1:])
+
+
 def write_unit_columns(directory: str | Path) -> None:
     """Write each numeric column of ``units.parquet`` but ``unit`` (the row number) as
-    ``units.<column>.npy`` (fixed-size arrays as 2-D), one column in memory at a time."""
+    ``units.<column>.npy`` (fixed-size arrays as 2-D), a slice in memory at a time."""
     path = Path(directory) / "units.parquet"
     for name, dtype in pl.read_parquet_schema(path).items():
         if name != "unit" and _is_numeric(dtype):
-            column = pl.read_parquet(path, columns=[name])[name]
-            np.save(path.with_name(f"units.{name}.npy"), column.to_numpy())
+            dt, shape = _column_shape(path, name)
+            npy = np.lib.format.open_memmap(
+                path.with_name(f"units.{name}.npy"), mode="w+", dtype=dt, shape=shape
+            )
+            _read_column(path, name, npy)
+            npy.flush()
 
 
 class UnitTable:
@@ -388,7 +418,7 @@ class UnitTable:
             self._columns[name] = (
                 np.load(npy, mmap_mode="r" if self._mmap else None)
                 if npy.exists()
-                else pl.read_parquet(self.path, columns=[name])[name].to_numpy()
+                else _read_column(self.path, name)
             )
         return self._columns[name]
 
