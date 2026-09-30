@@ -18,7 +18,8 @@ Postings are candidates minus promiscuous k-mers (``n_groups > max_groups``); un
 query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Tier 2
 maps each posting hash to its set of (unit, quantised ``p_in``), stored as bucketed
 fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can be hit, so
-only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep`` order;
+only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep`` order, and
+each numeric column is also written as ``units.<column>.npy`` for the query to memory-map;
 ``postings.parquet`` (every posting with its score) is written only for inspection.
 
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
@@ -35,6 +36,7 @@ The query probes it only for the units the sparse tier detects, to fit abundance
 import json
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Final, NamedTuple, Self
 
@@ -352,23 +354,89 @@ class PackedTable:
         return sum(getattr(self, f).nbytes for f in PACKED_FIELDS)
 
 
+def _is_numeric(dtype: pl.DataType) -> bool:
+    return dtype.is_numeric() or (isinstance(dtype, pl.Array) and dtype.inner.is_numeric())
+
+
+def write_unit_columns(directory: str | Path) -> None:
+    """Write each numeric column of ``units.parquet`` but ``unit`` (the row number) as
+    ``units.<column>.npy`` (fixed-size arrays as 2-D), one column in memory at a time."""
+    path = Path(directory) / "units.parquet"
+    for name, dtype in pl.read_parquet_schema(path).items():
+        if name != "unit" and _is_numeric(dtype):
+            column = pl.read_parquet(path, columns=[name])[name]
+            np.save(path.with_name(f"units.{name}.npy"), column.to_numpy())
+
+
+class UnitTable:
+    """The unit table, row = unit id, read by column.
+
+    Numeric columns are memory-mapped from ``units.<column>.npy`` (read into memory with
+    ``mmap=False``); without that file (an index written before them) a column is read from
+    ``units.parquet`` on first use. ``rows`` gathers whole rows for a few units.
+    """
+
+    def __init__(self, directory: Path, *, mmap: bool = True) -> None:
+        self.path = directory / "units.parquet"
+        self.schema = pl.read_parquet_schema(self.path)
+        self._mmap = mmap
+        self._columns: dict[str, np.ndarray] = {}
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        if name not in self._columns:
+            npy = self.path.with_name(f"units.{name}.npy")
+            self._columns[name] = (
+                np.load(npy, mmap_mode="r" if self._mmap else None)
+                if npy.exists()
+                else pl.read_parquet(self.path, columns=[name])[name].to_numpy()
+            )
+        return self._columns[name]
+
+    @cached_property
+    def height(self) -> int:
+        return int(pl.scan_parquet(self.path).select(pl.len()).collect().item())
+
+    def rows(self, units: np.ndarray) -> pl.DataFrame:
+        """Every column for ``units`` (sorted and distinct), in that order."""
+        units = np.asarray(units, dtype=np.uint32)
+        numeric = [n for n, d in self.schema.items() if n != "unit" and _is_numeric(d)]
+        other = [n for n in self.schema if n != "unit" and n not in numeric]
+        frame = pl.DataFrame(
+            [pl.Series("unit", units)]
+            + [pl.Series(n, self[n][units], dtype=self.schema[n]) for n in numeric]
+        )
+        if other:  # strings: scanned from the parquet, which is in unit order
+            frame = frame.hstack(
+                pl.scan_parquet(self.path)
+                .filter(pl.col("unit").is_in(pl.Series(units).implode()))
+                .select(other)
+                .collect()
+            )
+        return frame.select(list(self.schema))
+
+    def frame(self) -> pl.DataFrame:
+        """The whole table (tests and inspection)."""
+        return pl.read_parquet(self.path)
+
+
 @dataclass(frozen=True)
 class Index:
     """A built index: unit table, tiers and the metadata written by ``build_index``."""
 
     meta: dict[str, Any]
-    units: pl.DataFrame
+    units: UnitTable
     tier2: PackedTable
     dense: PackedTable | None = None
 
     @classmethod
     def load(cls, directory: str | Path, *, mmap: bool = True) -> Self:
-        """Read an index; its tiers are memory-mapped unless ``mmap`` is False."""
+        """Read an index; its tiers and unit columns are memory-mapped unless ``mmap`` is
+        False."""
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
         return cls(
             meta=meta,
-            units=pl.read_parquet(directory / "units.parquet"),
+            units=UnitTable(directory, mmap=mmap),
             tier2=PackedTable.load(directory, "tier2", meta["tier2"], mmap=mmap),
             dense=(
                 PackedTable.load(directory, "dense", meta["dense"], mmap=mmap)
@@ -861,6 +929,7 @@ def write_index(
         stats["dense_bytes"] = tables["dense"].nbytes()
 
     units.write_parquet(out / "units.parquet")
+    write_unit_columns(out)
     if postings_parquet:
         postings.write_parquet(out / "postings.parquet")
     stats = {

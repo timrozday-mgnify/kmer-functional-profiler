@@ -49,7 +49,7 @@ def hand(tmp_path: Path) -> tuple[Index, pl.DataFrame]:
     )
     index = Index.load(tmp_path / "idx")
     postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
-        index.units.select("unit", "cluster_rep"), on="unit"
+        index.units.frame().select("unit", "cluster_rep"), on="unit"
     )
     return index, postings
 
@@ -71,7 +71,7 @@ def test_scores_on_hand_built_clusters(hand: tuple[Index, pl.DataFrame]) -> None
 
 def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
     index, _ = hand
-    units = {row["cluster_rep"]: row for row in index.units.iter_rows(named=True)}
+    units = {row["cluster_rep"]: row for row in index.units.frame().iter_rows(named=True)}
     a, b, s = units[1], units[10], units[20]
     assert a["n_members"] == 5
     assert a["n_kmers"] == len(set().union(*(kmers(r[3]) for r in HAND if r[1] == 1)))
@@ -89,7 +89,7 @@ def test_promiscuous_kmers_are_dropped(tmp_path: Path) -> None:
     stats = build_index(members, tmp_path / "idx", params)
     assert stats["promiscuous_dropped"] == 3 * len(kmers(D))
     assert (stats["n_clusters"], stats["n_units"]) == (4, 3)
-    units = Index.load(tmp_path / "idx").units
+    units = Index.load(tmp_path / "idx").units.frame()
     assert units["cluster_rep"].to_list() == [1, 10, 20]
     assert units["unit"].to_list() == [0, 1, 2]
     a = (kmers(X + D + P) | kmers(Q + X[:10])) - kmers(D)
@@ -119,7 +119,7 @@ def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
     assert isinstance(expected, float)
     assert abs(stats["candidates"] - expected) < 5 * expected**0.5  # type: ignore[operator]
 
-    units = Index.load(tmp_path / "a").units
+    units = Index.load(tmp_path / "a").units.frame()
     raised = params.oversample * params.n_min / units["n_kmers"]
     expected_t = raised.clip(upper_bound=params.t_cap).clip(lower_bound=params.t_base)
     t_g = pl.Series(np.where(units["n_members"] > 1, expected_t, params.t_base))
@@ -168,7 +168,7 @@ def test_floored_units_keep_best_scoring_kmers(tmp_path: Path) -> None:
     params = IndexParams(k=K, t_base=0.001, n_min=5, t_cap=1.0, oversample=1000)
     build_index(members, tmp_path / "idx", params, postings_parquet=True)
     index = Index.load(tmp_path / "idx")
-    units = index.units.sort("cluster_rep")
+    units = index.units.frame().sort("cluster_rep")
     assert units["m_g"].to_list()[:2] == [5, 5]
     postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
         units.select("unit", "cluster_rep"), on="unit"

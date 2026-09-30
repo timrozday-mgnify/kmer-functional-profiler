@@ -683,7 +683,7 @@ def profile(
             batch_reads=batch_reads,
         )
 
-    max_hash_g = index.units["max_hash_g"].to_numpy()
+    max_hash_g = index.units["max_hash_g"]
 
     def by_read(hits: pl.DataFrame) -> pl.DataFrame:
         return hits.group_by("unit", "hash", "read").agg(
@@ -726,11 +726,8 @@ def profile(
         "unit_kmer_pairs": kmer_hits.height,
         "hit_units": kmer_hits["unit"].n_unique(),
     }
-    with timer("hit_units"):  # joins with the full table copy index-sized columns
-        units = index.units["unit"]
-        hit_info = index.units.filter(
-            units.is_in(kmer_hits["unit"].unique().cast(units.dtype).implode())
-        )
+    with timer("hit_units"):  # rows gathered from the unit columns, never the whole table
+        hit_info = index.units.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
     if record:
         with timer("components"):
             (
@@ -774,7 +771,7 @@ def profile(
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
-        max_hash_dense = index.units["max_hash_dense"].to_numpy()
+        max_hash_dense = index.units["max_hash_dense"]
         keep = assigned.select("unit")  # detected units are hit units, so renumber keeps all
         with timer("dense"):
             detected_reads = pl.concat(

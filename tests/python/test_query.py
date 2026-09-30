@@ -449,3 +449,21 @@ def test_posterior_draws_ignore_input_order() -> None:
     assert got.equals(
         posterior_zi(hit_reads.sample(fraction=1.0, shuffle=True, seed=1), m_g, pin_sum, 20)
     )
+
+
+def test_unit_columns_match_parquet(members: Path, tmp_path: Path) -> None:
+    # Memory-mapped unit columns give the parquet's rows and the same profile as an index
+    # written before them (columns read from units.parquet).
+    index = build(members, t_base=0.2, n_min=0, t_dense=1.0)
+    old = tmp_path / "old"
+    old.mkdir()
+    for f in Path(index.units.path).parent.iterdir():
+        if not f.name.startswith("units."):
+            (old / f.name).write_bytes(f.read_bytes())
+    (old / "units.parquet").write_bytes(index.units.path.read_bytes())
+    assert isinstance(index.units["m_g"], np.memmap)
+    some = np.array([0, 2, 3], dtype=np.uint32)
+    assert index.units.rows(some).equals(index.units.frame()[some.tolist()])
+    got = profile(index, *READS, draws=20)
+    want = profile(Index.load(old), *READS, draws=20)
+    assert got.equals(want)
