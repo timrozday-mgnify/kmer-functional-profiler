@@ -416,7 +416,7 @@ process QUERY {
     if [ -n "${scratch_dir}" ] && scratch=\$(mktemp -d "${scratch_dir}/kfp-index.XXXXXX"); then
         trap 'rm -rf "\$scratch"' EXIT
         start=\$SECONDS
-        if (cd -P ${index} && cp meta.json units.parquet tier2.*.npy \$(ls dense.*.npy 2>/dev/null) "\$scratch"); then
+        if (cd -P ${index} && cp meta.json units.parquet tier2.*.npy \$(ls units.*.npy dense.*.npy 2>/dev/null) "\$scratch"); then
             idx=\$scratch
             echo "index copied to \$scratch: \$(du -sh "\$scratch" | cut -f1) in \$((SECONDS - start)) s" >&2
         else

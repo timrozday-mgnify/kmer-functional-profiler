@@ -8,7 +8,7 @@ import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
-from kmer_functional_profiler.index import Index, IndexParams, build_index
+from kmer_functional_profiler.index import Index, IndexParams, build_index, write_unit_columns
 from kmer_functional_profiler.query import Timer, profile
 
 app = typer.Typer(no_args_is_help=True)
@@ -64,6 +64,12 @@ def import_sourmash(
 ) -> None:
     """Build an index from protein FracMinHash signatures (queried with sourmash hashing)."""
     typer.echo(json.dumps(import_signatures(signatures, out_dir, ksize), indent=2))
+
+
+@app.command()
+def unit_columns(index_dir: Path) -> None:
+    """Write the unit table's numeric columns as .npy files, for an index built without them."""
+    write_unit_columns(index_dir)
 
 
 @app.command()

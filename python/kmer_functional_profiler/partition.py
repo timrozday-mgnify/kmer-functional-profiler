@@ -54,6 +54,7 @@ from kmer_functional_profiler.index import (
     packed_layout,
     unit_columns,
     write_meta,
+    write_unit_columns,
 )
 
 QUANTILES: Final = 1024  # candidate-hash quantiles recorded for balanced hash ranges
@@ -375,5 +376,6 @@ def concat(
     for name in ("units.parquet", "unit_pfam.parquet"):
         if (units_dir / name).exists() and units_dir.resolve() != out.resolve():
             shutil.copyfile(units_dir / name, out / name)
+    write_unit_columns(out)
     stats = meta["stats"] | {"distinct_hashes": sum(c["distinct_hashes"] for c in counts)}
     return write_meta(out, params, {"tier2": tier2}, stats)

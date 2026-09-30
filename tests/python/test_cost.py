@@ -25,7 +25,7 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
     ).write_parquet(members)
     params = IndexParams(k=6, t_base=0.01, n_min=8, t_dense=0.1)
     stats = build_index(members, tmp_path / "idx", params)
-    units = Index.load(tmp_path / "idx").units
+    units = Index.load(tmp_path / "idx").units.frame()
 
     clusters, pairs = cluster_stats(members, params, rate=0.05)
     # The index keeps only units with a posting.
