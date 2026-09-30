@@ -81,11 +81,15 @@ def query(
         Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
     ] = None,
     stats: Annotated[
-        Path | None, typer.Option(help="JSON of time and peak RSS per stage, and hit counts")
+        Path | None,
+        typer.Option(
+            help="JSON of time and peak RSS per stage, and hit counts; rewritten after each "
+            "stage, and each stage's start and end are logged to stderr with its RSS"
+        ),
     ] = None,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
-    timer = Timer()
+    timer = Timer(stats, log=stats is not None)
     with timer("total"):
         with timer("load"):
             loaded = Index.load(index_dir)
@@ -100,6 +104,5 @@ def query(
             timer=timer if stats else None,
         )
         result.write_csv(out, separator="\t")
-    if stats:
-        stats.write_text(json.dumps(timer.as_dict(), indent=2))
+    timer.write()
     typer.echo(f"{result.height} units hit -> {out}", err=True)

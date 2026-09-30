@@ -137,7 +137,7 @@ of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 
 Profiles nested read subsets of one real metagenome against each index given, with
 the current query plus stage timers, to find which stages cost time and memory at scale.
 The default run is ERR7746321 (Hadza gut, ~140 bp pairs, 29 Gbp), which LADDER subsets
-to 0.4, 1.2, 4, 12 and 40 M pairs; each subset contains the smaller ones.
+to 0.01, 0.1, 0.4, 1.2, 4, 12 and 40 M pairs; each subset contains the smaller ones.
 
 ```bash
 nextflow run workflows/mgnify-subset -profile test               # builds results-test/1in*/index
@@ -179,7 +179,7 @@ pairs, hit and detected units, component sizes) and `{stage}_wall_s`, `_cpu_s` a
 | `--query_indexes` | `''` | Index directories (glob), each named by its parent directory |
 | `--query_run` | `ERR7746321` | Paired ENA run to download |
 | `--query_reads` | `''` | `R1,R2` local files instead of `--query_run` |
-| `--query_ladder` | `400000,1200000,4000000,12000000,40000000` | Nested subset sizes, in pairs |
+| `--query_ladder` | `10000,100000,400000,1200000,4000000,12000000,40000000` | Nested subset sizes, in pairs |
 | `--query_seed` | `1` | Seed of the ladder's shuffle |
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
 | `--query_draws_on` | `1in100` | Index that also gets the posterior |

@@ -14,6 +14,7 @@ from kmer_functional_profiler.index import Index, IndexParams, build_index
 from kmer_functional_profiler.query import (
     UFIRST_SCORE,
     WTA_SCORE,
+    Timer,
     assign_best,
     em,
     em_pin,
@@ -330,6 +331,17 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert counts["hit_rows"] == table["hits"].sum()
     assert counts["sampled_kmers"] >= counts["hit_kmers"] > 0
     assert counts["largest_component_units"] <= counts["hit_units"]
+    assert got["running"] == ""
+
+
+def test_timer_writes_stats_mid_stage(tmp_path: Path) -> None:
+    # A query killed out of memory leaves the stages done and the one it died in.
+    stats = tmp_path / "stats.json"
+    timer = Timer(stats)
+    with timer("load"), timer("keys"):
+        got = json.loads(stats.read_text())
+    assert got["running"] == "keys" and got["stages"] == {}
+    assert json.loads(stats.read_text())["stages"].keys() == {"load", "keys"}
 
 
 def test_presence_doubts_few_and_shared_hits() -> None:

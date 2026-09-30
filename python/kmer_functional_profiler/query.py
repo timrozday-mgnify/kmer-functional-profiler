@@ -17,6 +17,7 @@ hits give.
 """
 
 import heapq
+import json
 import resource
 import sys
 import time
@@ -44,19 +45,51 @@ def peak_rss() -> int:
     return peak if sys.platform == "darwin" else peak * 1024  # Linux reports KiB
 
 
+def rss() -> int:
+    """Current resident set size in bytes (Linux); the peak elsewhere."""
+    try:
+        return int(Path("/proc/self/statm").read_text().split()[1]) * resource.getpagesize()
+    except OSError:
+        return peak_rss()
+
+
 class Timer:
     """Wall time, CPU time and peak RSS per query stage, and counts (the query cost study).
 
     A stage entered once per read batch accumulates its times. ``peak_rss`` is the
     process's peak at the stage's last exit, so the stage that raises it shows as a step.
+
+    With ``path``, the stats are rewritten there after every stage, with ``running`` set to
+    the stage in progress, so a process killed mid-query (out of memory) leaves the stages
+    it finished and the one it died in. With ``log``, each stage's start and end are printed
+    to stderr with the current and peak RSS.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None = None, *, log: bool = False) -> None:
         self.stages: dict[str, dict[str, float]] = {}
         self.counts: dict[str, int] = {}
+        self.path, self.log, self.running = path, log, ""
+        self.start = time.perf_counter()
+
+    def _log(self, event: str, stage: str) -> None:
+        if self.log:
+            gib = 2**30
+            print(
+                f"[{time.perf_counter() - self.start:9.1f}s] {event:5} {stage:<11}"
+                f" rss {rss() / gib:7.2f} GiB  peak {peak_rss() / gib:7.2f} GiB",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def write(self) -> None:
+        if self.path is not None:
+            self.path.write_text(json.dumps(self.as_dict(), indent=2))
 
     @contextmanager
     def __call__(self, stage: str) -> Iterator[None]:
+        outer, self.running = self.running, stage
+        self._log("start", stage)
+        self.write()
         wall, cpu = time.perf_counter(), time.process_time()
         try:
             yield
@@ -65,9 +98,12 @@ class Timer:
             s["wall_s"] += time.perf_counter() - wall
             s["cpu_s"] += time.process_time() - cpu
             s["peak_rss"] = peak_rss()
+            self.running = outer
+            self._log("end", stage)
+            self.write()
 
     def as_dict(self) -> dict[str, object]:
-        return {"stages": self.stages, "counts": self.counts}
+        return {"running": self.running, "stages": self.stages, "counts": self.counts}
 
 
 def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
