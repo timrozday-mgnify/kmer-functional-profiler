@@ -21,15 +21,15 @@ import json
 import resource
 import sys
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 import numpy as np
 import polars as pl
-from scipy.sparse import coo_array, csr_array
+from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components
 
 from kmer_functional_profiler import _core
@@ -114,15 +114,105 @@ def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     _, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
     n = len(units)
-    # Bipartite graph: units are nodes 0..n, k-mers follow.
-    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
-    n_comp, label = connected_components(graph, directed=False)
     if n == 0:
         return 0, 0, 0
-    per_unit = np.bincount(label[:n])
+    label = _unit_components(col, row, n)
+    per_unit = np.bincount(label)
     largest = int(per_unit.argmax())
     n_units = int(per_unit[largest])
-    return int(n_comp), n_units, int((label[col] == largest).sum())
+    return len(per_unit), n_units, int((label[col] == largest).sum())
+
+
+def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
+    """Component label of each of ``n`` units, linked by pairs (unit ``col``, k-mer ``row``)."""
+    # Bipartite graph: units are nodes 0..n, k-mers follow.
+    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
+    label: np.ndarray = connected_components(graph, directed=False)[1][:n]
+    return label
+
+
+def _ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenated ``arange(start, start + length)`` for each pair."""
+    ends = np.cumsum(lengths)
+    total = int(ends[-1]) if len(ends) else 0
+    out: np.ndarray = np.arange(total) + np.repeat(starts - ends + lengths, lengths)
+    return out
+
+
+class _Block(NamedTuple):
+    """The components still being fitted: their units (grouped by component), the pairs of
+    those units, each pair's local unit ``c`` and local k-mer ``r``, and the k-mers."""
+
+    unit: np.ndarray
+    pairs: np.ndarray
+    c: np.ndarray
+    r: np.ndarray
+    kmer: np.ndarray
+
+
+# (coverage, second parameter) -> (new coverage, new second parameter, expected hits)
+Step = Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
+
+
+def _fit_components(
+    col: np.ndarray,
+    row: np.ndarray,
+    lam: np.ndarray,
+    other: np.ndarray,
+    make_step: Callable[[_Block], Step],
+    tol: float,
+    max_iter: int,
+) -> np.ndarray:
+    """Iterate an EM per component of units linked by shared k-mers (pairs of unit ``col``
+    and k-mer ``row``); return each unit's expected hits at its last step.
+
+    Components share no k-mer, so each is its own fit and stops at its own convergence:
+    its coverages ``lam`` change by at most ``tol`` x its largest, and ``other`` (presence
+    or scale) by at most ``tol``. An iteration only touches components still moving (most
+    converge in a few dozen, a few run to ``max_iter``); they are compacted into a new
+    ``_Block``, and ``make_step`` called on it, once half of the current block has
+    converged. ``lam`` and ``other`` are updated in place.
+    """
+    n = len(lam)
+    attributed = np.zeros(n)
+    label = _unit_components(col, row, n)
+    active = np.argsort(label, kind="stable")  # units grouped by component
+    seg = np.diff(np.flatnonzero(np.r_[True, np.diff(label[active]) != 0, True]))
+    by_unit = np.argsort(col, kind="stable")
+    pair_start = np.r_[0, np.cumsum(np.bincount(col, minlength=n))]
+    local = np.empty(n, dtype=np.intp)
+    it = 0
+    while len(active) and it < max_iter:
+        pairs = by_unit[_ranges(pair_start[active], np.diff(pair_start)[active])]
+        local[active] = np.arange(len(active))
+        kmer, r = np.unique(row[pairs], return_inverse=True)
+        step = make_step(_Block(active, pairs, local[col[pairs]], r, kmer))
+        starts = np.r_[0, np.cumsum(seg)[:-1]]
+        la, se, done = lam[active], other[active], np.zeros(len(active), dtype=bool)
+        while it < max_iter and done.sum() * 2 <= len(active):
+            it += 1
+            new, new_se, att = step(la, se)
+            converged = (
+                np.maximum.reduceat(np.abs(new - la), starts)
+                <= tol * np.maximum.reduceat(new, starts)
+            ) & (np.maximum.reduceat(np.abs(new_se - se), starts) <= tol)
+            la, se = new, new_se
+            now = np.repeat(converged, seg) & ~done
+            lam[active[now]], other[active[now]], attributed[active[now]] = (
+                la[now],
+                se[now],
+                att[now],
+            )
+            done |= now
+        rest = ~done  # at max_iter, units still moving keep their last values
+        lam[active[rest]], other[active[rest]], attributed[active[rest]] = (
+            la[rest],
+            se[rest],
+            att[rest],
+        )
+        moving = ~done[starts]
+        active, seg = active[np.repeat(moving, seg)], seg[moving]
+    return attributed
 
 
 def unit_hits(
@@ -219,7 +309,7 @@ def em(
     *,
     zero_inflated: bool = False,
     prior: tuple[float, float] | None = None,
-    tol: float = 1e-6,
+    tol: float = 1e-8,
     max_iter: int = 1000,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
@@ -227,8 +317,9 @@ def em(
     ``kmers`` has one row per (``unit``, ``hash``) with the k-mer's ``hits``. Each k-mer's
     hits are Poisson with mean the sum of ``coverage`` over the units holding it, and each
     unit's ``m_g`` kept k-mers (hit or not) all count in its expectation; EM finds the
-    maximum-likelihood coverages. Components share no k-mers, so their updates are
-    independent even though they run in one sparse product.
+    maximum-likelihood coverages. Components share no k-mers, so each is fitted and
+    stops on its own (:func:`_fit_components`); ``tol`` 1e-8 per component matches the
+    accuracy the joint fit had at 1e-6.
 
     ``zero_inflated`` lets only a fraction ``present`` of a unit's kept k-mers occur in the
     sample (the rest are structural zeros: the sample's strain differs there), so coverage
@@ -244,36 +335,42 @@ def em(
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
     or small ``m_g``; ``present`` is then updated by EM over the unhit k-mers' presence.
     """
+    kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
-    a = csr_array((np.ones(len(row)), (row, col)), shape=(len(hashes), len(units)))
     m = m_g[units].astype(np.float64)
-    lam, pi = (a.T @ hits) / m, np.ones(len(units))
-    for _ in range(max_iter):
-        w = lam * pi
-        mu = a @ w
-        attributed = w * (a.T @ _div(hits, mu))  # expected hits from each unit
-        if zero_inflated:
-            kmers_hit = w * (a.T @ _div(np.ones_like(mu), mu))  # expected hit k-mers per unit
-            seen = -np.expm1(-lam)  # chance a present k-mer is hit
-            if prior is None:
-                new_pi = np.minimum(1.0, _div(kmers_hit, m * seen))
+    lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
+    pi = np.ones(len(units))
+
+    def make_step(b: _Block) -> Step:
+        h, mb, per_unit = hits[b.kmer], m[b.unit], len(b.unit)
+
+        def over_units(x: np.ndarray) -> np.ndarray:  # per unit, sum of x over its k-mers
+            return np.bincount(b.c, weights=x[b.r], minlength=per_unit)
+
+        def step(la: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            w = la * p
+            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer))
+            attributed = w * over_units(_div(h, mu))  # expected hits from each unit
+            if zero_inflated:
+                kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
+                seen = -np.expm1(-la)  # chance a present k-mer is hit
+                if prior is None:
+                    new_p = np.minimum(1.0, _div(kmers_hit, mb * seen))
+                else:
+                    # Unhit k-mers are present with odds p (1 - seen) : (1 - p).
+                    odds = p * (1 - seen) / np.maximum(1 - p * seen, 1e-300)
+                    unhit_present = np.maximum(mb - kmers_hit, 0) * odds
+                    new_p = (kmers_hit + unhit_present + prior[0] - 1) / (mb + sum(prior) - 2)
             else:
-                # Unhit k-mers are present with odds pi (1 - seen) : (1 - pi).
-                odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
-                unhit_present = np.maximum(m - kmers_hit, 0) * odds
-                new_pi = (kmers_hit + unhit_present + prior[0] - 1) / (m + sum(prior) - 2)
-        else:
-            new_pi = pi
-        new = _div(attributed, m * new_pi)
-        done = np.abs(new - lam).max(initial=0) <= tol * new.max(initial=0) and np.allclose(
-            new_pi, pi, rtol=0, atol=tol
-        )
-        lam, pi = new, new_pi
-        if done:
-            break
+                new_p = p
+            return _div(attributed, mb * new_p), new_p, attributed
+
+        return step
+
+    attributed = _fit_components(col, row, lam, pi, make_step, tol, max_iter)
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
@@ -294,7 +391,7 @@ def em_pin(
     kmers: pl.DataFrame,
     pin_hist: np.ndarray,
     *,
-    tol: float = 1e-6,
+    tol: float = 1e-8,
     max_iter: int = 1000,
 ) -> pl.DataFrame:
     """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
@@ -315,6 +412,7 @@ def em_pin(
     ``coverage`` and ``present`` (expected fraction of kept k-mers present); units explained
     away get coverage 0.
     """
+    kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
     level = kmers["pin_q"].to_numpy().astype(np.intp)
@@ -322,26 +420,29 @@ def em_pin(
     hits[row] = kmers["hits"].to_numpy()
     n = len(units)
     hist = pin_hist[units].astype(np.float64)
+    levels = hist.shape[1]
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
-    for _ in range(max_iter):
-        weight = lam[col] * scale[col] * PIN_P[level]
-        share = _div(weight, np.bincount(row, weights=weight, minlength=len(hashes))[row])
-        attributed = np.bincount(col, weights=share * hits[row], minlength=n)
-        hit = np.zeros_like(hist)
-        np.add.at(hit, (col, level), share)
-        seen = -np.expm1(-lam)[:, None]  # chance a present k-mer is hit
-        pi = scale[:, None] * PIN_P
-        odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
-        present = hit.sum(axis=1) + (np.maximum(hist - hit, 0) * odds).sum(axis=1)
-        new = _div(attributed, present)
-        new_scale = np.clip(_div(present, expected), 0.0, 1 / PIN_P[-1])
-        done = np.abs(new - lam).max(initial=0) <= tol * new.max(initial=0) and np.allclose(
-            new_scale, scale, rtol=0, atol=tol
-        )
-        lam, scale = new, new_scale
-        if done:
-            break
+
+    def make_step(b: _Block) -> Step:
+        h, lv, hs, ex = hits[b.kmer], level[b.pairs], hist[b.unit], expected[b.unit]
+        cell = b.c * levels + lv
+
+        def step(la: np.ndarray, sc: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            weight = la[b.c] * sc[b.c] * PIN_P[lv]
+            share = _div(weight, np.bincount(b.r, weights=weight, minlength=len(b.kmer))[b.r])
+            att = np.bincount(b.c, weights=share * h[b.r], minlength=len(b.unit))
+            hit = np.bincount(cell, weights=share, minlength=hs.size).reshape(hs.shape)
+            seen = -np.expm1(-la)[:, None]  # chance a present k-mer is hit
+            pi = sc[:, None] * PIN_P
+            odds = pi * (1 - seen) / np.maximum(1 - pi * seen, 1e-300)
+            present = hit.sum(axis=1) + (np.maximum(hs - hit, 0) * odds).sum(axis=1)
+            return _div(att, present), np.clip(_div(present, ex), 0.0, 1 / PIN_P[-1]), att
+
+        return step
+
+    # tol 1e-8 per component matches the joint fit's accuracy at 1e-6 (phase 6, step 15).
+    attributed = _fit_components(col, row, lam, scale, make_step, tol, max_iter)
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
         {"unit": units, "coverage": lam, "present": scale * expected / m},
@@ -632,6 +733,7 @@ def profile(
     draws: int = 0,
     kmers_out: str | Path | None = None,
     timer: Timer | None = None,
+    all_estimators: bool = False,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -645,7 +747,10 @@ def profile(
     unit whose members come from many genomes (a KO), total depth over its gene copies.
     ``kmers_wta``/``coverage_wta`` and ``kmers_ufirst``/``coverage_ufirst`` are the k-mers
     :func:`assign_best` gives each unit and their hits per kept k-mer. Units without hits
-    are omitted.
+    are omitted. ``coverage_em`` is the shipped estimate; the others (``_zi`` and its
+    ``copies``/``abundance``, ``_zib``, ``_zip``, ``_wta``, ``_ufirst``) are fitted only
+    with ``all_estimators`` (benchmarks), except that ``draws`` > 0 fits ``_zi``, whose
+    intervals the posterior gives.
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
@@ -791,33 +896,40 @@ def profile(
         len_cv = hit_info["len_cv_dense"].to_numpy()
     with timer("fit_em"):
         plain = em(detected, m_g).select("unit", coverage_em="coverage")
-    with timer("fit_zi"):
-        inflated = em(detected, m_g, zero_inflated=True)
-    with timer("fit_zib"):
-        prior = fit_present_prior(inflated)
-        shrunk = (em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated).select(
-            "unit", coverage_zib="coverage", present_zib="present"
+    fits = [plain]
+    if all_estimators or draws > 0:
+        with timer("fit_zi"):
+            inflated = em(detected, m_g, zero_inflated=True)
+        # Present k-mers over an average member's kept k-mers: member-equivalents present.
+        copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
+        fits.append(
+            inflated.join(
+                pl.DataFrame(
+                    {"unit": np.arange(len(m_g), dtype=np.uint32), "m": m_g, "pin_sum": pin_sum}
+                ),
+                on="unit",
+            ).select(
+                "unit",
+                coverage_zi="coverage",
+                present_zi="present",
+                copies_zi=copies,
+                abundance_zi=pl.col("coverage") * copies,
+            )
         )
-    # Present k-mers over an average member's kept k-mers: member-equivalents present.
-    copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
-    inflated = inflated.join(
-        pl.DataFrame({"unit": np.arange(len(m_g), dtype=np.uint32), "m": m_g, "pin_sum": pin_sum}),
-        on="unit",
-    ).select(
-        "unit",
-        coverage_zi="coverage",
-        present_zi="present",
-        copies_zi=copies,
-        abundance_zi=pl.col("coverage") * copies,
-    )
-    with timer("fit_zip"):
-        weighted = em_pin(detected, pin_hist).select(
-            "unit", coverage_zip="coverage", present_zip="present"
-        )
+    if all_estimators:
+        with timer("fit_zib"):
+            prior = fit_present_prior(inflated)
+            fitted = em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated
+            fits.append(fitted.select("unit", coverage_zib="coverage", present_zib="present"))
+        with timer("fit_zip"):
+            fits.append(
+                em_pin(detected, pin_hist).select(
+                    "unit", coverage_zip="coverage", present_zip="present"
+                )
+            )
     unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
-    rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
     with timer("result"):
         result = (
             per_read.group_by("unit")
@@ -828,12 +940,10 @@ def profile(
             )
             .join(unit_info, on="unit")
             .join(assigned, on="unit", how="left")
-            .join(plain, on="unit", how="left")
-            .join(inflated, on="unit", how="left")
-            .join(shrunk, on="unit", how="left")
-            .join(weighted, on="unit", how="left")
             .join(present_prob, on="unit", how="left")
         )
+        for fit in fits:
+            result = result.join(fit, on="unit", how="left")
     if draws > 0:
         prob = np.zeros(len(m_g))
         prob[present_prob["unit"].to_numpy()] = present_prob["present_prob"].to_numpy()
@@ -848,17 +958,23 @@ def profile(
             on="unit",
             how="left",
         ).with_columns(pl.col("kmers_dense").fill_null(0))
-    with timer("baselines"):
-        for rule, score in (("wta", WTA_SCORE), ("ufirst", UFIRST_SCORE)):
-            won = (
-                assign_best(rated, score)
-                .group_by("unit")
-                .agg(
-                    pl.len().cast(pl.UInt32).alias(f"kmers_{rule}"),
-                    pl.col("hits").sum().alias(f"_{rule}"),
+    if all_estimators:
+        rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
+        with timer("baselines"):
+            for rule, score in (("wta", WTA_SCORE), ("ufirst", UFIRST_SCORE)):
+                won = (
+                    assign_best(rated, score)
+                    .group_by("unit")
+                    .agg(
+                        pl.len().cast(pl.UInt32).alias(f"kmers_{rule}"),
+                        pl.col("hits").sum().alias(f"_{rule}"),
+                    )
                 )
-            )
-            result = result.join(won, on="unit", how="left")
+                result = result.join(won, on="unit", how="left").with_columns(
+                    pl.col(f"kmers_{rule}").fill_null(0),
+                    (pl.col(f"_{rule}").fill_null(0) / pl.col("m_g")).alias(f"coverage_{rule}"),
+                )
+            result = result.drop("_wta", "_ufirst")
     return (
         result.with_columns(
             pl.col("^(coverage|present|copies|abundance)_(em|zi|zib|zip)(_lo|_hi)?$").fill_null(
@@ -868,12 +984,7 @@ def profile(
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
             kmers_unique=pl.col("kmers_unique").fill_null(0),
-            kmers_wta=pl.col("kmers_wta").fill_null(0),
-            coverage_wta=pl.col("_wta").fill_null(0) / pl.col("m_g"),
-            kmers_ufirst=pl.col("kmers_ufirst").fill_null(0),
-            coverage_ufirst=pl.col("_ufirst").fill_null(0) / pl.col("m_g"),
         )
-        .drop("_wta", "_ufirst")
         .with_columns(unit=pl.col("index"))  # back to the index's unit ids
         .drop("index")
         .sort("unit")
