@@ -741,6 +741,11 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Checked:* the `test,test_query` profile (fixture reads, ladder 10 and 40 pairs, both test indexes, draws 3 on 1in1) and a stub run of the download path; the CLI test checks the stats against the profile (hit rows = total hits, hit units = rows); a test checks that ladder subsets nest and pair.
   - *Not built yet:* the synthetic full-size tier 2 for resident vs cold lookups, and the check of `cost.py`'s query prediction against `query_cost.tsv`; both come after the run.
 
+* **Phase 6, step 12 — first Q1 run: every cell out of memory; stats written per stage.** Against `full-build`, all five rungs (0.4–40 M pairs) were OOM-killed at 128 GB within minutes, the 0.4 M rung included, so the cost does not come from the reads. `--stats` was written only on success, so the failed cells recorded nothing.
+  - *Suspect:* the `keys` stage. `stored_keys` materialises tier 2's full keys as uint64 (~27 GB at ~3.4×10⁹ keys) through temporaries of the same size (bucket repeat, shift, fingerprint cast).
+  - *Changed:* `Timer` rewrites the stats JSON at every stage start and end, with `running` naming the stage in progress, and logs each stage's start and end with current and peak RSS to stderr (`.command.err`), so a killed cell shows where it died. The ladder gains 10 k and 100 k rungs, where the read-side cost is negligible.
+  - *Next:* re-run; if `keys` is confirmed, lookups walk the memory-mapped `offsets`/`fingerprints` instead of materialising keys (part of Q3).
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
