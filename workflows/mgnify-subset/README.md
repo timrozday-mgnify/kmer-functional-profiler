@@ -152,7 +152,9 @@ the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}
 (`kmer-functional-profiler query --stats`); `query_cost.tsv` has one row per query:
 the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
 pairs, hit and detected units, component sizes) and `{stage}_wall_s`, `_cpu_s` and
-`_peak_rss` (bytes, the process's peak at the stage's end) per stage. Queries that exceed
+`_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
+the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
+`RssAnon` sampled every 50 ms) per stage. Queries that exceed
 `--query_memory` or 24 h fail without stopping the rest; they are FAILED in `trace.tsv`.
 
 | Parameter | Default | Meaning |

@@ -1,6 +1,8 @@
 """Query counts against an index built from the fixture proteins."""
 
+import itertools
 import json
+import time
 from functools import partial
 from pathlib import Path
 
@@ -9,7 +11,7 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner
 
-from kmer_functional_profiler import _core, reference
+from kmer_functional_profiler import _core, query, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import (
     PIN_BITS,
@@ -24,6 +26,7 @@ from kmer_functional_profiler.query import (
     UFIRST_SCORE,
     WTA_SCORE,
     Timer,
+    _Summed,
     assign_best,
     em,
     em_pin,
@@ -533,3 +536,29 @@ def test_default_fits_em_only(members: Path) -> None:
     assert not any(c.endswith(("_zi", "_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
     assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta"} <= set(full.columns)
     assert default.equals(full.select(default.columns))
+
+
+def test_summed_batches_equal_one_aggregation() -> None:
+    rng = np.random.default_rng(0)
+    frame = pl.DataFrame({"unit": rng.integers(0, 5, 300), "n": rng.integers(1, 4, 300)})
+    summed = _Summed(["unit"], {"n": pl.col("n").sum()})
+    summed.min_rows = 1  # merge at every batch
+    for start in range(0, 300, 40):
+        summed.add(frame[start : start + 40])
+    got, want = summed.total().sort("unit"), frame.group_by("unit").agg(pl.col("n").sum())
+    assert got.equals(want.sort("unit"))
+
+
+def test_timer_keeps_the_sampled_anonymous_peak(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = itertools.count()
+    # A spike seen only by the sampler mid-stage (call 0 is Timer's own start).
+    monkeypatch.setattr(query, "anon_rss", lambda: 100 if next(calls) == 2 else 1)
+    timer = Timer()
+    with timer("stage"):
+        time.sleep(0.3)
+    assert timer.stages["stage"]["peak_anon"] == 100
+    monkeypatch.setattr(query, "anon_rss", lambda: None)  # no /proc (macOS)
+    timer = Timer()
+    with timer("stage"):
+        pass
+    assert "peak_anon" not in timer.stages["stage"]
