@@ -16,9 +16,12 @@ Two more baselines give each hit k-mer to one unit (:func:`assign_best`): winner
 hits give.
 """
 
+import ctypes
 import json
+import os
 import resource
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -53,10 +56,24 @@ def rss() -> int:
         return peak_rss()
 
 
+def _footprint() -> int | None:
+    """macOS ``phys_footprint`` (what Activity Monitor calls Memory): anonymous and
+    compressed memory, without clean pages of memory-mapped files."""
+    buf = ctypes.create_string_buffer(512)  # rusage_info_v2; phys_footprint at byte 72
+    if _libc is None or _libc.proc_pid_rusage(os.getpid(), 2, buf) != 0:
+        return None
+    return int.from_bytes(buf.raw[72:80], "little")
+
+
+_libc = ctypes.CDLL(None) if sys.platform == "darwin" else None
+
+
 def anon_rss() -> int | None:
-    """Current anonymous RSS in bytes (Linux ``RssAnon``): memory the process owns, without
-    the page cache of memory-mapped files (the index), which the kernel can reclaim. None
-    where ``/proc`` is missing."""
+    """Current anonymous RSS in bytes (Linux ``RssAnon``; macOS ``phys_footprint``): memory
+    the process owns, without the page cache of memory-mapped files (the index), which the
+    kernel can reclaim. None elsewhere."""
+    if _libc is not None:
+        return _footprint()
     try:
         with open("/proc/self/status") as f:
             return next(int(line.split()[1]) * 1024 for line in f if line.startswith("RssAnon:"))
@@ -72,8 +89,8 @@ class Timer:
 
     A stage entered once per read batch accumulates its times. ``peak_rss`` is the
     process's peak at the stage's last exit, so the stage that raises it shows as a step.
-    It counts resident pages of memory-mapped files too, so where Linux reports it
-    ``peak_anon`` is the same high-water mark for anonymous memory only, sampled every
+    It counts resident pages of memory-mapped files too, so where the OS reports it (Linux,
+    macOS) ``peak_anon`` is the same high-water mark for anonymous memory only, sampled every
     ``ANON_SAMPLE_S`` while a stage runs (the kernel keeps no anonymous peak).
 
     With ``path``, the stats are rewritten there after every stage, with ``running`` set to
@@ -143,13 +160,20 @@ class Timer:
         return {"running": self.running, "stages": self.stages, "counts": self.counts}
 
 
+def _ids(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Distinct values of ``x`` and each element's index into them; the index is int32 when
+    it fits (half the memory of ``np.unique``'s int64), which changes no result."""
+    distinct, inverse = np.unique(x, return_inverse=True)
+    return distinct, inverse.astype(np.int32 if len(x) < 2**30 else np.int64, copy=False)
+
+
 def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
     """Connected components of hit units linked by shared k-mers.
 
     Returns the number of components, the largest's units and its (unit, hash) pairs.
     """
-    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
-    _, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    units, col = _ids(kmers["unit"].to_numpy())
+    _, row = _ids(kmers["hash"].to_numpy())
     n = len(units)
     if n == 0:
         return 0, 0, 0
@@ -215,14 +239,14 @@ def _fit_components(
     label = _unit_components(col, row, n)
     active = np.argsort(label, kind="stable")  # units grouped by component
     seg = np.diff(np.flatnonzero(np.r_[True, np.diff(label[active]) != 0, True]))
-    by_unit = np.argsort(col, kind="stable")
+    by_unit = np.argsort(col, kind="stable").astype(col.dtype)
     pair_start = np.r_[0, np.cumsum(np.bincount(col, minlength=n))]
-    local = np.empty(n, dtype=np.intp)
+    local = np.empty(n, dtype=col.dtype)
     it = 0
     while len(active) and it < max_iter:
         pairs = by_unit[_ranges(pair_start[active], np.diff(pair_start)[active])]
         local[active] = np.arange(len(active))
-        kmer, r = np.unique(row[pairs], return_inverse=True)
+        kmer, r = _ids(row[pairs])
         step = make_step(_Block(active, pairs, local[col[pairs]], r, kmer))
         starts = np.r_[0, np.cumsum(seg)[:-1]]
         la, se, done = lam[active], other[active], np.zeros(len(active), dtype=bool)
@@ -359,10 +383,11 @@ def em(
     or small ``m_g``; ``present`` is then updated by EM over the unhit k-mers' presence.
     """
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
-    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
-    hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    units, col = _ids(kmers["unit"].to_numpy())
+    hashes, row = _ids(kmers["hash"].to_numpy())
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
+    del kmers, hashes  # the sorted copy is not needed through the fit
     m = m_g[units].astype(np.float64)
     lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
     pi = np.ones(len(units))
@@ -436,11 +461,12 @@ def em_pin(
     away get coverage 0.
     """
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
-    units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
-    hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
+    units, col = _ids(kmers["unit"].to_numpy())
+    hashes, row = _ids(kmers["hash"].to_numpy())
     level = kmers["pin_q"].to_numpy().astype(np.intp)
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
+    del kmers, hashes  # the sorted copy is not needed through the fit
     n = len(units)
     hist = pin_hist[units].astype(np.float64)
     levels = hist.shape[1]
@@ -575,7 +601,8 @@ def _ztp_log_post(lam: np.ndarray, hits: np.ndarray, hit: np.ndarray) -> np.ndar
 
 
 def posterior_zi(
-    hit_reads: pl.DataFrame,
+    pairs: pl.DataFrame,
+    hash_reads: pl.DataFrame,
     m_g: np.ndarray,
     pin_sum: np.ndarray,
     draws: int,
@@ -587,11 +614,13 @@ def posterior_zi(
     level: float = 0.95,
     shared_evidence: float = 0.5,
     seed: int = 0,
+    scratch_in_memory: bool = False,
 ) -> pl.DataFrame:
     """Intervals and ambiguity groups for the zero-inflated model: resampled reads + Gibbs.
 
-    ``hit_reads`` has one row per (``unit``, ``hash``, ``read``) with ``n`` hits. Each of
-    ``draws`` replicates
+    ``pairs`` has one row per hit (``unit``, ``hash``) and ``hash_reads`` one per (``hash``,
+    ``read``) with the ``n`` times the read hit the k-mer (every unit holding a k-mer sees the
+    same reads, so they are stored once per k-mer). Each of ``draws`` replicates
 
     1. reweights every read (pair) by a Poisson(1) draw and rebuilds the k-mer counts (one
        read hits many neighbouring k-mers, so counts are not independent), and refits
@@ -625,19 +654,19 @@ def posterior_zi(
     """
     rng = np.random.default_rng(seed)
     # Sorted, so the seeded draws do not depend on row order (Polars group_by does not fix it).
-    keyed = (
-        hit_reads.sort("unit", "hash", "read")
-        .group_by("unit", "hash", maintain_order=True)
-        .agg("read", "n")
-    )
+    keyed = pairs.select("unit", "hash").sort("unit", "hash")
     units, col = np.unique(keyed["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(keyed["hash"].to_numpy(), return_inverse=True)
     n_units, n_rows = len(units), len(hashes)
-    key_of_hit = np.repeat(np.arange(keyed.height), keyed["read"].list.len().to_numpy())
-    reads, read_of = np.unique(
-        keyed["read"].explode(empty_as_null=False).to_numpy(), return_inverse=True
+    by_hash = hash_reads.join(pl.DataFrame({"hash": hashes}), on="hash", how="semi").sort(
+        "hash", "read"
     )
-    n = keyed["n"].explode(empty_as_null=False).to_numpy().astype(np.int64)
+    hash_of_hit: np.ndarray = np.searchsorted(hashes, by_hash["hash"].to_numpy()).astype(
+        np.int32 if n_rows < 2**31 else np.int64
+    )
+    reads, read_of = _ids(by_hash["read"].to_numpy())
+    n = by_hash["n"].to_numpy().astype(np.int64)
+    del by_hash
     # Entries sorted by k-mer, with their position within it, for sequential binomial splits.
     order = np.argsort(row, kind="stable")
     row_s, col_s = row[order], col[order]
@@ -647,12 +676,14 @@ def posterior_zi(
     m = m_g[units].astype(np.float64)
     keep_prob = np.ones(n_units) if present_prob is None else present_prob[units]
     cv2 = np.zeros(n_units) if len_cv is None else len_cv[units] ** 2
-    coverage = np.zeros((draws, n_units))
-    abundance, group_coverage, group_abundance = (np.zeros_like(coverage) for _ in range(3))
+    coverage, abundance, group_coverage, group_abundance = (
+        _scratch((draws, n_units), scratch_in_memory) for _ in range(4)
+    )
     evidence = np.zeros(len(row_s))  # hits allocated per (k-mer, unit) entry, all draws
     for b in range(draws):
         weight = rng.poisson(1.0, len(reads))[read_of]
-        per_key = np.rint(np.bincount(key_of_hit, weights=n * weight, minlength=keyed.height))
+        per_hash = np.rint(np.bincount(hash_of_hit, weights=n * weight, minlength=n_rows))
+        per_key = per_hash[row]
         table = keyed.select("unit", "hash").with_columns(hits=per_key).filter(pl.col("hits") > 0)
         if table.height == 0:
             continue
@@ -662,8 +693,7 @@ def posterior_zi(
         lam[at] = np.maximum(fit["coverage"].to_numpy(), 1e-6)
         pi[at] = np.clip(fit["present"].to_numpy(), 1e-6, 1 - 1e-6)
         # Holders of a k-mer see the same reads, so any holder's count is the k-mer's.
-        count = np.zeros(n_rows, dtype=np.int64)
-        count[row] = per_key.astype(np.int64)
+        count = per_hash.astype(np.int64)
         for _ in range(sweeps):
             rate = (lam * pi)[col_s]
             rest = np.bincount(row_s, weights=rate, minlength=n_rows)  # rate not yet visited
@@ -686,11 +716,17 @@ def posterior_zi(
                 gain = _ztp_log_post(new, hits, hit) - _ztp_log_post(lam, hits, hit) + step
                 lam = np.where(alive & (np.log(rng.random(n_units)) < gain), new, lam)
             seen = -np.expm1(-lam)
-            log_post = hit[:, None] * np.log(PI_GRID) + (m - hit)[:, None] * np.log1p(
-                -PI_GRID * seen[:, None]
-            )
-            cdf = np.cumsum(np.exp(log_post - log_post.max(axis=1, keepdims=True)), axis=1)
-            pick = (cdf < rng.random(n_units)[:, None] * cdf[:, -1:]).sum(axis=1)
+            u = rng.random(n_units)
+            pick = np.empty(n_units, dtype=np.intp)
+            # Units x grid arrays, a chunk of units at a time (8 GB per 2 M units at once).
+            chunk = max(1, SCRATCH_BYTES // (8 * len(PI_GRID)))
+            for lo in range(0, n_units, chunk):
+                part = slice(lo, lo + chunk)
+                log_post = hit[part, None] * np.log(PI_GRID) + (m - hit)[part, None] * np.log1p(
+                    -PI_GRID * seen[part, None]
+                )
+                cdf = np.cumsum(np.exp(log_post - log_post.max(axis=1, keepdims=True)), axis=1)
+                pick[part] = (cdf < u[part, None] * cdf[:, -1:]).sum(axis=1)
             pi = PI_GRID[np.minimum(pick, len(PI_GRID) - 1)]
         unhit_odds = pi * (1 - seen) / (1 - pi * seen)
         present = hit + rng.binomial(np.maximum(m - hit, 0).astype(np.int64), unhit_odds)
@@ -730,14 +766,24 @@ def posterior_zi(
     group_id = np.full(n_units, len(units), dtype=np.int64)
     np.minimum.at(group_id, group, np.arange(n_units))  # smallest member index per group
     group_unit = units[group_id[group]]
-    total = [np.stack([np.bincount(group, w, minlength=n_units) for w in x])[:, group]
-             for x in (group_coverage, group_abundance)]  # fmt: skip
-    total = [np.where(size > 1, t, x) for t, x in zip(total, (coverage, abundance), strict=True)]
+    for x in (group_coverage, group_abundance):  # each draw's group totals, in place
+        for b in range(draws):
+            x[b] = np.bincount(group, x[b], minlength=n_units)[group]
     tails = [(1 - level) / 2, (1 + level) / 2]
-    columns = {"unit": units.astype(np.uint32)}
-    for name, x in (("coverage_zi", coverage), ("abundance_zi", abundance),
-                    ("group_coverage_zi", total[0]), ("group_abundance_zi", total[1])):  # fmt: skip
-        columns[f"{name}_lo"], columns[f"{name}_hi"] = np.quantile(x, tails, axis=0)
+    columns: dict[str, np.ndarray] = {"unit": units.astype(np.uint32)}
+    names = ("coverage_zi", "abundance_zi", "group_coverage_zi", "group_abundance_zi")
+    for name in names:
+        columns[f"{name}_lo"], columns[f"{name}_hi"] = np.empty(n_units), np.empty(n_units)
+    # Quantiles per unit, over chunks of units, so only a chunk of draws is in memory.
+    chunk = max(1, SCRATCH_BYTES // (32 * draws))  # four draws x chunk arrays at a time
+    for lo in range(0, n_units, chunk):
+        part = slice(lo, lo + chunk)
+        grouped = size[part] > 1
+        for name, x in zip(names, (coverage[:, part], abundance[:, part],
+                                   np.where(grouped, group_coverage[:, part], coverage[:, part]),
+                                   np.where(grouped, group_abundance[:, part], abundance[:, part])),
+                           strict=True):  # fmt: skip
+            columns[f"{name}_lo"][part], columns[f"{name}_hi"][part] = np.quantile(x, tails, axis=0)
     return pl.DataFrame(columns).with_columns(
         ambiguity_group=pl.when(pl.Series(size) > 1).then(pl.Series(group_unit.astype(np.uint32))),
         group_size=pl.Series(size.astype(np.uint32)),
@@ -745,27 +791,61 @@ def posterior_zi(
     )
 
 
+SCRATCH_BYTES: Final = 2**28  # arrays larger than this are kept in a scratch file
+
+
+def _scratch(shape: tuple[int, int], in_memory: bool = False) -> np.ndarray:
+    """A zeroed float64 array, memory-mapped from an unlinked temporary file (``TMPDIR``)
+    when larger than ``SCRATCH_BYTES``, so its pages are the kernel's to write back and drop
+    rather than the process's memory; ``in_memory`` keeps it in RAM regardless (no local
+    disk). Written row by row, read in column chunks."""
+    if in_memory or shape[0] * shape[1] * 8 <= SCRATCH_BYTES:
+        return np.zeros(shape)
+    with tempfile.TemporaryFile() as f:  # the mapping keeps the file alive once closed
+        return np.memmap(f, dtype=np.float64, mode="w+", shape=shape)
+
+
 class _Summed:
     """Per-batch aggregates summed into one table, re-aggregated each time the batches
-    waiting outgrow the running total, so memory stays about twice the total's."""
+    waiting outgrow the running total, so memory stays about twice the total's.
 
-    min_rows = 1_000_000  # rows waiting before the first merge
+    The table is split into ``parts`` by the first key (mod ``parts``), each merged on its
+    own, so a merge's transient memory (polars' group-by over the concatenation) is that of
+    one part, not the whole table."""
 
-    def __init__(self, keys: list[str], aggs: dict[str, pl.Expr]) -> None:
-        self.keys, self.aggs = keys, aggs
-        self.total_df: pl.DataFrame | None = None
-        self.pending: list[pl.DataFrame] = []
-        self.rows = 0
+    min_rows = 1_000_000  # rows waiting before the first merge, over all parts
+
+    def __init__(self, keys: list[str], aggs: dict[str, pl.Expr], parts: int = 16) -> None:
+        self.keys, self.aggs, self.parts = keys, aggs, parts
+        self.totals: list[pl.DataFrame | None] = [None] * parts
+        self.pending: list[list[pl.DataFrame]] = [[] for _ in range(parts)]
+        self.rows = [0] * parts
 
     def add(self, df: pl.DataFrame) -> None:
-        self.pending.append(df)
-        self.rows += df.height
-        if self.rows > max(self.min_rows, 0 if self.total_df is None else self.total_df.height):
-            self.total_df, self.pending, self.rows = self.total(), [], 0
+        self.empty = df.clear()
+        split = df.with_columns(_part=pl.col(self.keys[0]) % self.parts).partition_by(
+            "_part", as_dict=True, include_key=False
+        )
+        for key, part in split.items():
+            p = int(key[0])
+            self.pending[p].append(part)
+            self.rows[p] += part.height
+            total = self.totals[p]
+            if self.rows[p] > max(
+                self.min_rows // self.parts, 0 if total is None else total.height
+            ):
+                self.totals[p], self.pending[p], self.rows[p] = self._merged(p), [], 0
+
+    def _merged(self, p: int) -> pl.DataFrame:
+        total = self.totals[p]
+        parts = [total, *self.pending[p]] if total is not None else self.pending[p]
+        return pl.concat([self.empty, *parts]).group_by(self.keys).agg(**self.aggs)
 
     def total(self) -> pl.DataFrame:
-        parts = [self.total_df, *self.pending] if self.total_df is not None else self.pending
-        return pl.concat(parts).group_by(self.keys).agg(**self.aggs)
+        """The summed table. It releases the parts, so it is called once, at the end."""
+        merged = [self._merged(p) for p in range(self.parts)]
+        self.totals, self.pending = [None] * self.parts, [[] for _ in range(self.parts)]
+        return pl.concat(merged, rechunk=False)
 
 
 def profile(
@@ -780,6 +860,7 @@ def profile(
     kmers_out: str | Path | None = None,
     timer: Timer | None = None,
     all_estimators: bool = False,
+    scratch_in_memory: bool = False,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -807,7 +888,9 @@ def profile(
     gather drops get 0.
 
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
-    ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). ``kmers_out``
+    ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`); its draws go to a
+    scratch file in ``TMPDIR`` above ``SCRATCH_BYTES``, or stay in RAM with
+    ``scratch_in_memory``. ``kmers_out``
     writes the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
 
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
@@ -865,7 +948,10 @@ def profile(
                 hits.select("unit", "read").unique().group_by("unit").agg(reads=pl.len())
             )
             if draws > 0:
-                batches.append(by_read(hits))
+                # Once per (hash, read): each hit has a row per unit holding the k-mer.
+                batches.append(
+                    hits.group_by("hash", "read").agg(n=pl.len() // pl.col("holders").first())
+                )
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
         sampled += len(b["hash"])
@@ -909,15 +995,11 @@ def profile(
         return df.join(ids, on="unit").drop("unit").rename({"index": "unit"})
 
     kmer_hits, unit_reads = renumber(kmer_hits), renumber(unit_reads)
-    per_read = None if per_read is None else renumber(per_read)
     hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
     t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
         assigned = gather(kmer_hits.select("unit", "hash"), t_g)
     counts["detected_units"] = assigned.height
-    detected_reads = (
-        None if per_read is None else per_read.join(assigned.select("unit"), on="unit", how="semi")
-    )
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = hit_info["m_g"].to_numpy()
     pin_hist = hit_info["pin_hist"].to_numpy()
@@ -949,6 +1031,8 @@ def profile(
                 ]
             )
             detected = per_kmer(detected_reads)
+            if draws > 0:
+                per_read = detected_reads.group_by("hash", "read").agg(pl.col("n").first())
         m_g = hit_info["m_dense"].to_numpy()
         pin_hist = hit_info["pin_hist_dense"].to_numpy()
         pin_sum = hit_info["pin_sum_dense"]
@@ -1003,10 +1087,17 @@ def profile(
     if draws > 0:
         prob = np.zeros(len(m_g))
         prob[present_prob["unit"].to_numpy()] = present_prob["present_prob"].to_numpy()
-        assert detected_reads is not None  # per-read rows are kept when draws > 0
+        assert per_read is not None  # per-read rows are kept when draws > 0
         with timer("posterior"):
             intervals = posterior_zi(
-                detected_reads, m_g, pin_sum.to_numpy(), draws, present_prob=prob, len_cv=len_cv
+                detected.select("unit", "hash"),
+                per_read,
+                m_g,
+                pin_sum.to_numpy(),
+                draws,
+                present_prob=prob,
+                len_cv=len_cv,
+                scratch_in_memory=scratch_in_memory,
             )
         result = result.join(intervals, on="unit", how="left")
     if dense is not None:
