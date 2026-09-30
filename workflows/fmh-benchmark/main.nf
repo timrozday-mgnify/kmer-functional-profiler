@@ -436,7 +436,8 @@ process HUMANN4 {
         --bowtie2out metaphlan.bowtie2.bz2 -o raw/metaphlan.tsv
     humann --input reads.fastq.gz --output out --threads ${task.cpus} \\
         --taxonomic-profile raw/metaphlan.tsv \\
-        --nucleotide-database ${chocophlan} --protein-database ${uniref}
+        --nucleotide-database ${chocophlan} --protein-database ${uniref} \\
+        --utility-database ${utility}
     humann_regroup_table --input out/reads_2_genefamilies.tsv \\
         --custom ${utility}/map_ko_uniref90.txt.gz --output raw/ko.tsv
     cp out/reads_2_genefamilies.tsv raw/
