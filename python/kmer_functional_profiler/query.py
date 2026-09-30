@@ -308,7 +308,7 @@ def em_pin(
     kmers: pl.DataFrame,
     pin_hist: np.ndarray,
     *,
-    tol: float = 1e-6,
+    tol: float = 1e-8,
     max_iter: int = 1000,
 ) -> pl.DataFrame:
     """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
@@ -340,7 +340,9 @@ def em_pin(
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
     attributed = np.zeros(n)
-    # Components share no k-mer, so each is its own fit and stops at its own convergence;
+    # Components share no k-mer, so each is its own fit and stops at its own convergence
+    # (``tol`` 1e-8 matches the accuracy of the joint fit at 1e-6, which ran every unit
+    # until the slowest converged);
     # an iteration only touches components still moving (most converge in a few dozen, a
     # few run to max_iter). Units are grouped by component; pairs by unit.
     label = _unit_components(col, row, n)
