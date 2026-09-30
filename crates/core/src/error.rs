@@ -16,6 +16,10 @@ pub enum Error {
     BloomSize(usize),
     #[error("mate files have different read counts")]
     MateCountMismatch,
+    #[error("hashes and reads differ in length")]
+    LengthMismatch,
+    #[error("set value names unit {0}, beyond the unit table")]
+    UnitOutOfRange(u64),
     #[error(transparent)]
     Fastx(#[from] needletail::errors::ParseError),
 }
