@@ -493,6 +493,34 @@ def test_posterior_scratch_file_changes_nothing(monkeypatch: pytest.MonkeyPatch)
     assert got.equals(in_memory)
 
 
+def test_component_batches_change_nothing(members: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One component per batch: every fit gives what it gives on all units at once. Each
+    # protein is also indexed as a second cluster with every 20th residue changed, so units
+    # share k-mers and components have two units.
+    shared = members.parent / "shared" / "members.parquet"
+    shared.parent.mkdir(exist_ok=True)
+    seqs = list(proteins().values())
+    copies = ["".join("W" if i % 20 == 10 else c for i, c in enumerate(q)) for q in seqs]
+    rows = [(i, i, True, q) for i, q in enumerate(seqs + copies)]
+    pl.DataFrame(
+        rows, schema=["protein_id", "cluster_rep", "full_length", "sequence"], orient="row"
+    ).write_parquet(shared)
+    indexes = [build(shared, t_base=0.2, n_min=0), build(shared, t_base=0.2, n_min=0, t_dense=1.0)]
+    timer = Timer()
+    profile(indexes[0], *READS, timer=timer)
+    assert timer.counts["components"] < timer.counts["hit_units"]
+    whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
+    monkeypatch.setattr(query, "MAX_BATCH_PAIRS", 1)
+    for index, expected in zip(indexes, whole, strict=True):
+        assert profile(index, *READS, all_estimators=True, draws=3).equals(expected)
+    pairs = pl.DataFrame(
+        {"unit": [0, 1, 1, 2, 3, 4], "hash": [10, 10, 11, 12, 11, 13]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64},
+    )
+    batches = [sorted(b["unit"].unique().to_list()) for b in query.component_batches(pairs)]
+    assert sorted(batches) == [[0, 1, 3], [2], [4]]
+
+
 def test_unit_columns_match_parquet(members: Path, tmp_path: Path) -> None:
     # Memory-mapped unit columns give the parquet's rows and the same profile as an index
     # written before them (columns read from units.parquet).

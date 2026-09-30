@@ -185,11 +185,41 @@ def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
 
 
 def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
-    """Component label of each of ``n`` units, linked by pairs (unit ``col``, k-mer ``row``)."""
-    # Bipartite graph: units are nodes 0..n, k-mers follow.
-    graph = coo_array((np.ones(len(col)), (col, n + row)), shape=(n + row.max(initial=-1) + 1,) * 2)
-    label: np.ndarray = connected_components(graph, directed=False)[1][:n]
+    """Component label of each of ``n`` units, linked by pairs (unit ``col``, k-mer ``row``);
+    components are numbered in order of their smallest unit."""
+    # Units only, each linked to the next holder of the same k-mer: a unit graph with fewer
+    # edges than pairs, instead of the bipartite unit-k-mer graph.
+    order = np.argsort(row, kind="stable")
+    by_kmer = col[order]
+    same = row[order][1:] == row[order][:-1]
+    graph = coo_array(
+        (np.ones(int(same.sum()), dtype=np.int8), (by_kmer[:-1][same], by_kmer[1:][same])),
+        shape=(n, n),
+    )
+    label: np.ndarray = connected_components(graph, directed=False)[1]
     return label
+
+
+MAX_BATCH_PAIRS: Final = 2_000_000  # (unit, hash) rows per batch of components fitted at once
+
+
+def component_batches(kmers: pl.DataFrame) -> list[pl.DataFrame]:
+    """``kmers`` (one row per ``unit``, ``hash``) split into batches of whole components of
+    units linked by shared k-mers, about ``MAX_BATCH_PAIRS`` rows each (a larger component is a
+    batch of its own). Fits that stop per component (:func:`em`, :func:`em_pin`) give the
+    same result per batch as on the whole, with the working memory of one batch."""
+    if kmers.height == 0:
+        return [kmers]
+    units, col = _ids(kmers["unit"].to_numpy())
+    _, row = _ids(kmers["hash"].to_numpy())
+    label = _unit_components(col, row, len(units))
+    size = np.bincount(label[col])  # rows per component
+    batch = ((np.cumsum(size) - size) // MAX_BATCH_PAIRS)[label[col]]  # by each component's start
+    del units, row, label
+    order = np.argsort(batch, kind="stable")
+    rows = kmers[order]
+    ends = np.cumsum(np.unique(batch, return_counts=True)[1])
+    return [rows.slice(lo, hi - lo) for lo, hi in zip(np.r_[0, ends[:-1]], ends, strict=True)]
 
 
 def _ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
@@ -1014,6 +1044,7 @@ def profile(
     )
     with timer("presence"):
         present_prob = presence(own, t_g, n_reads, index.units.height)
+    del own
     dense = index.dense
     if dense is not None:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -1038,11 +1069,18 @@ def profile(
         pin_sum = hit_info["pin_sum_dense"]
         len_cv = hit_info["len_cv_dense"].to_numpy()
     with timer("fit_em"):
-        plain = em(detected, m_g).select("unit", coverage_em="coverage")
+        # Fits stop per component, so batches of components give the same units' results.
+        parts = component_batches(detected)
+        detected = pl.concat(parts, rechunk=False)  # the batches' rows, not a second copy
+
+        def per_batch(fit: Callable[[pl.DataFrame], pl.DataFrame]) -> pl.DataFrame:
+            return pl.concat([fit(part) for part in parts]).sort("unit")
+
+        plain = per_batch(lambda part: em(part, m_g)).select("unit", coverage_em="coverage")
     fits = [plain]
     if all_estimators or draws > 0:
         with timer("fit_zi"):
-            inflated = em(detected, m_g, zero_inflated=True)
+            inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
         copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
         fits.append(
@@ -1062,11 +1100,15 @@ def profile(
     if all_estimators:
         with timer("fit_zib"):
             prior = fit_present_prior(inflated)
-            fitted = em(detected, m_g, zero_inflated=True, prior=prior) if prior else inflated
+            fitted = (
+                per_batch(lambda part: em(part, m_g, zero_inflated=True, prior=prior))
+                if prior
+                else inflated
+            )
             fits.append(fitted.select("unit", coverage_zib="coverage", present_zib="present"))
         with timer("fit_zip"):
             fits.append(
-                em_pin(detected, pin_hist).select(
+                per_batch(lambda part: em_pin(part, pin_hist)).select(
                     "unit", coverage_zip="coverage", present_zip="present"
                 )
             )
