@@ -10,7 +10,15 @@ from typer.testing import CliRunner
 
 from kmer_functional_profiler import _core, reference
 from kmer_functional_profiler.cli import app
-from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
+from kmer_functional_profiler.index import (
+    PIN_BITS,
+    Index,
+    IndexParams,
+    PackedTable,
+    UnitTable,
+    build_index,
+    write_unit_columns,
+)
 from kmer_functional_profiler.query import (
     UFIRST_SCORE,
     WTA_SCORE,
@@ -467,3 +475,19 @@ def test_unit_columns_match_parquet(members: Path, tmp_path: Path) -> None:
     got = profile(index, *READS, draws=20)
     want = profile(Index.load(old), *READS, draws=20)
     assert got.equals(want)
+
+
+def test_unit_columns_read_in_slices(
+    members: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Columns too long for one Polars array are read in slices: same arrays either way.
+    index = build(members, t_base=0.2, n_min=0)
+    want = {n: np.asarray(index.units[n]) for n in ("pin_hist", "t_g", "m_g")}
+    monkeypatch.setattr("kmer_functional_profiler.index.COLUMN_SLICE", 3)
+    (tmp_path / "units.parquet").write_bytes(index.units.path.read_bytes())
+    fallback = UnitTable(tmp_path)
+    for n, a in want.items():
+        assert np.array_equal(fallback[n], a)
+    write_unit_columns(tmp_path)
+    for n, a in want.items():
+        assert np.array_equal(np.load(tmp_path / f"units.{n}.npy"), a)
