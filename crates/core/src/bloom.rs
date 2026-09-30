@@ -6,6 +6,7 @@
 
 use crate::Error;
 use crate::kmers::hash_kmer;
+use crate::threads;
 
 /// Bytes per block (one cache line).
 pub const BLOCK_BYTES: usize = 64;
@@ -33,10 +34,6 @@ fn n_blocks(bits: &[u8]) -> Result<u64, Error> {
         return Err(Error::BloomSize(bits.len()));
     }
     Ok((bits.len() / BLOCK_BYTES) as u64)
-}
-
-fn threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// Adds `hashes` to the filter `bits` (a non-empty multiple of `BLOCK_BYTES` long).

@@ -16,10 +16,10 @@ Two more baselines give each hit k-mer to one unit (:func:`assign_best`): winner
 hits give.
 """
 
-import heapq
 import json
 import resource
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -53,11 +53,28 @@ def rss() -> int:
         return peak_rss()
 
 
+def anon_rss() -> int | None:
+    """Current anonymous RSS in bytes (Linux ``RssAnon``): memory the process owns, without
+    the page cache of memory-mapped files (the index), which the kernel can reclaim. None
+    where ``/proc`` is missing."""
+    try:
+        with open("/proc/self/status") as f:
+            return next(int(line.split()[1]) * 1024 for line in f if line.startswith("RssAnon:"))
+    except (OSError, StopIteration):
+        return None
+
+
+ANON_SAMPLE_S: Final = 0.05  # anonymous RSS sampling interval while a stage runs
+
+
 class Timer:
     """Wall time, CPU time and peak RSS per query stage, and counts (the query cost study).
 
     A stage entered once per read batch accumulates its times. ``peak_rss`` is the
     process's peak at the stage's last exit, so the stage that raises it shows as a step.
+    It counts resident pages of memory-mapped files too, so where Linux reports it
+    ``peak_anon`` is the same high-water mark for anonymous memory only, sampled every
+    ``ANON_SAMPLE_S`` while a stage runs (the kernel keeps no anonymous peak).
 
     With ``path``, the stats are rewritten there after every stage, with ``running`` set to
     the stage in progress, so a process killed mid-query (out of memory) leaves the stages
@@ -70,13 +87,26 @@ class Timer:
         self.counts: dict[str, int] = {}
         self.path, self.log, self.running = path, log, ""
         self.start = time.perf_counter()
+        self.peak_anon = anon_rss()
+
+    def _sample_anon(self, stop: threading.Event) -> None:
+        while not stop.wait(ANON_SAMPLE_S):
+            self._update_anon()
+
+    def _update_anon(self) -> None:
+        now = anon_rss()
+        if now is not None and self.peak_anon is not None:
+            self.peak_anon = max(self.peak_anon, now)
 
     def _log(self, event: str, stage: str) -> None:
         if self.log:
             gib = 2**30
             print(
                 f"[{time.perf_counter() - self.start:9.1f}s] {event:5} {stage:<11}"
-                f" rss {rss() / gib:7.2f} GiB  peak {peak_rss() / gib:7.2f} GiB",
+                f" rss {rss() / gib:7.2f} GiB  peak {peak_rss() / gib:7.2f} GiB"
+                + (
+                    "" if self.peak_anon is None else f"  anon peak {self.peak_anon / gib:7.2f} GiB"
+                ),
                 file=sys.stderr,
                 flush=True,
             )
@@ -90,14 +120,21 @@ class Timer:
         outer, self.running = self.running, stage
         self._log("start", stage)
         self.write()
+        stop = threading.Event()
+        if self.peak_anon is not None and not outer:  # one sampler, for the outermost stage
+            threading.Thread(target=self._sample_anon, args=(stop,), daemon=True).start()
         wall, cpu = time.perf_counter(), time.process_time()
         try:
             yield
         finally:
+            stop.set()
+            self._update_anon()
             s = self.stages.setdefault(stage, {"wall_s": 0.0, "cpu_s": 0.0})
             s["wall_s"] += time.perf_counter() - wall
             s["cpu_s"] += time.process_time() - cpu
             s["peak_rss"] = peak_rss()
+            if self.peak_anon is not None:
+                s["peak_anon"] = self.peak_anon
             self.running = outer
             self._log("end", stage)
             self.write()
@@ -244,27 +281,13 @@ def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> pl.DataFrame:
     k-mers. Units left with none are explained away and get no row. Returns ``unit``,
     ``kmers_unique`` (k-mers assigned) and ``gather_rank`` (0 = taken first).
     """
-    remaining = {u: set(h) for u, h in kmers.group_by("unit").agg("hash").iter_rows()}
-    # Scores only fall as k-mers are taken, so a lazy heap needs only stale-top rechecks.
-    heap = [(-len(h) / t_g[u], u) for u, h in remaining.items()]
-    heapq.heapify(heap)
-    taken: set[int] = set()
-    rows: list[tuple[int, int, int]] = []
-    while heap:
-        _, unit = heapq.heappop(heap)
-        mine = remaining[unit] = remaining[unit] - taken  # iterates the unit's set, not taken
-        if not mine:
-            continue
-        score = len(mine) / t_g[unit]
-        if heap and score < -heap[0][0]:
-            heapq.heappush(heap, (-score, unit))
-            continue
-        taken |= mine
-        rows.append((unit, len(mine), len(rows)))
-    return pl.DataFrame(
-        rows,
-        schema={"unit": pl.UInt32, "kmers_unique": pl.UInt32, "gather_rank": pl.UInt32},
-        orient="row",
+    got = _core.gather(
+        kmers["unit"].cast(pl.UInt32).to_numpy(),
+        kmers["hash"].cast(pl.UInt64).to_numpy(),
+        np.asarray(t_g, dtype=np.float64),
+    )
+    return pl.DataFrame(got).with_columns(
+        gather_rank=pl.int_range(len(got["unit"]), dtype=pl.UInt32)
     )
 
 
@@ -722,6 +745,29 @@ def posterior_zi(
     )
 
 
+class _Summed:
+    """Per-batch aggregates summed into one table, re-aggregated each time the batches
+    waiting outgrow the running total, so memory stays about twice the total's."""
+
+    min_rows = 1_000_000  # rows waiting before the first merge
+
+    def __init__(self, keys: list[str], aggs: dict[str, pl.Expr]) -> None:
+        self.keys, self.aggs = keys, aggs
+        self.total_df: pl.DataFrame | None = None
+        self.pending: list[pl.DataFrame] = []
+        self.rows = 0
+
+    def add(self, df: pl.DataFrame) -> None:
+        self.pending.append(df)
+        self.rows += df.height
+        if self.rows > max(self.min_rows, 0 if self.total_df is None else self.total_df.height):
+            self.total_df, self.pending, self.rows = self.total(), [], 0
+
+    def total(self) -> pl.DataFrame:
+        parts = [self.total_df, *self.pending] if self.total_df is not None else self.pending
+        return pl.concat(parts).group_by(self.keys).agg(**self.aggs)
+
+
 def profile(
     index: Index,
     r1: str | Path,
@@ -800,6 +846,11 @@ def profile(
             hits=pl.col("n").sum(), pin_q=pl.col("pin_q").first(), holders=pl.col("holders").first()
         )
 
+    # Per-(unit, hash) hits and per-unit reads are summed batch by batch (read ids never
+    # span batches), so per-read rows are kept only for the posterior.
+    first = {"pin_q": pl.col("pin_q").first(), "holders": pl.col("holders").first()}
+    pairs = _Summed(["unit", "hash"], {"hits": pl.col("hits").sum(), **first})
+    reads_summed = _Summed(["unit"], {"reads": pl.col("reads").sum()})
     empty = np.empty(0, dtype=np.uint64)
     batches, n_reads, subsample = [], 0, []
     sampled = hit_kmers = hit_rows = 0
@@ -809,7 +860,12 @@ def profile(
         with timer("lookup"):
             hits = unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])
         with timer("aggregate"):
-            batches.append(by_read(hits))
+            pairs.add(hits.group_by("unit", "hash").agg(hits=pl.len(), **first))
+            reads_summed.add(
+                hits.select("unit", "read").unique().group_by("unit").agg(reads=pl.len())
+            )
+            if draws > 0:
+                batches.append(by_read(hits))
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
         sampled += len(b["hash"])
@@ -819,15 +875,15 @@ def profile(
         with timer("hash"):
             b = next(reads, None)
     with timer("aggregate"):
-        per_read = pl.concat(batches)
-        kmer_hits = per_kmer(per_read)
+        per_read = pl.concat(batches) if batches else None
+        kmer_hits, unit_reads = pairs.total(), reads_summed.total()
     counts |= {
         "reads": n_reads,
         "sampled_kmers": sampled,
         "distinct_sampled_kmers_est": len(np.unique(np.concatenate(subsample))) * DISTINCT_SAMPLE,
         "hit_kmers": hit_kmers,
         "hit_rows": hit_rows,
-        "read_rows": per_read.height,
+        "read_rows": 0 if per_read is None else per_read.height,
         "unit_kmer_pairs": kmer_hits.height,
         "hit_units": kmer_hits["unit"].n_unique(),
     }
@@ -845,20 +901,23 @@ def profile(
     # From here units are numbered 0.. in the hit units' order (``index`` keeps the index's
     # ids), so per-unit arrays come from their rows only: a full column is ~4 GB per 8 bytes.
     ids = hit_info.select(
-        pl.col("unit").cast(per_read.schema["unit"]),
+        pl.col("unit").cast(kmer_hits.schema["unit"]),
         index=pl.int_range(pl.len(), dtype=pl.UInt32),
     )
 
     def renumber(df: pl.DataFrame) -> pl.DataFrame:
         return df.join(ids, on="unit").drop("unit").rename({"index": "unit"})
 
-    per_read, kmer_hits = renumber(per_read), renumber(kmer_hits)
+    kmer_hits, unit_reads = renumber(kmer_hits), renumber(unit_reads)
+    per_read = None if per_read is None else renumber(per_read)
     hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
     t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
         assigned = gather(kmer_hits.select("unit", "hash"), t_g)
     counts["detected_units"] = assigned.height
-    detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
+    detected_reads = (
+        None if per_read is None else per_read.join(assigned.select("unit"), on="unit", how="semi")
+    )
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = hit_info["m_g"].to_numpy()
     pin_hist = hit_info["pin_hist"].to_numpy()
@@ -932,12 +991,9 @@ def profile(
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
     with timer("result"):
         result = (
-            per_read.group_by("unit")
-            .agg(
-                hits=pl.col("n").sum().cast(pl.UInt64),
-                kmers_hit=pl.col("hash").n_unique().cast(pl.UInt32),
-                reads=pl.col("read").n_unique().cast(pl.UInt64),
-            )
+            kmer_hits.group_by("unit")
+            .agg(hits=pl.col("hits").sum().cast(pl.UInt64), kmers_hit=pl.len().cast(pl.UInt32))
+            .join(unit_reads.with_columns(pl.col("reads").cast(pl.UInt64)), on="unit")
             .join(unit_info, on="unit")
             .join(assigned, on="unit", how="left")
             .join(present_prob, on="unit", how="left")
@@ -947,6 +1003,7 @@ def profile(
     if draws > 0:
         prob = np.zeros(len(m_g))
         prob[present_prob["unit"].to_numpy()] = present_prob["present_prob"].to_numpy()
+        assert detected_reads is not None  # per-read rows are kept when draws > 0
         with timer("posterior"):
             intervals = posterior_zi(
                 detected_reads, m_g, pin_sum.to_numpy(), draws, present_prob=prob, len_cv=len_cv

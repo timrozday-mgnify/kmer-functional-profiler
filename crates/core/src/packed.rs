@@ -7,7 +7,7 @@
 //! pin_q`. So a lookup touches one bucket and one set, and no keys are materialised: the
 //! arrays can be memory-mapped `.npy` files.
 
-use crate::Error;
+use crate::{Error, threads};
 
 /// Low bits of a set value holding the k-mer's quantised `p_in` in that unit.
 pub const PIN_BITS: u32 = 4;
@@ -99,9 +99,16 @@ pub struct UnitHits {
     pub holders: Vec<u32>,
 }
 
+/// Hashes per thread below which `unit_hits` does not split further: a thread's start-up
+/// is worth ~10^4 lookups.
+const MIN_PER_THREAD: usize = 1 << 14;
+
 /// Expand `hashes` (with their `reads`) to unit hits through `table`, in input order and
 /// set order. A hash counts for a unit only if it passes that unit's `max_hash_g`, which
 /// also discards most fingerprint false hits.
+///
+/// Lookups are random reads into the table, bound by memory latency, so contiguous runs of
+/// hashes go to separate threads and their rows are joined in order.
 pub fn unit_hits(
     table: &PackedTable<'_>,
     max_hash_g: &[u64],
@@ -111,6 +118,35 @@ pub fn unit_hits(
     if hashes.len() != reads.len() {
         return Err(Error::LengthMismatch);
     }
+    let per_thread = hashes.len().div_ceil(threads()).max(MIN_PER_THREAD);
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = hashes
+            .chunks(per_thread)
+            .zip(reads.chunks(per_thread))
+            .map(|(h, r)| scope.spawn(move || unit_hits_serial(table, max_hash_g, h, r)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("lookup thread panicked"))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut out = UnitHits::default();
+    for part in parts {
+        out.unit.extend(part.unit);
+        out.hash.extend(part.hash);
+        out.read.extend(part.read);
+        out.pin_q.extend(part.pin_q);
+        out.holders.extend(part.holders);
+    }
+    Ok(out)
+}
+
+fn unit_hits_serial(
+    table: &PackedTable<'_>,
+    max_hash_g: &[u64],
+    hashes: &[u64],
+    reads: &[u64],
+) -> Result<UnitHits, Error> {
     let mut out = UnitHits::default();
     let mut kept: Vec<(u32, u8)> = Vec::new();
     for (&hash, &read) in hashes.iter().zip(reads) {
@@ -196,6 +232,20 @@ mod tests {
         assert_eq!(got.read, [7, 7, 9, 10]);
         assert_eq!(got.pin_q, [2, 15, 2, 0]);
         assert_eq!(got.holders, [2, 2, 1, 1]);
+    }
+
+    #[test]
+    fn unit_hits_threaded_equals_serial() {
+        let values = [(1 << PIN_BITS) | 2, (2 << PIN_BITS) | 15, 0];
+        let t = table(&[0, 1, 0], &values);
+        let max_hash_g = [u64::MAX, u64::MAX, hash(0, 3)];
+        // Several chunks of every bucket and fingerprint, hits and misses mixed.
+        let n = 5 * MIN_PER_THREAD + 7;
+        let hashes: Vec<u64> = (0..n as u64).map(|i| hash(i % 4, (i / 4) % 16)).collect();
+        let reads: Vec<u64> = (0..n as u64).collect();
+        let serial = unit_hits_serial(&t, &max_hash_g, &hashes, &reads).unwrap();
+        assert!(!serial.unit.is_empty());
+        assert_eq!(unit_hits(&t, &max_hash_g, &hashes, &reads).unwrap(), serial);
     }
 
     #[test]

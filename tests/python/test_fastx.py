@@ -39,6 +39,28 @@ def test_paired_hits_match_reference(batch_reads: int) -> None:
     assert hits.n_reads == len(mate1)
 
 
+@pytest.mark.parametrize("batch_reads", [5000, 100_000])
+def test_threaded_batches_keep_input_order(tmp_path: Path, batch_reads: int) -> None:
+    # Enough pairs that a batch is split over threads (4096 reads per thread at least).
+    rng = np.random.default_rng(0)
+    n = 3 * 4096 + 5
+    seqs = [
+        bytes(s) for s in np.frombuffer(b"ACGT", dtype=np.uint8)[rng.integers(0, 4, (2 * n, 140))]
+    ]
+    for mate in (0, 1):
+        with gzip.open(tmp_path / f"r{mate}.fastq.gz", "wb") as f:
+            f.writelines(b"@r\n%s\n+\n%s\n" % (s, b"I" * 140) for s in seqs[mate::2])
+    hits = _core.FastxHits(
+        tmp_path / "r0.fastq.gz", tmp_path / "r1.fastq.gz", k=8, batch_reads=batch_reads
+    )
+    got = concat(list(hits))
+    expected = {name: col.tolist() for name, col in _core.hash_dna(seqs, 8).items()}
+    expected["mate"] = [r % 2 for r in expected["read"]]
+    expected["read"] = [r // 2 for r in expected["read"]]
+    assert got == expected
+    assert hits.n_reads == n
+
+
 def test_true_frames_translate_to_the_source_protein() -> None:
     reads = {0: read_fastq(R1), 1: read_fastq(R2)}
     proteins = read_proteins()

@@ -210,6 +210,14 @@ impl Hits {
     pub fn is_empty(&self) -> bool {
         self.hash.is_empty()
     }
+
+    /// Moves `other`'s hits to the end of these.
+    pub fn append(&mut self, mut other: Self) {
+        self.read.append(&mut other.read);
+        self.mate.append(&mut other.mate);
+        self.frame.append(&mut other.frame);
+        self.hash.append(&mut other.hash);
+    }
 }
 
 /// Translates reads and collects their sampled k-mer hashes, reusing buffers across reads.
