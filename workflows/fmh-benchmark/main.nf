@@ -187,9 +187,11 @@ process SCORE {
     path 'score.tsv', emit: score
 
     script:
+    // DIAMOND's evidence is read pairs, not k-mers: its own range, to trace a curve
+    def min_hits = name == 'diamond' ? params.diamond_min_hits : params.min_hits
     """
     ${params.bench} score --truth ${truth} --profile ${profile} --sample seed${seed} --index ${name} \\
-        --min-hits ${params.min_hits.toString().tokenize(',').join(' ')}
+        --min-hits ${min_hits.toString().tokenize(',').join(' ')}
     """
 
     stub:

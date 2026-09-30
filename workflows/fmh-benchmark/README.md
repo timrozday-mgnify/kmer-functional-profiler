@@ -125,6 +125,7 @@ mapping; MetaPhlAn vOct22_202403).
 | `--iss_mode` | `kde` | `perfect`: error-free 151 bp reads, to see which false positives come from read errors (run through `bench.py iss`, which patches iss 2.0.1's perfect model: it otherwise exits 0 without output, and makes 125 bp reads) |
 | `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
+| `--diamond_min_hits` | `1,2,3,5,10,20,50,100` | Read pairs for a KO to count as detected by DIAMOND, in place of `--min_hits`: DIAMOND's purity/completeness curve, to compare at matched purity |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 | `--tools` | `diamond,fmh_funprofiler,kmermaid,humann,humann4` | Other tools to run and score; `''` for none |
 | `--db_dir` | `--data_dir` | Where tool databases are built once (DIAMOND, kMermaid model, HUMAnN) |
