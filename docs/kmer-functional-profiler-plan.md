@@ -744,7 +744,9 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Phase 6, step 12 — first Q1 run: every cell out of memory; stats written per stage.** Against `full-build`, all five rungs (0.4–40 M pairs) were OOM-killed at 128 GB within minutes, the 0.4 M rung included, so the cost does not come from the reads. `--stats` was written only on success, so the failed cells recorded nothing.
   - *Suspect:* the `keys` stage. `stored_keys` materialises tier 2's full keys as uint64 (~27 GB at ~3.4×10⁹ keys) through temporaries of the same size (bucket repeat, shift, fingerprint cast).
   - *Changed:* `Timer` rewrites the stats JSON at every stage start and end, with `running` naming the stage in progress, and logs each stage's start and end with current and peak RSS to stderr (`.command.err`), so a killed cell shows where it died. The ladder gains 10 k and 100 k rungs, where the read-side cost is negligible.
-  - *Next:* re-run; if `keys` is confirmed, lookups walk the memory-mapped `offsets`/`fingerprints` instead of materialising keys (part of Q3).
+  - *Re-run (10 k to 40 M pairs):* every cell killed in 30–70 s; the 10 k cell's stats show `load` done at 43.5 GB peak RSS (20.6 s wall, the unit table read into memory) and `running: keys`.
+  - *Fixed:* `stored_keys` shifts and fills the key array in place (`<<=`, `|=` with a buffered cast) instead of building the bucket, shifted, cast and result arrays side by side. Measured with `tracemalloc` on 2×10⁸ keys at ~4 keys per bucket: peak 4.8 → 2.4 GB, identical keys; ×17 for the full tier 2 (~3.4×10⁹ keys), ~82 → ~41 GB, so `load` + `keys` ≈ 85 GB, under 128 GB.
+  - *Next:* re-run the ladder. Walking the memory-mapped `offsets`/`fingerprints` without materialising keys (Q3) and memory-mapping the unit table remain the full-scale fixes.
 
 ## Libraries
 

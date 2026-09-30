@@ -335,12 +335,15 @@ class PackedTable:
     @cached_property
     def stored_keys(self) -> NDArray[np.uint64]:
         """Full sorted keys (bucket and fingerprint), materialised once for ``lookup``."""
-        # ponytail: 8 bytes per key in RAM; the Rust lookup will walk offsets directly
-        buckets = np.repeat(
+        # ponytail: 8 bytes per key in RAM; the Rust lookup will walk offsets directly.
+        # Shifted and filled in place: no second key-sized temporary (3.4e9 keys = 27 GB each).
+        keys = np.repeat(
             np.arange(len(self.offsets) - 1, dtype=np.uint64),
             np.diff(self.offsets).astype(np.int64),
         )
-        return (buckets << np.uint64(self.fp_bits)) | self.fingerprints.astype(np.uint64)
+        keys <<= np.uint64(self.fp_bits)
+        keys |= self.fingerprints  # buffered cast, no uint64 copy of the fingerprints
+        return keys
 
     def save(self, directory: Path, name: str) -> dict[str, int]:
         """Write one ``.npy`` per array; return the scalar layout for ``meta.json``."""
