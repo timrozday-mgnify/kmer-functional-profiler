@@ -850,7 +850,7 @@ def profile(
     # span batches), so per-read rows are kept only for the posterior.
     first = {"pin_q": pl.col("pin_q").first(), "holders": pl.col("holders").first()}
     pairs = _Summed(["unit", "hash"], {"hits": pl.col("hits").sum(), **first})
-    unit_reads = _Summed(["unit"], {"reads": pl.col("reads").sum()})
+    reads_summed = _Summed(["unit"], {"reads": pl.col("reads").sum()})
     empty = np.empty(0, dtype=np.uint64)
     batches, n_reads, subsample = [], 0, []
     sampled = hit_kmers = hit_rows = 0
@@ -861,7 +861,7 @@ def profile(
             hits = unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])
         with timer("aggregate"):
             pairs.add(hits.group_by("unit", "hash").agg(hits=pl.len(), **first))
-            unit_reads.add(
+            reads_summed.add(
                 hits.select("unit", "read").unique().group_by("unit").agg(reads=pl.len())
             )
             if draws > 0:
@@ -876,7 +876,7 @@ def profile(
             b = next(reads, None)
     with timer("aggregate"):
         per_read = pl.concat(batches) if batches else None
-        kmer_hits, unit_reads = pairs.total(), unit_reads.total()
+        kmer_hits, unit_reads = pairs.total(), reads_summed.total()
     counts |= {
         "reads": n_reads,
         "sampled_kmers": sampled,
