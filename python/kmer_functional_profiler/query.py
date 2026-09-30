@@ -305,7 +305,7 @@ PIN_P: Final = np.clip(
 
 def em_pin(
     kmers: pl.DataFrame,
-    pin_hist: np.ndarray | pl.Series,
+    pin_hist: np.ndarray | pl.DataFrame,
     *,
     tol: float = 1e-6,
     max_iter: int = 1000,
@@ -321,13 +321,14 @@ def em_pin(
     s_g is capped so presence stays <= 1.
 
     ``kmers`` has ``unit``, ``hash``, ``hits`` and ``pin_q``; ``pin_hist[unit]`` counts the
-    unit's kept k-mers per level (its sum is ``m_g``); a Series (the unit table's column) is
-    read for the hit units only, as a full index's column exceeds numpy conversion's 2**32
-    values. Coverage is attributed hits over expected present k-mers (hit ones by their
-    share, unhit ones by their posterior presence), and s_g is expected present k-mers over
-    the sum of p_in. Like :func:`em`, a hit k-mer counts as present for a unit by its share
-    of the hits. Returns ``unit``, ``coverage`` and ``present`` (expected fraction of kept
-    k-mers present); units explained away get coverage 0.
+    unit's kept k-mers per level (its sum is ``m_g``); or a table of ``unit`` and
+    ``pin_hist`` sorted by unit and holding every unit of ``kmers`` (the hit units' rows of
+    the unit table, whose full column is too large to convert). Coverage is attributed hits
+    over expected present k-mers (hit ones by their share, unhit ones by their posterior
+    presence), and s_g is expected present k-mers over the sum of p_in. Like :func:`em`, a
+    hit k-mer counts as present for a unit by its share of the hits. Returns ``unit``,
+    ``coverage`` and ``present`` (expected fraction of kept k-mers present); units explained
+    away get coverage 0.
     """
     units, col = np.unique(kmers["unit"].to_numpy(), return_inverse=True)
     hashes, row = np.unique(kmers["hash"].to_numpy(), return_inverse=True)
@@ -335,7 +336,11 @@ def em_pin(
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
     n = len(units)
-    hist = np.asarray(pin_hist[units], dtype=np.float64)
+    if isinstance(pin_hist, pl.DataFrame):
+        rows = np.searchsorted(pin_hist["unit"].to_numpy(), units)
+        hist = pin_hist["pin_hist"].to_numpy()[rows].astype(np.float64)
+    else:
+        hist = pin_hist[units].astype(np.float64)
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
     for _ in range(max_iter):
@@ -742,6 +747,11 @@ def profile(
         "unit_kmer_pairs": kmer_hits.height,
         "hit_units": kmer_hits["unit"].n_unique(),
     }
+    with timer("hit_units"):  # joins with the full table copy index-sized columns
+        units = index.units["unit"]
+        hit_info = index.units.filter(
+            units.is_in(kmer_hits["unit"].unique().cast(units.dtype).implode())
+        )
     if record:
         with timer("components"):
             (
@@ -757,7 +767,7 @@ def profile(
     detected_reads = per_read.join(assigned.select("unit"), on="unit", how="semi")
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = index.units["m_g"].to_numpy()
-    pin_hist = index.units["pin_hist"]
+    pin_hist = hit_info.select("unit", "pin_hist")
     pin_sum = index.units["pin_sum"]
     len_cv = index.units["len_cv"].to_numpy()
     # Each hit k-mer is gather's: the first unit in gather order holding it.
@@ -787,7 +797,7 @@ def profile(
             )
             detected = per_kmer(detected_reads)
         m_g = index.units["m_dense"].to_numpy()
-        pin_hist = index.units["pin_hist_dense"]
+        pin_hist = hit_info.select("unit", pin_hist="pin_hist_dense")
         pin_sum = index.units["pin_sum_dense"]
         len_cv = index.units["len_cv_dense"].to_numpy()
     with timer("fit_em"):
@@ -815,10 +825,10 @@ def profile(
         weighted = em_pin(detected, pin_hist).select(
             "unit", coverage_zip="coverage", present_zip="present"
         )
-    unit_info = index.units.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
+    unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
-    rated = kmer_hits.join(index.units.select("unit", "m_g", "t_g"), on="unit")
+    rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
     with timer("result"):
         result = (
             per_read.group_by("unit")
