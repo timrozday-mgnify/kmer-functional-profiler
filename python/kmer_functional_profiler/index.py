@@ -352,14 +352,17 @@ class PackedTable:
         return {f: getattr(self, f) for f in ("max_hash", "lead_bits", "bucket_bits", "fp_bits")}
 
     @classmethod
-    def load(cls, directory: Path, name: str, layout: dict[str, int]) -> Self:
-        """Memory-map a table written by ``save``."""
+    def load(cls, directory: Path, name: str, layout: dict[str, int], *, mmap: bool = True) -> Self:
+        """Memory-map a table written by ``save``, or read it into memory (``mmap=False``)."""
         return cls(
             layout["max_hash"],
             layout["lead_bits"],
             layout["bucket_bits"],
             layout["fp_bits"],
-            *(np.load(directory / f"{name}.{f}.npy", mmap_mode="r") for f in PACKED_FIELDS),
+            *(
+                np.load(directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None)
+                for f in PACKED_FIELDS
+            ),
         )
 
     def nbytes(self) -> int:
@@ -376,14 +379,19 @@ class Index:
     dense: PackedTable | None = None
 
     @classmethod
-    def load(cls, directory: str | Path) -> Self:
+    def load(cls, directory: str | Path, *, mmap: bool = True) -> Self:
+        """Read an index; its tiers are memory-mapped unless ``mmap`` is False."""
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
         return cls(
             meta=meta,
             units=pl.read_parquet(directory / "units.parquet"),
-            tier2=PackedTable.load(directory, "tier2", meta["tier2"]),
-            dense=PackedTable.load(directory, "dense", meta["dense"]) if "dense" in meta else None,
+            tier2=PackedTable.load(directory, "tier2", meta["tier2"], mmap=mmap),
+            dense=(
+                PackedTable.load(directory, "dense", meta["dense"], mmap=mmap)
+                if "dense" in meta
+                else None
+            ),
         )
 
 

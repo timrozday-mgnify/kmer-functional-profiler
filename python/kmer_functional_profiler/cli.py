@@ -87,12 +87,19 @@ def query(
             "stage, and each stage's start and end are logged to stderr with its RSS"
         ),
     ] = None,
+    in_memory: Annotated[
+        bool,
+        typer.Option(
+            help="Read the index tiers into memory instead of memory-mapping them: no page "
+            "faults during lookup, at the cost of their full size in RSS"
+        ),
+    ] = False,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     timer = Timer(stats, log=stats is not None)
     with timer("total"):
         with timer("load"):
-            loaded = Index.load(index_dir)
+            loaded = Index.load(index_dir, mmap=not in_memory)
         result = profile(
             loaded,
             r1,
