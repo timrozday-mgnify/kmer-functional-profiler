@@ -306,6 +306,12 @@ BLOCK_STEPS: Final = 30  # EM steps per block per round of a block-wise fit
 MAX_BLOCK_ROUNDS: Final = 1000  # rounds over a block-wise component's blocks
 
 
+# EM steps per fit. With SQUAREM only the components still moving keep iterating, so the cap
+# costs little: 1000 -> 10000 cut synthetic unconverged units 102 -> 0 for +33% EM time
+# (plan, phase 6, step 39).
+EM_MAX_ITER: Final = 10_000
+
+
 def _squarem(
     step: Step,
     la: np.ndarray,
@@ -619,7 +625,7 @@ def em(
     zero_inflated: bool = False,
     prior: tuple[float, float] | None = None,
     tol: float = 1e-8,
-    max_iter: int = 1000,
+    max_iter: int = EM_MAX_ITER,
     report: dict[str, int] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
@@ -716,7 +722,7 @@ def em_pin(
     pin_hist: np.ndarray,
     *,
     tol: float = 1e-8,
-    max_iter: int = 1000,
+    max_iter: int = EM_MAX_ITER,
 ) -> pl.DataFrame:
     """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
 
