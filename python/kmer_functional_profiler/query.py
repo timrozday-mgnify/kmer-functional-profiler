@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 import numpy as np
 import polars as pl
@@ -39,6 +39,9 @@ from scipy.sparse.csgraph import connected_components
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable
+
+if TYPE_CHECKING:
+    from kmer_functional_profiler.mask import Mask
 
 DISTINCT_SAMPLE: Final = 256  # distinct sampled k-mers are counted on 1 in this of hash space
 
@@ -1361,6 +1364,7 @@ def profile(
     with_aai: bool = False,
     min_aai: float = 0.0,
     extra: Sequence[Index] = (),
+    mask: "Mask | None" = None,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -1406,6 +1410,10 @@ def profile(
     their units compete with its units in gather, EM and the posterior, with ids offset by
     the units of the indexes before, and a ``source`` column (0 = ``index``) in the output.
 
+    ``mask`` (:class:`~kmer_functional_profiler.mask.Mask`, built against ``index``) drops
+    masked sampled hashes before any lookup and subtracts the masked postings from the unit
+    rows' expected counts; ``masked_fraction`` and ``host_like`` are added.
+
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
     space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
@@ -1418,6 +1426,14 @@ def profile(
     joint = _Joint([index, *extra])
 
     def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
+        batches = unmasked(max_hash)
+        if mask is None:
+            return batches
+        return (
+            {c: v[keep] for c, v in b.items()} for b in batches for keep in [mask.keep(b["hash"])]
+        )
+
+    def unmasked(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         if index.meta.get("hash") == "sourmash":
             return sourmash_hits(r1, r2, params.k, max_hash, batch_reads)
         return _core.FastxHits(
@@ -1503,6 +1519,8 @@ def profile(
     }
     with timer("hit_units"):  # rows gathered from the unit columns, never the whole table
         hit_info = joint.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
+        if mask is not None:
+            hit_info = mask.adjust(hit_info)
     with timer("components"):
         component = component_labels(kmer_hits)
         if record:

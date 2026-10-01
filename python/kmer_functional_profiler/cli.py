@@ -9,6 +9,7 @@ import typer
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import Index, IndexParams, build_index, write_unit_columns
+from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import Timer, profile
 
 app = typer.Typer(no_args_is_help=True)
@@ -70,6 +71,16 @@ def import_sourmash(
 def unit_columns(index_dir: Path) -> None:
     """Write the unit table's numeric columns as .npy files, for an index built without them."""
     write_unit_columns(index_dir)
+
+
+@app.command(name="mask")
+def mask_command(
+    genome: Annotated[Path, typer.Argument(help="Host genome FASTA (plain or gzip)")],
+    index_dir: Path,
+    out_dir: Path,
+) -> None:
+    """Build a mask sidecar: the index's k-mers in the six-frame translated genome."""
+    typer.echo(json.dumps(build_mask(genome, index_dir, out_dir), indent=2))
 
 
 @app.command()
@@ -134,6 +145,10 @@ def query(
             "units compete with the first index's; output ids are offset, with a source column"
         ),
     ] = None,
+    mask: Annotated[
+        Path | None,
+        typer.Option(help="Mask sidecar (from `mask`) of the first index: host k-mers dropped"),
+    ] = None,
     all_estimators: Annotated[
         bool,
         typer.Option(
@@ -148,6 +163,7 @@ def query(
         with timer("load"):
             loaded = Index.load(index_dir, mmap=not in_memory)
             extra = [Index.load(d, mmap=not in_memory) for d in extra_index or []]
+            masked = None if mask is None else Mask(mask)
         result = profile(
             loaded,
             r1,
@@ -163,6 +179,7 @@ def query(
             with_aai=aai,
             min_aai=min_aai,
             extra=extra,
+            mask=masked,
         )
         result.write_csv(out, separator="\t")
     timer.write()
