@@ -980,6 +980,12 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 ## Libraries
 
+* **Phase 6, step 34 — step 31's next items 1–4 in code (#59, review fixes after it); measurements pending on HPC.**
+  - *1. `madvise(MADV_RANDOM)`* on every memory-mapped unit column and packed table (tier 2 and dense), through `_madvise_random`; a test checks a loaded array's base is still the `mmap`, so the hook is not skipped silently. Effect to measure: peak RSS at hit\_units, not preloaded (preloaded pages are resident whatever the advice).
+  - *2. Prefetching read batches:* `FastxHits` reads and decompresses on its own thread, up to two batches ahead (a bounded channel), while the current batch is scanned. Errors arrive after the batches read before them (tested); a reader panic is re-raised when the channel closes, not taken as end of input. Effect to measure: hash time and CPU/wall at 40 M.
+  - *3. `presence` convergence:* `--stats` (and `query_cost.tsv`) gain `presence_iterations` and `presence_converged` (0 at `max_iter` = 500). Tested on the fixture, including a cut-off at one iteration. To read at 12 M and 40 M before changing `tol` or the iteration.
+  - *4. Draws on chosen cells:* `--query_draws_at` (default `40000000`; `''` = every cell) picks the ladder cells that also get the posterior on `--query_draws_on`. Stub-checked both ways. The run itself, the posterior's memory and time on real data and the `COPIES_ERROR` re-check, is still to do.
+
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
 
 | Need | Crate | Note |

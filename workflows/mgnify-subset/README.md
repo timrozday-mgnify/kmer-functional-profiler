@@ -159,7 +159,8 @@ the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}
 the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
 pairs, hit and detected units, component sizes; `fit_batches` and
 `fit_largest_batch_pairs` for the EM's batches of components, `em_iterations` and
-`em_unconverged_units` for its convergence) and `{stage}_wall_s`, `_cpu_s` and
+`em_unconverged_units` for its convergence, `presence_iterations` and
+`presence_converged` for `presence`'s) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
 the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
 `RssAnon` sampled every 50 ms) per stage. Queries that exceed
@@ -193,6 +194,7 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--query_seed` | `1` | Seed of the ladder's shuffle |
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
 | `--query_draws_on` | `1in100` | Index that also gets the posterior |
+| `--query_draws_at` | `40000000` | Ladder cells (pairs, comma-separated) that get the posterior; `''` = every cell |
 | `--query_memory` | `128 GB` | Memory per query |
 | `--query_scratch` | `${TMPDIR:-/tmp}` | Node-local directory to copy the index's query files to before each query (removed after; `false` queries it in place). If the copy fails, the query uses the index in place |
 | `--query_in_memory` | `false` | Read the tier-2 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |

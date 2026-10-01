@@ -91,6 +91,18 @@ def test_mate_count_mismatch_is_an_error(tmp_path: Path) -> None:
         list(_core.FastxHits(R1, short, k=5))
 
 
+def test_error_after_earlier_batches_reaches_the_caller(tmp_path: Path) -> None:
+    # Batches read ahead on the reader thread arrive first, then its parse error.
+    bad = tmp_path / "bad.fastq"
+    bad.write_text("@r\nACGTACGTACGT\n+\nIIIIIIIIIIII\n" * 3 + "not a record\n")
+    hits = _core.FastxHits(bad, k=5, batch_reads=1)
+    for _ in range(3):
+        next(hits)
+    with pytest.raises(OSError, match="end of input"):
+        next(hits)
+    assert hits.n_reads == 3
+
+
 def test_missing_file_is_an_os_error(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         _core.FastxHits(tmp_path / "missing.fastq", k=5)
