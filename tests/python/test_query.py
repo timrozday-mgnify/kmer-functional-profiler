@@ -546,7 +546,7 @@ def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.Monk
     profile(indexes[0], *READS, timer=timer)
     assert timer.counts["components"] < timer.counts["hit_units"]
     assert timer.counts["fit_batches"] == 1 and timer.counts["em_unconverged_units"] == 0
-    assert 0 < timer.counts["em_iterations"] <= 1000
+    assert 0 < timer.counts["em_iterations"] <= query.EM_MAX_ITER
     assert timer.counts["presence_converged"] == 1
     assert timer.counts["links"] >= timer.counts["cut_links_0.2"] >= timer.counts["cut_links_0.005"]
     whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
