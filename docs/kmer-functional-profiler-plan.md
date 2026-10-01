@@ -340,7 +340,7 @@ Prototype the algorithm in Python, with stable hot loops in Rust from day one vi
 
 ## Implementation plan
 
-Ten phases, each with a go/no-go gate, plus two optional ones; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index, and phase 11 (desirable, not essential) predicts which genomes are present from the function profile. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
+Ten phases, each with a go/no-go gate, plus two optional ones; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index, and phase 11 (desirable, not essential) predicts which genomes are present from the function profile. A separate companion tool (see Genome-informed unit presence) feeds those genomes back as a prior on which units are present. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
 
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
@@ -385,6 +385,8 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Decided (2026-10-01): additional references by joint query and mask sidecar; overlays only if needed.** This supersedes the overlay-first design of 2026-09-29. Gather, EM and the posterior take components from the hit table, so several indexes with one hash scheme can be queried jointly with offset unit ids. A study index or a host-proteome decoy then competes with MGnify units with no change to the model. In-place updates are I/O-heavy (any added unit touches almost every tier-2 hash range, and existing clusters' *p\_in* needs their members), so the base stays immutable and extras are layers. Host reads are handled upstream (hostile) for host-rich samples, plus a mask sidecar from the six-frame translated host genome (≈10⁻⁵ of postings lost at 20 letters, k = 11), which also flags host-derived MGnify clusters. The joint query and mask move to phase 7 (they decide whether the release ships a human mask); decoy role, study recipe and conditional overlays stay in phase 10. Details: Additional references.
 
 * **Decided (2026-10-01): genome mode is a desirable, non-essential objective (phase 11); batching by input count, not by shared lookups.** Users want to know which genomes are present, predicted from the function profile. Genomes are annotated by the query's own first pass (read id = genome), so their content is defined in the same sampled k-mer space as the reads' hits, and the genome fit reuses gather and the zero-inflated EM one level up (units play the role of k-mers, genomes the role of units). Batching: the measured per-sample fixed costs are per job (index staging 125–280 s, step 31) and per process (start-up, `Index.load`), not per lookup, so several inputs per process (phase 6, step 35) captures most of the gain; a shared, deduplicated lookup across samples (the cohort merge-join of Query cost) is built only where its deduplication is measured to pay. Details: Genome mode.
+
+* **Decided (2026-10-01): genome-informed unit presence is a separate companion tool (working name `kfp-prior`), as Bracken is to Kraken; desirable, not essential.** Units missed in low-coverage genomes that almost always carry them should be reported as probably present, and units missed in high-coverage genomes as confident absences. Detected genomes (phase 11) set a per-unit prior from clade carriage frequencies, which each unit's own hits then update. It is imputation from taxonomy: it raises completeness but adds no information beyond the taxonomic profile, so imputed values are reported apart from observed ones. A separate tool keeps the profiler's output evidence-only, and lets the prior take taxa from any source (genome mode or sylph). It talks to the profiler only through files, and needs its own release cycle and genome-set data, not the index. Details: Genome-informed unit presence.
 
 ### Phase 1
 
@@ -1294,6 +1296,83 @@ Recommended: G0 detection, G1 abundances, G4 as an ablation and the normaliser, 
 - **Cost:** annotation time per genome and per 10⁵ genomes; fit time against the query's.
 - **Gate:** see phase 11 in the table.
 
+## Genome-informed unit presence (Bayesian update from taxa)
+
+Use the genomes genome mode finds to set a prior on which units are present, then update it with each unit's own hits. A unit missed in a low-coverage genome that always carries it is then reported as probably present; a unit missed in a high-coverage genome becomes a confident absence. Desirable, not essential; it needs genome mode (phase 11) or an external taxonomic profile.
+
+**A companion tool, not a profiler stage** (working name `kfp-prior`), as Bracken is to Kraken. It reads the profiler's output files and writes its own; the profiler never imports it.
+
+- *The profiler's output stays evidence-only.* Imputed presence is a model of taxonomy, not of the reads, and should not be mixed into `profile.tsv` by default.
+- *Taxa from any source.* Genome mode's `genomes.tsv` or a sylph profile (option B2) are interchangeable inputs, so the companion does not depend on phase 11 shipping.
+- *Different data and cadence.* Its reference is a carriage table built from a genome set with taxonomy (GTDB, MGnify catalogues), not from the index; it can be rebuilt when a catalogue updates, without touching the index.
+- *Interface (the file contract):*
+  - **From the profiler:** `profile.tsv` with per-unit own hits *h*, `present_prob` and its likelihood-ratio term, expected hits per unit of coverage (from `m`, `pin_sum`), component id and Pfam labels, and the index checksum.
+  - **From genome mode:** `genomes.tsv` (genome, *P\_G*, λ\_G, π\_G) and the best-unit annotation per genome protein. **From sylph:** genome, abundance, ANI, mapped to annotated genome ids.
+  - **Written by the companion:** `presence.tsv` (unit, `prior`, `present_prob_updated`, `expected_hits`, `imputed`) and `pfam_presence.tsv` (observed, and observed + imputed).
+
+**Is it well formed?** Yes, with four qualifications.
+
+- *It is imputation, so it adds no new information.* The prior is a function of the taxonomic profile. Imputed units raise completeness and give pathway-level answers ("this sample can do X"). They cannot show functional differences beyond what taxonomy already shows (the PICRUSt critique). So `observed` and `imputed` are reported separately, and differential analyses should use observed values only.
+- *Unit is not the same as function.* A MGnify90 cluster tracks lineage closely, often species or genus. The sample's strain may carry the same function as a sibling cluster at < 90% identity, which is then hit in place of the expected unit. A zero for the expected unit is then right about the unit and wrong about the function. Siblings in the same connected component that are detected explain the missing unit away (step 2). Pfam-level presence is the summary users should read.
+- *The taxa come from the same reads.* Genome mode infers genomes from unit hits, and the update then reuses those hits. A single unit counts for little in its genome's fit (~5×10³ units per genome), and for a unit with zero hits the double counting only pulls its genome down. So the cavity correction (the genome fit without unit *u*) is left out, with an ablation to measure it. An external taxonomic profile (sylph on the same reads) can be used instead and does not have this problem.
+- *Genome false positives become function false positives.* One falsely detected genome imports thousands of units at its core frequencies. The prior is weighted by the genome's presence probability, and detection must be calibrated before this step can be.
+
+**Prior art.** PICRUSt2, Tax4Fun2 and Piphillin predict functions from 16S taxa alone, with no read evidence. PICRUSt2 uses hidden-state prediction on a tree (castor). HUMAnN aligns to the pangenomes of detected species before the translated search: it is taxon-informed, but only through the search space, with no prior. CheckM uses lineage-specific marker sets, the same "always present in this clade" signal, applied to MAG completeness. MGnify genome catalogues (e.g. UHGG) ship per-species pangenomes with core/accessory calls (Panaroo presence/absence).
+
+### Model
+
+For unit *u* and detected genome *G* (presence probability *P\_G*, depth λ\_G, present fraction π\_G from G1):
+
+- *Carriage frequency* *q\_{G,u}*: the probability that a genome related to *G* carries *u*. Phylogenetic similarity is done by taxonomy-rank shrinkage, a beta-binomial down the GTDB ranks: *q\_{s,u}* = (*n\_{s,u}* + α *q\_{genus,u}*) / (*N\_s* + α), and likewise genus toward family. *n\_{s,u}* is the number of species *s*'s genomes that carry *u* (best-unit annotation from `annotate-genomes`), *N\_s* the species' genome count, and α is fitted by leave-one-genome-out log loss. A tree-based alternative (castor-style hidden-state prediction, or a phylogenetic kernel) is used only if rank shrinkage loses on held-out genomes.
+- *Prior* (noisy-OR over genomes): carriage via *G*, *z\_{G,u}* \~ Bernoulli(*ρ\_{G,u}*), *ρ\_{G,u}* = *P\_G* · *q\_{G,u}*, independent across genomes. A unit that no detected genome carries keeps today's global prior (the *w\_h* / A of `present_prob`).
+- *Likelihood.* Own hits *h\_u* \~ Poisson(background + Σ\_G *z\_{G,u}* λ\_G π\_G *e\_u*), where *e\_u* is the expected hits per genome copy on *u*'s kept k-mers (*c\_{G,u}* from the content table). π\_G discounts for strain divergence; it mixes gene loss with sequence divergence, which the ablation checks.
+- *Zero hits (the case this exists for) has a closed form.* Background is ≈ 0 at *h* = 0, so genomes factorise:
+  P(*z\_{G,u}* = 1 | *h* = 0) = *ρ* e^(−λπ*e*) / (1 − *ρ* + *ρ* e^(−λπ*e*)), and P(*u* present | 0) = 1 − Π\_G (1 − that).
+  Worked example: *q* = 0.95, *P\_G* = 1. At λπ*e* = 0.5 expected hits, a zero gives P = 0.92 (missing is unsurprising). At 5 expected hits it gives 0.11 (a confident absence).
+- *Hit units (h > 0).* Multiply the odds of the existing `present_prob` by the per-unit prior odds over the global prior odds. Nothing else changes, so a unit with no genome-informed prior gets today's value exactly.
+- *Abundance (optional).* An imputed unit's coverage is Σ\_G P(*z\_{G,u}* = 1 | 0) λ\_G × its expected copies. Report it, but leave it out of the EM.
+
+### Options
+
+| Option | What | Strength | Weakness |
+| --- | --- | --- | --- |
+| **B1. Post-hoc closed form (default)** | The model above, run on the profile and genome outputs; per-unit prior, closed-form update | A few hundred lines; reuses `present_prob` and genome-mode outputs; components independent | Double counting (cavity left out); independence across genomes |
+| B2. External taxa | B1 with genomes and depths from sylph (or MetaPhlAn) instead of G1 | No circularity; sylph is the better species detector | Needs sylph genome ids mapped to annotated genomes; π\_G must come from sylph's ANI |
+| B3. Joint hierarchical model | Gibbs over genome presence, *z\_{G,u}* and unit coverage together | Exact: no double counting, correct joint uncertainty | Much more code and time; only worth it if B1 is miscalibrated |
+| B4. Function-level prior | Prior and update at Pfam (or component) level, not unit | Avoids the sibling-cluster problem | Loses unit resolution; Pfam presence from units is an aggregation anyway |
+
+Recommended: B1, reported at both unit and Pfam level, with B2 as an ablation arm. B3 only if B1's calibration fails.
+
+### Implementation plan
+
+1. **Carriage table (`kfp-prior build GENOME_UNITS TAXONOMY OUT`).**
+   - Input: the genome-mode content (best unit per protein above the annotation threshold) and GTDB taxonomy per genome.
+   - Output: `carriage` (clade, unit, *n*, *N*) at species, genus and family, and fitted α per rank.
+   - Fit α on held-out genomes, then write *q* per (species, unit) for units with *q* above a floor (e.g. 0.05). The table is sparse; the floor is a parameter.
+   - Tests: a species whose genomes all carry *u* gives *q* → 1 as *N* grows; a one-genome species shrinks toward its genus; leave-one-out log loss beats both no shrinkage and a genus-only prior on a fixture.
+2. **Update (`kfp-prior update PROFILE.tsv GENOMES.tsv CARRIAGE OUT`).**
+   - Per detected genome, read its species' *q* row; noisy-OR into per-unit priors; closed form for undetected units and odds rescaling for detected ones.
+   - Explain-away: when a unit has *h* = 0 and a sibling in its component is detected, the unit keeps its unit-level value but the function is marked `sibling_hit`. The sample's strain probably carries the function as the sibling's variant.
+   - Output: `presence.tsv` and `pfam_presence.tsv` (above); `imputed` is true when *h* = 0 and `present_prob_updated` ≥ 0.5. `profile.tsv` is not modified. Errors if the profile's and the carriage table's index checksums differ.
+   - Tests: with no genomes detected, every value equals the profile's `present_prob`; the worked example's numbers; a unit at *q* = 1 in a genome with λπ*e* → ∞ and *h* = 0 gives P → 0.
+3. **Taxa adapters and ablations:** a sylph adapter (B2: genome ids mapped to annotated genomes, π\_G from ANI); the cavity correction (refit G1 per component without unit *u*, small sets only); π\_G on vs off; species-only *q* vs shrinkage.
+4. **Packaging and Nextflow:** a separate Python package and CLI in this repository (no import of `kmer_functional_profiler`; tests use fixture files in the contract's format), split into its own repository only if its release cycle diverges. Nextflow: the carriage table is built once per genome set; the profile pipeline gains an optional module after the genome step.
+
+**Constraints on the profiler** (keep these possible; do not build for them):
+
+- `profile.tsv` columns in the file contract are stable and documented, with the index checksum in its header or `meta`.
+- Genome mode keeps the per-protein best-unit annotation, not only the raw content.
+- Genome input carries taxonomy (the `taxonomy` column already planned).
+- `present_prob` keeps its prior as a separable term (global odds × likelihood ratio).
+
+### Evaluation
+
+- **Depth ladder (fmh benchmark):** subsample reads so the 64 genomes span 0.05–5× coverage. Truth is the units carried by each source genome. Metrics per coverage bin: unit and Pfam completeness and purity, observed-only vs updated; and calibration of `present_prob_genome` (reliability curve, with the observed fraction among units with *h* = 0).
+- **Hold-out arm:** remove each source genome from the reference set, keeping same-species relatives. The prior then comes from relatives, so accessory units are where precision should fall; report precision by *q* bin.
+- **False-genome control:** add a distractor genome forced as detected at *P\_G* = 0.5 and count its imputed units.
+- **Expected outcome:** large completeness gains for core units (*q* > 0.9) of genomes at 0.1–1×, where floored units still miss often (8 kept k-mers at 0.2× is ~1.6 expected hits, P(0) ≈ 0.2). Little change for accessory units, where the evidence dominates anyway. Nothing for organisms absent from the genome set, which limits the benefit to well-catalogued biomes (human gut more than soil).
+- **Gate:** at 0.1–1× coverage, Pfam completeness rises by ≥ 10 points at ≤ 2 points of purity loss; calibration error ≤ 0.05 on *h* = 0 units; and no change when no genomes are detected.
+
 ## Risks and open questions
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
@@ -1316,6 +1395,10 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
   * *Shared mobile content.* Plasmid and phage units carried by many genomes can prop up genomes whose own content is absent; the zero inflation (π\_G) and G4's core-only fit are the checks.
   * *Near-identical strains.* Strains sharing almost all units are not identifiable; the posterior's ambiguity groups report them rather than a forced split.
   * *Two-stage correlation.* G1's composite likelihood may give intervals that are too narrow; check coverage on the fmh benchmark before reporting them.
+* **Genome-informed presence.**
+  * *Imputation is not evidence.* Imputed units follow from taxa; downstream statistics on them re-test taxonomy.
+  * *Sibling clusters.* A strain carrying the function as a < 90% variant makes the expected unit look absent; read function-level presence, not unit-level.
+  * *Double use of the reads.* Genomes come from the same unit hits; the cavity ablation and the sylph arm (B2) measure the effect.
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
 * **Open:** whether KO/eggNOG labels are worth the annotation run for users, or Pfam suffices. Benchmarking uses Pfam (see Benchmark labels), with KO only for the fmh-funprofiler comparison.
 
