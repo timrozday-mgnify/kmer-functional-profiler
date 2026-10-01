@@ -740,6 +740,8 @@ def test_link_cuts_on_largest_component() -> None:
     )
     got = query.link_cuts(kmers)
     assert got["links"] == 2 and got["links_one_kmer"] == 1 and got["links_le2_hits"] == 1
+    assert got["detected_largest_component_units"] == 3
+    assert got["detected_largest_component_pairs"] == 4 + 15 + 10
     assert got["cut_links_0.1"] == 0 and got["cut_largest_units_0.1"] == 3
     assert got["cut_links_0.2"] == 1 and got["cut_largest_units_0.2"] == 2
 
