@@ -369,7 +369,19 @@ process FETCH_READS {
     read -r _ urls md5s < <(curl -fsS --retry 5 \\
         'https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=fastq_ftp,fastq_md5&format=tsv' \\
         | tail -n 1)
-    for url in \${urls//;/ }; do curl -fsSL --retry 5 -C - -O "https://\$url"; done
+    # HTTPS, then FTP (a host refused on one may be served on the other, e.g. a 403 from
+    # ftp.sra.ebi.ac.uk over HTTPS), each with back-off; -C - resumes a partial file.
+    for url in \${urls//;/ }; do
+        for attempt in 1 2 3; do
+            for proto in https ftp; do
+                curl -fsSL --retry 5 -C - -O "\$proto://\$url" && continue 3
+                echo "attempt \$attempt: \$proto://\$url failed" >&2
+            done
+            sleep \$((attempt * 60))
+        done
+        echo "could not download \$url" >&2
+        exit 22
+    done
     paste -d ' ' <(tr ';' '\\n' <<< "\$md5s") <(tr ';' '\\n' <<< "\$urls" | xargs -n 1 basename | sed 's/^/ /') \\
         | md5sum -c -
     """
@@ -536,7 +548,15 @@ workflow {
         def ch_run
         def local_reads = params.query_reads.toString() in ['', 'true', 'false'] ? '' : params.query_reads.toString()  // CLI passes strings
         if (local_reads) {
-            ch_run = channel.of(local_reads.tokenize(',').collect { f -> file(f, checkIfExists: true) })
+            // R1,R2 or several pairs R1,R2,R1b,R2b,...: several pairs are pooled, in order.
+            def files = local_reads.tokenize(',').collect { f -> file(f, checkIfExists: true) }
+            if (files.size() % 2) {
+                error "--query_reads needs R1,R2 pairs, got ${files.size()} files"
+            }
+            def pairs = files.collate(2)
+            ch_run = pairs.size() == 1
+                ? channel.of(pairs[0])
+                : POOL(channel.of([pairs.collect { p -> p[0] }, pairs.collect { p -> p[1] }]))
         } else {
             // Several runs are pooled (one deeper, more diverse sample), in the order given.
             def runs = params.query_run.toString().tokenize(',')
