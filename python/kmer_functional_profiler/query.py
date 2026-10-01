@@ -1665,6 +1665,8 @@ def profile(
         )
         for fit in fits:
             result = result.join(fit, on="unit", how="left")
+    if detected.height == 0:  # nothing detected (e.g. host-only reads): no posterior to draw
+        draws = 0
     if draws > 0 and per_read is None:
         with timer("reread"):
             per_read = reread(detected["hash"].unique().to_numpy())

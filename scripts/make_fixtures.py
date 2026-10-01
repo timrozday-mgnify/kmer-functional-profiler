@@ -9,11 +9,15 @@ frame and amino-acid span.
 ``mini_release/`` holds a few MGnify90 clusters in the release's Parquet schemas, for
 testing ``workflows/mgnify-subset`` without the real release. ``mini_fmh/`` mimics the
 fmh-funprofiler benchmark inputs (Zenodo 10055954) for ``workflows/fmh-benchmark``: three
-genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches.
+genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches, plus
+``Pfam-mini.hmm``: Pfam-style HMMs (with GA cut-offs) built by ``hmmbuild`` from segments of
+some of those proteins, one of them carrying two, so Pfam truth has sub-gene domains.
 """
 
 import gzip
 import random
+import subprocess
+import tempfile
 from pathlib import Path
 
 import polars as pl
@@ -206,7 +210,38 @@ def mini_fmh(rng: random.Random) -> None:
         f.write("\n")
 
 
+def mini_pfam(rng: random.Random) -> None:
+    """Six single-sequence HMMs (``hmmbuild``, HMMER 3.4) from 40-80 aa segments of mini_fmh
+    proteins: two from one protein, the rest from five others (genes in several genomes)."""
+    genes = pl.concat(
+        pl.read_csv(p, columns=["gene_name", "aa_sequence"])
+        for p in sorted((OUT / "mini_fmh" / "genomes_extracted_from_kegg").glob("*/*_mapping.csv"))
+    )
+    picked = genes.sample(6, seed=rng.randrange(2**31))["aa_sequence"].to_list()
+    segments = [(picked[0], 5, 55), (picked[0], 70, 120)]
+    for protein in picked[1:5]:
+        start = rng.randrange(len(protein) - 80)
+        segments.append((protein, start, start + rng.randint(40, 80)))
+    with tempfile.TemporaryDirectory() as tmp:
+        hmms = []
+        for i, (protein, start, end) in enumerate(segments, start=1):
+            sto = Path(tmp) / f"{i}.sto"
+            sto.write_text(
+                f"# STOCKHOLM 1.0\n#=GF ID Mini{i}\n#=GF AC PF9{i:04d}.1\n"
+                f"#=GF GA 25.00 25.00;\n#=GF TC 25.00 25.00;\n#=GF NC 24.00 24.00;\n"
+                f"seq{i} {protein[start:end]}\n//\n"
+            )
+            hmm = Path(tmp) / f"{i}.hmm"
+            subprocess.run(["hmmbuild", "--amino", "--seed", "1", str(hmm), str(sto)],
+                           check=True, capture_output=True)  # fmt: skip
+            # hmmbuild stamps the build date; drop it so reruns give the same bytes
+            hmms.append("".join(line for line in hmm.read_text().splitlines(keepends=True)
+                                if not line.startswith("DATE")))  # fmt: skip
+    (OUT / "mini_fmh" / "Pfam-mini.hmm").write_text("".join(hmms))
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
     mini_fmh(random.Random(20260930))
+    mini_pfam(random.Random(20261001))

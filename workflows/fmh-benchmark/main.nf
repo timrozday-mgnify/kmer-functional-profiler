@@ -1,6 +1,7 @@
-// fmh-funprofiler benchmark: KO detection by kmer-functional-profiler indexes and by the
-// fmh-funprofiler KO sketches (compat mode) on InSilicoSeq metagenomes, and by other tools
-// (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4). See README.md.
+// fmh-funprofiler benchmark: KO and Pfam detection by kmer-functional-profiler indexes and
+// by the fmh-funprofiler KO sketches (compat mode) on InSilicoSeq metagenomes, and KO
+// detection by other tools (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4).
+// See README.md.
 
 
 process FETCH {
@@ -52,12 +53,11 @@ process INDEX {
     publishDir params.outdir, mode: 'copy', pattern: 'meta.json', saveAs: { "index_${name}/meta.json" }
 
     input:
-    tuple val(name), val(args)
-    path members
+    tuple val(label), val(name), val(args), path(members)
     path code, stageAs: 'code/*'  // package sources: only here so -resume rebuilds on changes
 
     output:
-    tuple val(name), path("index_${name}"), emit: index
+    tuple val(label), val(name), path("index_${name}"), emit: index
     path 'meta.json'
 
     script:
@@ -76,7 +76,7 @@ process IMPORT_SKETCHES {
     path code, stageAs: 'code/*'  // package sources: only here so -resume rebuilds on changes
 
     output:
-    tuple val('fmh_compat'), path('index_fmh_compat'), emit: index
+    tuple val('ko'), val('fmh_compat'), path('index_fmh_compat'), emit: index
     path 'meta.json'
 
     script:
@@ -87,6 +87,86 @@ process IMPORT_SKETCHES {
 
     stub:
     "mkdir index_fmh_compat && touch index_fmh_compat/meta.json meta.json"
+}
+
+// ---- Pfam labels (Benchmark labels in the plan): the genomes' proteins annotated with
+// Pfam-A (hmmsearch --cut_ga), domains as truth features and as members of Pfam units.
+
+process PFAM_DB {
+    label 'process_single'
+    storeDir "${params.db_dir}/pfam"
+
+    output:
+    path 'Pfam-A.hmm', emit: hmm
+    path 'Pfam.version'
+
+    script:
+    """
+    curl -fsSL ${params.pfam_url}/Pfam-A.hmm.gz | gunzip > Pfam-A.hmm
+    curl -fsSL ${params.pfam_url}/Pfam.version.gz | gunzip > Pfam.version
+    """
+
+    stub:
+    "touch Pfam-A.hmm Pfam.version"
+}
+
+process PFAM_PROTEINS {
+    label 'process_single'
+
+    input:
+    path genomes
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'proteins.*.faa', emit: faa
+
+    script:
+    "${params.bench} pfam-proteins --genomes-dir ${genomes} --chunks ${params.pfam_chunks}"
+
+    stub:
+    "touch proteins.0.faa proteins.1.faa"
+}
+
+process PFAM_ANNOTATE {
+    tag "${faa.baseName}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/hmmer:3.4--hdbdd923_2'
+
+    input:
+    path faa
+    path hmm
+
+    output:
+    path "${faa.baseName}.domtbl", emit: domtbl
+
+    script:
+    """
+    hmmsearch --cpu ${task.cpus} ${params.pfam_threshold} --domtblout ${faa.baseName}.domtbl \\
+        -o /dev/null ${hmm} ${faa}
+    """
+
+    stub:
+    "touch ${faa.baseName}.domtbl"
+}
+
+process PFAM_DOMAINS {
+    label 'process_medium'
+    publishDir "${params.outdir}/pfam", mode: 'copy'
+
+    input:
+    path domtbl, stageAs: 'tbl/*'
+    path faa, stageAs: 'faa/*'
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'domains.parquet', emit: domains
+    path 'pfam_members.parquet', emit: members
+
+    script:
+    "${params.bench} pfam-domains --domtbl tbl/* --proteins faa/*"
+
+    stub:
+    "touch domains.parquet pfam_members.parquet"
 }
 
 process SAMPLE {
@@ -133,24 +213,26 @@ process SIMULATE {
 process TRUTH {
     tag "seed ${seed}"
     label 'process_medium'
-    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { "seed${seed}.csv" }
+    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { f -> f == 'truth.csv' ? "seed${seed}.csv" : "seed${seed}_pfam.csv" }
 
     input:
     tuple val(seed), path(fna), path(genes), path(r1), path(r2)
     path kos
+    path domains  // [] without Pfam
     path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
-    tuple val(seed), path('truth.csv'), emit: truth
+    tuple val(seed), val('ko'), path('truth.csv'), emit: truth
+    tuple val(seed), val('pfam'), path('truth_pfam.csv'), emit: pfam, optional: true
 
     script:
     """
     ${params.bench} truth --fna ${fna} --genes ${genes} --kos ${kos} --r1 ${r1} --r2 ${r2} \\
-        --threads ${task.cpus}
+        --threads ${task.cpus} ${domains ? "--domains ${domains}" : ''}
     """
 
     stub:
-    "touch truth.csv"
+    "touch truth.csv ${domains ? 'truth_pfam.csv' : ''}"
 }
 
 process PROFILE {
@@ -162,14 +244,20 @@ process PROFILE {
     }
 
     input:
-    tuple val(seed), path(r1), path(r2), val(name), path(index)
+    tuple val(seed), path(r1), path(r2), val(label), val(name), path(index), val(by_pfam)
     path code, stageAs: 'code/*'  // query sources: only here so -resume reruns on changes
 
     output:
-    tuple val(seed), val(name), path('profile.tsv'), path('kmers.parquet'), emit: profile
+    tuple val(seed), val(label), val(name), path('profile.tsv'), path('kmers.parquet'), emit: profile
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --draws ${params.draws} --kmers kmers.parquet --all-estimators"
+    // by_pfam: units carry Pfam labels (MGnify90 clusters), and the profile is summed per Pfam
+    def out = by_pfam ? 'units.tsv' : 'profile.tsv'
+    def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet"
+    """
+    ${params.kfp} query ${index} ${r1} ${r2} --out ${out} --draws ${params.draws} --kmers kmers.parquet --all-estimators
+    ${by_pfam ? "${per_pfam} --out profile.tsv" : ''}
+    """
 
     stub:
     "touch profile.tsv kmers.parquet"
@@ -180,7 +268,7 @@ process SCORE {
     label 'process_single'
 
     input:
-    tuple val(seed), val(name), path(profile), path(truth)
+    tuple val(seed), val(label), val(name), path(profile), path(truth)
     path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
@@ -191,7 +279,7 @@ process SCORE {
     def min_hits = name == 'diamond' ? params.diamond_min_hits : params.min_hits
     """
     ${params.bench} score --truth ${truth} --profile ${profile} --sample seed${seed} --index ${name} \\
-        --min-hits ${min_hits.toString().tokenize(',').join(' ')}
+        --label ${label} --min-hits ${min_hits.toString().tokenize(',').join(' ')}
     """
 
     stub:
@@ -204,7 +292,7 @@ process DETECTED {
     publishDir "${params.outdir}/detected", mode: 'copy', saveAs: { "seed${seed}_${name}.tsv" }
 
     input:
-    tuple val(name), val(seed), path(profile), path(kmers), path(truth), path(fna), path(index)
+    tuple val(label), val(name), val(seed), path(profile), path(kmers), path(truth), path(fna), path(index)
     path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
 
     output:
@@ -500,29 +588,56 @@ def git(List cmd) {
 workflow {
     FETCH()
     MEMBERS(FETCH.out.faa, FETCH.out.kos)
+    def bench_py = file("${projectDir}/bench.py")
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
     ch_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()
-    ch_configs = channel.fromList(params.indexes).map { cfg -> [cfg.name, cfg.args] }
-    INDEX(ch_configs, MEMBERS.out.members, ch_code)
+    def labels = params.labels.toString().tokenize(',')*.trim()
+    if (labels - ['ko', 'pfam']) {
+        error "Unknown --labels: ${(labels - ['ko', 'pfam']).join(', ')}"
+    }
+    def ch_members = channel.of('ko').combine(MEMBERS.out.members)
+    def ch_domains = channel.value([])
+    if ('pfam' in labels) {
+        def ch_hmm = params.pfam_hmm ? channel.value(file(params.pfam_hmm)) : PFAM_DB().hmm
+        PFAM_PROTEINS(FETCH.out.genomes, bench_py)
+        PFAM_ANNOTATE(PFAM_PROTEINS.out.faa.flatten(), ch_hmm)
+        PFAM_DOMAINS(PFAM_ANNOTATE.out.domtbl.collect(), PFAM_PROTEINS.out.faa, bench_py)
+        ch_domains = PFAM_DOMAINS.out.domains
+        ch_members = ch_members.mix(channel.of('pfam').combine(PFAM_DOMAINS.out.members))
+    }
+    // Every index config is built per label: KO units (names as before) and Pfam units
+    // (pfam_<name>), each Pfam domain of the genomes' proteins a member of its Pfam's unit
+    ch_configs = channel.fromList(params.indexes)
+        .combine(ch_members)
+        .filter { _cfg, label, _members -> label in labels }
+        .map { cfg, label, members -> [label, label == 'ko' ? cfg.name : "${label}_${cfg.name}", cfg.args, members] }
+    INDEX(ch_configs, ch_code)
     IMPORT_SKETCHES(FETCH.out.sketches, ch_code)
+    // label, name, index, by_pfam (the profile is summed per Pfam through unit_pfam.parquet)
     ch_indexes = INDEX.out.index.mix(IMPORT_SKETCHES.out.index)
+        .filter { it[0] in labels }
+        .map { it + [false] }
+        .mix(channel.fromList(params.mgnify_indexes).filter { 'pfam' in labels }
+            .map { cfg -> ['pfam', cfg.name, file(cfg.path, checkIfExists: true), true] })
 
     SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
-    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, file("${projectDir}/bench.py"))
+    TRUTH(SAMPLE.out.sample.join(SIMULATE.out.reads), FETCH.out.kos, ch_domains, bench_py)
+    ch_truth = TRUTH.out.truth.mix(TRUTH.out.pfam).filter { it[1] in labels }  // seed, label, truth
 
     PROFILE(SIMULATE.out.reads.combine(ch_indexes), ch_code)
-    ch_scored = PROFILE.out.profile.combine(TRUTH.out.truth, by: 0)  // seed, name, profile, kmers, truth
+    ch_scored = PROFILE.out.profile.combine(ch_truth, by: [0, 1])  // seed, label, name, profile, kmers, truth
     DETECTED(
         ch_scored
             .combine(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] }, by: 0)
-            .map { seed, name, profile, kmers, truth, fna -> [name, seed, profile, kmers, truth, fna] }
-            .combine(ch_indexes, by: 0),
-        file("${projectDir}/bench.py"),
+            .map { seed, label, name, profile, kmers, truth, fna -> [label, name, seed, profile, kmers, truth, fna] }
+            .combine(ch_indexes.filter { !it[3] }.map { it.take(3) }, by: [0, 1]),
+        bench_py,
     )
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
 
-    def tools = params.tools ? params.tools.toString().tokenize(',')*.trim() : []
+    // `--tools ''` arrives as true: no tools
+    def tools = params.tools.toString() in ['', 'true', 'false'] ? [] : params.tools.toString().tokenize(',')*.trim()
     def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann', 'humann4']
     if (unknown) {
         error "Unknown --tools: ${unknown.join(', ')}"
@@ -564,13 +679,14 @@ workflow {
         HUMANN4(SIMULATE.out.reads, ch_humann_db.filter { it[0] == 'humann4' }.map { it.drop(1) }.first())
         ch_raw = ch_raw.mix(HUMANN4.out.raw)
     }
-    TOOL_PROFILE(ch_raw, FETCH.out.kos, MEMBERS.out.members, file("${projectDir}/bench.py"))
+    TOOL_PROFILE(ch_raw, FETCH.out.kos, MEMBERS.out.members, bench_py)
 
     SCORE(
         ch_scored
-            .map { seed, name, profile, _kmers, truth -> [seed, name, profile, truth] }
-            .mix(TOOL_PROFILE.out.profile.combine(TRUTH.out.truth, by: 0)),
-        file("${projectDir}/bench.py"),
+            .map { seed, label, name, profile, _kmers, truth -> [seed, label, name, profile, truth] }
+            .mix(TOOL_PROFILE.out.profile.map { seed, tool, profile -> [seed, 'ko', tool, profile] }
+                .combine(TRUTH.out.truth, by: [0, 1])),
+        bench_py,
     )
     SUMMARY(SCORE.out.score.collect())
 
@@ -580,7 +696,8 @@ workflow {
     def wf = workflow
     def reads = params.iss_mode == 'perfect' ? 'error-free (iss perfect)' : "iss ${params.iss_model} (${params.iss_mode})"
     def description = "${params.replicates} metagenomes x ${params.n_genomes} KEGG genomes, " +
-        "${params.n_reads} reads, ${reads}; ${params.indexes.size()} indexes + fmh_compat; draws ${params.draws}"
+        "${params.n_reads} reads, ${reads}; labels ${params.labels}; ${params.indexes.size()} index configs" +
+        " + fmh_compat + ${params.mgnify_indexes.size()} MGnify; draws ${params.draws}"
     def code = [commit: git(['rev-parse', 'HEAD']), branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
                 uncommitted_changes: !git(['status', '--porcelain']).isEmpty()]
     def out = file(params.outdir)

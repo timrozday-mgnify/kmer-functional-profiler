@@ -1,3 +1,6 @@
+[files]
+extend-exclude = ["*.hmm"] # HMMER files: ALPH is a keyword
+
 [default.extend-words]
 flate = "flate"
 Tru = "Tru"     # Illumina TruSeq

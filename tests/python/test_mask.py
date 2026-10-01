@@ -100,6 +100,17 @@ def test_query_with_the_mask(masked: tuple[Path, Path]) -> None:
     assert got.filter(pl.col("unit") > 10).select(rest.columns).equals(rest)
 
 
+def test_reads_that_hit_nothing(tmp_path: Path) -> None:
+    rng = np.random.default_rng(3)
+    seqs = ["".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), 200)) for _ in range(3)]
+    rows = [(i, i, True, q) for i, q in enumerate(seqs)]
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(tmp_path / "m.parquet")
+    build_index(tmp_path / "m.parquet", tmp_path / "idx", IndexParams(k=K, t_base=1.0))
+    got = profile(Index.load(tmp_path / "idx"), *READS, draws=5, with_aai=True)
+    assert got.height == 0
+
+
 def test_cli_mask(masked: tuple[Path, Path], tmp_path: Path) -> None:
     idx, mask_dir = masked
     runner = CliRunner()

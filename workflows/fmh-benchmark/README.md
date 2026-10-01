@@ -4,20 +4,29 @@ KO detection by kmer-functional-profiler indexes against fmh-funprofiler's KO sk
 simulated metagenomes, following the fmh-funprofiler paper (Bioinformatics 2024) but with
 InSilicoSeq instead of CAMISIM. This was the phase-3 gate (completeness and purity at equal
 density); from phase 5 it also runs other tools on the same metagenomes (`--tools`, see
-[Other tools](#other-tools)) and scores them the same way.
+[Other tools](#other-tools)) and scores them the same way, and it scores Pfam as well as
+KO (`--labels`, see [Pfam](#pfam)), Pfam being the primary label from phase 5 on.
 
 ```text
 FETCH            Zenodo 10055954 (CC-BY): KEGG genomes (9.1 GB zip), KEGG proteins (3.2 GB),
                  gene -> KO table, KO sketches. Downloaded once into --data_dir.
 MEMBERS          proteins grouped by KO -> members.parquet
-INDEX            kmer-functional-profiler index, one per --indexes entry
+PFAM_DB          Pfam-A.hmm from --pfam_url (or --pfam_hmm), once into --db_dir
+PFAM_PROTEINS, PFAM_ANNOTATE, PFAM_DOMAINS
+                 every genome's proteins, hmmsearch --cut_ga in --pfam_chunks jobs ->
+                 pfam/domains.parquet (gene, Pfam, envelope) and the domains as members of
+                 one unit per Pfam
+INDEX            kmer-functional-profiler index, one per --indexes entry and label (KO
+                 units as named; Pfam units as pfam_<name>)
 IMPORT_SKETCHES  the KO sketches as a sourmash-compatible index ("fmh_compat")
 SAMPLE           --n_genomes random genomes per replicate (seed = replicate number)
 SIMULATE         iss generate, lognormal abundances (--iss_mode perfect: no read errors)
 TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a read
                  overlaps one of its genes (the paper's rule, on CAMISIM's alignments); its
-                 depth is aligned bases / gene length, summed over its genes
-PROFILE          kmer-functional-profiler query, every metagenome x every index
+                 depth is aligned bases / gene length, summed over its genes. The same over
+                 Pfam domains (their nt span on the genome, either strand) -> truth/seedN_pfam.csv
+PROFILE          kmer-functional-profiler query, every metagenome x every index; profiles of
+                 --mgnify_indexes (Pfam-labelled units) are summed per Pfam
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
@@ -173,6 +182,25 @@ median `holders` (index KOs holding the k-mer), `hits_max` (most hits on one k-m
 `fmh_compat`, which hashes with sourmash). A false positive's k-mers that are in the
 genomes are real sequence (another gene or KO); those that are not come from read errors.
 Rerunning with `--iss_mode perfect` shows how many false positives errors cause.
+
+## Pfam
+
+With `--labels ko,pfam` (the default), every gene of every genome in the KEGG extraction is
+annotated with Pfam-A (`hmmsearch --cut_ga`, envelope coordinates). Pfam truth uses the
+domains, not the genes: a Pfam is present if a read overlaps one of its domains on the
+genome, and its depth is the sum over those domains of aligned bases / domain length
+(Benchmark labels in the plan). Two kinds of profile are scored against it:
+
+- *Pfam units* (`pfam_<name>`, one per `--indexes` entry): each domain is a member of its
+  Pfam's unit, the Pfam analogue of the KO index, which isolates the method from the reference.
+- *MGnify90 indexes* (`--mgnify_indexes`, e.g. the phase-6 full build): the profile is summed
+  per Pfam through the index's `unit_pfam.parquet`, each unit counting for each of its Pfams,
+  the shipped configuration. Pass them in a config file:
+  `params.mgnify_indexes = [[name: 'mgnify_full', path: '/shared/full-build/index']]`.
+
+`summary.tsv` and `scores.tsv` gain a `label` column (`ko`, `pfam`). Set `--pfam_url` to the
+Pfam release MGnify's `mgy_proteins_pfam` used, so the labels match (default: current
+release). Other tools are scored on KO only, for now.
 
 ## Other tools
 

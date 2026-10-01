@@ -2,6 +2,7 @@
 
 import math
 import random
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from kmer_functional_profiler.reference import reverse_complement
+from kmer_functional_profiler.reference import reverse_complement, translate
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "workflows" / "fmh-benchmark" / "bench.py"
@@ -58,7 +59,7 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
         str(MINI / "present_genes_and_koids.csv"), "--r1", "r1.fq", "--r2", "r2.fq",
         "--threads", "2")  # fmt: skip
     truth = pl.read_csv(tmp_path / "truth.csv")
-    assert set(truth["ko_id"]) == expected
+    assert set(truth["label"]) == expected
     assert (truth["depth"] > 0).all()
 
     found = sorted(expected)[:2]
@@ -74,7 +75,7 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
 
     # An exact abundance estimate scores perfectly.
     exact = truth.select(
-        name="ko_id",
+        name="label",
         kmers_hit=pl.lit(1),
         kmers_unique=pl.lit(1),
         coverage="depth",
@@ -171,3 +172,72 @@ def test_tool_profile_and_cost(tmp_path: Path) -> None:
     cost = pl.read_csv(tmp_path / "cost.tsv", separator="\t").row(0, named=True)
     assert (cost["what"], cost["tasks"], cost["hours_mean"], cost["cpu_hours_mean"],
             cost["peak_rss_gb"]) == ("kfp_s100", 2, 1.5, 1.0, 2.0)  # fmt: skip
+
+
+@pytest.mark.skipif(shutil.which("hmmsearch") is None, reason="needs HMMER")
+def test_pfam_domains_truth_and_profile(tmp_path: Path) -> None:
+    genomes = str(MINI / "genomes_extracted_from_kegg")
+    hmmsearch = ["hmmsearch", "--cut_ga", "--domtblout", "d.tbl", "-o", "/dev/null"]
+    run(tmp_path, "pfam-proteins", "--genomes-dir", genomes, "--chunks", "2")
+    for i in (0, 1):
+        search = [*hmmsearch[:3], f"d{i}.tbl", *hmmsearch[4:], MINI / "Pfam-mini.hmm"]
+        subprocess.run([*search, f"proteins.{i}.faa"], cwd=tmp_path, check=True)
+    run(tmp_path, "pfam-domains", "--domtbl", "d0.tbl", "d1.tbl", "--proteins",
+        "proteins.0.faa", "proteins.1.faa")  # fmt: skip
+    domains = pl.read_parquet(tmp_path / "domains.parquet")
+    assert domains.height == 6 and domains["gene_name"].n_unique() == 5  # one gene has two
+    members = pl.read_parquet(tmp_path / "pfam_members.parquet")
+    assert (
+        members["sequence"].str.len_chars().to_list()
+        == (domains["aa_end"] - domains["aa_start"]).to_list()
+    )
+
+    # Domain intervals on the genome translate back to the domain, on either strand.
+    run(tmp_path, "sample", "--genomes-dir", genomes, "--n", "3", "--seed", "1")
+    records = (tmp_path / "sample.fna").read_text().split(">")[1:]
+    contigs = {r.split("\n")[0]: r.split("\n")[1] for r in records}
+    genes = pl.read_parquet(tmp_path / "genes.parquet")
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    features = bench.domain_features(genes, domains)
+    assert features.height == 6
+    by_name = dict(members.select("cluster_rep", "sequence").iter_rows())
+    for contig, start, end, label in features.iter_rows():
+        dna = contigs[contig][start:end].encode()
+        strand = genes.filter(pl.col("contig") == contig, pl.col("start") <= start,
+                              pl.col("end") >= end)["strand"].item()  # fmt: skip
+        if strand == "-":
+            dna = reverse_complement(dna)
+        assert translate(dna).decode() == by_name[label]
+
+    # Truth: reads over a domain make its Pfam present; reads elsewhere on the gene do not.
+    contig, start, end, label = features.row(0)
+    seq = contigs[contig]
+    lo = max(0, start - 100)
+    frag = seq[lo : lo + FRAG]
+    fastq(tmp_path / "r1.fq", [frag[:READ]])
+    fastq(tmp_path / "r2.fq", [reverse_complement(frag[-READ:].encode()).decode()])
+    run(tmp_path, "truth", "--fna", "sample.fna", "--genes", "genes.parquet", "--kos",
+        str(MINI / "present_genes_and_koids.csv"), "--r1", "r1.fq", "--r2", "r2.fq",
+        "--domains", "domains.parquet")  # fmt: skip
+    pfam = pl.read_csv(tmp_path / "truth_pfam.csv")
+    hit = features.filter(pl.col("contig") == contig, pl.col("start") < lo + FRAG,
+                          pl.col("end") > lo)  # fmt: skip
+    assert set(pfam["label"]) == set(hit["label"]) and label in set(pfam["label"])
+
+    # A unit profile summed per Pfam: a unit with two Pfams counts for both.
+    units = {"unit": [0, 1, 2], "name": ["a", "b", "c"], "kmers_hit": [1, 2, 4],
+             "coverage": [0.5, 1.0, 2.0]}  # fmt: skip
+    pl.DataFrame(units).write_csv(tmp_path / "u.tsv", separator="\t")
+    pl.DataFrame({"unit": [0, 1, 1], "pfam_accession": ["PF1.2", "PF1.2", "PF2.1"],
+                  "n_members": [1, 1, 1]}).write_parquet(tmp_path / "up.parquet")  # fmt: skip
+    run(tmp_path, "pfam-profile", "--profile", "u.tsv", "--unit-pfam", "up.parquet")
+    got = pl.read_csv(tmp_path / "pfam_profile.tsv", separator="\t")
+    assert got.select("name", "kmers_hit", "coverage").rows() == [("PF1", 3, 1.5), ("PF2", 2, 1.0)]
+    pl.DataFrame({"unit": [0, 1], "pfam_accession": [1007, 42], "n_members": [1, 1]}).write_parquet(
+        tmp_path / "up.parquet"
+    )
+    run(tmp_path, "pfam-profile", "--profile", "u.tsv", "--unit-pfam", "up.parquet")
+    got = pl.read_csv(tmp_path / "pfam_profile.tsv", separator="\t")
+    assert got["name"].to_list() == ["PF00042", "PF01007"]
