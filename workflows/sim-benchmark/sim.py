@@ -23,6 +23,20 @@ the true depth:
 - ``bias_<identity>``: median estimate / depth of true positives at that strain identity,
   over the median at 100%; 1 = divergence costs nothing.
 
+Phase 7 adds, per ``--frames`` mode (one set of rows each, column ``frames``):
+
+- ``complete_<bin>``, ``bias_len_<bin>``: completeness, and median estimate / depth of true
+  positives over the median of all of them, by protein length (``LENGTH_BINS`` aa). Reads
+  crossing a gene end are dropped by the stop-free filter, which costs short proteins more;
+  ``--frames edges`` is meant to recover them.
+- On ``gather_zi`` rows, containment AAI against the truth (substitutions only, so identity
+  is per position): ``aai_bias_<identity>`` (median ``aai`` minus the strain's mean identity
+  to its unit's members, by the strain's identity to the unit centroid);
+  ``aai_bias_nearest`` and ``aai_bias_centroid`` (against the nearest member and the
+  centroid, all identities); ``aai_spearman``; ``aai_cover`` and ``aai_cover_centroid``
+  (the posterior interval holds the mean-member and the centroid identity; with
+  ``--draws``); ``aai_naive_bias``; ``aai_n`` (true positives with an ``aai``).
+
 ``index_mb`` is the size of the index's lookup tables. The ``gather_zi`` rows add how
 ``present_prob`` separates true from false positives (:func:`presence_scores`) and, with
 ``--draws`` D, interval calibration (:func:`calibration`). Writes ``scores.tsv`` (per
@@ -30,6 +44,7 @@ seed) and ``summary.tsv`` (means) to ``--out`` and prints the summary. Seconds p
 """
 
 import argparse
+import itertools
 import math
 import random
 from pathlib import Path
@@ -47,6 +62,7 @@ AMINO = "ACDEFGHIKLMNPQRSTVWY"
 CODONS = [a + b + c for a in BASES for b in BASES for c in BASES]
 SYNONYMS = {aa: [c for c, t in zip(CODONS, CODE_11, strict=True) if t == aa] for aa in AMINO}
 IDENTITIES = (1.0, 0.95, 0.9, 0.85)
+LENGTH_BINS = ((200, 300), (300, 450), (450, 601))  # aa, half-open
 READ, FLANK = 150, 150
 CONFIGS = {
     "dense": IndexParams(t_base=1.0, n_min=0),
@@ -125,7 +141,8 @@ def reference(args: argparse.Namespace) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def sample(units: pl.DataFrame, args: argparse.Namespace, seed: int, fasta: Path) -> pl.DataFrame:
-    """Write the sample's reads to ``fasta``; return truth (``unit``, ``depth``, ``identity``)."""
+    """Write the sample's reads to ``fasta``; return truth (``unit``, ``depth``, ``identity``,
+    ``strain``)."""
     rng = random.Random(seed)
     chosen = rng.sample(range(units.height), round(args.present * units.height))
     truth, reads = [], []
@@ -142,7 +159,7 @@ def sample(units: pl.DataFrame, args: argparse.Namespace, seed: int, fasta: Path
             if rng.random() < 0.5:
                 read = reverse_complement(read.encode()).decode()
             reads.append(read)
-        truth.append((unit, depth, identity))
+        truth.append((unit, depth, identity, strain))
     n_decoys = round(args.decoys * len(reads))
     reads += ["".join(rng.choices(BASES, k=READ)) for _ in range(n_decoys)]
     reads = [
@@ -150,13 +167,15 @@ def sample(units: pl.DataFrame, args: argparse.Namespace, seed: int, fasta: Path
         for r in reads
     ]
     fasta.write_text("".join(f">r{i}\n{r}\n" for i, r in enumerate(reads)))
-    return pl.DataFrame(truth, schema=["unit", "depth", "identity"], orient="row")
+    return pl.DataFrame(truth, schema=["unit", "depth", "identity", "strain"], orient="row")
 
 
 def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> dict[str, float]:
-    """Scores of one rule; ``found`` has ``unit`` and ``estimate`` for the detected units."""
+    """Scores of one rule; ``found`` has ``unit`` and ``estimate`` for the detected units;
+    ``families`` has ``unit``, ``family`` and ``length`` (aa)."""
     both = (
-        truth.join(found, on="unit", how="full", coalesce=True)
+        truth.select("unit", "depth", "identity")
+        .join(found, on="unit", how="full", coalesce=True)
         .join(families, on="unit")
         .with_columns(pl.col("depth", "estimate").fill_null(0.0))
     )
@@ -183,7 +202,79 @@ def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> d
             f"bias_{i}": tp.filter(pl.col("identity") == i)["ratio"].median() / ref  # type: ignore[operator]
             for i in IDENTITIES[1:]
         },
+        **length_scores(both, tp),
     }
+
+
+def length_scores(both: pl.DataFrame, tp: pl.DataFrame) -> dict[str, float | None]:
+    """Completeness and relative abundance bias of true positives by protein length."""
+    out: dict[str, float | None] = {}
+    overall = tp["ratio"].median()
+    for lo, hi in LENGTH_BINS:
+        in_bin = pl.col("length").is_between(lo, hi, closed="left")
+        present = both.filter(pl.col("depth") > 0, in_bin)
+        found = tp.filter(in_bin)
+        out[f"complete_{lo}"] = found.height / present.height if present.height else None
+        out[f"bias_len_{lo}"] = (
+            found["ratio"].median() / overall if found.height and overall else None  # type: ignore[operator]
+        )
+    return out
+
+
+def _identity(a: str, b: str) -> float:
+    """Share of equal positions (sequences of one length: substitutions only)."""
+    return sum(x == y for x, y in zip(a, b, strict=True)) / len(a)
+
+
+def aai_scores(
+    truth: pl.DataFrame, result: pl.DataFrame, members: pl.DataFrame
+) -> dict[str, float | None]:
+    """Containment AAI of the true positives against their strains' identity to the unit's
+    members (mean and nearest), by the strain's identity to the unit centroid."""
+    if "aai" not in result.columns:
+        return {}
+    by_unit = members.group_by(unit=pl.col("cluster_rep").cast(pl.Int64)).agg("sequence")
+    rows = []
+    joined = truth.join(result.filter(pl.col("aai").is_not_null()), on="unit").join(
+        by_unit, on="unit"
+    )
+    for row in joined.iter_rows(named=True):
+        ids = [_identity(row["strain"], m) for m in row["sequence"]]
+        rows.append(
+            {
+                "identity": row["identity"],
+                "aai": row["aai"],
+                "naive": row["aai_naive"],
+                "mean": sum(ids) / len(ids),
+                "nearest": max(ids),
+                "lo": row.get("aai_lo"),
+                "hi": row.get("aai_hi"),
+            }
+        )
+    if not rows:
+        return {"aai_n": 0}
+    df = pl.DataFrame(rows, infer_schema_length=None)
+    out: dict[str, float | None] = {
+        "aai_n": df.height,
+        "aai_bias_nearest": (df["aai"] - df["nearest"]).median(),  # type: ignore[dict-item]
+        "aai_bias_centroid": (df["aai"] - df["identity"]).median(),  # type: ignore[dict-item]
+        "aai_naive_bias": (df["naive"] - df["mean"]).median(),  # type: ignore[dict-item]
+        "aai_spearman": df.select(pl.corr("aai", "mean", method="spearman")).item()
+        if df.height > 2
+        else None,
+        **{
+            f"aai_cover{suffix}": df.drop_nulls("lo")
+            .select(pl.col(truth_col).is_between("lo", "hi").mean())
+            .item()
+            if df["lo"].drop_nulls().len()
+            else None
+            for suffix, truth_col in (("", "mean"), ("_centroid", "identity"))
+        },
+    }
+    for i in IDENTITIES:
+        part = df.filter(pl.col("identity") == i)
+        out[f"aai_bias_{i}"] = (part["aai"] - part["mean"]).median() if part.height else None  # type: ignore[assignment]
+    return out
 
 
 def presence_scores(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, float]:
@@ -267,41 +358,44 @@ def main() -> None:
     parser.add_argument("--draws", type=int, default=0, help="posterior draws for intervals")
     parser.add_argument("--twins", type=float, default=0.0, help="families with a 99%% twin")
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
+    parser.add_argument("--frames", nargs="+", default=["stopfree"],
+                        help="frame modes queried, e.g. stopfree edges:20 all")  # fmt: skip
     parser.add_argument("--out", type=Path, default=Path("sim-results"))
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
     members, units = reference(args)
     members.write_parquet(args.out / "members.parquet")
-    families = units.select("unit", "family")
+    families = units.select("unit", "family", length=pl.col("centroid").str.len_chars())
     rows = []
     for config in args.configs:
         build_index(args.out / "members.parquet", args.out / f"index_{config}", CONFIGS[config])
         index = Index.load(args.out / f"index_{config}")
         stats = index.meta["stats"]
         index_mb = (stats["tier2_bytes"] + stats.get("dense_bytes", 0)) / 1e6
-        for seed in range(1, args.seeds + 1):
+        for seed, frames in itertools.product(range(1, args.seeds + 1), args.frames):
             reads = args.out / f"reads_{seed}.fa"
             truth = sample(units, args, seed, reads)
-            result = profile(index, reads, draws=args.draws, all_estimators=True).with_columns(
-                unit=pl.col("cluster_rep").cast(pl.Int64)
-            )
+            result = profile(
+                index, reads, frames=frames, draws=args.draws, all_estimators=True
+            ).with_columns(unit=pl.col("cluster_rep").cast(pl.Int64))
             for rule, (count, abundance) in RULES.items():
                 found = result.filter(pl.col(count) >= 1).select("unit", estimate=abundance)
                 extra = (
                     {
                         **presence_scores(truth, result),
                         **(calibration(truth, result, units) if args.draws else {}),
+                        **aai_scores(truth, result, members),
                     }
                     if rule == "gather_zi"
                     else {}
                 )
-                rows.append({"config": config, "rule": rule, "seed": seed, "index_mb": index_mb,
-                             **score(truth, found, families), **extra})  # fmt: skip
+                key = {"config": config, "frames": frames, "rule": rule, "seed": seed}
+                rows.append({**key, "index_mb": index_mb, **score(truth, found, families), **extra})
     scores = pl.DataFrame(rows, infer_schema_length=None)
     scores.write_csv(args.out / "scores.tsv", separator="\t")
     summary = (
-        scores.group_by("config", "rule", maintain_order=True)
+        scores.group_by("config", "frames", "rule", maintain_order=True)
         .agg(pl.exclude("seed").mean())
         .with_columns(pl.selectors.float().round(3))
     )
