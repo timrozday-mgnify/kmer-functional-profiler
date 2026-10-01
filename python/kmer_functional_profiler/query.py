@@ -1209,6 +1209,7 @@ def profile(
     *,
     genetic_code: int = 11,
     frames: str = "stopfree",
+    min_qual: int = 0,
     batch_reads: int = 100_000,
     draws: int = 0,
     kmers_out: str | Path | None = None,
@@ -1270,6 +1271,7 @@ def profile(
             frames=frames,
             max_hash=max_hash,
             batch_reads=batch_reads,
+            min_qual=min_qual,
         )
 
     max_hash_g = index.units["max_hash_g"]

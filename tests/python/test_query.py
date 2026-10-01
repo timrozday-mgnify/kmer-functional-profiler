@@ -437,6 +437,28 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert pl.read_csv(loaded, separator="\t").equals(pl.read_csv(mapped, separator="\t"))
 
 
+def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path: Path) -> None:
+    runner = CliRunner()
+    idx = tmp_path / "idx"
+    build_args = ["index", str(members), str(idx), "--k", str(K), "--t-base", "1"]
+    assert runner.invoke(app, build_args).exit_code == 0
+    hits = {}
+    for name, extra in {
+        "stopfree": [],
+        "edges": ["--frames", "edges:5"],
+        "masked": ["--min-qual", "41"],  # above every fixture quality: everything is N
+    }.items():
+        out = tmp_path / f"{name}.tsv"
+        args = ["query", str(idx), *map(str, READS), "--out", str(out), *extra]
+        assert runner.invoke(app, args).exit_code == 0
+        hits[name] = pl.read_csv(out, separator="\t").select("unit", name=pl.col("hits"))
+    # Edges hash a superset of the stop-free k-mers, so no unit loses hits.
+    both = hits["stopfree"].join(hits["edges"], on="unit", how="left", suffix="_e")
+    assert (both["name_e"] >= both["name"]).all()
+    assert hits["edges"]["name"].sum() > hits["stopfree"]["name"].sum()
+    assert hits["masked"].height == 0
+
+
 def test_timer_writes_stats_mid_stage(tmp_path: Path) -> None:
     # A query killed out of memory leaves the stages done and the one it died in.
     stats = tmp_path / "stats.json"

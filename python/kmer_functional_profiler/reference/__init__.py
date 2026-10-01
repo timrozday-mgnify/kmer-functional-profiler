@@ -89,6 +89,22 @@ def protein_kmers(
     return hashes
 
 
+def _segments(aa: bytes, frames: str) -> list[bytes]:
+    """The parts of one translated frame that a frame mode hashes."""
+    if frames == "all" or b"*" not in aa:
+        return [aa]
+    if frames == "stopfree":
+        return []
+    min_len = int(frames.partition(":")[2] or 20)  # "edges" or "edges:M"
+    parts = aa.split(b"*")
+    return [seg for seg in (parts[0], parts[-1]) if len(seg) >= min_len]
+
+
+def mask_quality(seq: bytes, qual: bytes, min_qual: int) -> bytes:
+    """Bases with Phred quality below ``min_qual`` become ``N`` (Phred+33)."""
+    return bytes(b if q - 33 >= min_qual else ord("N") for b, q in zip(seq, qual, strict=True))
+
+
 def hash_dna(
     seqs: Iterable[bytes],
     k: int,
@@ -104,13 +120,12 @@ def hash_dna(
     out: dict[str, list[int]] = {"read": [], "mate": [], "frame": [], "hash": []}
     for i, seq in enumerate(seqs):
         for frame, aa in enumerate(six_frames(seq, genetic_code)):
-            if frames == "stopfree" and b"*" in aa:
-                continue
-            for h in protein_kmers(aa, k, alphabet, max_hash):
-                out["read"].append(reads[i] if reads else i)
-                out["mate"].append(mates[i] if mates else 0)
-                out["frame"].append(frame)
-                out["hash"].append(h)
+            for seg in _segments(aa, frames):
+                for h in protein_kmers(seg, k, alphabet, max_hash):
+                    out["read"].append(reads[i] if reads else i)
+                    out["mate"].append(mates[i] if mates else 0)
+                    out["frame"].append(frame)
+                    out["hash"].append(h)
     return out
 
 

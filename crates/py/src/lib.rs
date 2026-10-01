@@ -317,7 +317,7 @@ impl PyFastxHits {
     #[new]
     #[pyo3(signature = (
         r1, r2 = None, *, k, alphabet = "protein", genetic_code = 11, frames = "stopfree",
-        max_hash = u64::MAX, batch_reads = 100_000,
+        max_hash = u64::MAX, batch_reads = 100_000, min_qual = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -329,10 +329,11 @@ impl PyFastxHits {
         frames: &str,
         max_hash: u64,
         batch_reads: usize,
+        min_qual: u8,
     ) -> PyResult<Self> {
         let params = params(k, alphabet, genetic_code, frames, max_hash)?;
-        let inner =
-            kfp::FastxHits::open(&r1, r2.as_deref(), params, batch_reads).map_err(to_py_err)?;
+        let inner = kfp::FastxHits::open(&r1, r2.as_deref(), params, batch_reads, min_qual)
+            .map_err(to_py_err)?;
         Ok(Self {
             inner: Mutex::new(inner),
         })

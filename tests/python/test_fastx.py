@@ -61,6 +61,52 @@ def test_threaded_batches_keep_input_order(tmp_path: Path, batch_reads: int) -> 
     assert hits.n_reads == n
 
 
+def write_fastq(path: Path, records: list[tuple[bytes, bytes]]) -> Path:
+    path.write_bytes(b"".join(b"@r\n%s\n+\n%s\n" % rec for rec in records))
+    return path
+
+
+@pytest.mark.parametrize("min_qual", [0, 10, 20, 30])
+def test_quality_mask_matches_reference(tmp_path: Path, min_qual: int) -> None:
+    rng = np.random.default_rng(1)
+    records = [
+        (
+            bytes(rng.choice(list(b"ACGT"), 120).astype(np.uint8)),
+            bytes(rng.integers(35, 75, 120).astype(np.uint8)),
+        )
+        for _ in range(50)
+    ]
+    path = write_fastq(tmp_path / "r.fastq", records)
+    got = concat(list(_core.FastxHits(path, k=6, frames="all", min_qual=min_qual)))
+    masked = [reference.mask_quality(s, q, min_qual) for s, q in records]
+    assert got == reference.hash_dna(masked, 6, frames="all")
+    if min_qual == 0:
+        assert got == concat(list(_core.FastxHits(path, k=6, frames="all")))
+
+
+def test_masked_base_removes_only_its_codon_kmers_and_never_a_stop(tmp_path: Path) -> None:
+    # Frame 0: M A W G K K K K; base 7 (TGG -> TGA would be a stop) is low quality.
+    seq = b"ATGGCCTGGGGCAAAAAAAAAAAA"
+    qual = bytearray(b"I" * len(seq))
+    qual[8] = ord("#")  # Phred 2: the third base of codon 3 (TGG)
+    path = write_fastq(tmp_path / "r.fastq", [(seq, bytes(qual))])
+    frame0 = [
+        h
+        for f, h in zip(
+            *(concat(list(_core.FastxHits(path, k=3, min_qual=10)))[c] for c in ("frame", "hash")),
+            strict=True,
+        )
+        if f == 0
+    ]
+    # Only the k-mers not spanning residue 2 (W -> X): GKK, KKK x3.
+    assert frame0 == reference.protein_kmers(b"MAXGKKKK", 3)
+    fasta = tmp_path / "r.fa"
+    fasta.write_bytes(b">r\n%s\n" % seq)
+    assert concat(list(_core.FastxHits(fasta, k=3, min_qual=40))) == concat(
+        list(_core.FastxHits(fasta, k=3))
+    )
+
+
 def test_true_frames_translate_to_the_source_protein() -> None:
     reads = {0: read_fastq(R1), 1: read_fastq(R2)}
     proteins = read_proteins()

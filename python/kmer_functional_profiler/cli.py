@@ -78,7 +78,16 @@ def query(
     r1: Path,
     r2: Annotated[Path | None, typer.Argument()] = None,
     out: Annotated[Path, typer.Option(help="TSV of per-unit counts")] = Path("profile.tsv"),
-    frames: str = "stopfree",
+    frames: Annotated[
+        str,
+        typer.Option(
+            help="Frames hashed: stopfree; edges (also the terminal segments, >= 20 aa, of "
+            "frames with stops; edges:M sets the length); all"
+        ),
+    ] = "stopfree",
+    min_qual: Annotated[
+        int, typer.Option(help="Mask bases below this Phred quality as N (0 = off)")
+    ] = 0,
     genetic_code: int = 11,
     draws: Annotated[
         int, typer.Option(help="Posterior draws for 95% intervals and ambiguity groups")
@@ -127,6 +136,7 @@ def query(
             r2,
             genetic_code=genetic_code,
             frames=frames,
+            min_qual=min_qual,
             draws=draws,
             kmers_out=kmers,
             timer=timer if stats else None,

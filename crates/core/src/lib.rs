@@ -18,7 +18,9 @@ pub use fastx::FastxHits;
 pub use gather::{Gathered, gather};
 pub use kmers::{DnaScanner, Hits, KmerParams, distinct_kmers, hash_kmer, max_hash, protein_kmers};
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};
-pub use translate::{FrameMode, GeneticCode, reverse_complement, six_frames, translate};
+pub use translate::{
+    EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
+};
 
 /// Worker threads for the parallel kernels: the CPUs this process may use.
 pub(crate) fn threads() -> usize {
