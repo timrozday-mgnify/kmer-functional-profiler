@@ -169,6 +169,54 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     assert got.equals(profile(index, *READS, draws=60, all_estimators=True))  # seeded
 
 
+def test_ztp_lambda_inverts_the_truncated_mean() -> None:
+    lam = np.array([0.05, 0.5, 2.0, 10.0, 40.0])
+    mean = lam / -np.expm1(-lam)
+    assert query.ztp_lambda(mean) == pytest.approx(lam, rel=1e-9)
+    assert (query.ztp_lambda(np.array([0.0, 1.0])) == 0).all()
+
+
+def test_aai_naive_equals_aai_without_shared_kmers(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, with_aai=True)
+    assert {"aai", "aai_naive", "aai_naive_lower_bound", "component", "hits_em"} <= set(got.columns)
+    assert got["component"].n_unique() == got.height  # unrelated proteins: no links
+    both = got.filter(pl.col("aai").is_not_null() & ~pl.col("aai_naive_lower_bound"))
+    assert both.height > 0
+    assert both["aai"].to_list() == pytest.approx(both["aai_naive"].to_list(), abs=1e-6)
+    assert got["aai_naive"].is_between(0, 1).all()
+    # Reads come from the indexed proteins themselves: identity ~1 where coverage allows.
+    assert both["aai"].median() > 0.95  # type: ignore[operator]
+    # min_aai drops rows; the plain profile has no aai but has aai_naive.
+    assert profile(index, *READS, min_aai=1.1).height == 0
+    assert "aai" not in profile(index, *READS).columns
+
+
+def test_aai_of_a_unit_explained_away(tmp_path: Path) -> None:
+    # Unit 1 is the first half of unit 0's protein: all its k-mers are unit 0's too.
+    first = max(proteins().values(), key=len)
+    rows = [(0, 0, True, first), (1, 1, True, first[: len(first) // 2])]
+    path = tmp_path / "m.parquet"
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    build_index(path, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    got = profile(Index.load(tmp_path / "idx"), *READS, with_aai=True).sort("unit")
+    assert got.height == 2
+    assert got["component"].to_list() == [0, 0]
+    half = got.row(1, named=True)
+    assert half["kmers_unique"] == 0  # gather gives its k-mers to unit 0
+    assert half["aai"] is None
+    assert half["aai_naive"] > 0.7  # its own hits still show it close (~1x: uncorrected)
+
+
+def test_posterior_aai_interval(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, draws=60).filter(pl.col("aai").is_not_null())
+    assert got.height > 0
+    assert (got["aai_lo"] <= got["aai_hi"]).all()
+    assert got["aai"].is_between(got["aai_lo"] - 1e-3, got["aai_hi"] + 1e-3).mean() >= 0.9  # type: ignore[operator]
+
+
 def test_shared_evidence_groups_lopsided_pair() -> None:
     # Unit 0: 20 k-mers of its own and 3 shared with unit 1; unit 2 stands alone. 4 hits
     # (one read each) per k-mer. Unit 1 lives mostly on the shared k-mers, which barely move
@@ -410,10 +458,12 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     out = tmp_path / "p.tsv"
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
-    result = runner.invoke(app, [*args, "--draws", "3"])
+    result = runner.invoke(app, [*args, "--draws", "3", "--aai"])
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
-    assert {"cluster_rep", "hits", "containment", "coverage"} <= set(table.columns)
+    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
+        table.columns
+    )
     got = json.loads(stats.read_text())
     assert {"load", "hash", "lookup", "gather", "fit_zi", "posterior", "total"} <= set(
         got["stages"]

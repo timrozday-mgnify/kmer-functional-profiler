@@ -117,6 +117,16 @@ def query(
             "every hit unit through the query"
         ),
     ] = False,
+    aai: Annotated[
+        bool,
+        typer.Option(
+            help="Containment AAI (aai, with intervals under --draws) of the detected units; "
+            "fits the zero-inflated EM. aai_naive is reported for every hit unit regardless"
+        ),
+    ] = False,
+    min_aai: Annotated[
+        float, typer.Option(help="Drop units with aai_naive below this (0 = keep all)")
+    ] = 0.0,
     all_estimators: Annotated[
         bool,
         typer.Option(
@@ -142,6 +152,8 @@ def query(
             timer=timer if stats else None,
             all_estimators=all_estimators,
             low_memory=low_memory,
+            with_aai=aai,
+            min_aai=min_aai,
         )
         result.write_csv(out, separator="\t")
     timer.write()
