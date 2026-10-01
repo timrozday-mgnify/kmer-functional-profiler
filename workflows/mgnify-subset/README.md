@@ -166,7 +166,12 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
 
 Compute nodes without internet: run FETCH_READS on the head node
 (`process.withName: 'FETCH_READS' { executor = 'local' }` in a `-c` config), or download
-the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}.{draws}.json`
+the run and pass `--query_reads R1,R2` (several pairs, `R1,R2,R1b,R2b`, are pooled as
+`--query_run` pools runs). FETCH_READS downloads one run at a time, tries HTTPS then FTP
+with back-off, and retries with waits of 2, 4 and 8 min; if ENA still answers 403 (e.g.
+throttling after large downloads from one host), download on a login node:
+`curl -fsSLO https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR773/005/ERR7738575/ERR7738575_1.fastq.gz`
+(paths from ENA's filereport, as in FETCH_READS), or with `wget` or Aspera. Each QUERY writes `query/{index}.{pairs}.{draws}.json`
 (`kmer-functional-profiler query --stats`); `query_cost.tsv` has one row per query:
 the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
 pairs, hit and detected units, component sizes; `fit_batches` and
@@ -204,7 +209,7 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--query` | `false` | Query cost study (skips extraction unless `--index`, `--stats` or `--build`) |
 | `--query_indexes` | `''` | Index directories (glob), each named by its parent directory |
 | `--query_run` | `ERR7738575` | Paired ENA run to download; comma-separated runs are pooled into one sample |
-| `--query_reads` | `''` | `R1,R2` local files instead of `--query_run` |
+| `--query_reads` | `''` | `R1,R2` local files instead of `--query_run`; several pairs (`R1,R2,R1b,R2b`) are pooled in order |
 | `--query_ladder` | `10000,100000,400000,1200000,4000000,12000000,40000000,100000000` | Nested subset sizes, in pairs (each at most the run's pairs) |
 | `--query_seed` | `1` | Seed of the ladder's shuffle |
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
