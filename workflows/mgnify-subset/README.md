@@ -152,6 +152,18 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
     --query_indexes 'cost-nested/1in*/index' --outdir query-cost
 ```
 
+Plan step 32 (one run to 100 M pairs, then the pooled sample to 200 M pairs, both on the
+full build, posterior at the 40 M and 100 M cells):
+
+```bash
+nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
+    --query_indexes 'full-build/index' --outdir query-cost
+nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
+    --query_indexes 'full-build/index' --query_run ERR7738575,ERR7746321 \
+    --query_ladder 40000000,100000000,200000000 --query_draws_at 100000000,200000000 \
+    --outdir query-cost-pooled
+```
+
 Compute nodes without internet: run FETCH_READS on the head node
 (`process.withName: 'FETCH_READS' { executor = 'local' }` in a `-c` config), or download
 the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}.{draws}.json`
@@ -159,8 +171,11 @@ the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}
 the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
 pairs, hit and detected units, component sizes; `fit_batches` and
 `fit_largest_batch_pairs` for the EM's batches of components, `em_iterations` and
-`em_unconverged_units` for its convergence, `presence_iterations` and
-`presence_converged` for `presence`'s) and `{stage}_wall_s`, `_cpu_s` and
+`em_unconverged_units` for its convergence (`em_block_rounds` when a component above
+10 M pairs was fitted block-wise), `presence_iterations` and `presence_converged` for
+`presence`'s; `links`, `links_one_kmer`, `links_le2_hits`, `cut_links_{tau}` and
+`cut_largest_units_{tau}` for the largest component of detected units and what a weak-link
+cut at tau would leave of it, plan step 33's A1) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
 the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
 `RssAnon` sampled every 50 ms) per stage. Queries that exceed
@@ -193,8 +208,8 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--query_ladder` | `10000,100000,400000,1200000,4000000,12000000,40000000,100000000` | Nested subset sizes, in pairs (each at most the run's pairs) |
 | `--query_seed` | `1` | Seed of the ladder's shuffle |
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
-| `--query_draws_on` | `1in100` | Index that also gets the posterior |
-| `--query_draws_at` | `40000000` | Ladder cells (pairs, comma-separated) that get the posterior; `''` = every cell |
+| `--query_draws_on` | `''` | Index (name) that also gets the posterior; `''` = every index |
+| `--query_draws_at` | `40000000,100000000` | Ladder cells (pairs, comma-separated) that get the posterior; `''` = every cell |
 | `--query_memory` | `128 GB` | Memory per query |
 | `--query_scratch` | `${TMPDIR:-/tmp}` | Node-local directory to copy the index's query files to before each query (removed after; `false` queries it in place). If the copy fails, the query uses the index in place |
 | `--query_in_memory` | `false` | Read the tier-2 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |

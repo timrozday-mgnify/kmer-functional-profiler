@@ -548,6 +548,7 @@ def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.Monk
     assert timer.counts["fit_batches"] == 1 and timer.counts["em_unconverged_units"] == 0
     assert 0 < timer.counts["em_iterations"] <= 1000
     assert timer.counts["presence_converged"] == 1
+    assert timer.counts["links"] >= timer.counts["cut_links_0.2"] >= timer.counts["cut_links_0.005"]
     whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
     monkeypatch.setattr(query, "MAX_BATCH_PAIRS", 1)
     for index, expected in zip(indexes, whole, strict=True):
@@ -658,3 +659,106 @@ def test_timer_keeps_the_sampled_anonymous_peak(monkeypatch: pytest.MonkeyPatch)
     with timer("stage"):
         pass
     assert "peak_anon" not in timer.stages["stage"]
+
+
+def _families(n: int, seed: int = 0, chained: bool = False) -> tuple[pl.DataFrame, np.ndarray]:
+    """Families of units sharing core k-mers (slow for EM to split), Poisson hits; with
+    ``chained``, consecutive units also share a k-mer, so all form one component."""
+    rng = np.random.default_rng(seed)
+    unit, kmer, m_g, u, h = [], [], [], 0, 0
+    for _ in range(n):
+        core = int(rng.integers(5, 40))
+        for j in range(int(rng.integers(1, 6))):
+            own = int(rng.integers(0, 20))
+            ks = [*range(h, h + core), *range(h + 100 * (j + 1), h + 100 * (j + 1) + own)]
+            unit += [u] * len(ks)
+            kmer += ks
+            m_g.append(len(ks) + int(rng.integers(0, 10)))
+            u += 1
+        h += 1000
+    if chained:
+        unit += [*range(u - 1), *range(1, u)]
+        kmer += [10**9 + i for i in range(u - 1)] * 2
+    pairs = pl.DataFrame(
+        {"unit": unit, "hash": kmer}, schema={"unit": pl.UInt32, "hash": pl.UInt64}
+    )
+    cov = rng.gamma(0.5, 2.0, u) * (rng.random(u) < 0.6)
+    per_hash = (
+        pairs.with_columns(c=pl.Series(cov[unit]))
+        .group_by("hash")
+        .agg(pl.col("c").sum())
+        .sort("hash")
+    )
+    per_hash = per_hash.with_columns(
+        hits=pl.Series(rng.poisson(per_hash["c"].to_numpy()) + chained)
+    )
+    kmers = pairs.join(per_hash.select("hash", hits=pl.col("hits").cast(pl.UInt32)), on="hash")
+    return kmers.filter(pl.col("hits") > 0), np.array(m_g)
+
+
+def _plain_two_steps(step, la, se, *_):  # type: ignore[no-untyped-def]
+    l1, s1, _att = step(la, se)
+    l2, s2, att = step(l1, s1)
+    return l1, s1, l2, s2, att
+
+
+def test_squarem_reaches_plain_em_fixed_point(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SQUAREM: the same coverages as plain EM run to convergence, in fewer EM steps.
+    kmers, m_g = _families(200)
+    fast: dict[str, int] = {}
+    got = em(kmers, m_g, report=fast, max_iter=100_000)
+    monkeypatch.setattr(query, "_squarem", _plain_two_steps)
+    slow: dict[str, int] = {}
+    want = em(kmers, m_g, report=slow, max_iter=100_000)
+    assert fast["em_unconverged_units"] == slow["em_unconverged_units"] == 0
+    assert fast["em_iterations"] * 2 < slow["em_iterations"]
+    assert np.allclose(got["coverage"], want["coverage"], rtol=0, atol=1e-5)
+
+
+def test_blockwise_em_matches_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One component fitted in blocks of ~300 pairs reaches the whole fit's coverages (plain EM
+    # has one fixed point). The zero-inflated fits may reach another of their fixed points.
+    kmers, m_g = _families(60, chained=True)
+    assert query.components(kmers)[0] == 1
+    whole = em(kmers, m_g, tol=1e-10)
+    monkeypatch.setattr(query, "MAX_FIT_PAIRS", 300)
+    report: dict[str, int] = {}
+    blocks = em(kmers, m_g, tol=1e-10, report=report)
+    assert report["em_block_rounds"] > 1 and report["em_unconverged_units"] == 0
+    assert np.allclose(blocks["coverage"], whole["coverage"], rtol=0, atol=1e-6)
+    zi = em(kmers, m_g, zero_inflated=True)
+    assert zi.height == whole.height and np.isfinite(zi["coverage"].to_numpy()).all()
+
+
+def test_link_cuts_on_largest_component() -> None:
+    # Units 0-1 share 4 of 4 k-mers (strength 1); 1-2 share one k-mer of 10 (0.1, 1 hit);
+    # unit 3 is a component of its own.
+    rows = [(0, h, 3) for h in range(4)] + [(1, h, 3) for h in [*range(4), *range(20, 30)]]
+    rows += [(1, 4, 1), (2, 4, 1)] + [(2, h, 2) for h in range(5, 14)] + [(3, 99, 5)]
+    kmers = pl.DataFrame(
+        rows, schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32}, orient="row"
+    )
+    got = query.link_cuts(kmers)
+    assert got["links"] == 2 and got["links_one_kmer"] == 1 and got["links_le2_hits"] == 1
+    assert got["cut_links_0.1"] == 0 and got["cut_largest_units_0.1"] == 3
+    assert got["cut_links_0.2"] == 1 and got["cut_largest_units_0.2"] == 2
+
+
+def test_posterior_in_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reads reweighted in chunks: identical (integer sums). Sweeps in k-mer blocks: the same
+    # model, other random numbers; the same units, groups and similar intervals.
+    kmer_units = [(h, [0]) for h in range(6)] + [(h, [0, 1]) for h in range(6, 12)]
+    kmer_units += [(h, [1, 2]) for h in range(12, 16)] + [(h, [2]) for h in range(16, 20)]
+    rows = [(u, h, r, 1 + r % 2) for h, us in kmer_units for u in us for r in range(h % 3, 9, 2)]
+    schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
+    hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
+    m_g, pin_sum = np.array([10, 14, 8]), np.array([10.0, 14.0, 8.0])
+    want = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 200)
+    monkeypatch.setattr(query, "READ_CHUNK", 5)
+    assert posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 200).equals(want)
+    monkeypatch.setattr(query, "SWEEP_BLOCK_PAIRS", 4)
+    got = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 200)
+    assert got.select("unit", "ambiguity_group", "group_size").equals(
+        want.select("unit", "ambiguity_group", "group_size")
+    )
+    assert np.allclose(got["coverage_zi_hi"], want["coverage_zi_hi"], rtol=0.3)
