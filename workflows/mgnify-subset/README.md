@@ -178,7 +178,7 @@ pairs, hit and detected units, component sizes; `fit_batches` and
 `fit_largest_batch_pairs` for the EM's batches of components, `em_iterations` and
 `em_unconverged_units` for its convergence (`em_block_rounds` when a component above
 10 M pairs was fitted block-wise), `presence_iterations` and `presence_converged` for
-`presence`'s; `links`, `links_one_kmer`, `links_le2_hits`, `cut_links_{tau}` and
+`presence`'s; `detected_largest_component_units` and `_pairs` (the largest component the fits see; `largest_component_*` counts all hit units, before gather); `links`, `links_one_kmer`, `links_le2_hits`, `cut_links_{tau}` and
 `cut_largest_units_{tau}` for the largest component of detected units and what a weak-link
 cut at tau would leave of it, plan step 33's A1) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of

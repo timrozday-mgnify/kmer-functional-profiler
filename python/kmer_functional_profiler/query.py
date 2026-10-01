@@ -208,7 +208,9 @@ def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
 
     ``kmers`` has ``unit``, ``hash`` and ``hits``. In the largest component of units linked
     by shared k-mers, a link's strength is its shared k-mers over the smaller unit's k-mers.
-    Returns the component's ``links``, the weak ones (``links_one_kmer``: one shared k-mer;
+    Returns its size (``detected_largest_component_units``, ``_pairs``: the largest
+    component the fits see, unlike :func:`components` over all hit units), its ``links``,
+    the weak ones (``links_one_kmer``: one shared k-mer;
     ``links_le2_hits``: at most 2 hits on the shared k-mers), and per cut tau the links below
     it (``cut_links_{tau}``) and the largest component left (``cut_largest_units_{tau}``).
     """
@@ -229,6 +231,8 @@ def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
     a, b = links["u"].to_numpy(), links["u2"].to_numpy()
     strength = links["shared"].to_numpy() / np.minimum(n_kmers[a], n_kmers[b])
     out = {
+        "detected_largest_component_units": int(n_kmers.astype(bool).sum()),
+        "detected_largest_component_pairs": int(keep.sum()),
         "links": links.height,
         "links_one_kmer": int((links["shared"] == 1).sum()),
         "links_le2_hits": int((links["shared_hits"] <= 2).sum()),
