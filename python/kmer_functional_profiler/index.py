@@ -344,7 +344,10 @@ class PackedTable:
         def _load(f: str) -> np.ndarray:
             # No MADV_RANDOM here (unlike unit columns): on a preloaded tier 2 it turned off
             # fault-around, and lookup at 40 M pairs took 74 s, not 40 s (plan, phase 6, step 36).
-            return np.load(directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None)
+            arr: np.ndarray = np.load(
+                directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None
+            )
+            return arr
 
         return cls(
             layout["max_hash"],
