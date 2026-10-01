@@ -340,7 +340,7 @@ Prototype the algorithm in Python, with stable hot loops in Rust from day one vi
 
 ## Implementation plan
 
-Ten phases, each with a go/no-go gate, plus an optional eleventh; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
+Ten phases, each with a go/no-go gate, plus two optional ones; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index, and phase 11 (desirable, not essential) predicts which genomes are present from the function profile. Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
 
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
@@ -350,11 +350,12 @@ Ten phases, each with a go/no-go gate, plus an optional eleventh; phases 1–5 a
 | 3. Query + naive counts (done; gate passed, see Progress log) | Hit counting and containment; `--sourmash-compat` using the sourmash Python API. Lookup moves to Rust once the layout settles. | Python (+ Rust lookup) | Matches fmh-funprofiler containment in compat mode; ≥ parity in completeness/purity at equal density. **Stop here if not.** |
 | 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence, copies-scaled abundance, posterior intervals, ambiguity groups, presence probability, copies error calibrated on real data; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Tool benchmarks (in progress: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3.9 and 4 scored on KO; cost and Pfam pending; see Progress log) | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND on the fmh benchmark, with CPU time and peak memory per tool. Pfam truth and scoring on the same metagenomes (the primary benchmark, see Benchmark labels); KO scoring kept for the direct comparison with fmh-funprofiler. | Python + Nextflow | Every tool scored with the same truth and metrics, on Pfam where it can report Pfam and on KO otherwise; our accuracy and cost relative to each recorded. |
-| 6. Full-scale method (in progress: nested builds done and cost model checked; free index cuts, Rust pass-1 kernel and partitioned build (tier 2 packed by hash range, sets deduplicated by set hash) done; whole-release statistics pending on HPC; query cost planned (see Query cost), Q1 ladder measured to 40 M pairs (step 17) and re-run after the memory steps (step 31: 207 s, 5.8 GB anonymous; next: unit-column readahead, read prefetch, `presence`, posterior on real data; ladder to 200 M reads on ERR7738575 and pooled runs (step 32); EM and posterior on giant components: exact methods first (step 33)); Q3's Rust tier-2 lookup built; unit table memory-mapped by column; Q2 done (`coverage_em` default, EM per component); see Progress log) | Make the method run on all of MGnify Proteins at a reasonable compute cost, before any ablation. Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale. Query cost: per-stage query time and memory against the nested and full indexes, a Rust sorted-merge lookup, a unit-major dense tier and cohort mode (see Query cost). Scalable build: index build and lookup in Rust (ported ahead of the spec, as the rules above allow for a component that blocks experiments) or a hash-partitioned Nextflow build; memory-mapped lookup. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding; re-run the Pfam and simulation benchmarks at each candidate to choose defaults on cost vs accuracy (KO alongside, for comparison). Then the full build and a query of the fmh-benchmark metagenomes against it, scored on Pfam truth (the full MGnify index carries Pfam labels only). Expect many iterations and some accuracy given up for cost. | Rust + Python + Nextflow | Full MGnify index builds on one HPC node at a chosen cost/accuracy point (build time, index size, query memory and time recorded), with the accuracy given up versus phases 4–5 recorded. |
+| 6. Full-scale method (in progress: nested builds done and cost model checked; free index cuts, Rust pass-1 kernel and partitioned build (tier 2 packed by hash range, sets deduplicated by set hash) done; whole-release statistics pending on HPC; query cost planned (see Query cost), Q1 ladder measured to 40 M pairs (step 17) and re-run after the memory steps (step 31: 207 s, 5.8 GB anonymous; next: unit-column readahead, read prefetch, `presence`, posterior on real data; ladder to 200 M reads on ERR7738575 and pooled runs (step 32); EM and posterior on giant components: exact methods first (step 33); several inputs per query process (step 35)); Q3's Rust tier-2 lookup built; unit table memory-mapped by column; Q2 done (`coverage_em` default, EM per component); see Progress log) | Make the method run on all of MGnify Proteins at a reasonable compute cost, before any ablation. Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale. Query cost: per-stage query time and memory against the nested and full indexes, a Rust sorted-merge lookup, a unit-major dense tier and cohort mode (see Query cost). Scalable build: index build and lookup in Rust (ported ahead of the spec, as the rules above allow for a component that blocks experiments) or a hash-partitioned Nextflow build; memory-mapped lookup. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding; re-run the Pfam and simulation benchmarks at each candidate to choose defaults on cost vs accuracy (KO alongside, for comparison). Then the full build and a query of the fmh-benchmark metagenomes against it, scored on Pfam truth (the full MGnify index carries Pfam labels only). Expect many iterations and some accuracy given up for cost. | Rust + Python + Nextflow | Full MGnify index builds on one HPC node at a chosen cost/accuracy point (build time, index size, query memory and time recorded), with the accuracy given up versus phases 4–5 recorded. |
 | 7. Ablations and freeze | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k, frame mode (stop-free, stop-free + edges, all six), read QC (raw, quality mask, fastp); divergence ladder; host spike-in ladder with the joint query (`--extra-index`) and human mask sidecar (`mask`) built for it (Additional references, steps 1–2), deciding whether the release ships the human mask. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen on Pfam metrics at full-scale cost, including host handling; spec reviewed and covering joint queries and masks. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
 | 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
 | 10. Additional references (desirable, not essential) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
+| 11. Genome mode (desirable, not essential) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; optional stratified (genome, Pfam) table. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -382,6 +383,8 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Decision rule:* make the mask the default at the *q* that matches fastp-then-raw on Pfam completeness, purity and abundance error. Then document external QC as optional. If fastp still wins, identify which step accounts for the gap (adapters, poly-G) before adding any of it to the tool.
 
 * **Decided (2026-10-01): additional references by joint query and mask sidecar; overlays only if needed.** This supersedes the overlay-first design of 2026-09-29. Gather, EM and the posterior take components from the hit table, so several indexes with one hash scheme can be queried jointly with offset unit ids. A study index or a host-proteome decoy then competes with MGnify units with no change to the model. In-place updates are I/O-heavy (any added unit touches almost every tier-2 hash range, and existing clusters' *p\_in* needs their members), so the base stays immutable and extras are layers. Host reads are handled upstream (hostile) for host-rich samples, plus a mask sidecar from the six-frame translated host genome (≈10⁻⁵ of postings lost at 20 letters, k = 11), which also flags host-derived MGnify clusters. The joint query and mask move to phase 7 (they decide whether the release ships a human mask); decoy role, study recipe and conditional overlays stay in phase 10. Details: Additional references.
+
+* **Decided (2026-10-01): genome mode is a desirable, non-essential objective (phase 11); batching by input count, not by shared lookups.** Users want to know which genomes are present, predicted from the function profile. Genomes are annotated by the query's own first pass (read id = genome), so their content is defined in the same sampled k-mer space as the reads' hits, and the genome fit reuses gather and the zero-inflated EM one level up (units play the role of k-mers, genomes the role of units). Batching: the measured per-sample fixed costs are per job (index staging 125–280 s, step 31) and per process (start-up, `Index.load`), not per lookup, so several inputs per process (phase 6, step 35) captures most of the gain; a shared, deduplicated lookup across samples (the cohort merge-join of Query cost) is built only where its deduplication is measured to pay. Details: Genome mode.
 
 ### Phase 1
 
@@ -980,13 +983,29 @@ What each step did, and the choices, results and interpretations behind it, newe
     - *Measure first:* a histogram of link strength and shared hits per link in the largest component, recorded with `--stats` only. If the giant component is held together by links of strength ~0.01 (one k-mer, one or two hits: fingerprint false hits or sequencing-error k-mers), a small τ breaks it at little cost; if by strong links (multi-domain families), cutting costs accuracy and E1–E3 are the route.
     - *Sweep (development only, as the step-18 calibrations):* τ ∈ {0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2} as a list parameter in the fmh-benchmark and query-cost workflows (like `--diamond_min_hits`), scored side by side. Cost on the query ladder (largest component, EM iterations, posterior batch, time, memory at 100 M pairs and on the pooled sample); accuracy on the fmh benchmark against τ = 0 (L1, Spearman, completeness, purity, interval coverage; KO, then Pfam), also at depth, where weak links multiply. Choose the largest τ with negligible accuracy loss, record the evidence here, and make it the default.
 
-## Libraries
-
 * **Phase 6, step 34 — step 31's next items 1–4 in code (#59, review fixes after it); measurements pending on HPC.**
   - *1. `madvise(MADV_RANDOM)`* on every memory-mapped unit column and packed table (tier 2 and dense), through `_madvise_random`; a test checks a loaded array's base is still the `mmap`, so the hook is not skipped silently. Effect to measure: peak RSS at hit\_units, not preloaded (preloaded pages are resident whatever the advice).
   - *2. Prefetching read batches:* `FastxHits` reads and decompresses on its own thread, up to two batches ahead (a bounded channel), while the current batch is scanned. Errors arrive after the batches read before them (tested); a reader panic is re-raised when the channel closes, not taken as end of input. Effect to measure: hash time and CPU/wall at 40 M.
   - *3. `presence` convergence:* `--stats` (and `query_cost.tsv`) gain `presence_iterations` and `presence_converged` (0 at `max_iter` = 500). Tested on the fixture, including a cut-off at one iteration. To read at 12 M and 40 M before changing `tol` or the iteration.
   - *4. Draws on chosen cells:* `--query_draws_at` (default `40000000`; `''` = every cell) picks the ladder cells that also get the posterior on `--query_draws_on`. Stub-checked both ways. The run itself, the posterior's memory and time on real data and the `COPIES_ERROR` re-check, is still to do.
+
+* **Phase 6, step 35 — plan for several inputs per query process (no code yet).** Where a batch of samples saves work, from step 31's costs:
+
+  | Cost | Per | Batching saves it? |
+  | --- | --- | --- |
+  | Index staging (scratch copy, preload) | job | Yes: 125–280 s per job, more than the whole 40 M-pair query (207 s), so it sets the time of every smaller sample. |
+  | Interpreter start-up, imports, `Index.load` (memory-mapping, `meta.json`) | process | Yes; seconds, which matters only for thousands of tiny inputs. |
+  | Page faults on tier 2 and unit columns | node | Partly: the page cache is shared by every process on a node, so co-locating jobs already shares it. |
+  | Hashing, translation | read | No. |
+  | Lookup | sampled k-mer | Only through k-mers repeated across samples (one lookup per distinct hash in the batch) and a sequential index walk. Lookup is 19% of wall at 40 M pairs; a 2× cross-sample dedup would save ~10% with the index resident. With a cold index (laptop, network file system) the sequential walk is what matters: that is Query cost's cohort merge-join. |
+  | Gather, EM, presence, posterior | sample | No: samples are fitted independently. Small samples can run side by side to fill the cores their small components leave idle. |
+
+  - **B1 (build): several inputs in one process.** `query --samples SAMPLES.tsv --out-dir DIR` (columns `sample`, `r1`, optional `r2`): load the index once and loop over `profile()`, one `profile.tsv` (and `--stats` JSON) per sample, named by `sample`. Results identical to separate runs (tested). The query workflows group small samples into one job up to a total read budget (e.g. 40 M pairs per job, a parameter), so staging is paid once per job.
+  - **B2 (conditional): one lookup per distinct hash across a batch.** Hash every sample of the batch with a sample tag, sort and deduplicate the sampled hashes, look each up once, and join the hits back per sample. Memory grows with the batch's sampled hashes (8–16 B each), so the batch is capped by the scratch budget, as in the laptop mode. Build it only if a measurement says it pays: the distinct-hash ratio across a batch (e.g. 10 gut samples of one study; a set of strains of one species). Expected: small for metagenomes with a resident index, large for redundant genome sets and for a cold index, where it is the cohort merge-join already planned in Query cost.
+  - **Genome annotation needs neither:** many genomes stream as one input with read id = genome (Genome mode), so one process and one lookup pass serve the whole set.
+  - *Measure:* per-sample wall time and peak memory for batches of 1, 10 and 100 samples of 1 M pairs, and the staging time saved per job; the distinct-hash ratio for B2's decision.
+
+## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
 
@@ -1208,6 +1227,73 @@ Steps 1–2 are small Python changes needed for the phase-7 host ablation, becau
   - the joint query with a study index recovers ≥ 90% of the completeness gain of a rebuild;
   - extending with one study (~10⁶ proteins) takes minutes on one node.
 
+## Genome mode (predicting genomes from functions)
+
+Given a sample's function profile, predict which reference genomes are present and at what depth. Annotate each genome with the index by running its proteins through the query's first pass, then explain the sample's per-unit hits as a mixture of genome contents with the same gather and zero-inflated EM the unit level uses. Desirable, not essential: phase 11.
+
+**Why from functions.** One index and one read pass give both profiles; genomes are seen in protein space, so synonymous variation does not cost sensitivity; and the EM's allocation gives a stratified table (which genome carries which function's hits), as HUMAnN reports.
+
+**Prior art.**
+
+| Tool | Approach | Relevance |
+| --- | --- | --- |
+| sylph | DNA FracMinHash containment per genome, zero-truncated Poisson coverage, winner-take-all on shared k-mers. | The accuracy baseline at species level, run on the same genomes. |
+| sourmash gather | Greedy minimum set cover of the sample sketch by genome sketches; also works on protein sketches of proteomes. | The detection rule we already use for units (`gather`), one level up. |
+| PanPhlAn | Matches a species' gene-family presence/absence profile in a metagenome to reference strains. | Genome identity from gene content, as here; per species only. |
+| MetaPhlAn, mOTUs | Clade-specific or single-copy marker genes. | Markers are a restriction to ablate (core units only), and give the genome-equivalents normaliser. |
+
+### Annotating genomes: what differs from reads
+
+The query's first pass already gives what the model needs. With read id = genome, `unit_hits` returns per (genome, unit) the raw hits on the unit's kept k-mers (each k-mer counted for every holder, before any splitting) and the distinct k-mers hit. That table is the genome's content *c\_{G,u}*.
+
+- **Same sampler, same space.** Content must be measured with the tier and thresholds the sample's hits use (tier 2 and *t\_g*; the dense tier only if the fit uses dense hits). Units the sampler cannot see, e.g. a singleton at *t\_base* with ~0.3 kept k-mers, are invisible in both the genome and the sample, so they drop out consistently. This is the sketch-consistency rule of the critique applied to genomes.
+- **No splitting at annotation.** Raw hits add across genomes, so a sample of genomes at depths λ\_G has expected raw unit hits *h\_u* = Σ\_G λ\_G *c\_{G,u}* exactly, shared k-mers included. Gather, EM and the posterior are not run per genome: at depth 1 with no error their statistics mean nothing.
+- **No containment threshold.** A genome protein that shares one k-mer with an unrelated unit really does put hits there in the sample, so low-containment links stay in *c* with their small weight. A threshold is applied only to the human-readable annotation (best unit per protein).
+- **Input.** Long records break the read kernel's assumptions: `stopfree` drops every frame of a contig, since each contains stops. Default input is protein FASTA (genome sets ship `.faa`; otherwise pyrodigal, as in the study-index recipe), hashed by a protein mode of `FastxHits` (the `hash_proteins` scanner behind the same streaming reader). Six-frame windows (the mask sidecar's path) are a fallback: ~8×10⁶ off-frame k-mers per 4 Mbp genome, sampled at 0.2 and hitting at the ~0.3% chance rate, give ~5×10³ chance hits per genome, which the model then has to explain.
+- **Batching is built in.** All genomes stream as one input (a list of files, each record tagged with its genome), so there is one process and one lookup pass for the whole set.
+
+**Size.** A 4 Mbp genome has ~1.1×10⁶ amino-acid k-mers, ~2.2×10⁵ sampled at *t\_max* = 0.2. 10⁵ genomes (order of GTDB's species representatives) are ~2.2×10¹⁰ sampled k-mers, about 30 deep metagenomes' worth: ~30 min of hashing and lookup on 8 CPUs at step 31's rates. The content table is ~5×10³ units per genome, ~5×10⁸ rows for 10⁵ genomes (~4 GB as unit-major CSR of (genome u32, hits f32)).
+
+### Genome model: options
+
+| Option | Model | Strength | Weakness |
+| --- | --- | --- | --- |
+| G0. Genome gather | Greedy cover of hit units by genome contents (`_core.gather` with genome as unit and unit as item). | Existing code, order of minutes. Detection only. | Order-dependent; favours large genomes; no abundances. |
+| **G1. Two-stage weighted ZI EM (default)** | *h\_u* \~ Poisson(Σ\_G λ\_G *c\_{G,u}*) over the units any candidate carries, zero-inflated: only a fraction π\_G of G's content is present (strain divergence, incomplete MAGs), as in the unit-level ZI EM. Gather (G0) first for detection. | Reuses `profile.tsv` (`hits`); small (detected units × genomes holding them); the same fixed point as the unit EM. | Raw unit hits are correlated (a shared k-mer counts in each holder), so the Poisson likelihood is composite: point estimates are fine, intervals need care. |
+| G2. Joint EM on k-mer hits | Holders of a k-mer are the genomes carrying any unit that holds it; the existing `em` with genome as unit. | Exact likelihood; no correlation issue. | Holder lists blow up for core k-mers (every strain of a species); needs per-(genome, hash) content, ~8× the G1 table. Ablation on small genome sets only. |
+| G3. NNLS / sparse regression | Unit coverages on the content matrix, L1 or Dirichlet (α < 1) penalty to pick few genomes among near-identical ones. | Standard; the sparsity prior is a cheap answer to near-identical strains. | Gaussian on counts; same information as G1 with a worse noise model. Sparsity prior can be tried inside G1 instead. |
+| G4. Marker units only | G1 restricted to units single-copy and core for each species cluster. | Robust to mobile elements and accessory genes; gives genome-equivalents for Normalisation. | Throws away accessory content, the part that separates strains. |
+
+Recommended: G0 detection, G1 abundances, G4 as an ablation and the normaliser, G2 as an exactness check on the fmh benchmark. Code changes:
+
+- A per-pair `weight` column (default 1, identical results) in `em`, its zero-inflated form and `_fit_components`: the expected count of item *u* from holder G is λ\_G *w\_{G,u}*, and the ZI present fraction counts an item as hit with probability 1 − e^(−λ *w*).
+- Candidate screen before the fit: genomes with content-weighted containment (Σ *c* over hit units / Σ *c*) ≥ a floor, so the EM never sees the 10⁵ reference genomes at once. A unit-major CSR (unit → genomes) is read for hit units only.
+- Ambiguity groups and intervals from the existing posterior, with the overdispersion of unit hits handled by drawing unit hits from the unit-level posterior rather than Poisson.
+
+**What it reports.** Per genome: λ\_G (depth), π\_G (present fraction), relative abundance, genome-equivalents (Σ λ\_G, the normaliser of Risks). Per sample: the fraction of unit hits explained by genomes (the rest are organisms not in the set). With `--stratify`: hits per (genome, Pfam) from the EM's allocation, plus "unexplained".
+
+**Reference sets.** GTDB species representatives (CC BY-SA 4.0: check share-alike before shipping a precomputed table), MGnify genome catalogues per biome, and a study's own MAGs through the study-index recipe's pyrodigal step. Units carried by no candidate genome are left out of the fit and counted as unexplained.
+
+### Implementation plan
+
+1. **`annotate-genomes INDEX GENOMES.tsv OUT`** (columns `genome`, `path`, optional `taxonomy`): protein mode for `FastxHits` (Rust, small), read id = genome; writes `genome_units` (unit-major CSR: unit → (genome, hits, kmers)) and `genomes` (genome, proteins, Σ *c*, taxonomy), with the index's `meta.json` checksum so a mismatched index errors. Tests: a fixture "genome" made of an index's member proteins carries those units; two genomes annotated together equal each annotated alone; reads simulated from a genome at depth λ give unit hits ≈ λ·*c*.
+2. **`genomes PROFILE.tsv GENOME_INDEX OUT`**: screen, G0, G1 per component, outputs above. Tests: the weighted EM with all weights 1 equals today's `em`; two genomes with disjoint content recover their depths; a genome held out with a 95%-identical relative in the set is reported as the relative with π < 1.
+3. **Posterior and `--stratify`**, then the G2 and G4 ablations.
+4. **Nextflow:** genome-set annotation as a one-off HPC job published beside the index; the profile pipeline gains an optional genome step.
+
+**Constraints on earlier phases** (keep these possible; do not build for them):
+
+- Keep `unit_hits` callable with any per-record id, not just read ids.
+- Keep the raw per-unit `hits` (tier 2, before splitting) in `profile.tsv`.
+- Keep gather and the EM generic over (holder, item) pairs, as they are now.
+
+### Evaluation
+
+- **fmh benchmark** (phase 11): its 64 genomes have exact simulated abundances. Annotate them plus distractors (other KEGG genomes from the same Zenodo record), against the full MGnify index and the KO index. Metrics: genome purity, completeness, F1, abundance L1 and Spearman. Baselines on the same genomes: sylph (DNA) and sourmash gather on protein sketches.
+- **Hold-out ladder:** remove each source genome from the set, keeping relatives at ~95/90% ANI, as the divergence ladder does for proteins: the relative should be reported, with π\_G falling as identity falls.
+- **Cost:** annotation time per genome and per 10⁵ genomes; fit time against the query's.
+- **Gate:** see phase 11 in the table.
+
 ## Risks and open questions
 
 The biggest risk is that the gain over fmh-funprofiler with a lower scaled value is too small to justify a new tool.
@@ -1225,6 +1311,11 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
   * *Joint queries.* They inherit per-index `n_groups`, so promiscuity cuts and scores are only approximate across indexes, and duplicate units split coverage. The step-5 overlay is the fix, built only if measured to matter.
   * *Human mask.* It removes truly conserved microbial k-mers, and with reduced alphabets ~2% of postings by chance; with reduced alphabets, mask with the host proteome only.
   * *Host contamination in MGnify itself.* MGnify90 clusters from host contigs are flagged `host_like`, not removed; whether to drop them from the release is open.
+* **Genome mode.**
+  * *Visible content.* Genomes from biomes MGnify covers poorly have few units the sampler sees, so little power; report Σ *c* per genome so users can tell.
+  * *Shared mobile content.* Plasmid and phage units carried by many genomes can prop up genomes whose own content is absent; the zero inflation (π\_G) and G4's core-only fit are the checks.
+  * *Near-identical strains.* Strains sharing almost all units are not identifiable; the posterior's ambiguity groups report them rather than a forced split.
+  * *Two-stage correlation.* G1's composite likelihood may give intervals that are too narrow; check coverage on the fmh benchmark before reporting them.
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
 * **Open:** whether KO/eggNOG labels are worth the annotation run for users, or Pfam suffices. Benchmarking uses Pfam (see Benchmark labels), with KO only for the fmh-funprofiler comparison.
 
@@ -1247,3 +1338,4 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * [MGnify: the microbiome sequence data analysis resource in 2023 (NAR)](https://academic.oup.com/nar/article/51/D1/D753/6880769)
 * [sylph (Nature Biotechnology 2024)](https://pmc.ncbi.nlm.nih.gov/articles/PMC12339375/)
 * [sylph releases (two-stage .syl2db)](https://github.com/bluenote-1577/sylph/releases)
+* [PanPhlAn (strain identification from gene-family profiles)](https://github.com/SegataLab/panphlan)
