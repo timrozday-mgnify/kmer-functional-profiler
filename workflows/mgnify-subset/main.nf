@@ -554,10 +554,11 @@ workflow {
         ch_indexes = channel.fromPath(params.query_indexes, type: 'dir', checkIfExists: true)
             .map { d -> [d.parent.name, d] }
         ch_cells = ch_reads.combine(ch_indexes)
-        // draws 0 everywhere; posterior draws on one index column only, at query_draws_at cells.
+        // draws 0 everywhere; posterior draws on query_draws_on ('' = every index), at query_draws_at cells.
         def draws_at = params.query_draws_at.toString() in ['', 'true', 'false'] ? [] : params.query_draws_at.toString().tokenize(',').collect { n -> n as long }
+        def draws_on = params.query_draws_on.toString() in ['', 'true', 'false'] ? '' : params.query_draws_on.toString()
         ch_query = ch_cells.map { c -> c + [0] }
-            .mix(ch_cells.filter { c -> (params.query_draws as int) > 0 && c[3] == params.query_draws_on && (!draws_at || c[0] in draws_at) }
+            .mix(ch_cells.filter { c -> (params.query_draws as int) > 0 && (!draws_on || c[3] == draws_on) && (!draws_at || c[0] in draws_at) }
                 .map { c -> c + [params.query_draws] })
         QUERY(ch_query)
         QUERY_COST(QUERY.out.collect())

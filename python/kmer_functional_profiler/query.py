@@ -17,6 +17,7 @@ hits give.
 """
 
 import ctypes
+import itertools
 import json
 import os
 import resource
@@ -199,6 +200,51 @@ def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
     return label
 
 
+LINK_TAUS: Final = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)  # A1's sweep of link-strength cuts
+
+
+def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
+    """What weak-link cuts would do to the largest component (phase 6, step 33, A1).
+
+    ``kmers`` has ``unit``, ``hash`` and ``hits``. In the largest component of units linked
+    by shared k-mers, a link's strength is its shared k-mers over the smaller unit's k-mers.
+    Returns the component's ``links``, the weak ones (``links_one_kmer``: one shared k-mer;
+    ``links_le2_hits``: at most 2 hits on the shared k-mers), and per cut tau the links below
+    it (``cut_links_{tau}``) and the largest component left (``cut_largest_units_{tau}``).
+    """
+    units, col = _ids(kmers["unit"].to_numpy())
+    _, row = _ids(kmers["hash"].to_numpy())
+    if len(units) == 0:
+        return {}
+    label = _unit_components(col, row, len(units))
+    keep = label[col] == np.bincount(label).argmax()
+    own = pl.DataFrame({"u": col[keep], "k": row[keep], "hits": kmers["hits"].to_numpy()[keep]})
+    n_kmers = np.bincount(col[keep], minlength=len(units))
+    links = (
+        own.join(own.select("u", "k"), on="k", suffix="2")
+        .filter(pl.col("u") < pl.col("u2"))
+        .group_by("u", "u2")
+        .agg(shared=pl.len(), shared_hits=pl.col("hits").sum())
+    )
+    a, b = links["u"].to_numpy(), links["u2"].to_numpy()
+    strength = links["shared"].to_numpy() / np.minimum(n_kmers[a], n_kmers[b])
+    out = {
+        "links": links.height,
+        "links_one_kmer": int((links["shared"] == 1).sum()),
+        "links_le2_hits": int((links["shared_hits"] <= 2).sum()),
+    }
+    for tau in LINK_TAUS:
+        kept = strength >= tau
+        graph = coo_array(
+            (np.ones(int(kept.sum()), dtype=np.int8), (a[kept], b[kept])),
+            shape=(len(units), len(units)),
+        )
+        left = connected_components(graph, directed=False)[1][np.unique(col[keep])]
+        out[f"cut_links_{tau}"] = int((~kept).sum())
+        out[f"cut_largest_units_{tau}"] = int(np.bincount(left).max())
+    return out
+
+
 MAX_BATCH_PAIRS: Final = 2_000_000  # (unit, hash) rows per batch of components fitted at once
 
 
@@ -234,17 +280,74 @@ def _ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
 
 class _Block(NamedTuple):
     """The components still being fitted: their units (grouped by component), the pairs of
-    those units, each pair's local unit ``c`` and local k-mer ``r``, and the k-mers."""
+    those units, each pair's local unit ``c`` and local k-mer ``r``, the k-mers, and each
+    k-mer's weight from holders fitted elsewhere (``offset``: 0, or per k-mer in a block of a
+    component fitted block-wise, added to the k-mer's expected hits)."""
 
     unit: np.ndarray
     pairs: np.ndarray
     c: np.ndarray
     r: np.ndarray
     kmer: np.ndarray
+    offset: np.ndarray | float = 0.0
 
 
 # (coverage, second parameter) -> (new coverage, new second parameter, expected hits)
 Step = Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
+# pairs -> each pair's weight in its k-mer's expected hits, at the current lam and other
+PairWeight = Callable[[np.ndarray], np.ndarray]
+
+MAX_FIT_PAIRS: Final = 10_000_000  # a component with more pairs is fitted block-wise (~1.5 GB)
+BLOCK_STEPS: Final = 30  # EM steps per block per round of a block-wise fit
+MAX_BLOCK_ROUNDS: Final = 1000  # rounds over a block-wise component's blocks
+
+
+def _squarem(
+    step: Step,
+    la: np.ndarray,
+    se: np.ndarray,
+    starts: np.ndarray,
+    seg: np.ndarray,
+    step_max: np.ndarray,
+    other_max: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One SQUAREM cycle per component (Varadhan & Roland 2008, SqS3): two EM steps, a
+    squared extrapolation along them, and an EM step from there. Returns the point the
+    last step started from, that step's result and expected hits, as one EM step would.
+
+    The step length is capped by ``step_max`` per component, which grows 4x whenever the cap
+    is reached (updated in place). Extrapolated coverages are kept above 1e-3 x the second
+    step's (EM is multiplicative: a coverage of 0 could never grow back) and ``other`` inside
+    [0, ``other_max``]. A component whose EM residual grows over the cycle falls back to its
+    two plain steps and its cap to 1, so a cycle never does worse than plain EM's progress.
+    """
+    l1, s1, _ = step(la, se)
+    l2, s2, att2 = step(l1, s1)
+
+    def per_component(x: np.ndarray) -> np.ndarray:
+        return np.add.reduceat(x, starts)
+
+    r_l, r_s = l1 - la, s1 - se
+    v_l, v_s = l2 - l1 - r_l, s2 - s1 - r_s
+    rr = per_component(r_l**2 + r_s**2)
+    vv = per_component(v_l**2 + v_s**2)
+    alpha = -np.sqrt(_div(rr, vv))
+    alpha = np.clip(np.where(vv > 0, alpha, -1.0), -step_max, -1.0)  # -1: the plain two steps
+    step_max[alpha <= -step_max] *= 4
+    a = np.repeat(alpha, seg)
+    lx = np.maximum(la - 2 * a * r_l + a * a * v_l, 1e-3 * l2)
+    sx = np.clip(se - 2 * a * r_s + a * a * v_s, 0.0, other_max)
+    l3, s3, att3 = step(lx, sx)
+    worse = per_component((l3 - lx) ** 2 + (s3 - sx) ** 2) > rr
+    step_max[worse] = 1.0
+    back = np.repeat(worse, seg)
+    return (
+        np.where(back, l1, lx),
+        np.where(back, s1, sx),
+        np.where(back, l2, l3),
+        np.where(back, s2, s3),
+        np.where(back, att2, att3),
+    )
 
 
 def _fit_components(
@@ -256,6 +359,10 @@ def _fit_components(
     tol: float,
     max_iter: int,
     report: dict[str, int] | None = None,
+    other_max: float = 1.0,
+    pair_weight: PairWeight | None = None,
+    offset: np.ndarray | None = None,
+    pair_ids: np.ndarray | None = None,
 ) -> np.ndarray:
     """Iterate an EM per component of units linked by shared k-mers (pairs of unit ``col``
     and k-mer ``row``); return each unit's expected hits at its last step.
@@ -266,26 +373,70 @@ def _fit_components(
     converge in a few dozen, a few run to ``max_iter``); they are compacted into a new
     ``_Block``, and ``make_step`` called on it, once half of the current block has
     converged. ``lam`` and ``other`` are updated in place.
+
+    Steps are accelerated by SQUAREM (:func:`_squarem`; ``other`` kept in [0, ``other_max``]),
+    which reaches the same fixed point in fewer steps; ``max_iter`` counts EM steps, three
+    per cycle. Convergence is still tested on a plain EM step, so it means the same.
+
+    With ``pair_weight``, a component of more than ``MAX_FIT_PAIRS`` pairs is fitted
+    block-wise (:func:`_fit_blockwise`). Only units with pairs are fitted; ``offset`` (per
+    k-mer ``row``) and ``pair_ids`` (each pair's index in the caller's pairs) serve the blocks.
     """
     n = len(lam)
-    attributed = np.zeros(n)
     label = _unit_components(col, row, n)
+    if pair_weight is not None:
+        size = np.bincount(label[col])  # pairs per component
+        if (size > MAX_FIT_PAIRS).any():
+            in_big = (size > MAX_FIT_PAIRS)[label[col]]
+            small = np.flatnonzero(~in_big)
+            attributed = _fit_components(
+                col[small],
+                row[small],
+                lam,
+                other,
+                make_step,
+                tol,
+                max_iter,
+                report,
+                other_max,
+                pair_ids=small,
+            )
+            for c in np.flatnonzero(size > MAX_FIT_PAIRS):
+                pairs = np.flatnonzero(label[col] == c)
+                args = (col, row, lam, other, make_step, tol, max_iter, report, other_max)
+                attributed += _fit_blockwise(pairs, pair_weight, *args)
+            return attributed
+    attributed = np.zeros(n)
     active = np.argsort(label, kind="stable")  # units grouped by component
+    active = active[np.bincount(col, minlength=n)[active] > 0]
     seg = np.diff(np.flatnonzero(np.r_[True, np.diff(label[active]) != 0, True]))
     by_unit = np.argsort(col, kind="stable").astype(col.dtype)
     pair_start = np.r_[0, np.cumsum(np.bincount(col, minlength=n))]
     local = np.empty(n, dtype=col.dtype)
+    step_max = np.ones(len(seg))  # per component, kept through compactions
     it = 0
     while len(active) and it < max_iter:
         pairs = by_unit[_ranges(pair_start[active], np.diff(pair_start)[active])]
         local[active] = np.arange(len(active))
         kmer, r = _ids(row[pairs])
-        step = make_step(_Block(active, pairs, local[col[pairs]], r, kmer))
+        block = _Block(
+            active,
+            pairs if pair_ids is None else pair_ids[pairs],
+            local[col[pairs]],
+            r,
+            kmer,
+            0.0 if offset is None else offset[kmer],
+        )
+        step = make_step(block)
         starts = np.r_[0, np.cumsum(seg)[:-1]]
         la, se, done = lam[active], other[active], np.zeros(len(active), dtype=bool)
         while it < max_iter and done.sum() * 2 <= len(active):
-            it += 1
-            new, new_se, att = step(la, se)
+            if it + 3 <= max_iter:
+                la, se, new, new_se, att = _squarem(step, la, se, starts, seg, step_max, other_max)
+                it += 3
+            else:
+                it += 1
+                new, new_se, att = step(la, se)
             converged = (
                 np.maximum.reduceat(np.abs(new - la), starts)
                 <= tol * np.maximum.reduceat(new, starts)
@@ -305,10 +456,81 @@ def _fit_components(
             att[rest],
         )
         moving = ~done[starts]
-        active, seg = active[np.repeat(moving, seg)], seg[moving]
+        active, seg, step_max = active[np.repeat(moving, seg)], seg[moving], step_max[moving]
     if report is not None:  # units still moving here stopped at max_iter, not converged
         report["em_iterations"] = max(report.get("em_iterations", 0), it)
         report["em_unconverged_units"] = report.get("em_unconverged_units", 0) + len(active)
+    return attributed
+
+
+def _fit_blockwise(
+    pairs: np.ndarray,
+    pair_weight: PairWeight,
+    col: np.ndarray,
+    row: np.ndarray,
+    lam: np.ndarray,
+    other: np.ndarray,
+    make_step: Callable[[_Block], Step],
+    tol: float,
+    max_iter: int,
+    report: dict[str, int] | None,
+    other_max: float,
+) -> np.ndarray:
+    """Fit one component (its ``pairs``) in blocks of units of at most ``MAX_FIT_PAIRS``
+    pairs, so a step's working memory is one block's. Each round takes ``BLOCK_STEPS`` EM
+    steps on each block in turn, with the weight of its k-mers' other holders held fixed (an
+    ``offset`` per k-mer); rounds repeat until no unit's parameters move by more than
+    :func:`_fit_components`' test. At convergence that is the whole component's fixed point.
+    Few steps per block, not a fit to convergence: a block fitted alone can drive a unit
+    towards 0 that the others' next round would need back, and EM is slow to bring it back.
+    ``report`` gains ``em_block_rounds`` (the most rounds a component took) and counts
+    ``em_iterations`` as rounds x ``BLOCK_STEPS``; a component still moving after
+    ``MAX_BLOCK_ROUNDS`` counts as unconverged.
+    """
+    units, per_unit = np.unique(col[pairs], return_counts=True)
+    # ponytail: blocks are runs of unit ids, not a graph partition; partition the unit graph
+    # (fewer k-mers across blocks, fewer rounds) if em_block_rounds is high.
+    chunk = np.zeros(len(lam), dtype=np.int64)
+    chunk[units] = (np.cumsum(per_unit) - per_unit) // MAX_FIT_PAIRS
+    pair_chunk = chunk[col[pairs]]
+    order = np.argsort(pair_chunk, kind="stable")
+    blocks = np.split(pairs[order], np.flatnonzero(np.diff(pair_chunk[order])) + 1)
+    n_rows = int(row[pairs].max()) + 1
+    attributed = np.zeros(len(lam))
+    converged = False
+    rounds = 0
+    while not converged and rounds < MAX_BLOCK_ROUNDS:
+        rounds += 1
+        before_lam, before_other = lam[units], other[units]
+        total = np.bincount(row[pairs], weights=pair_weight(pairs), minlength=n_rows)
+        for b in blocks:
+            total -= np.bincount(row[b], weights=pair_weight(b), minlength=n_rows)
+            att = _fit_components(
+                col[b],
+                row[b],
+                lam,
+                other,
+                make_step,
+                tol,
+                BLOCK_STEPS,
+                None,
+                other_max,
+                offset=total,
+                pair_ids=b,
+            )
+            own = np.unique(col[b])
+            attributed[own] = att[own]
+            total += np.bincount(row[b], weights=pair_weight(b), minlength=n_rows)
+        converged = bool(
+            np.abs(lam[units] - before_lam).max() <= tol * lam[units].max()
+            and np.abs(other[units] - before_other).max() <= tol
+        )
+    if report is not None:
+        report["em_iterations"] = max(report.get("em_iterations", 0), rounds * BLOCK_STEPS)
+        report["em_block_rounds"] = max(report.get("em_block_rounds", 0), rounds)
+        report["em_unconverged_units"] = report.get("em_unconverged_units", 0) + (
+            0 if converged else len(units)
+        )
     return attributed
 
 
@@ -440,7 +662,7 @@ def em(
 
         def step(la: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             w = la * p
-            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer))
+            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer)) + b.offset
             attributed = w * over_units(_div(h, mu))  # expected hits from each unit
             if zero_inflated:
                 kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
@@ -458,7 +680,17 @@ def em(
 
         return step
 
-    attributed = _fit_components(col, row, lam, pi, make_step, tol, max_iter, report)
+    attributed = _fit_components(
+        col,
+        row,
+        lam,
+        pi,
+        make_step,
+        tol,
+        max_iter,
+        report,
+        pair_weight=lambda p: lam[col[p]] * pi[col[p]],
+    )
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
@@ -519,7 +751,8 @@ def em_pin(
 
         def step(la: np.ndarray, sc: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             weight = la[b.c] * sc[b.c] * PIN_P[lv]
-            share = _div(weight, np.bincount(b.r, weights=weight, minlength=len(b.kmer))[b.r])
+            mu = np.bincount(b.r, weights=weight, minlength=len(b.kmer)) + b.offset
+            share = _div(weight, mu[b.r])
             att = np.bincount(b.c, weights=share * h[b.r], minlength=len(b.unit))
             hit = np.bincount(cell, weights=share, minlength=hs.size).reshape(hs.shape)
             seen = -np.expm1(-la)[:, None]  # chance a present k-mer is hit
@@ -531,7 +764,17 @@ def em_pin(
         return step
 
     # tol 1e-8 per component matches the joint fit's accuracy at 1e-6 (phase 6, step 15).
-    attributed = _fit_components(col, row, lam, scale, make_step, tol, max_iter)
+    attributed = _fit_components(
+        col,
+        row,
+        lam,
+        scale,
+        make_step,
+        tol,
+        max_iter,
+        other_max=1 / PIN_P[-1],
+        pair_weight=lambda p: lam[col[p]] * scale[col[p]] * PIN_P[level[p]],
+    )
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
         {"unit": units, "coverage": lam, "present": scale * expected / m},
@@ -731,6 +974,8 @@ def posterior_zi(
 
 
 POSTERIOR_BATCH_BYTES: Final = 2**29  # working memory of one batch of the posterior's draws
+SWEEP_BLOCK_PAIRS: Final = 2**20  # (unit, hash) entries per block of a Gibbs sweep
+READ_CHUNK: Final = 2**22  # (hash, read) rows reweighted at once per draw
 
 # Poisson(1) CDF at 0..24; beyond, a probability below 1e-24.
 POISSON1_CDF: Final = np.cumsum(np.exp(-1.0) / np.cumprod(np.r_[1.0, np.arange(1.0, 25.0)]))
@@ -794,9 +1039,15 @@ def _posterior_batch(
     coverage = np.zeros((draws, n_units))
     abundance, group_coverage, group_abundance = (np.zeros_like(coverage) for _ in range(3))
     evidence = np.zeros(len(row_s))  # hits allocated per (k-mer, unit) entry, all draws
+    # Whole k-mers in blocks of about SWEEP_BLOCK_PAIRS entries, swept one block at a time.
+    cuts = np.unique(np.r_[starts[row_s[::SWEEP_BLOCK_PAIRS]], len(row_s)])
     for b in range(draws):
-        weight = _poisson1(seed, b, reads)[read_of]
-        per_hash = np.rint(np.bincount(hash_of_hit, weights=n * weight, minlength=n_rows))
+        per_hash = np.zeros(n_rows)
+        for lo in range(0, len(read_of), READ_CHUNK):  # integer sums: exact in any order
+            part = slice(lo, lo + READ_CHUNK)
+            weight = n[part] * _poisson1(seed, b, reads[read_of[part]])
+            per_hash += np.bincount(hash_of_hit[part], weights=weight, minlength=n_rows)
+        per_hash = np.rint(per_hash)
         per_key = per_hash[row]
         table = keyed.select("unit", "hash").with_columns(hits=per_key).filter(pl.col("hits") > 0)
         if table.height == 0:
@@ -808,21 +1059,28 @@ def _posterior_batch(
         pi[at] = np.clip(fit["present"].to_numpy(), 1e-6, 1 - 1e-6)
         # Holders of a k-mer see the same reads, so any holder's count is the k-mer's.
         count = per_hash.astype(np.int64)
-        for _ in range(sweeps):
-            rate = (lam * pi)[col_s]
-            rest = np.bincount(row_s, weights=rate, minlength=n_rows)  # rate not yet visited
-            left = count.copy()
-            given = np.zeros(len(row_s), dtype=np.int64)
-            for j in range(int(holders.max(initial=0))):
-                here = position == j
-                r = row_s[here]
-                last = holders[r] == j + 1
-                share = np.where(last, 1.0, _div(rate[here], rest[r]))
-                given[here] = rng.binomial(left[r], np.clip(share, 0.0, 1.0))
-                left[r] -= given[here]
-                rest[r] -= rate[here]
-            hits = np.bincount(col_s, weights=given, minlength=n_units)
-            hit = np.bincount(col_s, weights=given > 0, minlength=n_units)  # k-mers given
+        for sweep in range(sweeps):
+            unit_rate = lam * pi
+            hits, hit = np.zeros(n_units), np.zeros(n_units)  # hits and k-mers given
+            for lo, hi in itertools.pairwise(cuts):
+                first = row_s[lo]
+                r_b, c_b, pos_b = row_s[lo:hi] - first, col_s[lo:hi], position[lo:hi]
+                held = holders[first : row_s[hi - 1] + 1]
+                rate = unit_rate[c_b]
+                rest = np.bincount(r_b, weights=rate, minlength=len(held))  # rate not yet visited
+                left = count[first : first + len(held)].copy()
+                given = np.zeros(hi - lo, dtype=np.int64)
+                for j in range(int(held.max())):
+                    here = pos_b == j
+                    r = r_b[here]
+                    share = np.where(held[r] == j + 1, 1.0, _div(rate[here], rest[r]))
+                    given[here] = rng.binomial(left[r], np.clip(share, 0.0, 1.0))
+                    left[r] -= given[here]
+                    rest[r] -= rate[here]
+                hits += np.bincount(c_b, weights=given, minlength=n_units)
+                hit += np.bincount(c_b, weights=given > 0, minlength=n_units)
+                if sweep == sweeps - 1:
+                    evidence[lo:hi] += given
             alive = hit > 0
             for _ in range(MH_STEPS):
                 step = rng.normal(0.0, 1.5 / np.sqrt(hits + 1))
@@ -853,7 +1111,6 @@ def _posterior_batch(
         alive &= rng.random(n_units) < keep_prob
         coverage[b] = np.where(alive, lam, 0.0)
         abundance[b] = np.where(alive, scaled, 0.0)
-        evidence += given
 
     # Ambiguity groups: link a unit to another holder of its hit k-mers when most of its
     # allocated hits lie on k-mers the two share.
@@ -1147,6 +1404,9 @@ def profile(
         pin_hist = hit_info["pin_hist_dense"].to_numpy()
         pin_sum = hit_info["pin_sum_dense"]
         len_cv = hit_info["len_cv_dense"].to_numpy()
+    if record:
+        with timer("links"):
+            counts |= link_cuts(detected)
     with timer("fit_em"):
         # Fits stop per component, so batches of components give the same units' results.
         parts = component_batches(detected)
