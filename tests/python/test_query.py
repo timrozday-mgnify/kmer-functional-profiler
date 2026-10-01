@@ -217,6 +217,51 @@ def test_posterior_aai_interval(members: Path) -> None:
     assert got["aai"].is_between(got["aai_lo"] - 1e-3, got["aai_hi"] + 1e-3).mean() >= 0.9  # type: ignore[operator]
 
 
+def write_members(path: Path, seqs: list[str], first_rep: int = 0) -> Path:
+    rows = [(first_rep + i, first_rep + i, True, q) for i, q in enumerate(seqs)]
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    return path
+
+
+@pytest.mark.parametrize(("t_base", "t_dense"), [(1.0, 0.0), (0.3, 1.0)])
+def test_joint_query_equals_one_index_of_the_union(
+    tmp_path: Path, t_base: float, t_dense: float
+) -> None:
+    seqs = list(proteins().values())
+    half = len(seqs) // 2
+    params = IndexParams(k=K, t_base=t_base, t_dense=t_dense, fp_bits=64)
+    for name, part, first in (("a", seqs[:half], 0), ("b", seqs[half:], half), ("ab", seqs, 0)):
+        build_index(
+            write_members(tmp_path / f"{name}.parquet", part, first), tmp_path / name, params
+        )
+    a, b, ab = (Index.load(tmp_path / n) for n in ("a", "b", "ab"))
+    union = profile(ab, *READS, draws=5, with_aai=True)
+    joint = profile(a, *READS, draws=5, with_aai=True, extra=[b])
+    assert joint["source"].to_list() == [int(u >= a.units.height) for u in joint["unit"]]
+    assert joint.drop("source").equals(union.select(joint.drop("source").columns))
+    # An unrelated extra index leaves the first index's rows as they were, but for
+    # present_prob, whose prior counts every index's units.
+    unrelated = tmp_path / "unrelated"
+    rng = np.random.default_rng(0)
+    random_seqs = ["".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), 300)) for _ in range(5)]
+    build_index(write_members(tmp_path / "r.parquet", random_seqs), unrelated, params)
+    alone = profile(a, *READS)
+    with_unrelated = profile(a, *READS, extra=[Index.load(unrelated)])
+    assert with_unrelated.filter(pl.col("source") == 1).height == 0
+    keep = [c for c in alone.columns if c != "present_prob"]
+    assert with_unrelated.select(keep).equals(alone.select(keep))
+
+
+def test_joint_query_rejects_a_different_scheme(tmp_path: Path) -> None:
+    seqs = list(proteins().values())[:3]
+    path = write_members(tmp_path / "m.parquet", seqs)
+    build_index(path, tmp_path / "k7", IndexParams(k=7, t_base=1.0))
+    build_index(path, tmp_path / "k8", IndexParams(k=8, t_base=1.0))
+    with pytest.raises(ValueError, match="differ in k"):
+        profile(Index.load(tmp_path / "k7"), *READS, extra=[Index.load(tmp_path / "k8")])
+
+
 def test_shared_evidence_groups_lopsided_pair() -> None:
     # Unit 0: 20 k-mers of its own and 3 shared with unit 1; unit 2 stands alone. 4 hits
     # (one read each) per k-mer. Unit 1 lives mostly on the shared k-mers, which barely move
@@ -497,6 +542,7 @@ def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path:
         "stopfree": [],
         "edges": ["--frames", "edges:5"],
         "masked": ["--min-qual", "41"],  # above every fixture quality: everything is N
+        "joint": ["--extra-index", str(idx)],  # itself: every unit twice, each half the hits
     }.items():
         out = tmp_path / f"{name}.tsv"
         args = ["query", str(idx), *map(str, READS), "--out", str(out), *extra]
@@ -507,6 +553,7 @@ def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path:
     assert (both["name_e"] >= both["name"]).all()
     assert hits["edges"]["name"].sum() > hits["stopfree"]["name"].sum()
     assert hits["masked"].height == 0
+    assert hits["joint"].height == 2 * hits["stopfree"].height
 
 
 def test_timer_writes_stats_mid_stage(tmp_path: Path) -> None:

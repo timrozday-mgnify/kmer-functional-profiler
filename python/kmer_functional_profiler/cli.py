@@ -127,6 +127,13 @@ def query(
     min_aai: Annotated[
         float, typer.Option(help="Drop units with aai_naive below this (0 = keep all)")
     ] = 0.0,
+    extra_index: Annotated[
+        list[Path] | None,
+        typer.Option(
+            help="Another index (same k, alphabet, hash) queried jointly; repeatable. Its "
+            "units compete with the first index's; output ids are offset, with a source column"
+        ),
+    ] = None,
     all_estimators: Annotated[
         bool,
         typer.Option(
@@ -140,6 +147,7 @@ def query(
     with timer("total"):
         with timer("load"):
             loaded = Index.load(index_dir, mmap=not in_memory)
+            extra = [Index.load(d, mmap=not in_memory) for d in extra_index or []]
         result = profile(
             loaded,
             r1,
@@ -154,6 +162,7 @@ def query(
             low_memory=low_memory,
             with_aai=aai,
             min_aai=min_aai,
+            extra=extra,
         )
         result.write_csv(out, separator="\t")
     timer.write()
