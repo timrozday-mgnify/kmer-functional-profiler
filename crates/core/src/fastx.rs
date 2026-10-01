@@ -1,7 +1,9 @@
 use std::fmt;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 
-use needletail::{FastxReader, parse_fastx_file};
+use needletail::parse_fastx_file;
 
 use crate::{DnaScanner, Error, Hits, KmerParams, threads};
 
@@ -11,18 +13,20 @@ use crate::{DnaScanner, Error, Hits, KmerParams, threads};
 /// when none of its reads had a sampled k-mer; [`FastxHits::n_reads`] counts all reads.
 /// A batch's records are read on one thread and scanned on all, in contiguous runs of
 /// reads joined in order, so hits come in input order at any thread count.
+pub type BatchResult = Result<(Vec<u8>, Vec<usize>, usize), Error>;
+
 pub struct FastxHits {
-    r1: Box<dyn FastxReader>,
-    r2: Option<Box<dyn FastxReader>>,
+    rx: Receiver<BatchResult>,
+    _reader_thread: Option<JoinHandle<()>>,
     scanner: DnaScanner,
-    batch_reads: usize,
+    mates: u8,
     n_reads: u64,
 }
 
 impl fmt::Debug for FastxHits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FastxHits")
-            .field("paired", &self.r2.is_some())
+            .field("paired", &(self.mates == 2))
             .field("params", self.scanner.params())
             .field("n_reads", &self.n_reads)
             .finish_non_exhaustive()
@@ -40,11 +44,73 @@ impl FastxHits {
         params: KmerParams,
         batch_reads: usize,
     ) -> Result<Self, Error> {
+        let mut r1_reader = parse_fastx_file(r1)?;
+        let mut r2_reader = r2.map(parse_fastx_file).transpose()?;
+        let batch_reads = batch_reads.max(1);
+        let mates = if r2_reader.is_some() { 2 } else { 1 };
+
+        let (tx, rx) = mpsc::sync_channel(2);
+
+        let reader_thread = thread::spawn(move || {
+            loop {
+                let mut seqs = Vec::new();
+                let mut ends = Vec::new();
+                let mut n = 0;
+                let mut error = None;
+
+                while n < batch_reads {
+                    let rec1 = match r1_reader.next() {
+                        Some(Ok(rec)) => rec,
+                        Some(Err(e)) => {
+                            error = Some(Error::from(e));
+                            break;
+                        }
+                        None => {
+                            if r2_reader.as_mut().is_some_and(|r2| r2.next().is_some()) {
+                                error = Some(Error::MateCountMismatch);
+                            }
+                            break;
+                        }
+                    };
+                    seqs.extend_from_slice(&rec1.seq());
+                    ends.push(seqs.len());
+
+                    if let Some(r2) = &mut r2_reader {
+                        let rec2 = match r2.next() {
+                            Some(Ok(rec)) => rec,
+                            Some(Err(e)) => {
+                                error = Some(Error::from(e));
+                                break;
+                            }
+                            None => {
+                                error = Some(Error::MateCountMismatch);
+                                break;
+                            }
+                        };
+                        seqs.extend_from_slice(&rec2.seq());
+                        ends.push(seqs.len());
+                    }
+                    n += 1;
+                }
+
+                if let Some(err) = error {
+                    let _ = tx.send(Err(err));
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+                if tx.send(Ok((seqs, ends, n))).is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
-            r1: parse_fastx_file(r1)?,
-            r2: r2.map(parse_fastx_file).transpose()?,
+            rx,
+            _reader_thread: Some(reader_thread),
             scanner: DnaScanner::new(params),
-            batch_reads: batch_reads.max(1),
+            mates,
             n_reads: 0,
         })
     }
@@ -54,41 +120,17 @@ impl FastxHits {
         self.n_reads
     }
 
-    /// Appends the next read (pair)'s sequences to `seqs`, ending each at `ends`;
-    /// `Ok(false)` at end of input.
-    // ponytail: mates are paired by position only; read IDs are not compared.
-    // ponytail: reading and decompression stay on one thread (~10% of the scan's work on
-    // gzip input); a reader thread overlapping the scan if that becomes the ceiling.
-    fn read_next(&mut self, seqs: &mut Vec<u8>, ends: &mut Vec<usize>) -> Result<bool, Error> {
-        let Some(rec1) = self.r1.next().transpose()? else {
-            if self.r2.as_mut().is_some_and(|r2| r2.next().is_some()) {
-                return Err(Error::MateCountMismatch);
-            }
-            return Ok(false);
-        };
-        seqs.extend_from_slice(&rec1.seq());
-        ends.push(seqs.len());
-        if let Some(r2) = &mut self.r2 {
-            let rec2 = r2.next().transpose()?.ok_or(Error::MateCountMismatch)?;
-            seqs.extend_from_slice(&rec2.seq());
-            ends.push(seqs.len());
-        }
-        Ok(true)
-    }
-
     /// Reads and scans the next batch.
     fn next_batch(&mut self) -> Result<Option<Hits>, Error> {
-        let (mut seqs, mut ends) = (Vec::new(), Vec::new());
-        let mut n = 0;
-        while n < self.batch_reads && self.read_next(&mut seqs, &mut ends)? {
-            n += 1;
-        }
-        if n == 0 {
-            return Ok(None);
-        }
-        let mates = if self.r2.is_some() { 2 } else { 1 };
+        let (seqs, ends, n) = match self.rx.recv() {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+
+        let mates = self.mates as usize;
         let per_thread = n.div_ceil(threads()).max(MIN_READS_PER_THREAD);
-        let (first, seqs, ends) = (self.n_reads, &seqs, &ends);
+        let (first, seqs_ref, ends_ref) = (self.n_reads, &seqs, &ends);
         let parts: Vec<Hits> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n)
                 .step_by(per_thread)
@@ -99,10 +141,10 @@ impl FastxHits {
                         for read in lo..(lo + per_thread).min(n) {
                             for mate in 0..mates {
                                 let i = read * mates + mate;
-                                let start = if i == 0 { 0 } else { ends[i - 1] };
+                                let start = if i == 0 { 0 } else { ends_ref[i - 1] };
                                 #[allow(clippy::cast_possible_truncation)] // mate is 0 or 1
                                 scanner.scan(
-                                    &seqs[start..ends[i]],
+                                    &seqs_ref[start..ends_ref[i]],
                                     first + read as u64,
                                     mate as u8,
                                     &mut hits,

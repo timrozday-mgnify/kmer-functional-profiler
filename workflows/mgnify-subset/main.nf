@@ -554,9 +554,9 @@ workflow {
         ch_indexes = channel.fromPath(params.query_indexes, type: 'dir', checkIfExists: true)
             .map { d -> [d.parent.name, d] }
         ch_cells = ch_reads.combine(ch_indexes)
-        // draws 0 everywhere; posterior draws on one index column only.
+        // draws 0 everywhere; posterior draws on one index column only, on the 40 M cell if specified.
         ch_query = ch_cells.map { c -> c + [0] }
-            .mix(ch_cells.filter { c -> params.query_draws > 0 && c[3] == params.query_draws_on }
+            .mix(ch_cells.filter { c -> (params.query_draws as int) > 0 && c[3] == params.query_draws_on && c[0] == 40000000L }
                 .map { c -> c + [params.query_draws] })
         QUERY(ch_query)
         QUERY_COST(QUERY.out.collect())

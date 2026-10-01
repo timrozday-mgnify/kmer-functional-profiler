@@ -614,13 +614,21 @@ def presence(
         0.0,
     )
     prob = np.ones(len(units))
-    for _ in range(max_iter):
+    for i in range(max_iter):
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
         new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
         done = np.abs(new - prob).max(initial=0) <= tol
         prob = new
         if done:
+            print(f"presence converged in {i + 1} iterations", file=sys.stderr, flush=True)
             break
+    else:
+        print(
+            f"presence failed to converge in {max_iter} iterations, "
+            f"max change {np.abs(new - prob).max(initial=0):.2e}",
+            file=sys.stderr,
+            flush=True,
+        )
     return pl.DataFrame(
         {"unit": units, "present_prob": prob},
         schema={"unit": pl.UInt32, "present_prob": pl.Float64},

@@ -34,6 +34,7 @@ The query probes it only for the units the sparse tier detects, to fit abundance
 """
 
 import json
+import mmap
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from functools import cached_property
@@ -339,19 +340,28 @@ class PackedTable:
     @classmethod
     def load(cls, directory: Path, name: str, layout: dict[str, int], *, mmap: bool = True) -> Self:
         """Memory-map a table written by ``save``, or read it into memory (``mmap=False``)."""
+
+        def _load(f: str) -> np.ndarray:
+            arr = np.load(directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None)
+            return _madvise_random(arr) if mmap else arr
+
         return cls(
             layout["max_hash"],
             layout["lead_bits"],
             layout["bucket_bits"],
             layout["fp_bits"],
-            *(
-                np.load(directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None)
-                for f in PACKED_FIELDS
-            ),
+            *(_load(f) for f in PACKED_FIELDS),
         )
 
     def nbytes(self) -> int:
         return sum(getattr(self, f).nbytes for f in PACKED_FIELDS)
+
+
+def _madvise_random(array: np.ndarray) -> np.ndarray:
+    """Advise the kernel that memory-mapped array pages will be accessed in random order."""
+    if hasattr(mmap, "MADV_RANDOM") and isinstance(array.base, mmap.mmap):
+        array.base.madvise(mmap.MADV_RANDOM)
+    return array
 
 
 def _is_numeric(dtype: pl.DataType) -> bool:
@@ -428,11 +438,11 @@ class UnitTable:
     def __getitem__(self, name: str) -> np.ndarray:
         if name not in self._columns:
             npy = self.path.with_name(f"units.{name}.npy")
-            self._columns[name] = (
-                np.load(npy, mmap_mode="r" if self._mmap else None)
-                if npy.exists()
-                else _read_column(self.path, name)
-            )
+            if npy.exists():
+                arr = np.load(npy, mmap_mode="r" if self._mmap else None)
+                self._columns[name] = _madvise_random(arr) if self._mmap else arr
+            else:
+                self._columns[name] = _read_column(self.path, name)
         return self._columns[name]
 
     @cached_property
