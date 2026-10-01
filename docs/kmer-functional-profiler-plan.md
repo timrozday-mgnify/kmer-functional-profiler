@@ -351,10 +351,10 @@ Ten phases, each with a go/no-go gate, plus an optional eleventh; phases 1–5 a
 | 4. Model (in progress: baselines, EM, zero-inflated EM adopted, dense tier, *p\_in*-weighted presence, copies-scaled abundance, posterior intervals, ambiguity groups, presence probability, copies error calibrated on real data; simulation benchmark; see Progress log) | Uniqueness-weighted detection, EM per connected component, zero-inflated negative-binomial model, dispersion flag, genome normalisation, dense tier 2. | Python | Clear completeness gain for low-abundance groups over phase 3 at ≤ 2x index size; calibrated intervals on simulations. |
 | 5. Tool benchmarks (in progress: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3.9 and 4 scored on KO; cost and Pfam pending; see Progress log) | Benchmarks vs fmh-funprofiler, HUMAnN, kMermaid, DIAMOND on the fmh benchmark, with CPU time and peak memory per tool. Pfam truth and scoring on the same metagenomes (the primary benchmark, see Benchmark labels); KO scoring kept for the direct comparison with fmh-funprofiler. | Python + Nextflow | Every tool scored with the same truth and metrics, on Pfam where it can report Pfam and on KO otherwise; our accuracy and cost relative to each recorded. |
 | 6. Full-scale method (in progress: nested builds done and cost model checked; free index cuts, Rust pass-1 kernel and partitioned build (tier 2 packed by hash range, sets deduplicated by set hash) done; whole-release statistics pending on HPC; query cost planned (see Query cost), Q1 ladder measured to 40 M pairs (step 17) and re-run after the memory steps (step 31: 207 s, 5.8 GB anonymous; next: unit-column readahead, read prefetch, `presence`, posterior on real data; ladder to 200 M reads on ERR7738575 and pooled runs (step 32); EM and posterior on giant components: exact methods first (step 33)); Q3's Rust tier-2 lookup built; unit table memory-mapped by column; Q2 done (`coverage_em` default, EM per component); see Progress log) | Make the method run on all of MGnify Proteins at a reasonable compute cost, before any ablation. Full-scale cost study: nested all-biome MGnify subsets (1 in 10⁴ to 1 in 10 clusters) and a full-release statistics pass (per-cluster k-mer counts, predicted postings) to fit how storage, build and query cost scale. Query cost: per-stage query time and memory against the nested and full indexes, a Rust sorted-merge lookup, a unit-major dense tier and cohort mode (see Query cost). Scalable build: index build and lookup in Rust (ported ahead of the spec, as the rules above allow for a component that blocks experiments) or a hash-partitioned Nextflow build; memory-mapped lookup. Tune for cost: *t\_base*, *n\_min*, *t\_cap*, dense-tier rate and scope (e.g. non-singletons only), fingerprint width, unit-ID encoding; re-run the Pfam and simulation benchmarks at each candidate to choose defaults on cost vs accuracy (KO alongside, for comparison). Then the full build and a query of the fmh-benchmark metagenomes against it, scored on Pfam truth (the full MGnify index carries Pfam labels only). Expect many iterations and some accuracy given up for cost. | Rust + Python + Nextflow | Full MGnify index builds on one HPC node at a chosen cost/accuracy point (build time, index size, query memory and time recorded), with the accuracy given up versus phases 4–5 recorded. |
-| 7. Ablations and freeze | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k, frame mode (stop-free, stop-free + edges, all six), read QC (raw, quality mask, fastp); divergence ladder. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen on Pfam metrics at full-scale cost; spec reviewed. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
+| 7. Ablations and freeze | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k, frame mode (stop-free, stop-free + edges, all six), read QC (raw, quality mask, fastp); divergence ladder; host spike-in ladder with the joint query (`--extra-index`) and human mask sidecar (`mask`) built for it (Additional references, steps 1–2), deciding whether the release ships the human mask. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen on Pfam metrics at full-scale cost, including host handling; spec reviewed and covering joint queries and masks. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
 | 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
-| 10. Reference extension (desirable, not essential) | `extend`: add a study's own proteins (MAG protein predictions, assembly gene calls with their functional annotations) to a released MGnify index as an overlay, without rebuilding it; query base + overlays together; `compact` folds overlays into a new base. See Extending the reference below. | Rust (+ Nextflow module) | On the divergence ladder, adding the held-out genomes' proteins as an overlay recovers ≥ 90% of the completeness of a full rebuild that includes them, with no loss on units already in the base; extending with one study (~10⁶ proteins) takes minutes on one node, not a rebuild. |
+| 10. Additional references (desirable, not essential) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -370,7 +370,7 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 * **Decided (2026-09-28): full-scale check in phase 6, not phase 4.** No test or benchmark so far uses the full MGnify release: unit tests use fixtures, the simulation 300 synthetic units from 100 MGnify seed proteins, the fmh benchmark KEGG KO indexes (tier 2 72 MB, dense tier 1.09 GB at 1/10), and the only real MGnify build is the pre-fix gut 1-in-10,000 subset (213,645 proteins, about 4×10⁻⁵ of the release). The Python build holds the members table and k-mer tables in memory, so a full-release build needs the Rust port (or a partitioned build) anyway. Phase 6 therefore carries the full-scale cost study and tuning (see the phase table). Expect a lot of tuning there to bring cost down, and some compromises on accuracy; defaults chosen in phase 5 are provisional until phase 6 has priced them, and the phase-4/5 accuracy numbers are the reference that any cost saving is measured against.
 * **Decided (2026-09-29): full-scale method before ablations; phases re-ordered.** Supersedes the phase-6 placement above. Ablations measured on the prototype at small scale could pick defaults that the full-scale cost tuning then overturns, so the full-scale method now comes first. Phase 5 keeps only the tool benchmarks; the new phase 6 (full-scale method) takes the cost study, scalable build, tuning and full build from the old phase 6; ablations, divergence ladder, spec and golden outputs move to phase 7 and run against the phase-6 method; the Rust port of query, model and CLI becomes phase 8 and release phase 9. The index build and lookup move to Rust (or a partitioned build) in phase 6, ahead of the spec, because they block full-scale work; phase 8 brings them in line with the spec.
-* **Decided (2026-09-29): reference extension is a desirable, non-essential objective (phase 10).** Users should be able to add their own proteins (a study's MAGs and assembly functions) to the MGnify90 index. It does not gate the release, but earlier phases should not rule it out: see the constraints in Extending the reference.
+* **Decided (2026-09-29): reference extension is a desirable, non-essential objective (phase 10).** Users should be able to add their own proteins (a study's MAGs and assembly functions) to the MGnify90 index. It does not gate the release, but earlier phases should not rule it out: see the constraints in Extending the reference (superseded 2026-10-01: see below and Additional references).
 * **Decided (2026-09-29): Pfam is the primary benchmark label; KO is secondary.** The tool labels MGnify90 clusters with Pfam, so defaults and gates from phase 5 on are chosen on Pfam truth. The KO benchmark stays, for direct comparison with fmh-funprofiler (which profiles KOs) and with the phase-3 to phase-5 KO results. The fmh benchmark gains Pfam truth from the same genomes and Pfam scoring for our indexes, DIAMOND and HUMAnN; fmh-funprofiler and kMermaid stay on KO. Details: Benchmark labels. Earlier KO-based decisions (phases 3–4) stand until the Pfam benchmark has rerun them.
 * **Decided (2026-10-01): frame mode is a phase-7 ablation, with a new *stop-free + edges* mode.** The default stop-free filter drops every read whose coding frame holds a stop, so reads crossing a gene's stop codon (and often its start) are lost whole, under-covering the \~40 residues at each gene end: a length bias against short clusters (estimate in Translation and frame detection; not yet measured). Plan:
   - *Mode:* `FrameMode::Edges` (`--frames edges`) in `DnaScanner::scan`: stop-free frames whole; in frames with stops, the segment before the first stop and the segment after the last, each kept if ≥ *m* aa (*m* a developer-only constant, default 20, swept in the benchmark). Internal segments are dropped. Reference twin in `reference/`; tests: a read crossing a stop keeps its coding terminal segment, internal segments never hash, stop-free reads hash as in `StopFree`.
@@ -380,6 +380,8 @@ What each step did, and the choices, results and interpretations behind it, newe
   - *Mask:* in `FastxHits::read_next`, bases whose quality byte is below 33 + *q* become `N` as they are copied into the batch (needletail already parses `qual()`). `--min-qual` (CLI and `query`; 0 = off, the default until phase 7). Reference twin: a `mask_quality` helper in `reference/` applied before `hash_dna`. Tests: a low-quality base removes exactly the k-mers that span its codon; a low-quality base that would make a stop leaves the frame stop-free; *q* = 0 and FASTA input are unchanged.
   - *Benchmark:* a `qc` list parameter in the fmh-benchmark and simulation workflows: raw, mask at *q* = 10, 20, 30, and fastp (defaults, with poly-G trimming) followed by raw. Use InSilicoSeq's novaseq model (binned qualities) and its miseq model (poor tails). Score the usual metrics (Pfam, KO alongside), plus coding reads dropped by the stop filter (simulation, where frames are known), sampled k-mers per read, and end-to-end time including fastp. On the Q1 run (ERR7738575), record the fraction of bases masked and the change in sampled k-mers and hits, for raw vs mask. Run crossed with the frame-mode arms (mask × edges), since both recover reads the stop filter drops.
   - *Decision rule:* make the mask the default at the *q* that matches fastp-then-raw on Pfam completeness, purity and abundance error. Then document external QC as optional. If fastp still wins, identify which step accounts for the gap (adapters, poly-G) before adding any of it to the tool.
+
+* **Decided (2026-10-01): additional references by joint query and mask sidecar; overlays only if needed.** This supersedes the overlay-first design of 2026-09-29. Gather, EM and the posterior take components from the hit table, so several indexes with one hash scheme can be queried jointly with offset unit ids. A study index or a host-proteome decoy then competes with MGnify units with no change to the model. In-place updates are I/O-heavy (any added unit touches almost every tier-2 hash range, and existing clusters' *p\_in* needs their members), so the base stays immutable and extras are layers. Host reads are handled upstream (hostile) for host-rich samples, plus a mask sidecar from the six-frame translated host genome (≈10⁻⁵ of postings lost at 20 letters, k = 11), which also flags host-derived MGnify clusters. The joint query and mask move to phase 7 (they decide whether the release ships a human mask); decoy role, study recipe and conditional overlays stay in phase 10. Details: Additional references.
 
 ### Phase 1
 
@@ -1043,7 +1045,8 @@ Three tiers: tiny hand-built fixtures in the repo, a small simulated community f
 | CAMI II (marine, strain madness, plant-associated) | Public simulated metagenomes with genome-level truth. | Functional truth derived by annotating the source genomes with Pfam (primary) and KofamScan KOs (for fmh-funprofiler) and projecting read origins. | CAMI data portal. |
 | Mock communities | ZymoBIOMICS standards (e.g. the gut standard) with published reference genomes. | Real sequencing error and library bias with known composition. | ENA/SRA runs. |
 | Real cohort | A subset of HMP2/IBDMDB with published HUMAnN outputs. | Concordance with HUMAnN; runtime at scale. | IBDMDB portal. |
-| Negative controls | Shuffled reads, human reads, intergenic-only simulated reads. | False-positive rate. | Generated. |
+| Negative controls | Shuffled reads, human reads, intergenic-only simulated reads. | False-positive rate; human reads also with and without the human mask. | Generated. |
+| Host spike-in ladder | fmh benchmark metagenomes plus simulated T2T-CHM13 reads at 0/50/90/99% host. | Host handling: none, upstream removal, mask, decoy (Additional references). | Generated (InSilicoSeq). |
 
 **Reference databases:** develop on a human-gut biome subset of MGnify Proteins 2026\_07; release on the full set (CC0, so pre-built indexes can be shared). Ground-truth genomes for the CI community and CAMI must be annotated against the same unit definitions, e.g. by mapping their predicted proteins to MGnify clusters, and with the same Pfam release as MGnify's labels.
 
@@ -1096,25 +1099,114 @@ Keeping `crates/core` free of PyO3 means phases 6 and 8 reuse the kernels unchan
 - `release.yml` (phase 9): `cargo-dist` binaries on tags, optional wheels via `PyO3/maturin-action`; bioconda recipe after the first tagged release.
 - Dependabot for Cargo, uv and Actions; branch protection on `main` requiring `ci.yml`.
 
-## Extending the reference (desirable)
+## Additional references (study proteins, hosts, contaminants)
 
-Users should be able to add their own proteins to a released index: typically MGnify90 plus a study's MAG protein predictions plus the genes and functional annotations of its assemblies. This is desirable, not essential; it is phase 10, after the release, and nothing earlier depends on it. It matters because a study's own genomes are the closest references its reads will ever have, and much of a new study's protein content is not yet in MGnify.
+Users need three kinds of extra reference beside MGnify90. **Augment:** a study's own proteins (MAG gene predictions, assembly gene calls and their annotations) are the closest references its reads will ever have, and much of a new study's protein content is not yet in MGnify. **Subtract:** host reads (human, mouse, plant), mitochondria and PhiX spike-in should not register as microbial functions. **Compete:** contaminants that only exist as proteins (diet plants, chloroplasts, fungi) should absorb the reads that match them rather than leave those reads to their nearest microbial relatives. The plan handles all three with two query-time mechanisms: querying several indexes jointly, and a mask sidecar. Both work on a released index without rebuilding it. Index overlays and compaction (the earlier "Extending the reference" design) become a conditional last step, built only if joint queries prove too approximate.
 
-**Approach: overlays, not rebuilds.** A full build is an HPC job over the whole release, so extension adds a small overlay index next to the base and never rewrites it.
+### Can several indexes be queried together?
 
-1. *Assign added proteins to units.* Proteins that match an existing MGnify90 cluster at ≥ 90% identity join it; the rest are clustered among themselves at 90% (MMseqs2 linclust, as MGnify does) into new units. Candidate clusters come cheaply from the index itself (dense-tier containment), then an alignment against their representatives confirms them, so no search of all 1.66×10⁹ representatives is needed.
-2. *Build the overlay with the same rules.* New units get *t\_g* from their own *n\_kmers*, exactly as in the build; existing units that gain members keep their *t\_g* and add the new members' k-mers under it, so nested thresholds stay consistent and the query needs no change in sampling. The overlay has the base's layout (tier 1, tier 2, dense) and unit ids that continue the base's.
-3. *Global quantities.* *n\_groups* (score and promiscuity cut) is the base value plus the overlay's, found by probing the base; components are merged at query time with a union-find over units linked across base and overlay. *p\_in* of existing units is not recomputed (added members are few against the cluster), and this approximation is recorded in the overlay's metadata.
-4. *Labels.* Added units carry the study's own annotations (e.g. KO, eggNOG or Pfam from its assembly pipeline) beside the MGnify Pfam labels; existing units that gain members keep their labels and record the added ones.
-5. *Query and compaction.* The query probes the base and each overlay and runs detection and EM over the union. `compact` folds overlays into a new base when they grow large or many (a partitioned rebuild of only the affected components).
+Yes, and almost nothing breaks, because the model links units at query time. Gather, EM and the posterior find components from the k-mers that actually got hits (`_unit_components` over the hit table), not from build-time components. If the hit tables of several indexes are joined with offset unit ids, a study unit and an MGnify unit that share hit k-mers fall into one component and split those hits in the EM. Units of different indexes that share no hits never interact, so the base profile is unchanged.
 
-**Constraints on earlier phases** (keep extension possible; do not build for it):
+| Concern | Effect | Handling |
+| --- | --- | --- |
+| Hash scheme (k, alphabet, hash, seed) | Units are comparable only if their k-mers are hashed the same way. | Required to match, checked from `meta.json`. One read pass serves every index; the query samples at the largest *t\_max*, and each index looks up only hashes ≤ its own *t\_max*. |
+| `n_groups` (score, promiscuity cut, floor choice) | Each build counts only its own units. A k-mer held by 40 base units and 40 study units passes both cuts although it is promiscuous across the union. | Accepted as an approximation. The effect is somewhat larger components and slightly wrong scores; the evaluation measures it. An overlay build (step 5) fixes it by probing the base. |
+| Duplicate units (a study protein already in an MGnify90 cluster) | Two units with near-identical k-mer sets split the coverage, so each shows about half. Pfam totals are unaffected when the labels agree. | The existing ambiguity groups (posterior) report such pairs. Assigning study proteins to existing clusters (step 5) removes the duplicates. |
+| Fingerprint false hits | Each index adds its own background, Q·ε·*m\_g*/n. | Background computed per index, as now. |
+| Unit ids and labels | Unit ids clash across indexes. | Offset ids at load; the output gains an `index` column; each index carries its own label tables. |
+| Normalisation (single-copy markers) | Markers come from the base. | Computed from the base only. |
+| Cost | Lookups and residency add up across indexes; hashing does not. | A study index (~10⁶ proteins) is MB to GB, negligible next to the base. |
 
-- Keep per-unit build rules local to the unit (*t\_g*, floor, *p\_in*), with only *n\_groups* and components global, so an overlay can compute its part alone.
-- Keep unit ids appendable and the unit table separate from the hash tables; record the base release and parameters in `meta.json` so an overlay can check it matches.
+Indexes built with different k or alphabets cannot be joined: their units share no k-mer space and so cannot compete. They can still be queried in one read pass, but their profiles stay separate and may double-count reads.
+
+### Can an index be updated in place?
+
+It can, but it is I/O-heavy. Adding units costs about as much I/O as compaction, and much less than a rebuild; changing existing units is the expensive case.
+
+- *Adding units* (new clusters): their postings spread uniformly over hash space. Tier 2 is packed by hash range, so almost every range changes, which amounts to one sequential rewrite of tier 2 and the dense tier (~50 GB: minutes on HPC). Set ids deduplicated by set hash must be re-resolved for the k-mers that change.
+- *Changing existing units* (members added to an MGnify90 cluster): *p\_in* and the floor's choice of kept k-mers need every member's k-mers, and so the cluster's member sequences from the 1 TB release. That cost is high, which is why overlays keep the old *p\_in*.
+- *Global ripple:* a new k-mer raises `n_groups` for every unit that holds it, which changes scores, the promiscuity cut, and other units' floors. A strictly exact update recomputes all affected units, which in practice means a partitioned rebuild of those components.
+- *Removing* (masks): dropping postings needs the same tier-2 rewrite. A sidecar of masked hashes avoids it.
+
+So the index is treated like an LSM tree: an immutable base, small layers next to it (study indexes, decoy indexes, masks), and an occasional `compact` that merges them into a new base in one sequential pass. Layers come first because they cost nothing to the base and are easy to drop.
+
+### Options compared
+
+| Option | Kind | Handles | Cost | Weakness |
+| --- | --- | --- | --- | --- |
+| Upstream read removal (hostile or KneadData: bowtie2 or minimap2 against T2T-CHM13) | Subtract, per read | Host, PhiX | One alignment pass, but host-rich samples then hash 10–100× fewer reads | Needs the host genome. A sparse sketch cannot classify single reads, so read-level removal must happen upstream; this tool cannot replace it. |
+| Mask sidecar (host genome k-mers ∩ index) | Subtract, per k-mer | Host coding and non-coding reads, mitochondria, PhiX; also flags host-derived MGnify clusters | Build: one six-frame pass over the genome and one merge with tier 2. Query: one `isin` on sampled hashes | Drops microbial k-mers that coincide with host ones: ~10⁻⁵ of postings by chance at 20 letters and k = 11, more where proteins are truly conserved. At Murphy-10 and k = 11, ~2% by chance: use a proteome-only mask there. |
+| Decoy index (host or contaminant proteins) queried jointly | Compete | Coding reads of anything with a proteome (diet, chloroplast, fungi, a host without a genome) | A small index plus joint query | Catches only coding reads; host reads are ~98% non-coding. |
+| Study index queried jointly | Augment | MAGs, assembly gene calls | A small index plus joint query; no new code beyond step 1 | Duplicate units and `n_groups` approximations (table above) |
+| Overlay plus `compact` (old phase-10 design) | Augment | Same, exactly | Cluster assignment by alignment; compaction rewrites tier 2 | Most code; build only if joint queries fall short |
+| Rebuild a subset index including the study proteins | Augment | Biome subsets, development | A subset build (laptop to one node) | Not for the full release |
+| Post-hoc decontamination with negative controls (e.g. decontam on unit tables) | Subtract, statistical | Kit and reagent bacteria, which have no separate reference because they are in MGnify | None for the tool | Needs control samples; out of scope, but the output tables should stay usable for it |
+
+Recommended defaults:
+
+- **Host-rich samples** (biopsy, skin, oral, sputum): upstream removal in the Nextflow module, plus the human mask as a safety net.
+- **Everything else:** the human mask alone. It costs ~10⁻⁵ of postings and removes the ~0.3% per-k-mer chance hits of residual human reads.
+- **Decoys and study indexes:** opt-in.
+
+**Why the mask beats a host decoy for genomes.**
+
+- *Coverage of host reads.* The mask is built from the six-frame translation of the whole host genome, so it covers non-coding reads too: repeats, and the low-complexity peptides from translated LINE/Alu.
+- *Exactness.* It removes host-derived hits outright, instead of relying on the EM to give them to a decoy. Host variation leaves ~3% of host 11-mers off-reference (heterozygosity ~10⁻³/bp over 33 bp). Those k-mers hit the index at the ~0.3% chance rate, so ~10⁻⁴ of host k-mers still hit by chance.
+- *Flagging contaminated clusters.* The per-unit masked fraction flags MGnify90 clusters that come from host contigs gene-called as prokaryotes, a contamination of MGnify itself that no decoy would expose. Such units are reported as `host_like` rather than dropped.
+
+### Implementation plan
+
+Steps 1–2 are small Python changes needed for the phase-7 host ablation, because the result decides whether the release ships a human mask by default. The phase-8 spec and the Rust query must then include them. Steps 3–5 stay in phase 10.
+
+1. **Joint query (`query --extra-index DIR`, repeatable).**
+   - `Index.load` each index; error unless k, alphabet, hash scheme and seed match.
+   - Sample at the largest *t\_max*; look each hash up in every index whose *t\_max* admits it.
+   - Offset unit ids by the cumulative unit counts and join the unit tables (`m`, `pin_sum`, `m_dense`, `pin_sum_dense`, `max_hash_g`, labels) with an `index` column.
+   - Leave gather, EM, presence and posterior untouched: they already work on the joined hit table. The dense second pass runs per index.
+   - Tests:
+     - querying [base] and [base, unrelated] gives identical rows for base units;
+     - [A, B] equals one index built from A ∪ B when A and B share no k-mers;
+     - a scheme mismatch errors.
+2. **Mask sidecar (`mask GENOME.fa INDEX OUT`, `query --mask OUT`).**
+   - Cut the genome into overlapping windows (10 kb, overlap 3k − 1 nt) and run them through the existing read kernel with `frames="all"`. Keep hashes ≤ the index's *t\_max*, then sort and deduplicate (human: ~7×10⁸ sampled, ~3 GB of u64 while building, not kept).
+   - Look them up in tier 2 and the dense tier, and write `mask.npy` (masked hashes found in the index; expected MB).
+   - Write the per-unit decrements of `m`, `pin_sum`, `m_dense` and `pin_sum_dense` (from the masked postings' *p\_in*), and the masked fraction.
+   - At query, drop sampled hashes in the mask before lookup, subtract the decrements, and report units with masked fraction > 0.5 as `host_like`. Record the mask's source genome and checksum in the output `meta`.
+   - Release one human mask: T2T-CHM13 + rCRS chrM + PhiX174.
+   - Tests:
+     - an index built from proteins encoded in a fixture "genome" is fully masked by that genome;
+     - containment of unmasked units is unchanged;
+     - the decrements equal a rebuild that drops the masked hashes (when the floor is not involved).
+   - Fallback if the evaluation shows the mask costs too much: a build-time drop rule beside the promiscuity cut in `_select_postings` and the partitioned build, so floored units refill from other candidates.
+3. **Decoy role.** Add `role: decoy` in an index's `meta.json` (`index --role decoy`). Decoy units join gather and the EM but are left out of the unit and Pfam tables; one summary row per decoy index reports its hits and coverage. Build decoy indexes with the existing `index` command from a proteome clustered at 90% (or one unit per protein).
+4. **Study-index recipe** (Nextflow module, no tool code): contigs or MAGs → pyrodigal (meta mode) → MMseqs2 linclust at 90% → members Parquet, plus Pfam by `hmmsearch --cut_ga` with MGnify's Pfam release → `index` with the base's k, alphabet and seed → `query --extra-index`. Protein FASTA input skips the gene calling.
+5. **Overlay and `compact` (conditional).** Build only if step 4's evaluation shows duplicate units or `n_groups` approximations costing more than 2 points of completeness or purity against a rebuild. The design is unchanged from before:
+   - assign study proteins to existing MGnify90 clusters (dense-tier containment for candidates, then alignment to their representatives) and cluster the rest at 90%;
+   - build the new units under the base's rules, with `n_groups` probed from the base;
+   - keep *p\_in* of existing units, and use appendable unit ids;
+   - `compact` partition-rebuilds the affected components.
+
+**Constraints on earlier phases** (keep these possible; do not build for them):
+
+- Keep the per-unit build rules local to the unit (*t\_g*, floor, *p\_in*), with only `n_groups` and components global.
+- Record the base release, k, alphabet, hash scheme and seed in `meta.json`.
+- Keep unit ids appendable and the unit table separate from the hash tables.
 - Let the phase-6 Rust lookup probe more than one table and merge their hits.
+- Keep per-unit expected counts (`m`, `pin_sum` and the dense versions) as plain columns that a layer can adjust, not baked into the hash tables.
 
-**Evaluation.** Reuse the divergence ladder: hold genomes out of the index, add their proteins back as an overlay, and compare against a rebuild that includes them and against the base alone. Also check that adding unrelated proteins changes no base unit's profile.
+### Evaluation
+
+- **Host spike-in ladder** (phase 7):
+  - *Samples.* The fmh benchmark metagenomes mixed with simulated human reads (T2T-CHM13 plus chrM, InSilicoSeq with the same error model) at 0, 50, 90 and 99% host.
+  - *Arms.* No handling; upstream hostile; mask; human-proteome decoy; mask + decoy.
+  - *Metrics.* Pfam purity and completeness, false detections, `host_like` units detected, and query time.
+  - *Negative control.* The existing human-reads control should detect ~0 units with the mask.
+  - *Mask cost.* The fraction of postings masked, and the units losing > 10% of their kept k-mers (expected: conserved proteins such as EF-Tu, DnaK, GroEL, ATP synthase).
+- **Study ladder** (phase 10): on the divergence ladder, hold genomes out of the index and compare four arms: base alone; base + study index (joint query); overlay, if built; and a full rebuild that includes them. Also confirm that a joint query with an unrelated index leaves every base unit unchanged.
+- **Gate:**
+  - the mask removes ≥ 99% of false detections from 90% host reads at ≤ 0.1% loss of base-unit completeness;
+  - the joint query with a study index recovers ≥ 90% of the completeness gain of a rebuild;
+  - extending with one study (~10⁶ proteins) takes minutes on one node.
 
 ## Risks and open questions
 
@@ -1129,7 +1221,10 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 * **Shared k-mers and hierarchy.** EM at protein-cluster level, then aggregation to function, is likely better than EM directly on functions. Untested.
 * **Normalisation.** Which single-copy marker set, and whether to report per-genome copies by default.
 * **Frame filter at high GC.** Keeps \~3 frames at 70% GC; acceptable, but check false positives there specifically.
-* **Reference extension (phase 10).** Overlay approximations (*p\_in* of existing units not updated, *n\_groups* summed across tables) may bias scores for clusters that gain many members; `compact` bounds the drift. Assigning added proteins to MGnify90 clusters by alignment is the costliest part of `extend`.
+* **Additional references.**
+  * *Joint queries.* They inherit per-index `n_groups`, so promiscuity cuts and scores are only approximate across indexes, and duplicate units split coverage. The step-5 overlay is the fix, built only if measured to matter.
+  * *Human mask.* It removes truly conserved microbial k-mers, and with reduced alphabets ~2% of postings by chance; with reduced alphabets, mask with the host proteome only.
+  * *Host contamination in MGnify itself.* MGnify90 clusters from host contigs are flagged `host_like`, not removed; whether to drop them from the release is open.
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
 * **Open:** whether KO/eggNOG labels are worth the annotation run for users, or Pfam suffices. Benchmarking uses Pfam (see Benchmark labels), with KO only for the fmh-funprofiler comparison.
 
