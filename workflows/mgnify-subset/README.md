@@ -26,7 +26,8 @@ UNITS       all units numbered by cluster_rep; tier-2 layout and pack ranges
 PACK_RANGE  per pack range: keys and value sets                            (--ranges jobs)
 DEDUP       per set-hash range: distinct value sets                        (--ranges jobs)
 CONCAT      -> index/
-FETCH_READS one paired ENA run (--query_run)                                (--query true)
+FETCH_READS paired ENA run(s) (--query_run)                                 (--query true)
+POOL        several runs concatenated into one sample                  (two or more runs)
 LADDER      nested read subsets of it                                    (--query_ladder)
 QUERY       per subset x index: kmer-functional-profiler query --stats
 QUERY_COST  -> query_cost.tsv
@@ -136,8 +137,13 @@ of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 
 
 Profiles nested read subsets of one real metagenome against each index given, with
 the current query plus stage timers, to find which stages cost time and memory at scale.
-The default run is ERR7746321 (Hadza gut, ~140 bp pairs, 29 Gbp), which LADDER subsets
-to 0.01, 0.1, 0.4, 1.2, 4, 12 and 40 M pairs; each subset contains the smaller ones.
+The default run is ERR7738575 (human gut, NovaSeq, 111.5 M pairs = 223 M reads, 31 Gbp),
+which LADDER subsets to 0.01, 0.1, 0.4, 1.2, 4, 12, 40 and 100 M pairs (100 M pairs is
+200 M reads, about the deepest metagenome to expect); each subset contains the smaller
+ones. Several comma-separated runs are fetched and pooled into one sample in the order
+given, for depths and diversity beyond one run: e.g. `--query_run ERR7738575,ERR7746321`
+(two people's gut, 217.6 M pairs) with `--query_ladder ...,100000000,200000000`. Step 31
+of the plan used ERR7746321 (Hadza gut, 106 M pairs) up to 40 M pairs.
 
 ```bash
 nextflow run workflows/mgnify-subset -profile test               # builds results-test/1in*/index
@@ -151,7 +157,9 @@ Compute nodes without internet: run FETCH_READS on the head node
 the run and pass `--query_reads R1,R2`. Each QUERY writes `query/{index}.{pairs}.{draws}.json`
 (`kmer-functional-profiler query --stats`); `query_cost.tsv` has one row per query:
 the counts (reads, sampled and distinct sampled k-mers, hit k-mers, hit rows, (unit, hash)
-pairs, hit and detected units, component sizes) and `{stage}_wall_s`, `_cpu_s` and
+pairs, hit and detected units, component sizes; `fit_batches` and
+`fit_largest_batch_pairs` for the EM's batches of components, `em_iterations` and
+`em_unconverged_units` for its convergence) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
 the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
 `RssAnon` sampled every 50 ms) per stage. Queries that exceed
@@ -179,9 +187,9 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--cost_args` | `--n-min 4 8 16 --t-cap 0.05 0.2 --t-dense 0 0.02 0.1` | Parameter grid for COMBINE (also `--t-base`, `--max-groups`, `--sets`) |
 | `--query` | `false` | Query cost study (skips extraction unless `--index`, `--stats` or `--build`) |
 | `--query_indexes` | `''` | Index directories (glob), each named by its parent directory |
-| `--query_run` | `ERR7746321` | Paired ENA run to download |
+| `--query_run` | `ERR7738575` | Paired ENA run to download; comma-separated runs are pooled into one sample |
 | `--query_reads` | `''` | `R1,R2` local files instead of `--query_run` |
-| `--query_ladder` | `10000,100000,400000,1200000,4000000,12000000,40000000` | Nested subset sizes, in pairs |
+| `--query_ladder` | `10000,100000,400000,1200000,4000000,12000000,40000000,100000000` | Nested subset sizes, in pairs (each at most the run's pairs) |
 | `--query_seed` | `1` | Seed of the ladder's shuffle |
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
 | `--query_draws_on` | `1in100` | Index that also gets the posterior |

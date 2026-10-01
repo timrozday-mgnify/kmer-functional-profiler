@@ -255,6 +255,7 @@ def _fit_components(
     make_step: Callable[[_Block], Step],
     tol: float,
     max_iter: int,
+    report: dict[str, int] | None = None,
 ) -> np.ndarray:
     """Iterate an EM per component of units linked by shared k-mers (pairs of unit ``col``
     and k-mer ``row``); return each unit's expected hits at its last step.
@@ -305,6 +306,9 @@ def _fit_components(
         )
         moving = ~done[starts]
         active, seg = active[np.repeat(moving, seg)], seg[moving]
+    if report is not None:  # units still moving here stopped at max_iter, not converged
+        report["em_iterations"] = max(report.get("em_iterations", 0), it)
+        report["em_unconverged_units"] = report.get("em_unconverged_units", 0) + len(active)
     return attributed
 
 
@@ -390,6 +394,7 @@ def em(
     prior: tuple[float, float] | None = None,
     tol: float = 1e-8,
     max_iter: int = 1000,
+    report: dict[str, int] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -413,6 +418,9 @@ def em(
     ``prior`` (a, b >= 1) puts a Beta prior on ``present`` (see :func:`fit_present_prior`),
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
     or small ``m_g``; ``present`` is then updated by EM over the unhit k-mers' presence.
+
+    ``report`` collects ``em_iterations`` (the most any component took) and
+    ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over calls.
     """
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())
@@ -450,7 +458,7 @@ def em(
 
         return step
 
-    attributed = _fit_components(col, row, lam, pi, make_step, tol, max_iter)
+    attributed = _fit_components(col, row, lam, pi, make_step, tol, max_iter, report)
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0
     return pl.DataFrame(
@@ -1140,7 +1148,11 @@ def profile(
         def per_batch(fit: Callable[[pl.DataFrame], pl.DataFrame]) -> pl.DataFrame:
             return pl.concat([fit(part) for part in parts]).sort("unit")
 
-        plain = per_batch(lambda part: em(part, m_g)).select("unit", coverage_em="coverage")
+        counts["fit_batches"] = len(parts)
+        counts["fit_largest_batch_pairs"] = max(part.height for part in parts)
+        plain = per_batch(lambda part: em(part, m_g, report=counts)).select(
+            "unit", coverage_em="coverage"
+        )
     fits = [plain]
     if all_estimators or draws > 0:
         with timer("fit_zi"):

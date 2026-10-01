@@ -926,6 +926,18 @@ What each step did, and the choices, results and interpretations behind it, newe
     3. *Explain `presence`'s jump:* record its iterations and convergence at 12 M and 40 M; if it hits `max_iter`, find why before changing `tol` or the iteration.
     4. *Re-run the ladder with steps 27–30 and `draws` > 0* on the 40 M cell: the posterior's memory and time on real data (expected ~6–8 GB peak), and the fmh benchmark's interval calibration (`COPIES_ERROR`) re-checked after step 28's change to the draws.
 
+* **Phase 6, step 32 — the ladder to 200 M reads (ERR7738575), pooled runs beyond it, EM convergence counts.** A deep metagenome is ~200 M reads (100 M pairs), 2.5× step 31's top cell, and the EM has to hold up in more complex samples (more taxa and functions) than that.
+  - *Workflow:* `--query_run` defaults to ERR7738575 (human gut, NovaSeq, 111.5 M pairs = 223 M reads, 31 Gbp; ENA's `read_count` counts reads, ~139 bp each), and `--query_ladder` gains a 100 M-pair cell. Comma-separated runs are fetched and pooled (`POOL`: R1s and R2s concatenated in the given order) into one deeper, more diverse sample, e.g. ERR7738575 + ERR7746321 (two people's gut, 217.6 M pairs = 435 M reads) with a 200 M-pair cell. Checked by stub runs: one run, two runs (with `POOL`) and local reads (no fetch).
+  - *Counts:* `--stats` (and `query_cost.tsv`) gain `fit_batches`, `fit_largest_batch_pairs` (a component above `MAX_BATCH_PAIRS` is a batch of its own, so this is the largest component when it exceeds 2 M pairs), `em_iterations` (the most any component took) and `em_unconverged_units` (units of components stopped at `max_iter` = 1000, not converged) for the shipped EM. Tests: a component cut off at 3 iterations is reported; the fixture's fit converges in one batch.
+  - *What depth does to the EM (from step 31):* the largest component grew 5.4 K → 110 K units from 12 M to 40 M pairs (exponent ~2.5), while components overall grow ~0.4. Extrapolated: ~1 M units and ~3 M pairs at 100 M pairs, more in pooled or more diverse samples: a giant component may be forming (percolation). EM results do not depend on how components are batched, so this is cost and convergence, not correctness:
+    - *EM memory:* ~110–160 B per pair, so even a 10 M-pair component is ~1.5 GB. Safe.
+    - *EM convergence:* a giant component couples many units and may converge slowly; at `max_iter` its units keep their last values silently. `em_unconverged_units` now measures this.
+    - *Posterior:* ~1.6 KB per pair, and a component is never split, so a 3 M-pair component is ~5 GB in one batch, beyond `POSTERIOR_BATCH_BYTES`. The posterior is the stage depth puts at risk.
+  - *Run:* `--query_run ERR7738575` (default) to 100 M pairs, `draws` 0 on `full-build`; then the pooled sample to 200 M pairs. Read `largest_component_*`, `fit_largest_batch_pairs`, `em_iterations`, `em_unconverged_units`, `peak_anon` and stage times per cell.
+  - *If the giant component appears:* first find what links it. Fingerprint false hits and sequencing-error k-mers link unrelated units at random, which would grow with depth as observed; conserved motifs below the 64-cluster promiscuity cut would not. Count the linking k-mers by hits and holders before changing anything.
+  - *If EM stops at `max_iter`:* accelerate the fixed point (SQUAREM), which reaches the same fixed point in fewer iterations, rather than raising `max_iter`.
+  - *If the posterior's giant batch is too large:* its Gibbs sweeps need only one k-mer's holders at a time, so the per-pair arrays can be streamed in k-mer blocks inside the batch.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
