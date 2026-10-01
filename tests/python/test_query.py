@@ -521,12 +521,27 @@ def test_posterior_component_alone_or_batched(monkeypatch: pytest.MonkeyPatch) -
     assert both.filter(pl.col("unit") < 2).equals(alone)
 
 
+def test_em_reports_unconverged_components() -> None:
+    # Two units sharing every k-mer split them slowly; with 3 iterations both are cut off.
+    kmers = pl.DataFrame(
+        {"unit": [0, 0, 1, 1, 2], "hash": [1, 2, 1, 2, 3], "hits": [5, 7, 5, 7, 4]},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32},
+    )
+    report: dict[str, int] = {}
+    em(kmers, np.array([4, 6, 2]), max_iter=3, report=report)
+    assert report == {"em_iterations": 3, "em_unconverged_units": 2}
+    em(kmers, np.array([4, 6, 2]), report=report)
+    assert report["em_unconverged_units"] == 2 and report["em_iterations"] > 3
+
+
 def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # One component per batch: every fit gives what it gives on all units at once.
     indexes = [build(shared, t_base=0.2, n_min=0), build(shared, t_base=0.2, n_min=0, t_dense=1.0)]
     timer = Timer()
     profile(indexes[0], *READS, timer=timer)
     assert timer.counts["components"] < timer.counts["hit_units"]
+    assert timer.counts["fit_batches"] == 1 and timer.counts["em_unconverged_units"] == 0
+    assert 0 < timer.counts["em_iterations"] <= 1000
     whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
     monkeypatch.setattr(query, "MAX_BATCH_PAIRS", 1)
     for index, expected in zip(indexes, whole, strict=True):

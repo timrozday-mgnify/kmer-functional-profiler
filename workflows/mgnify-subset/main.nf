@@ -362,7 +362,7 @@ process FETCH_READS {
     val run
 
     output:
-    tuple path("${run}_1.fastq.gz"), path("${run}_2.fastq.gz")
+    tuple val(run), path("${run}_1.fastq.gz"), path("${run}_2.fastq.gz")
 
     script:
     """
@@ -376,6 +376,23 @@ process FETCH_READS {
 
     stub:
     "touch ${run}_1.fastq.gz ${run}_2.fastq.gz"
+}
+
+process POOL {
+    input:
+    tuple path(r1s, stageAs: 'r1/*'), path(r2s, stageAs: 'r2/*')
+
+    output:
+    tuple path('pooled_1.fastq.gz'), path('pooled_2.fastq.gz')
+
+    script:  // concatenated gzip members are one gzip stream; mates stay in the same order
+    """
+    cat ${r1s.join(' ')} > pooled_1.fastq.gz
+    cat ${r2s.join(' ')} > pooled_2.fastq.gz
+    """
+
+    stub:
+    "touch pooled_1.fastq.gz pooled_2.fastq.gz"
 }
 
 process LADDER {
@@ -516,9 +533,19 @@ workflow {
         if (!params.query_indexes) {
             error "--query needs --query_indexes, e.g. 'cost-nested/1in*/index'"
         }
-        ch_run = params.query_reads
-            ? channel.of(params.query_reads.toString().tokenize(',').collect { f -> file(f, checkIfExists: true) })
-            : FETCH_READS(params.query_run)
+        def ch_run
+        def local_reads = params.query_reads.toString() in ['', 'true', 'false'] ? '' : params.query_reads.toString()  // CLI passes strings
+        if (local_reads) {
+            ch_run = channel.of(local_reads.tokenize(',').collect { f -> file(f, checkIfExists: true) })
+        } else {
+            // Several runs are pooled (one deeper, more diverse sample), in the order given.
+            def runs = params.query_run.toString().tokenize(',')
+            def ch_fetched = FETCH_READS(channel.fromList(runs))
+                .toSortedList { a, b -> runs.indexOf(a[0]) <=> runs.indexOf(b[0]) }
+            ch_run = runs.size() == 1
+                ? ch_fetched.map { l -> l[0][1..2] }
+                : POOL(ch_fetched.map { l -> [l.collect { r -> r[1] }, l.collect { r -> r[2] }] })
+        }
         ch_reads = LADDER(ch_run).flatten()
             .map { f -> [(f.name =~ /reads\.(\d+)_/)[0][1] as long, f] }
             .groupTuple(size: 2)
