@@ -146,6 +146,15 @@ mapping; MetaPhlAn vOct22_202403).
 | `--humann4_container` | `kfp-humann4:e07b3a3` | HUMAnN 4 image, as above |
 | `--metaphlan_index` | `mpa_vJun23_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN 3.9 (MetaPhlAn 4.1.1) |
 | `--humann4_metaphlan_index` | `mpa_vOct22_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN 4 (the one it checks for) |
+| `--labels` | `ko,pfam` | Labels scored (see [Pfam](#pfam)) |
+| `--pfam_url`, `--pfam_hmm`, `--pfam_threshold`, `--pfam_chunks` | current release, `''`, `--cut_ga`, `64` | Pfam-A source (or a local file), hmmsearch inclusion, hmmsearch jobs |
+| `--mgnify_indexes` | `[]` | `[name:, path:]` maps of Pfam-labelled indexes, profiles summed per Pfam (config file only) |
+| `--query_arms` | one plain arm | `[name:, args:, reads:, mask:, decoy:]` maps (config file only; see [Ablations](#ablations)) |
+| `--host_fractions` | `0` | Host share of read pairs, comma-separated, e.g. `0,0.5,0.9,0.99` |
+| `--host_genome_url`, `--host_extra_url` | T2T-CHM13v2.0; rCRS chrM + PhiX174 (NCBI) | Host genome for spike-in reads and masks |
+| `--decoy_proteome_url` | UniProt UP000005640 (human) | Proteome of the decoy index, one unit per protein |
+| `--hostile_index` | `human-t2t-hla` | hostile's bowtie2 index |
+| `--fastp_args` | `''` | Extra fastp options (always `--trim_poly_g`) |
 
 Defaults compare, at k = 11: fmh-funprofiler's sketches (scaled 1000); our index at the
 same base rate without and with the per-KO floor (`--n-min 8`); and our index at 10x
@@ -201,6 +210,50 @@ genome, and its depth is the sum over those domains of aligned bases / domain le
 `summary.tsv` and `scores.tsv` gain a `label` column (`ko`, `pfam`). Set `--pfam_url` to the
 Pfam release MGnify's `mgy_proteins_pfam` used, so the labels match (default: current
 release). Other tools are scored on KO only, for now.
+
+## Ablations
+
+Phase 7 measures each change against the phase-6 method on this benchmark (plan, phase 7).
+Three runs, each a config in `ablations/` on top of the site's `hpc.config`, with its own
+output and work directory, so they can run at once:
+
+```bash
+sbatch workflows/fmh-benchmark/run_ablations.sh index /shared/kfp-ablations/index
+sbatch workflows/fmh-benchmark/run_ablations.sh reads /shared/kfp-ablations/reads-novaseq
+sbatch workflows/fmh-benchmark/run_ablations.sh reads /shared/kfp-ablations/reads-miseq --iss_model miseq
+sbatch workflows/fmh-benchmark/run_ablations.sh host  /shared/kfp-ablations/host
+```
+
+| Run | Arms | Profiles (10 seeds) |
+| --- | --- | --- |
+| `index` | Base (k 11, 20 letters, *t_base* 1/1000, *n_min* 8) and one change each: *n_min* 0/4/16, *t_base* 1/100, dense tier 0.05/0.1/0.2, k 9/10/12, Murphy-10 k 13/15, Dayhoff k 17/20. Built per label (KO and Pfam units). | 31 indexes × 10 |
+| `reads` | On the base and *t_base* 1/100 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model. | 5 indexes × 11 arms × 10 |
+| `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy | 4 shares × (3 × 2 + 2 × 3) × 10 |
+
+Every profile is queried with `--all-estimators`, so the estimator ablations (EM against
+gather, winner-take-all and uniqueness-first; zero inflation; *p_in* weighting) are the
+`abundance` rows of the same `summary.tsv`. Read the results from `summary.tsv` and
+`scores.tsv`, grouped by `label`, `index` and `arm`, at `min_hits` 1 and the shipped pair
+(`kmers_unique`, `abundance_zi`), Pfam first:
+
+- *every arm:* `purity`, `completeness`, `completeness_low25`, `l1`, `spearman_tp`,
+  `ci_cover`; cost per arm from `bench.py cost <outdir>/trace.tsv` (PROFILE rows are named
+  `index~arm`);
+- *index:* also `split_l1` (within-component share error, weighted by true depth) and
+  `group_size_mean` (ambiguity groups), which the function × taxon table depends on;
+- *host:* also `n_pred - tp` (false detections) and `host_like_detected` per share and arm,
+  and the mask's cost in `masks/<index>.json` (masked hashes and postings).
+
+The host samples have ids `<seed>h<percent>` (e.g. `seed3h90`); their truth is recomputed on
+the mixed reads, so it counts only the microbial reads kept. Masks and decoys exist only for
+the indexes built in the run (not `fmh_compat` or `--mgnify_indexes`). Locally,
+`-profile test,docker -c <arms config>` runs every arm on the mini fixture (a 60 kb random
+"host" and the fixture proteins as decoy) in a few minutes; hostile needs its ~4 GB index, so
+leave it out there.
+
+Not here: the divergence ladder and containment-AAI calibration (truth needs held-out
+genomes with relatives at known identity; the simulation benchmark has them), and the
+other tools on Pfam.
 
 ## Other tools
 

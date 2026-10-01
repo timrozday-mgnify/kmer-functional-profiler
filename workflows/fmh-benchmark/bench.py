@@ -36,13 +36,15 @@
 """
 
 import argparse
+import gzip
 import itertools
 import json
 import random
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from typing import IO
 
 import mappy
 import numpy as np
@@ -54,10 +56,15 @@ GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_positio
                   "end_position": pl.Int64, "strand": pl.String}  # fmt: skip
 
 
+def _open(path: str | Path) -> IO[str]:
+    """A text file, gzip-compressed if its name ends in .gz."""
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)  # noqa: SIM115
+
+
 def fasta(path: str | Path) -> Iterator[tuple[str, str]]:
     """(header, sequence) records; headers keep everything after ``>``."""
     header, chunks = None, []
-    with open(path) as f:
+    with _open(path) as f:
         for line in f:
             if line.startswith(">"):
                 if header is not None:
@@ -233,6 +240,71 @@ def read_profile(path: str | Path) -> pl.DataFrame:
                          for c in profile.columns if c not in strings})  # fmt: skip
 
 
+def mix(args: argparse.Namespace) -> None:
+    """A host spike-in sample at constant depth: each microbial pair kept with probability
+    1 - ``fraction``, then host pairs, ``fraction`` x the microbial pairs, from the start of
+    the host reads. Truth is recomputed on the mixed reads (host reads map to no genome)."""
+    rng = random.Random(args.seed)
+    n = 0
+    with (
+        gzip.open(args.r1, "rt") as m1, gzip.open(args.r2, "rt") as m2,
+        gzip.open("mixed_R1.fastq.gz", "wt", compresslevel=1) as o1,
+        gzip.open("mixed_R2.fastq.gz", "wt", compresslevel=1) as o2,
+    ):  # fmt: skip
+        for rec1, rec2 in zip(_records(m1), _records(m2), strict=True):
+            n += 1
+            if rng.random() >= args.fraction:
+                o1.write(rec1)
+                o2.write(rec2)
+        want = round(n * args.fraction)
+        with gzip.open(args.host_r1, "rt") as h1, gzip.open(args.host_r2, "rt") as h2:
+            got = 0
+            for rec1, rec2 in itertools.islice(zip(_records(h1), _records(h2), strict=True), want):
+                o1.write(rec1)
+                o2.write(rec2)
+                got += 1
+    if got < want:
+        raise ValueError(f"{got} host pairs, {want} wanted: simulate more host reads")
+
+
+def _records(f: Iterable[str]) -> Iterator[str]:
+    """FASTQ records (four lines each) as strings."""
+    lines = iter(f)
+    for header in lines:
+        yield header + next(lines) + next(lines) + next(lines)
+
+
+def host_abundance(args: argparse.Namespace) -> None:
+    """iss abundance file for a host genome: reads in proportion to record length, the
+    mitochondrion at ``--mito-copies`` copies and PhiX at ``--phix`` of the reads."""
+    lengths: dict[str, int] = {}
+    with _open(args.fasta) as f:
+        name = None
+        for line in f:
+            if line.startswith(">"):
+                name = line[1:].split()[0]
+                lengths[name] = 0
+            elif name is not None:
+                lengths[name] += len(line.strip())
+    weight = {n: n_bp * (args.mito_copies if n in MITO else 1) for n, n_bp in lengths.items()
+              if n not in PHIX}  # fmt: skip
+    total = sum(weight.values())
+    rows = [(n, (1 - args.phix) * w / total) for n, w in weight.items()]
+    rows += [(n, args.phix) for n in lengths if n in PHIX]
+    Path(args.out).write_text("".join(f"{n}\t{a}\n" for n, a in rows))
+
+
+MITO = {"chrM", "NC_012920.1"}
+PHIX = {"NC_001422.1"}
+
+
+def decoy_members(args: argparse.Namespace) -> None:
+    """A proteome as a members table, one unit per protein (decoy indexes)."""
+    rows = [(i, i, True, seq) for i, (_, seq) in enumerate(fasta(args.faa))]
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(args.out)
+
+
 def read_truth(path: str | Path) -> pl.DataFrame:
     """A truth table, with ``label`` (truth files before Pfam called it ``ko_id``)."""
     return pl.read_csv(path).rename({"ko_id": "label"}, strict=False)
@@ -372,6 +444,44 @@ def presence_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, fl
     return out
 
 
+def split_scores(
+    truth: pl.DataFrame, detected: pl.DataFrame, abundance: str | None
+) -> dict[str, float | None]:
+    """How the detected units' abundance is split within components (phase 7: k, alphabet).
+
+    ``split_l1``: per component with two or more detected units, the L1 between the
+    estimate's and the truth's shares of the component (0 to 2), averaged with the
+    component's true depth as weight; components with no true depth are left out.
+    ``group_size_mean``: mean ambiguity-group size of the detected units.
+    ``host_like_detected``: detected units flagged ``host_like`` (host mask arms).
+    """
+    out: dict[str, float | None] = dict.fromkeys(
+        ("split_l1", "group_size_mean", "host_like_detected")
+    )
+    if "host_like" in detected.columns:
+        out["host_like_detected"] = float(detected["host_like"].cast(pl.Boolean).sum())
+    if "group_size" in detected.columns and abundance == "abundance_zi":
+        out["group_size_mean"] = detected["group_size"].mean()  # type: ignore[assignment]
+    if not abundance or "component" not in detected.columns:
+        return out
+    units = (
+        detected.select("component", "name", estimate=abundance)
+        .join(truth.select(name="label", depth="depth"), on="name", how="left")
+        .with_columns(pl.col("depth").fill_null(0.0))
+        .filter(pl.len().over("component") >= 2)
+    )
+    share = lambda c: pl.col(c) / pl.col(c).sum().over("component")  # noqa: E731
+    per = (
+        units.filter((pl.col("depth").sum() > 0).over("component"))
+        .filter((pl.col("estimate").sum() > 0).over("component"))
+        .group_by("component")
+        .agg(l1=(share("estimate") - share("depth")).abs().sum(), weight=pl.col("depth").sum())
+    )
+    if per.height:
+        out["split_l1"] = float((per["l1"] * per["weight"]).sum() / per["weight"].sum())
+    return out
+
+
 def interval_scores(tp: pl.DataFrame) -> dict[str, float | None]:
     if "lo" not in tp.columns or tp.height == 0:
         return {"ci_cover": None, "ci_width": None}
@@ -439,6 +549,7 @@ def score(args: argparse.Namespace) -> None:
                     if abundance == "abundance_zi"
                     else dict.fromkeys(("prob_tp", "prob_fp", "flag_tp", "flag_fp"))
                 ),
+                **split_scores(truth, detected, abundance),
             }
         )
     pl.DataFrame(rows).write_csv(args.out, separator="\t")
@@ -704,6 +815,19 @@ def main() -> None:
     p.add_argument("--profile", required=True)
     p.add_argument("--unit-pfam", required=True)
     p.add_argument("--out", default="pfam_profile.tsv")
+    p = sub.add_parser("mix")
+    for name in ("r1", "r2", "host-r1", "host-r2"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, required=True, help="host share of read pairs")
+    p.add_argument("--seed", type=int, default=0)
+    p = sub.add_parser("host-abundance")
+    p.add_argument("--fasta", required=True)
+    p.add_argument("--mito-copies", type=float, default=100)
+    p.add_argument("--phix", type=float, default=0.005, help="share of host reads")
+    p.add_argument("--out", default="abundance.txt")
+    p = sub.add_parser("decoy-members")
+    p.add_argument("--faa", required=True)
+    p.add_argument("--out", default="decoy_members.parquet")
     p = sub.add_parser("cost")
     p.add_argument("trace")
     p.add_argument("--out", default="cost.tsv")
@@ -714,7 +838,8 @@ def main() -> None:
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
              "cost": cost, "pfam-proteins": pfam_proteins, "pfam-domains": pfam_domains,
-             "pfam-profile": pfam_profile}  # fmt: skip
+             "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
+             "decoy-members": decoy_members}  # fmt: skip
     steps[args.step](args)
 
 

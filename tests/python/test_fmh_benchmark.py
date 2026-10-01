@@ -1,5 +1,6 @@
 """The fmh-benchmark steps on the mini fixture, with reads from known positions."""
 
+import gzip
 import math
 import random
 import shutil
@@ -241,3 +242,57 @@ def test_pfam_domains_truth_and_profile(tmp_path: Path) -> None:
     run(tmp_path, "pfam-profile", "--profile", "u.tsv", "--unit-pfam", "up.parquet")
     got = pl.read_csv(tmp_path / "pfam_profile.tsv", separator="\t")
     assert got["name"].to_list() == ["PF00042", "PF01007"]
+
+
+def test_mix_host_abundance_and_decoy(tmp_path: Path) -> None:
+    def pairs(prefix: str, n: int) -> None:
+        for mate in (1, 2):
+            with gzip.open(tmp_path / f"{prefix}_R{mate}.fastq.gz", "wt") as f:
+                f.writelines(f"@{prefix}{i}/{mate}\nACGT\n+\nIIII\n" for i in range(n))
+
+    pairs("m", 1000)
+    pairs("h", 950)
+    reads = ["--r1", "m_R1.fastq.gz", "--r2", "m_R2.fastq.gz", "--host-r1", "h_R1.fastq.gz",
+             "--host-r2", "h_R2.fastq.gz"]  # fmt: skip
+    run(tmp_path, "mix", *reads, "--fraction", "0.9", "--seed", "1")
+    texts = [gzip.decompress((tmp_path / f"mixed_R{m}.fastq.gz").read_bytes()) for m in (1, 2)]
+    names = [t.decode().splitlines()[::4] for t in texts]
+    assert [n[:-2] for n in names[0]] == [n[:-2] for n in names[1]]  # mates stay paired
+    host = sum(n.startswith("@h") for n in names[0])
+    assert host == 900 and 60 < len(names[0]) - host < 140  # ~100 microbial pairs kept
+    with pytest.raises(subprocess.CalledProcessError):  # too few host reads for 99%
+        run(tmp_path, "mix", *reads, "--fraction", "0.99")
+
+    with gzip.open(tmp_path / "host.fa.gz", "wt") as f:
+        f.write(">chr1 x\n" + "A" * 900 + "\n>chrM\n" + "A" * 10 + "\n>NC_001422.1\nAAAA\n")
+    run(tmp_path, "host-abundance", "--fasta", "host.fa.gz", "--mito-copies", "10")
+    got = dict(line.split("\t") for line in (tmp_path / "abundance.txt").read_text().splitlines())
+    assert float(got["chr1"]) == pytest.approx(0.995 * 0.9)
+    assert float(got["chrM"]) == pytest.approx(0.995 * 0.1)
+    assert float(got["NC_001422.1"]) == pytest.approx(0.005)
+
+    (tmp_path / "p.faa").write_text(">sp|P1|A\nMKV\nLL\n>sp|P2|B\nMAA\n")
+    run(tmp_path, "decoy-members", "--faa", "p.faa")
+    decoy = pl.read_parquet(tmp_path / "decoy_members.parquet")
+    assert decoy["sequence"].to_list() == ["MKVLL", "MAA"] and decoy["cluster_rep"].n_unique() == 2
+
+
+def test_split_scores() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    truth = pl.DataFrame({"label": ["a", "b", "c"], "depth": [3.0, 1.0, 5.0]})
+    detected = pl.DataFrame(
+        {
+            "name": ["a", "b", "c", "x", "y"],
+            "component": [0, 0, 1, 2, 2],  # c alone; x, y have no truth
+            "abundance_zi": [2.0, 2.0, 7.0, 1.0, 1.0],
+            "group_size": [2, 2, 1, 1, 1],
+            "host_like": [False, False, False, True, False],
+        }
+    )
+    got = bench.split_scores(truth, detected, "abundance_zi")
+    # Component 0: shares (0.5, 0.5) against (0.75, 0.25)
+    assert got["split_l1"] == pytest.approx(0.5)
+    assert got["group_size_mean"] == pytest.approx(1.4)
+    assert got["host_like_detected"] == 1

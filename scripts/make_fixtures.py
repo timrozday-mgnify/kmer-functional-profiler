@@ -240,8 +240,30 @@ def mini_pfam(rng: random.Random) -> None:
     (OUT / "mini_fmh" / "Pfam-mini.hmm").write_text("".join(hmms))
 
 
+def mini_host(rng: random.Random) -> None:
+    """A stand-in host for the fmh-benchmark test profile: 60 kb of random DNA (two
+    chromosomes) gzipped, the extra records (``chrM``, PhiX) plain, and the fixture proteins
+    gzipped as a decoy proteome."""
+    out = OUT / "mini_fmh"
+    chroms = "".join(f">chr{i}\n{''.join(rng.choices('ACGT', k=30_000))}\n" for i in (1, 2))
+    extra = f">NC_012920.1 mito\n{''.join(rng.choices('ACGT', k=2_000))}\n" + (
+        f">NC_001422.1 phiX\n{''.join(rng.choices('ACGT', k=1_000))}\n"
+    )
+    for name, text in (
+        ("host_mini.fa.gz", chroms),
+        ("decoy_mini.faa.gz", (OUT / "proteins.faa").read_text()),
+    ):
+        with (
+            (out / name).open("wb") as f,
+            gzip.GzipFile(filename="", mode="wb", fileobj=f, mtime=0) as gz,
+        ):
+            gz.write(text.encode())
+    (out / "host_extra.fa").write_text(extra)
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
     mini_fmh(random.Random(20260930))
     mini_pfam(random.Random(20261001))
+    mini_host(random.Random(20261002))
