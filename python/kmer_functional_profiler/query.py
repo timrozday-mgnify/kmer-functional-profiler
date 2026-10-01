@@ -574,6 +574,7 @@ def presence(
     clump: float = CLUMP,
     max_iter: int = 500,
     tol: float = 1e-9,
+    report: dict[str, int] | None = None,
 ) -> pl.DataFrame:
     """Probability that each unit gather keeps is present rather than hit by background.
 
@@ -594,6 +595,9 @@ def presence(
     so fits collapse to no background or to everything being background). Scaling by
     t_g rather than m_g matches the fmh benchmark, where false positives are small,
     often floored, KOs.
+
+    ``report`` gets ``presence_iterations`` and ``presence_converged`` (0 when stopped at
+    ``max_iter``).
     """
     per_unit = (
         own.group_by("unit")
@@ -614,21 +618,16 @@ def presence(
         0.0,
     )
     prob = np.ones(len(units))
-    for i in range(max_iter):
+    it, done = 0, False
+    while not done and it < max_iter:
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
         new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
         done = np.abs(new - prob).max(initial=0) <= tol
         prob = new
-        if done:
-            print(f"presence converged in {i + 1} iterations", file=sys.stderr, flush=True)
-            break
-    else:
-        print(
-            f"presence failed to converge in {max_iter} iterations, "
-            f"max change {np.abs(new - prob).max(initial=0):.2e}",
-            file=sys.stderr,
-            flush=True,
-        )
+        it += 1
+    if report is not None:
+        report["presence_iterations"] = it
+        report["presence_converged"] = int(done)
     return pl.DataFrame(
         {"unit": units, "present_prob": prob},
         schema={"unit": pl.UInt32, "present_prob": pl.Float64},
@@ -1123,7 +1122,7 @@ def profile(
         .select("unit", "hash", "holders")
     )
     with timer("presence"):
-        present_prob = presence(own, t_g, n_reads, index.units.height)
+        present_prob = presence(own, t_g, n_reads, index.units.height, report=counts)
     del own
     dense = index.dense
     if dense is not None:

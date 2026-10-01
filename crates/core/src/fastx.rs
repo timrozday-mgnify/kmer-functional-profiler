@@ -7,17 +7,18 @@ use needletail::parse_fastx_file;
 
 use crate::{DnaScanner, Error, Hits, KmerParams, threads};
 
+/// A batch's concatenated sequences, the end of each, and its reads (pairs).
+type BatchResult = Result<(Vec<u8>, Vec<usize>, usize), Error>;
+
 /// Streams FASTA/FASTQ (plain, gzip or zstd; single or paired) as batches of k-mer hits.
 ///
 /// Each item holds the hits of up to `batch_reads` reads (pairs). A batch can be empty
 /// when none of its reads had a sampled k-mer; [`FastxHits::n_reads`] counts all reads.
 /// A batch's records are read on one thread and scanned on all, in contiguous runs of
 /// reads joined in order, so hits come in input order at any thread count.
-pub type BatchResult = Result<(Vec<u8>, Vec<usize>, usize), Error>;
-
 pub struct FastxHits {
     rx: Receiver<BatchResult>,
-    _reader_thread: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
     scanner: DnaScanner,
     mates: u8,
     n_reads: u64,
@@ -51,7 +52,9 @@ impl FastxHits {
 
         let (tx, rx) = mpsc::sync_channel(2);
 
-        let reader_thread = thread::spawn(move || {
+        // ponytail: mates are paired by position only; read IDs are not compared.
+        // Reading and decompression run one batch ahead of the scan, on their own thread.
+        let reader = thread::spawn(move || {
             loop {
                 let mut seqs = Vec::new();
                 let mut ends = Vec::new();
@@ -108,7 +111,7 @@ impl FastxHits {
 
         Ok(Self {
             rx,
-            _reader_thread: Some(reader_thread),
+            reader: Some(reader),
             scanner: DnaScanner::new(params),
             mates,
             n_reads: 0,
@@ -125,7 +128,14 @@ impl FastxHits {
         let (seqs, ends, n) = match self.rx.recv() {
             Ok(Ok(batch)) => batch,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                // Disconnected: the reader finished, or panicked, which must not pass as
+                // end of input.
+                if let Some(Err(panic)) = self.reader.take().map(JoinHandle::join) {
+                    std::panic::resume_unwind(panic);
+                }
+                return Ok(None);
+            }
         };
 
         let mates = self.mates as usize;

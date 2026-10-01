@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner
 
-from kmer_functional_profiler import reference
+from kmer_functional_profiler import index, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
 
@@ -199,3 +199,12 @@ def test_packed_table_layout_is_compact() -> None:
     assert 2 <= len(hashes) / 2**table.bucket_bits <= 4
     assert table.set_values.dtype == np.uint16
     assert table.nbytes() / len(hashes) < 10
+
+
+def test_madvise_random_reaches_memory_mapped_arrays(tmp_path: Path) -> None:
+    # The hook acts only when a loaded array's base is the mmap; a numpy change there
+    # would skip it silently.
+    np.save(tmp_path / "a.npy", np.arange(10))
+    mapped = np.load(tmp_path / "a.npy", mmap_mode="r")
+    assert isinstance(mapped.base, index.mmap.mmap)
+    assert index._madvise_random(mapped) is mapped

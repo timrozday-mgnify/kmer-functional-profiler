@@ -467,6 +467,11 @@ def test_presence_doubts_few_and_shared_hits() -> None:
     # Ten times fewer reads: less background, so one k-mer is more credible.
     fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
     assert fewer[400] > unique
+    report: dict[str, int] = {}
+    presence(own, t_g, 3_000_000, 2000, report=report)
+    assert report["presence_converged"] == 1 and 1 < report["presence_iterations"] < 500
+    presence(own, t_g, 3_000_000, 2000, max_iter=1, report=report)
+    assert report == {"presence_iterations": 1, "presence_converged": 0}
 
 
 def by_hash(hit_reads: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -542,6 +547,7 @@ def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.Monk
     assert timer.counts["components"] < timer.counts["hit_units"]
     assert timer.counts["fit_batches"] == 1 and timer.counts["em_unconverged_units"] == 0
     assert 0 < timer.counts["em_iterations"] <= 1000
+    assert timer.counts["presence_converged"] == 1
     whole = [profile(i, *READS, all_estimators=True, draws=3) for i in indexes]
     monkeypatch.setattr(query, "MAX_BATCH_PAIRS", 1)
     for index, expected in zip(indexes, whole, strict=True):
