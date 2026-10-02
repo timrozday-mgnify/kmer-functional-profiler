@@ -1620,15 +1620,6 @@ def profile(
         hit_info = joint.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
         if mask is not None:
             hit_info = mask.adjust(hit_info)
-        # k-mers seen only in fragment members have p_in 0, so a unit whose kept k-mers are all
-        # such had pin_sum 0 and infinite copies. Read level 0 as em_pin does (PIN_P[0]).
-        # ponytail: adds PIN_P[0] to level-0 k-mers whose p_in was already in (0, PIN_P[0]),
-        # an overcount of at most 1/30 each; exact needs the build to floor p_in.
-        hit_info = hit_info.with_columns(
-            pl.col(f"pin_sum{s}") + pl.col(f"pin_hist{s}").arr.first() * PIN_P[0]
-            for s in ("", "_dense")
-            if f"pin_sum{s}" in hit_info.columns
-        )
     with timer("components"):
         component = component_labels(kmer_hits)
         if record:
