@@ -609,6 +609,11 @@ def _t_g(params: IndexParams) -> pl.Expr:
     )
 
 
+def _max_hash_dense(params: IndexParams) -> pl.Expr:
+    """Per-unit dense-tier threshold: max(``t_dense``, ``t_g``), as a hash."""
+    return pl.col("max_hash_g").clip(lower_bound=_core.max_hash(params.t_dense))
+
+
 def _n_kmers(batches: list[pl.DataFrame], params: IndexParams) -> pl.DataFrame:
     """Distinct k-mers per unit (all k-mers hashed, only counts kept; units are contiguous)."""
     return pl.concat(
@@ -772,11 +777,9 @@ def build_index(
     if params.t_dense > 0:
         # Pass 4: every unit's k-mers at max(t_dense, t_g), so the dense set of each unit
         # contains its tier-2 set, with p_in, minus promiscuous ones.
-        units = units.with_columns(
-            max_hash_dense=pl.col("max_hash_g").clip(lower_bound=_core.max_hash(params.t_dense))
-        )
+        units = units.with_columns(max_hash_dense=_max_hash_dense(params))
         dense_hash = int(units["max_hash_dense"].max())  # type: ignore[arg-type]
-        dense = (
+        dense = dense_rows(
             pl.concat(
                 [
                     _kmers(b, params, dense_hash)
@@ -784,17 +787,9 @@ def build_index(
                     .agg(c=pl.col("counts").sum())
                     for b in batches
                 ]
-            )
-            .filter(pl.len().over("hash") <= params.max_groups)
-            .join(units.select("unit", "n_counting", "max_hash_dense"), on="unit")
-            .filter(pl.col("hash") <= pl.col("max_hash_dense"))
-            .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
-            .select(
-                "hash",
-                "unit",
-                "p_in",
-                pin_q=(pl.col("p_in") * (2**PIN_BITS - 1)).round().cast(pl.UInt64),
-            )
+            ).with_columns(n_groups=pl.len().over("hash")),
+            units,
+            params,
         )
         units = units.join(
             _len_cv(batches, params, dense.select("unit", "hash"), members).rename(
@@ -905,6 +900,43 @@ def unit_columns(units: pl.DataFrame, postings: pl.DataFrame) -> pl.DataFrame:
     ).with_columns(pl.col("m_g").fill_null(0))
 
 
+def dense_columns(units: pl.DataFrame, dense: pl.DataFrame) -> pl.DataFrame:
+    """Add ``m_dense``, ``pin_hist_dense``, ``pin_sum_dense`` and a filled f32
+    ``len_cv_dense`` to ``units`` (``unit`` 0..n-1) from their ``dense`` rows."""
+    return units.join(
+        dense.group_by("unit").agg(m_dense=pl.len().cast(pl.UInt32)),
+        on="unit",
+        how="left",
+        maintain_order="left",
+    ).with_columns(
+        pl.col("m_dense").fill_null(0),
+        pl.col("len_cv_dense").fill_null(0.0).cast(pl.Float32),
+        pin_hist_dense=_pin_hist(dense, units.height),
+        pin_sum_dense=_pin_sum(dense, units.height),
+    )
+
+
+def dense_rows(presence: pl.DataFrame, units: pl.DataFrame, params: IndexParams) -> pl.DataFrame:
+    """Dense-tier rows (``hash``, ``unit``, ``p_in``, ``pin_q``): every (unit, k-mer) of
+    ``presence`` with hash <= the unit's ``max_hash_dense``, minus promiscuous k-mers.
+
+    ``presence`` has ``hash``, ``unit``, ``c`` and ``n_groups`` (units holding the k-mer)
+    for at least those rows.
+    """
+    return (
+        presence.filter(pl.col("n_groups") <= params.max_groups)
+        .join(units.select("unit", "n_counting", "max_hash_dense"), on="unit")
+        .filter(pl.col("hash") <= pl.col("max_hash_dense"))
+        .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
+        .select(
+            "hash",
+            "unit",
+            "p_in",
+            pin_q=(pl.col("p_in") * (2**PIN_BITS - 1)).round().cast(pl.UInt64),
+        )
+    )
+
+
 def write_meta(
     out: Path,
     params: IndexParams,
@@ -971,17 +1003,7 @@ def write_index(
             int(units["max_hash_dense"].max()),  # type: ignore[arg-type]
             params.fp_bits,
         )
-        units = units.join(
-            dense.group_by("unit").agg(m_dense=pl.len().cast(pl.UInt32)),
-            on="unit",
-            how="left",
-            maintain_order="left",
-        ).with_columns(
-            pl.col("m_dense").fill_null(0),
-            pl.col("len_cv_dense").fill_null(0.0).cast(pl.Float32),
-            pin_hist_dense=_pin_hist(dense, units.height),
-            pin_sum_dense=_pin_sum(dense, units.height),
-        )
+        units = dense_columns(units, dense)
         stats["dense_postings"] = dense.height
         stats["dense_bytes"] = tables["dense"].nbytes()
 

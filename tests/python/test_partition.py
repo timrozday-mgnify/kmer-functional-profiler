@@ -60,7 +60,8 @@ def test_packed_table_from_parts_equals_whole() -> None:
     assert len(whole.set_offsets) - 1 < len(whole.fingerprints)  # keys share sets
 
 
-def test_partitioned_build_equals_single(tmp_path: Path) -> None:
+@pytest.mark.parametrize("t_dense", [0.0, 0.2])
+def test_partitioned_build_equals_single(tmp_path: Path, t_dense: float) -> None:
     rng = random.Random(3)
     rows, pfam = [], []
     for rep in range(1, 300):
@@ -77,11 +78,13 @@ def test_partitioned_build_equals_single(tmp_path: Path) -> None:
         tmp_path / "pfam.parquet"
     )
     # k = 4 shares many k-mers across buckets, so n_groups and the promiscuity cut matter.
-    params = IndexParams(k=4, t_base=0.05, n_min=4, t_cap=0.5, max_groups=3)
+    params = IndexParams(k=4, t_base=0.05, n_min=4, t_cap=0.5, max_groups=3, t_dense=t_dense)
     single = build_index(
         tmp_path / "members.parquet", tmp_path / "single", params, tmp_path / "pfam.parquet", True
     )
     assert single["promiscuous_dropped"] > 0  # type: ignore[operator]
+    if t_dense:  # the dense tier holds more than tier 2, and the reduce must count them
+        assert single["dense_postings"] > 2 * single["postings"]  # type: ignore[operator]
 
     d = tmp_path / "parts"
     d.mkdir()
@@ -124,4 +127,6 @@ def test_partitioned_build_equals_single(tmp_path: Path) -> None:
     for npy in (tmp_path / "single").glob("*.npy"):
         assert np.array_equal(np.load(npy), np.load(tmp_path / "parted" / npy.name)), npy.name
     meta = [json.loads((tmp_path / x / "meta.json").read_text()) for x in ("single", "parted")]
-    assert meta[0]["tier2"] == meta[1]["tier2"]
+    for table in ("tier2", "dense"):
+        assert meta[0].get(table) == meta[1].get(table), table
+    assert ("dense" in meta[1]) == (t_dense > 0)
