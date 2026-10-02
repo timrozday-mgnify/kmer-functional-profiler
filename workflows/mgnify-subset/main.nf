@@ -97,19 +97,19 @@ process SUBSET {
 }
 
 process INDEX {
-    tag "1 in ${sample}"
+    tag "1 in ${sample}${dense ? ', t_dense ' + dense : ''}"
     label 'process_high_memory'
-    publishDir path: { "${params.outdir}/1in${sample}" }, mode: 'copy'
+    publishDir path: { "${params.outdir}/1in${sample}${dense ? '_d' + dense : ''}" }, mode: 'copy'
 
     input:
-    tuple val(sample), path(members), path(pfam)
+    tuple val(sample), val(dense), path(members), path(pfam)
 
     output:
     path 'index', emit: index
 
     script:
     """
-    ${params.kfp} index ${members} index --pfam ${pfam} ${params.index_args}
+    ${params.kfp} index ${members} index --pfam ${pfam} ${params.index_args}${dense ? ' --t-dense ' + dense : ''}
     """
 
     stub:
@@ -490,13 +490,21 @@ workflow {
     if (samples.any { it % samples[0] != 0 }) {
         error "--sample ${params.sample}: every sample must be a multiple of the smallest"
     }
-    if (params.index && ((params.buckets as int) > 1 || !params.pfam)) {
+    def members_table = params.members.toString() in ['', 'true', 'false'] ? '' : params.members.toString()  // CLI passes strings
+    def pfam_table = params.pfam_table.toString() in ['', 'true', 'false'] ? '' : params.pfam_table.toString()
+    if (members_table && !pfam_table) {
+        error "--members needs --pfam_table"
+    }
+    if (params.index && !members_table && ((params.buckets as int) > 1 || !params.pfam)) {
         error "--index needs --buckets 1 and --pfam true"
     }
+    // '' or 0: the sparse build (index_args alone); other rates add --t-dense
+    def dense = params.t_dense.toString() in ['', 'true', 'false'] ? [''] :
+        params.t_dense.toString().tokenize(',')*.trim().collect { r -> (r as double) == 0 ? '' : r }
     if (params.build && (samples.size() > 1 || !params.pfam)) {
         error "--build needs one --sample and --pfam true"
     }
-    if (params.index || params.stats || params.build) {
+    if ((params.index && !members_table) || params.stats || params.build) {
         // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
         def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
         MEMBERSHIP(samples[0], width)
@@ -509,8 +517,12 @@ workflow {
         COMBINE(STATS.out.stats.flatten().collect())
     }
     if (params.index) {
-        SUBSET(channel.fromList(samples), MERGE.out.members.first(), MERGE.out.pfam.first())
-        INDEX(SUBSET.out)
+        SUBSET(
+            channel.fromList(samples),
+            members_table ? channel.value(file(members_table, checkIfExists: true)) : MERGE.out.members.first(),
+            pfam_table ? channel.value(file(pfam_table, checkIfExists: true)) : MERGE.out.pfam.first(),
+        )
+        INDEX(SUBSET.out.combine(channel.fromList(dense)).map { s, m, p, d -> [s, d, m, p] })
     }
     if (params.build) {
         ch_members = MERGE.out.members.flatten().map { f ->

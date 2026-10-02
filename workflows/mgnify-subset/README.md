@@ -73,6 +73,16 @@ nextflow run workflows/mgnify-subset -profile slurm --biome root \
     --sample 100,1000,10000 --outdir cost-nested
 ```
 
+A dense-tier ladder over an existing subset (phase 7, `aai` ablation): `--members` and
+`--pfam_table` skip extraction, and `--t_dense` builds one index per rate, each its own
+INDEX job, under `1inN/index` (rate 0) and `1inN_d<rate>/index`:
+
+```bash
+nextflow run workflows/mgnify-subset -profile slurm --members cost-nested/members.parquet \
+    --pfam_table cost-nested/pfam.parquet --sample 100 --t_dense 0,0.02,0.05,0.1 \
+    --index_args '--k 11 --t-base 0.001 --n-min 8' --outdir aai-ladder
+```
+
 Whole-release statistics. Every cluster lands in one of `--buckets` members tables
 (about 4 GB each at 256), so each STATS job counts its clusters' distinct k-mers exactly,
 with the build's own code (adapter masking, k, alphabet). COMBINE predicts the index for
@@ -217,6 +227,8 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--publish_mode` | `copy` | How members tables are published; `link` at full scale |
 | `--index` | `true` | Build an index per sample, under `1inN/index/` |
 | `--index_args` | `''` | Extra `kmer-functional-profiler index` options, e.g. `'--t-base 0.001 --n-min 8'`; also used by `--build` |
+| `--t_dense` | `''` | Dense-tier rates, e.g. `'0,0.02,0.1'`: one INDEX job per sample and rate, under `1inN_d<rate>/index` (0: `1inN/index`) |
+| `--members`, `--pfam_table` | `''` | Index these members and Pfam tables instead of extracting from the release |
 | `--build` | `false` | Partitioned index build over the buckets, under `index/` (one `--sample`, `--pfam true`) |
 | `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce and tier-2 packing |
 | `--bloom_bits` | `10` | Bloom filter bits per candidate hash |
