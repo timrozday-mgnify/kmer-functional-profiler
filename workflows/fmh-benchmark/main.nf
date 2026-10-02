@@ -209,6 +209,30 @@ process AAI_SCORE {
     "touch aai_score.tsv"
 }
 
+process AAI_CALIBRATE {
+    tag "${name}${arm ? '~' + arm : ''}"
+    label 'process_single'
+    publishDir "${params.outdir}/calibration", mode: 'copy', saveAs: { f -> "${name}${arm ? '~' + arm : ''}${f.endsWith('.json') ? '.json' : '_scores.tsv'}" }
+
+    input:
+    // units and genes in the same seed order: the step pairs them by position
+    tuple val(name), val(arm), path(units, stageAs: 'units/u*.tsv'), path(genes, stageAs: 'genes/g*.csv'), path(gene_units), path(index)
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'aai_calibration.json'
+    path 'aai_calibration_scores.tsv'
+
+    script:
+    """
+    ${params.bench} aai-calibrate --profiles ${units} --genes ${genes} --gene-units ${gene_units} \
+        --index ${index} --min-id ${params.mgnify_min_id} --min-cov ${params.mgnify_min_cov}
+    """
+
+    stub:
+    "touch aai_calibration.json aai_calibration_scores.tsv"
+}
+
 process AAI_SUMMARY {
     label 'process_single'
     publishDir params.outdir, mode: 'copy'
@@ -1204,15 +1228,25 @@ workflow BENCHMARK {
     )
     SUMMARY(SCORE.out.score.collect())
     // unit-level detection and AAI of the MGnify indexes against the DIAMOND truth
-    AAI_SCORE(
-        PROFILE.out.units
-            .map { sid, name, arm, units -> [name, sid, arm, units] }
-            .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
-            .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }
-            .combine(TRUTH.out.genes, by: 0),
+    def ch_aai = PROFILE.out.units
+        .map { sid, name, arm, units -> [name, sid, arm, units] }
+        .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
+        .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }
+        .combine(TRUTH.out.genes, by: 0)  // sid, name, arm, units, gene_units, genes
+    AAI_SCORE(ch_aai, bench_py)
+    AAI_SUMMARY(AAI_SCORE.out.score.collect())
+    // aai -> identity map per index and arm, fitted on half the clusters of every seed
+    AAI_CALIBRATE(
+        ch_aai
+            .map { sid, name, arm, units, gene_units, genes -> [[name, arm], sid, units, genes, gene_units] }
+            .groupTuple()
+            .map { key, sids, units, genes, gene_units ->
+                def order = (0..<sids.size()).toList().sort { sids[it] }
+                [key[0], key[1], order.collect { units[it] }, order.collect { genes[it] }, gene_units[0]]
+            }
+            .combine(ch_mgnify, by: 0),  // name, arm, units, genes, gene_units, index
         bench_py,
     )
-    AAI_SUMMARY(AAI_SCORE.out.score.collect())
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and
     // workflow are read here: inside the handler, names resolve against the workflow metadata.

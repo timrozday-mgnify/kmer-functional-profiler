@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import fields
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import numpy as np
 import polars as pl
@@ -1308,6 +1308,62 @@ def aai(copies: pl.Expr, present_kmers: pl.Expr, coverage: pl.Expr, k: int) -> p
     )
 
 
+# build parameters an aai calibration depends on: a map fitted under others does not apply
+AAI_CALIBRATION_PARAMS: Final = ("k", "alphabet", "t_base", "n_min", "t_cap", "t_dense")
+
+
+def check_aai_calibration(cal: dict[str, Any], params: dict[str, Any]) -> None:
+    """Raise ValueError unless ``cal`` is a usable map for an index built with ``params``:
+    ``aai`` strictly increasing knots, ``identity`` non-decreasing in [0, 1] of the same
+    length, ``widen`` >= 0, and the build parameters it records (``params``, if any) equal
+    to the index's in ``AAI_CALIBRATION_PARAMS``."""
+    xs, ys = np.asarray(cal.get("aai", []), float), np.asarray(cal.get("identity", []), float)
+    if len(xs) < 2 or len(xs) != len(ys):
+        raise ValueError("aai and identity must be knots of equal length, at least 2")
+    if np.any(np.diff(xs) <= 0) or np.any(np.diff(ys) < 0) or ys.min() < 0 or ys.max() > 1:
+        raise ValueError("aai must increase strictly, identity must not decrease, in [0, 1]")
+    if not cal.get("widen", 0.0) >= 0:
+        raise ValueError("widen must be >= 0")
+    fitted = cal.get("params", {})
+    differ = [p for p in AAI_CALIBRATION_PARAMS if p in fitted and fitted[p] != params.get(p)]
+    if differ:
+        raise ValueError(f"calibration fitted on an index with other {', '.join(differ)}")
+
+
+def calibrate_aai(profile: pl.DataFrame, cal: dict[str, Any]) -> pl.DataFrame:
+    """``aai``, ``aai_lo`` and ``aai_hi`` through an inverse calibration map (knots
+    ``aai`` -> ``identity``, linear between them, constant beyond; fitted by the benchmark's
+    ``aai-calibrate``), the interval widened by ``widen`` and clipped to [0, 1]; a null
+    ``aai`` stays null."""
+    xs, ys = np.asarray(cal["aai"], float), np.asarray(cal["identity"], float)
+    widen = {"aai": 0.0, "aai_lo": -cal["widen"], "aai_hi": cal["widen"]}
+    return profile.with_columns(
+        pl.col(c)
+        .map_batches(lambda s: pl.Series(np.interp(s.to_numpy(), xs, ys)), return_dtype=pl.Float64)
+        .add(d)
+        .clip(0.0, 1.0)
+        .fill_nan(None)
+        for c, d in widen.items()
+    )
+
+
+def _calibrated(result: pl.DataFrame, calibrations: list[dict[str, Any] | None]) -> pl.DataFrame:
+    """Each index's calibration on its own units (``source`` with joint indexes); the raw
+    estimate kept as ``aai_raw``, ``aai_raw_lo``, ``aai_raw_hi``."""
+    if "aai" not in result.columns or all(c is None for c in calibrations):
+        return result
+    result = result.with_columns(aai_raw="aai", aai_raw_lo="aai_lo", aai_raw_hi="aai_hi")
+    if len(calibrations) == 1:
+        return calibrate_aai(result, calibrations[0])  # type: ignore[arg-type]
+    return pl.concat(
+        calibrate_aai(part, cal) if cal is not None else part
+        for cal, part in (
+            (calibrations[i], result.filter(pl.col("source") == i))
+            for i in range(len(calibrations))
+        )
+    ).sort("unit")
+
+
 def aai_interval(
     coverage: np.ndarray,
     present: np.ndarray,
@@ -1601,6 +1657,8 @@ def profile(
     unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` = min(1, ``copies_zi``)^(1/k)
     on the units gather keeps whenever ``_zi`` is fitted (``with_aai`` fits it), with a
     closed-form 95% interval ``aai_lo``/``_hi`` (:func:`aai_interval`; no draws needed).
+    An index with an ``aai_calibration.json`` maps them to alignment identity
+    (:func:`calibrate_aai`) and keeps the raw ones as ``aai_raw``, ``aai_raw_lo``/``_hi``.
     ``component`` labels the hit units linked by shared k-mers by their smallest unit id, so
     the units that bracket a sample variant can be read together. ``min_aai`` drops rows
     with ``aai_naive`` below it.
@@ -1975,6 +2033,7 @@ def profile(
         .drop("index")
         .sort("unit")
     )
+    result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.
         summary |= sample_summary(

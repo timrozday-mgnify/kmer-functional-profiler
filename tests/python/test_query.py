@@ -1024,3 +1024,37 @@ def test_unknown_fraction_of_known_and_random_reads(tmp_path: Path) -> None:
     only_random = summary(unknown)
     assert only_random["census_containment"] < 0.05  # type: ignore[operator]
     assert (only_random["explained_fraction"] or 0.0) < 0.05
+
+
+def test_aai_calibration_attached_and_applied_per_index(tmp_path: Path) -> None:
+    seqs = list(proteins().values())
+    half = len(seqs) // 2
+    params = IndexParams(k=K, t_base=1.0, fp_bits=64)
+    for name, part, first in (("a", seqs[:half], 0), ("b", seqs[half:], half)):
+        build_index(
+            write_members(tmp_path / f"{name}.parquet", part, first), tmp_path / name, params
+        )
+    # identity = aai - 0.1 over [0.5, 1], interval 0.02 wider each side
+    cal = {"aai": [0.5, 1.0], "identity": [0.4, 0.9], "widen": 0.02, "params": {"k": K}}
+    runner = CliRunner()
+    attach = ["calibrate-aai", str(tmp_path / "a")]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(cal | {"params": {"k": K + 1}}))
+    assert runner.invoke(app, [*attach, str(bad)]).exit_code != 0  # fitted at another k
+    good = tmp_path / "cal.json"
+    good.write_text(json.dumps(cal))
+    assert runner.invoke(app, [*attach, str(good)]).exit_code == 0
+    a, b = Index.load(tmp_path / "a"), Index.load(tmp_path / "b")
+    assert a.aai_calibration == cal and b.aai_calibration is None
+
+    got = profile(a, *READS, with_aai=True, extra=[b]).filter(pl.col("aai").is_not_null())
+    mine, other = got.filter(pl.col("source") == 0), got.filter(pl.col("source") == 1)
+    assert mine.height > 0 and other.height > 0
+    assert mine["aai"].to_list() == pytest.approx((mine["aai_raw"] - 0.1).to_list())
+    lo = np.interp(mine["aai_raw_lo"].to_numpy(), cal["aai"], cal["identity"]) - 0.02
+    assert mine["aai_lo"].to_list() == pytest.approx(lo.tolist())  # constant below 0.5
+    assert other["aai"].to_list() == other["aai_raw"].to_list()  # b has no calibration
+    assert "aai_raw" not in profile(b, *READS, with_aai=True).columns
+    # removing it restores the raw estimate
+    assert runner.invoke(app, attach).exit_code == 0
+    assert Index.load(tmp_path / "a").aai_calibration is None

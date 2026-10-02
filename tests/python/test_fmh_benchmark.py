@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -336,3 +337,28 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     assert got["naive_n"] == 3 and got["naive_bias_0.8"] == pytest.approx(
         (0.86 - 0.85 + 0.79 - 0.8) / 2
     )
+
+
+def test_aai_calibration_inverts_a_biased_estimator() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    # aai reads high and compressed (0.6 + 0.4 a) with noise; the inverse map undoes it
+    # whatever the identity distribution, and a null aai stays null
+    rng = np.random.default_rng(0)
+    true = rng.uniform(0.7, 1.0, 20_000)
+    aai = 0.6 + 0.4 * true + rng.normal(0, 0.01, true.size)
+    pairs = pl.DataFrame({"true": true, "aai": aai, "aai_lo": aai - 0.005, "aai_hi": aai + 0.005})
+    cal = bench.fit_aai_calibration(pairs)
+    assert np.all(np.diff(cal["aai"]) > 0)
+    got = bench.calibrate_aai(pairs, cal)
+    err = (got["aai"] - got["true"]).to_numpy()
+    assert abs(np.median(err)) < 0.005 and np.median(np.abs(err)) < 0.03
+    assert got.select(pl.col("true").is_between("aai_lo", "aai_hi").mean()).item() >= 0.94
+    f64 = pl.Float64
+    nulls = pl.DataFrame(
+        {"aai": [None, 0.9], "aai_lo": [None, 0.89], "aai_hi": [None, 0.91]},
+        schema={"aai": f64, "aai_lo": f64, "aai_hi": f64},
+    )
+    nulls = bench.calibrate_aai(nulls, cal)
+    assert nulls["aai"].null_count() == 1 and nulls["aai"][1] == pytest.approx(0.75, abs=0.01)

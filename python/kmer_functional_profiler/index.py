@@ -70,6 +70,9 @@ ADAPTERS: Final = (
 MASK_WIDTH: Final = 6
 
 
+AAI_CALIBRATION: Final = "aai_calibration.json"
+
+
 @dataclass(frozen=True)
 class IndexParams:
     """Build parameters, recorded in ``meta.json``."""
@@ -488,14 +491,19 @@ class Index:
     units: UnitTable
     tier2: PackedTable
     dense: PackedTable | None = None
+    aai_calibration: dict[str, Any] | None = None
 
     @classmethod
     def load(cls, directory: str | Path, *, mmap: bool = True) -> Self:
         """Read an index; its tiers and unit columns are memory-mapped unless ``mmap`` is
-        False."""
+        False. ``aai_calibration.json``, if present, is the map the query applies to ``aai``
+        (attached after the build, see ``query.check_aai_calibration``; a sidecar, so
+        ``meta.json`` and the hashes recorded of it stay as built)."""
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
+        calibration = directory / AAI_CALIBRATION
         return cls(
+            aai_calibration=json.loads(calibration.read_text()) if calibration.exists() else None,
             meta=meta,
             units=UnitTable(directory, mmap=mmap),
             tier2=PackedTable.load(directory, "tier2", meta["tier2"], mmap=mmap),

@@ -36,6 +36,9 @@ AAI_SCORE, AAI_SUMMARY
                  unit profiles of --mgnify_indexes against that truth: detection at the 90%
                  level, nearest-cluster recall beyond it, aai and aai_naive against alignment
                  identity -> aai_summary.tsv, aai_scores.tsv
+AAI_CALIBRATE    per MGnify index and arm, over all seeds: an aai -> identity map fitted on
+                 half the clusters and scored on the other half ->
+                 calibration/<name>[~arm].json, calibration/<name>[~arm]_scores.tsv
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
@@ -246,6 +249,15 @@ its near hits, each with identity and coverage. A present gene (reads in the sam
 | `recall_<lo>` | Present genes whose nearest cluster is detected, by that hit's identity (0.95, 0.9, 0.8, 0.7, 0.5): resolution below 90% |
 | `aai_bias_<lo>`, `aai_cover_<lo>`, `aai_spearman`, `aai_n` | Detected units' `aai` against the depth-weighted identity of the present genes they are nearest to; `aai_cover` = share inside `aai_lo`–`aai_hi` |
 | `naive_bias_<lo>`, `naive_within05_<lo>`, `naive_spearman` | Every profiled unit a present gene hits (near hits included): `aai_naive` against the best identity of a present gene to it |
+
+`calibration/<name>[~arm].json` is an inverse calibration of `aai` (plan, phase 7, steps
+16–17): knots `aai` -> `identity`, the interval widening `widen`, the index's build
+parameters it holds for, and the fit's provenance. `_scores.tsv` has the `aai_*` columns
+above, raw and calibrated, per seed on the held-out half of the clusters. A map is attached
+to an index with `kmer-functional-profiler calibrate-aai INDEX_DIR MAP.json` (the query then
+reports calibrated `aai` and keeps `aai_raw`); it is fitted on this benchmark only, so check
+it on others before attaching it to an index for real samples (plan, step 17). A test
+fixture has too few units for a map (`widen` null; `calibrate-aai` refuses it).
 
 The identity is to the cluster *representative*, which is what `aai` estimates (to the
 cluster's consensus; plan, phase 7, steps 7 and 9). Entries take either a built index and the
