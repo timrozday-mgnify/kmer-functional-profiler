@@ -36,6 +36,11 @@ Phase 7 adds, per ``--frames`` mode (one set of rows each, column ``frames``):
   centroid, all identities); ``aai_spearman``; ``aai_cover`` and ``aai_cover_centroid``
   (the posterior interval holds the mean-member and the centroid identity; with
   ``--draws``); ``aai_naive_bias``; ``aai_n`` (true positives with an ``aai``).
+- Near hits, on ``none`` rows (:func:`near_scores`): every hit unit that is not itself
+  present but has a present strain in its family, scored by ``aai_naive`` against the
+  highest identity of those strains to its centroid: ``near_n``, ``near_bias_<lo>`` and
+  ``near_cover_<lo>`` (``aai_naive`` within 0.05) by truth bin (``NEAR_BINS``),
+  ``near_spearman``, ``near_lower_bound`` (share flagged as lower bounds).
 
 ``index_mb`` is the size of the index's lookup tables. The ``gather_zi`` rows add how
 ``present_prob`` separates true from false positives (:func:`presence_scores`) and, with
@@ -61,7 +66,8 @@ SEEDS_FASTA = ROOT / "data" / "mgnify" / "mgy_clusters_head.faa"
 AMINO = "ACDEFGHIKLMNPQRSTVWY"
 CODONS = [a + b + c for a in BASES for b in BASES for c in BASES]
 SYNONYMS = {aa: [c for c, t in zip(CODONS, CODE_11, strict=True) if t == aa] for aa in AMINO}
-IDENTITIES = (1.0, 0.95, 0.9, 0.85)
+IDENTITIES = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7)  # strain to its unit's centroid
+NEAR_BINS = ((0.9, 1.01), (0.8, 0.9), (0.6, 0.8))  # identity bins of near-hit AAI truth
 LENGTH_BINS = ((200, 300), (300, 450), (450, 601))  # aa, half-open
 READ, FLANK = 150, 150
 CONFIGS = {
@@ -199,8 +205,9 @@ def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> d
         "l1_family": l1(both.group_by("family").agg(pl.col("depth", "estimate").sum())),
         "log_ratio_sd": float(np.log(tp["ratio"].to_numpy()).std()),
         **{
-            f"bias_{i}": tp.filter(pl.col("identity") == i)["ratio"].median() / ref  # type: ignore[operator]
+            f"bias_{i}": med / ref if med is not None and ref else None  # type: ignore[operator]
             for i in IDENTITIES[1:]
+            for med in [tp.filter(pl.col("identity") == i)["ratio"].median()]
         },
         **length_scores(both, tp),
     }
@@ -288,6 +295,39 @@ def presence_scores(truth: pl.DataFrame, result: pl.DataFrame) -> dict[str, floa
         out[f"prob_{name}"] = part["present_prob"].mean()
         out[f"flag_{name}"] = (part["present_prob"] < 0.5).mean()
     return out  # type: ignore[return-value]
+
+
+def near_scores(
+    truth: pl.DataFrame, result: pl.DataFrame, units: pl.DataFrame
+) -> dict[str, float | None]:
+    """``aai_naive`` of near hits: hit units not present, against the best identity of their
+    family's present strains to their centroid (what sylph's blanket ANI reports)."""
+    family = dict(units.select("unit", "family").iter_rows())
+    centroid = dict(units.select("unit", "centroid").iter_rows())
+    strains: dict[int, list[str]] = {}
+    for unit, strain in truth.select("unit", "strain").iter_rows():
+        strains.setdefault(family[unit], []).append(strain)
+    present = set(truth["unit"])
+    rows = [
+        (naive, low, max(_identity(st, centroid[u]) for st in strains[family[u]]))
+        for u, naive, low in result.select("unit", "aai_naive", "aai_naive_lower_bound").iter_rows()
+        if u not in present and family.get(u) in strains
+    ]
+    out: dict[str, float | None] = {"near_n": len(rows)}
+    if not rows:
+        return out
+    df = pl.DataFrame(rows, schema=["naive", "low", "true"], orient="row")
+    out["near_spearman"] = (
+        df.select(pl.corr("naive", "true", method="spearman")).item() if df.height > 2 else None
+    )
+    out["near_lower_bound"] = df["low"].mean()  # type: ignore[assignment]
+    for lo, hi in NEAR_BINS:
+        part = df.filter(pl.col("true").is_between(lo, hi, closed="left"))
+        out[f"near_bias_{lo}"] = (part["naive"] - part["true"]).median() if part.height else None  # type: ignore[assignment]
+        out[f"near_cover_{lo}"] = (
+            ((part["naive"] - part["true"]).abs() <= 0.05).mean() if part.height else None
+        )
+    return out
 
 
 def calibration(truth: pl.DataFrame, result: pl.DataFrame, units: pl.DataFrame) -> dict[str, float]:
@@ -388,6 +428,8 @@ def main() -> None:
                         **aai_scores(truth, result, members),
                     }
                     if rule == "gather_zi"
+                    else near_scores(truth, result, units)
+                    if rule == "none"
                     else {}
                 )
                 key = {"config": config, "frames": frames, "rule": rule, "seed": seed}

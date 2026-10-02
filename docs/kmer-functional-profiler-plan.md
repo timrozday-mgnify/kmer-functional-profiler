@@ -1214,6 +1214,22 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - Slightly conservative at high coverage, because the simulation places an exact number of substitutions, which varies less than the random-substitution model. Real substitutions cluster in variable regions, which pushes the other way. The floored index without a dense tier reports intervals too, wide as expected.
   - Tests: the interval holds its point and stays within [0, 1] on the fixture profile; the survival variance matches simulated substitutions (92–98% inside); more kept windows give narrower intervals, and sparse windows narrower than dense ones at equal counts.
 
+* **Phase 7, step 9 — the simulation ladder below 90%, and near-hit AAI.**
+  - *Code:* strains at 100, 95, 90, 85, 80, 75 and 70% to their unit's centroid (was down to 85%). On `none` rows, `near_scores` scores `aai_naive` on every hit unit that is not itself present but has a present strain in its family (a sibling paralog) against the best identity of those strains to its centroid. That is what a blanket, sylph-`query`-style AAI reports. Columns `near_bias_<bin>`, `near_cover_<bin>` (within 0.05), `near_spearman` and `near_lower_bound`.
+  - *Run* (`results/sim-ladder`, 3 seeds, stop-free):
+
+    | Config | Completeness | `aai` Spearman | `aai` − mean member at 100/90/80/70% | Coverage (centroid) |
+    | --- | --- | --- | --- | --- |
+    | dense | 0.958 | 0.93 | +0.028/+0.021/+0.027/+0.041 | 0.96 |
+    | floor\_d100 | 0.576 | 0.91 | +0.028/+0.021/+0.037/+0.074 | 0.94 |
+    | floor\_d20 | 0.573 | 0.87 | +0.026/+0.026/+0.033/+0.076 | 0.96 |
+    | s10 | 0.789 | 0.85 | +0.025/+0.024/+0.058/+0.14 | 0.96 |
+    | floor | 0.576 | 0.31 | +0.03/+0.088/+0.209/+0.32 | 0.93 |
+
+    - *`aai` holds to 70% with a dense tier.* The +0.02–0.03 offset is the consensus-vs-member offset of step 7, not divergence: it is flat from 100 to 80%. It rises at 70% only on sparse tiers, where few kept k-mers survive. The intervals stay calibrated in every config, because they widen as k-mers thin.
+    - *Resolution:* `aai` separates 90% from 95–100% strains on the dense and `floor_d100` indexes (Spearman ≥ 0.9). On a 1-in-10 tier it separates them only above ~85%; on the floor alone it does not.
+    - *Near hits (`aai_naive`, dense):* 87 per seed, unbiased (+0.002 at 80–90%, −0.003 at 60–80%) but noisy (76% and 64% within 0.05; Spearman 0.79). On every floored index it has 8 near hits per seed and 44% flagged as lower bounds, because `aai_naive` uses tier 2 only, whatever the dense tier. Bracketing neighbours by AAI therefore needs the dense tier for hit units, not only detected ones; recorded as a limitation, not built.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
