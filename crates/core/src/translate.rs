@@ -62,7 +62,14 @@ pub enum FrameMode {
     StopFree,
     /// All six frames; k-mers are still split at stops.
     All,
+    /// Stop-free frames whole; in frames with stops, only the segment before the first stop
+    /// and the one after the last, each if at least `min_len` residues. A read crossing a
+    /// gene end keeps its coding part; internal segments are almost never coding.
+    Edges { min_len: u16 },
 }
+
+/// Default `min_len` of [`FrameMode::Edges`].
+pub const EDGES_MIN_LEN: u16 = 20;
 
 impl FromStr for FrameMode {
     type Err = Error;
@@ -71,7 +78,15 @@ impl FromStr for FrameMode {
         match s.to_ascii_lowercase().as_str() {
             "stopfree" => Ok(Self::StopFree),
             "all" => Ok(Self::All),
-            _ => Err(Error::UnknownFrameMode(s.to_owned())),
+            "edges" => Ok(Self::Edges {
+                min_len: EDGES_MIN_LEN,
+            }),
+            // `edges:M` sets the minimum segment length (a benchmark sweep, not a user knob).
+            other => other
+                .strip_prefix("edges:")
+                .and_then(|m| m.parse().ok())
+                .map(|min_len| Self::Edges { min_len })
+                .ok_or_else(|| Error::UnknownFrameMode(s.to_owned())),
         }
     }
 }

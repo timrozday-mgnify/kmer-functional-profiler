@@ -160,13 +160,133 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     got = profile(index, *READS, draws=60, all_estimators=True)
     assert "coverage_zi_lo" not in plain.columns
     # intervals and groups change nothing else
-    assert got.drop("^.*_(lo|hi)$", "ambiguity_group", "group_size", "own_evidence").equals(plain)
+    posterior = ("^coverage_zi_(lo|hi)$", "^.*abundance_zi_(lo|hi)$", "^group_coverage.*$")
+    assert got.drop(*posterior, "ambiguity_group", "group_size", "own_evidence").equals(plain)
     assert got["own_evidence"].drop_nulls().is_between(0, 1).all()
     found = got.filter(pl.col("coverage_zi") > 0)
     assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
     inside = found["coverage_zi"].is_between(found["coverage_zi_lo"], found["coverage_zi_hi"])
     assert inside.mean() >= 0.9  # type: ignore[operator]
     assert got.equals(profile(index, *READS, draws=60, all_estimators=True))  # seeded
+
+
+def test_ztp_lambda_inverts_the_truncated_mean() -> None:
+    lam = np.array([0.05, 0.5, 2.0, 10.0, 40.0])
+    mean = lam / -np.expm1(-lam)
+    assert query.ztp_lambda(mean) == pytest.approx(lam, rel=1e-9)
+    assert (query.ztp_lambda(np.array([0.0, 1.0])) == 0).all()
+
+
+def test_aai_naive_equals_aai_without_shared_kmers(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, with_aai=True)
+    assert {"aai", "aai_naive", "aai_naive_lower_bound", "component", "hits_em"} <= set(got.columns)
+    assert got["component"].n_unique() == got.height  # unrelated proteins: no links
+    both = got.filter(pl.col("aai").is_not_null() & ~pl.col("aai_naive_lower_bound"))
+    assert both.height > 0
+    assert both["aai"].to_list() == pytest.approx(both["aai_naive"].to_list(), abs=1e-6)
+    assert got["aai_naive"].is_between(0, 1).all()
+    # Reads come from the indexed proteins themselves: identity ~1 where coverage allows.
+    assert both["aai"].median() > 0.95  # type: ignore[operator]
+    # min_aai drops rows; the plain profile has no aai but has aai_naive.
+    assert profile(index, *READS, min_aai=1.1).height == 0
+    assert "aai" not in profile(index, *READS).columns
+
+
+def test_aai_of_a_unit_explained_away(tmp_path: Path) -> None:
+    # Unit 1 is the first half of unit 0's protein: all its k-mers are unit 0's too.
+    first = max(proteins().values(), key=len)
+    rows = [(0, 0, True, first), (1, 1, True, first[: len(first) // 2])]
+    path = tmp_path / "m.parquet"
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    build_index(path, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    got = profile(Index.load(tmp_path / "idx"), *READS, with_aai=True).sort("unit")
+    assert got.height == 2
+    assert got["component"].to_list() == [0, 0]
+    half = got.row(1, named=True)
+    assert half["kmers_unique"] == 0  # gather gives its k-mers to unit 0
+    assert half["aai"] is None
+    assert half["aai_naive"] > 0.7  # its own hits still show it close (~1x: uncorrected)
+
+
+def test_aai_interval_without_draws(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, with_aai=True).filter(pl.col("aai").is_not_null())
+    assert got.height > 0
+    assert (got["aai_lo"] <= got["aai"] + 1e-12).all() and (
+        got["aai"] <= got["aai_hi"] + 1e-12
+    ).all()
+    assert got["aai_hi"].max() <= 1.0  # type: ignore[operator]
+
+
+def test_aai_interval_survival_variance() -> None:
+    # Substitutions at identity a over L positions: the share of the L - k + 1 windows that
+    # survive has variance c (1 - c) d / L, d the overlap factor aai_interval uses.
+    rng = np.random.default_rng(0)
+    k, length, a = 11, 400, 0.93
+    hit = rng.random((4000, length)) < a
+    windows = np.lib.stride_tricks.sliding_window_view(hit, k, axis=1).all(axis=2)
+    c = windows.mean(axis=1)
+    n = length - k + 1
+    lo, hi = query.aai_interval(
+        coverage=np.array([1e6]), present=np.array([a**k]), m=np.array([n]),
+        pin_sum=np.array([n]), n_kmers=np.array([n]), k=k,
+    )  # fmt: skip
+    # The interval of a from the survival term alone holds ~95% of simulated strains.
+    inside = ((c ** (1 / k) >= lo[0]) & (c ** (1 / k) <= hi[0])).mean()
+    assert 0.92 <= inside <= 0.98
+    # More kept windows, narrower; sparse sampling (t << 1) removes the overlap term.
+    args = {"coverage": np.full(3, 1e6), "present": np.full(3, a**k), "k": k}
+    lo, hi = query.aai_interval(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
+                                n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
+    width = hi - lo
+    assert width[0] > width[1] > width[2]
+
+
+def write_members(path: Path, seqs: list[str], first_rep: int = 0) -> Path:
+    rows = [(first_rep + i, first_rep + i, True, q) for i, q in enumerate(seqs)]
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    return path
+
+
+@pytest.mark.parametrize(("t_base", "t_dense"), [(1.0, 0.0), (0.3, 1.0)])
+def test_joint_query_equals_one_index_of_the_union(
+    tmp_path: Path, t_base: float, t_dense: float
+) -> None:
+    seqs = list(proteins().values())
+    half = len(seqs) // 2
+    params = IndexParams(k=K, t_base=t_base, t_dense=t_dense, fp_bits=64)
+    for name, part, first in (("a", seqs[:half], 0), ("b", seqs[half:], half), ("ab", seqs, 0)):
+        build_index(
+            write_members(tmp_path / f"{name}.parquet", part, first), tmp_path / name, params
+        )
+    a, b, ab = (Index.load(tmp_path / n) for n in ("a", "b", "ab"))
+    union = profile(ab, *READS, draws=5, with_aai=True)
+    joint = profile(a, *READS, draws=5, with_aai=True, extra=[b])
+    assert joint["source"].to_list() == [int(u >= a.units.height) for u in joint["unit"]]
+    assert joint.drop("source").equals(union.select(joint.drop("source").columns))
+    # An unrelated extra index leaves the first index's rows as they were, but for
+    # present_prob, whose prior counts every index's units.
+    unrelated = tmp_path / "unrelated"
+    rng = np.random.default_rng(0)
+    random_seqs = ["".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), 300)) for _ in range(5)]
+    build_index(write_members(tmp_path / "r.parquet", random_seqs), unrelated, params)
+    alone = profile(a, *READS)
+    with_unrelated = profile(a, *READS, extra=[Index.load(unrelated)])
+    assert with_unrelated.filter(pl.col("source") == 1).height == 0
+    keep = [c for c in alone.columns if c != "present_prob"]
+    assert with_unrelated.select(keep).equals(alone.select(keep))
+
+
+def test_joint_query_rejects_a_different_scheme(tmp_path: Path) -> None:
+    seqs = list(proteins().values())[:3]
+    path = write_members(tmp_path / "m.parquet", seqs)
+    build_index(path, tmp_path / "k7", IndexParams(k=7, t_base=1.0))
+    build_index(path, tmp_path / "k8", IndexParams(k=8, t_base=1.0))
+    with pytest.raises(ValueError, match="differ in k"):
+        profile(Index.load(tmp_path / "k7"), *READS, extra=[Index.load(tmp_path / "k8")])
 
 
 def test_shared_evidence_groups_lopsided_pair() -> None:
@@ -410,10 +530,12 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     out = tmp_path / "p.tsv"
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
-    result = runner.invoke(app, [*args, "--draws", "3"])
+    result = runner.invoke(app, [*args, "--draws", "3", "--aai"])
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
-    assert {"cluster_rep", "hits", "containment", "coverage"} <= set(table.columns)
+    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
+        table.columns
+    )
     got = json.loads(stats.read_text())
     assert {"load", "hash", "lookup", "gather", "fit_zi", "posterior", "total"} <= set(
         got["stages"]
@@ -435,6 +557,30 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert runner.invoke(app, [*base, str(mapped)]).exit_code == 0
     assert runner.invoke(app, [*base, str(loaded), "--in-memory"]).exit_code == 0
     assert pl.read_csv(loaded, separator="\t").equals(pl.read_csv(mapped, separator="\t"))
+
+
+def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path: Path) -> None:
+    runner = CliRunner()
+    idx = tmp_path / "idx"
+    build_args = ["index", str(members), str(idx), "--k", str(K), "--t-base", "1"]
+    assert runner.invoke(app, build_args).exit_code == 0
+    hits = {}
+    for name, extra in {
+        "stopfree": [],
+        "edges": ["--frames", "edges:5"],
+        "masked": ["--min-qual", "41"],  # above every fixture quality: everything is N
+        "joint": ["--extra-index", str(idx)],  # itself: every unit twice, each half the hits
+    }.items():
+        out = tmp_path / f"{name}.tsv"
+        args = ["query", str(idx), *map(str, READS), "--out", str(out), *extra]
+        assert runner.invoke(app, args).exit_code == 0
+        hits[name] = pl.read_csv(out, separator="\t").select("unit", name=pl.col("hits"))
+    # Edges hash a superset of the stop-free k-mers, so no unit loses hits.
+    both = hits["stopfree"].join(hits["edges"], on="unit", how="left", suffix="_e")
+    assert (both["name_e"] >= both["name"]).all()
+    assert hits["edges"]["name"].sum() > hits["stopfree"]["name"].sum()
+    assert hits["masked"].height == 0
+    assert hits["joint"].height == 2 * hits["stopfree"].height
 
 
 def test_timer_writes_stats_mid_stage(tmp_path: Path) -> None:

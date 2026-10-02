@@ -8,7 +8,7 @@ pub enum Error {
     UnknownAlphabet(String),
     #[error("unsupported genetic code {0} (expected 11 or 4)")]
     UnknownGeneticCode(u8),
-    #[error("unknown frame mode {0:?} (expected stopfree or all)")]
+    #[error("unknown frame mode {0:?} (expected stopfree, all, edges or edges:M)")]
     UnknownFrameMode(String),
     #[error("group ids must be non-decreasing and one per sequence")]
     UnsortedGroups,

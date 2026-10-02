@@ -24,20 +24,24 @@ import resource
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 import numpy as np
 import polars as pl
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components
+from scipy.stats import norm
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable
+
+if TYPE_CHECKING:
+    from kmer_functional_profiler.mask import Mask
 
 DISTINCT_SAMPLE: Final = 256  # distinct sampled k-mers are counted on 1 in this of hash space
 
@@ -182,6 +186,17 @@ def components(kmers: pl.DataFrame) -> tuple[int, int, int]:
     largest = int(per_unit.argmax())
     n_units = int(per_unit[largest])
     return len(per_unit), n_units, int((label[col] == largest).sum())
+
+
+def component_labels(kmers: pl.DataFrame) -> pl.DataFrame:
+    """``unit`` and its ``component`` label (:func:`_unit_components`) for every unit in
+    ``kmers`` (``unit``, ``hash``)."""
+    units, col = _ids(kmers["unit"].to_numpy())
+    _, row = _ids(kmers["hash"].to_numpy())
+    label = _unit_components(col, row, len(units)) if len(units) else np.empty(0, np.int64)
+    return pl.DataFrame(
+        {"unit": units, "component": label}, schema_overrides={"component": pl.UInt32}
+    ).with_columns(pl.col("unit").cast(kmers.schema["unit"]))
 
 
 def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
@@ -557,6 +572,77 @@ def unit_hits(
             np.asarray(reads, dtype=u64),
         )
     )
+
+
+class _Joint:
+    """Several indexes with one hash scheme queried as one: unit ids are offset by the units
+    of the indexes before, so gather, EM and the posterior see one hit table (Additional
+    references, step 1). Each index looks up only hashes up to its own threshold. A single
+    index goes straight through, so its results are unchanged."""
+
+    def __init__(self, indexes: Sequence[Index]) -> None:
+        base = indexes[0]
+        for other in indexes[1:]:
+            for key in ("k", "alphabet"):
+                if other.meta["params"][key] != base.meta["params"][key]:
+                    raise ValueError(f"indexes differ in {key}: cannot be queried jointly")
+            if other.meta.get("hash") != base.meta.get("hash"):
+                raise ValueError("indexes differ in hash scheme: cannot be queried jointly")
+            if (other.dense is None) != (base.dense is None):
+                raise ValueError("either every index or none must have a dense tier")
+        self.indexes = list(indexes)
+        heights = [i.units.height for i in indexes]
+        self.offsets = np.cumsum([0, *heights])
+        self.height = int(self.offsets[-1])
+        self.dense = base.dense is not None
+
+    def max_hash(self, tier: str) -> int:
+        return max(int(getattr(i, tier).max_hash) for i in self.indexes)
+
+    def hits(self, tier: str, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
+        """:func:`unit_hits` in every index's ``tier`` ("tier2" or "dense"), units offset;
+        ``holders`` counts the units holding the k-mer over all indexes."""
+        column = "max_hash_g" if tier == "tier2" else "max_hash_dense"
+        if len(self.indexes) == 1:
+            index = self.indexes[0]
+            return unit_hits(getattr(index, tier), index.units[column], hashes, reads)
+        parts = []
+        for index, offset in zip(self.indexes, self.offsets[:-1], strict=True):
+            table = getattr(index, tier)
+            ok = hashes <= np.uint64(table.max_hash)
+            got = unit_hits(table, index.units[column], hashes[ok], reads[ok])
+            parts.append(got.with_columns(pl.col("unit").cast(pl.UInt64) + int(offset)))
+        hits = pl.concat(parts)
+        per_index = hits.group_by("hash", "unit").agg(pl.col("holders").first())
+        holders = (
+            hits.select("hash", "unit")
+            .unique()
+            .join(per_index, on=["hash", "unit"])
+            .group_by("hash")
+            .agg(total=pl.len())
+        )
+        return (
+            hits.join(holders, on="hash", maintain_order="left")
+            .with_columns(holders=pl.col("total").cast(hits.schema["holders"]))
+            .drop("total")
+        )
+
+    def rows(self, units: np.ndarray) -> pl.DataFrame:
+        """Unit table rows of (sorted) joint ``units``; with several indexes, ``source`` is
+        each unit's index (0 = the first)."""
+        if len(self.indexes) == 1:
+            return self.indexes[0].units.rows(units)
+        at = np.searchsorted(units, self.offsets)
+        parts = [
+            index.units.rows(units[lo:hi] - offset).with_columns(
+                pl.col("unit").cast(pl.UInt64) + int(offset), source=pl.lit(i, pl.UInt32)
+            )
+            for i, (index, offset, lo, hi) in enumerate(
+                zip(self.indexes, self.offsets[:-1], at[:-1], at[1:], strict=True)
+            )
+            if hi > lo
+        ]
+        return pl.concat(parts, how="diagonal_relaxed")
 
 
 def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> pl.DataFrame:
@@ -1156,6 +1242,114 @@ def _posterior_batch(
     )
 
 
+MIN_AAI_KMERS: Final = 3  # present k-mers below which aai is null
+MIN_AAI_LAMBDA: Final = 0.1  # zero-truncated coverage below which aai_naive is not corrected
+
+
+def aai(copies: pl.Expr, present_kmers: pl.Expr, coverage: pl.Expr, k: int) -> pl.Expr:
+    """Containment AAI, min(1, copies)^(1/k): an exact k-mer survives identity a with
+    probability a^k, and copies (present k-mers over an average member's kept k-mers) is
+    the coverage-corrected containment. Null below ``MIN_AAI_KMERS`` present k-mers, and
+    below ``MIN_AAI_LAMBDA`` coverage, where every hit k-mer has about one hit and the
+    zero-inflated fit cannot tell coverage from presence (it then reports all present)."""
+    return (
+        pl.when((present_kmers >= MIN_AAI_KMERS) & (coverage >= MIN_AAI_LAMBDA))
+        .then(pl.min_horizontal(copies, pl.lit(1.0)) ** (1 / k))
+        .otherwise(None)
+    )
+
+
+def aai_interval(
+    coverage: np.ndarray,
+    present: np.ndarray,
+    m: np.ndarray,
+    pin_sum: np.ndarray,
+    n_kmers: np.ndarray,
+    k: int,
+    clumping: np.ndarray | float = 1.0,
+    level: float = 0.95,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Closed-form ``level`` interval of :func:`aai` from a zero-inflated fit, no draws.
+
+    Copies c = present x m / ``pin_sum`` estimates a^k, the share of an average member's
+    kept k-mers that survive at identity a. Its variance adds three terms:
+
+    - *survival*: which k-mers a strain at identity a keeps depends on where its
+      substitutions fall. Over ``pin_sum`` kept windows, Var = c (1 - c) d / ``pin_sum``, with
+      d = 1 + 2 t sum_{j=1}^{k-1} (a^j - a^k) / (1 - a^k) for windows j apart, which both survive
+      with probability a^(k+j); t = m / ``n_kmers`` is the chance a nearby window is kept
+      too (d -> k for dense, unsampled windows near a = 1; -> 1 for sparse ones);
+    - *hit k-mers*: present = h / (m x seen), seen = 1 - exp(-coverage), with h ~
+      Binomial(present x m, seen) of the present k-mers hit;
+    - *coverage*: seen depends on the fitted coverage, whose zero-truncated Poisson MLE has
+      variance lambda (1 - e^-l)^2 / (h (1 - e^-l - l e^-l)) over h hit k-mers (delta method).
+
+    The last two treat k-mers as independent, but a read hits a run of neighbouring k-mers,
+    so they are scaled by ``clumping`` (1 + the unit's expected kept k-mers per covering
+    read, the variance inflation of Poisson clumps): at low depth the sample size is the
+    reads, not the k-mers. Without it a strain at 100% identity and depth ~1 got intervals
+    around 0.88-0.95 (phase 7, step 8).
+
+    The interval is a +- z sd_a, with sd_a = sd_c / (k c^((k-1)/k)) (delta method), clipped
+    to [0, 1], so a strain identical to the consensus can be covered (a Beta's quantiles
+    never reach 1, which left 73% of 100% strains outside). The survival variance uses a
+    Jeffreys-smoothed c, so it is not 0 at c = 0 or 1. Arrays are per unit.
+    """
+    lam = np.maximum(np.asarray(coverage, dtype=np.float64), 1e-9)
+    m = np.asarray(m, dtype=np.float64)
+    pin = np.maximum(np.asarray(pin_sum, dtype=np.float64), 1e-9)
+    pi = np.asarray(present, dtype=np.float64)
+    c = np.clip(pi * m / pin, 0.0, 1.0)
+    a = np.minimum(c ** (1 / k), 1 - 1e-9)
+    t = np.clip(_div(m, np.asarray(n_kmers, dtype=np.float64)), 0.0, 1.0)
+    j = np.arange(1, k)[:, None]
+    d = 1 + 2 * t * ((a**j - a**k) / (1 - a**k)).sum(axis=0)
+    n_eff = pin / d
+    smooth = (c * n_eff + 0.5) / (n_eff + 1)  # Jeffreys: c = 0 or 1 still has a variance
+    var = smooth * (1 - smooth) / n_eff
+    seen = -np.expm1(-lam)
+    b = np.maximum(np.asarray(clumping, dtype=np.float64), 1.0)
+    hit = pi * m * seen
+    # of the present k-mers, how many reads happened to hit (survival is counted above)
+    var += b * (pi * m + 0.5) * seen * (1 - seen) / (pin * seen) ** 2
+    info = _div(hit * (seen - lam * np.exp(-lam)), lam * seen**2)  # Fisher information on lambda
+    var += b * c**2 * (np.exp(-lam) / seen) ** 2 * _div(np.ones_like(info), info)
+    # On the AAI scale (delta method): symmetric in c it reached 0 at c ~ 0.17 (85% identity)
+    half = norm.ppf((1 + level) / 2) * np.sqrt(var) / (k * smooth ** ((k - 1) / k))
+    return np.clip(c ** (1 / k) - half, 0.0, 1.0), np.clip(c ** (1 / k) + half, 0.0, 1.0)
+
+
+def ztp_lambda(mean: np.ndarray, iterations: int = 50) -> np.ndarray:
+    """Zero-truncated Poisson MLE of the rate from the mean count of the non-zero items:
+    lambda / (1 - exp(-lambda)) = mean, by Newton from lambda = mean; 0 where mean <= 1."""
+    mean = np.asarray(mean, dtype=np.float64)
+    lam = mean.copy()
+    fit = mean > 1
+    for _ in range(iterations):
+        e = np.exp(-lam[fit])
+        seen = -np.expm1(-lam[fit])
+        f = lam[fit] / seen - mean[fit]
+        df = (seen - lam[fit] * e) / seen**2
+        lam[fit] = np.maximum(lam[fit] - f / df, 1e-9)
+    lam[~fit] = 0.0
+    return lam
+
+
+def aai_naive(hits: np.ndarray, kmers_hit: np.ndarray, pin_sum: np.ndarray, k: int) -> pl.DataFrame:
+    """Per unit, independently (shared k-mers count for every holder, as sylph's ``query``):
+    containment k-mers hit / ``pin_sum`` corrected for coverage by 1 - exp(-lambda), lambda the
+    zero-truncated Poisson MLE from hits per hit k-mer; AAI = min(1, that)^(1/k). Below
+    ``MIN_AAI_LAMBDA`` the correction is not identifiable: the uncorrected value is reported
+    and ``aai_naive_lower_bound`` set."""
+    lam = ztp_lambda(_div(hits.astype(np.float64), kmers_hit.astype(np.float64)))
+    low = lam < MIN_AAI_LAMBDA
+    seen = np.where(low, 1.0, -np.expm1(-np.maximum(lam, MIN_AAI_LAMBDA)))
+    containment = _div(kmers_hit / seen, pin_sum.astype(np.float64))
+    return pl.DataFrame(
+        {"aai_naive": np.minimum(containment, 1.0) ** (1 / k), "aai_naive_lower_bound": low}
+    )
+
+
 CHUNK_BYTES: Final = 2**25  # units x grid arrays of the posterior are built in chunks of this
 
 
@@ -1209,20 +1403,26 @@ def profile(
     *,
     genetic_code: int = 11,
     frames: str = "stopfree",
+    min_qual: int = 0,
     batch_reads: int = 100_000,
     draws: int = 0,
     kmers_out: str | Path | None = None,
     timer: Timer | None = None,
     all_estimators: bool = False,
     low_memory: bool = False,
+    with_aai: bool = False,
+    min_aai: float = 0.0,
+    extra: Sequence[Index] = (),
+    mask: "Mask | None" = None,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
     ``containment`` is the fraction of the unit's kept k-mers seen at least once;
     ``coverage`` is hits per kept k-mer; ``kmers_unique`` and ``gather_rank`` come from
     :func:`gather` (0 and null for units explained away) and ``coverage_em`` from :func:`em`
-    over the units gather keeps (0 for the rest), with ``coverage_zi`` and ``present_zi``
-    from its zero-inflated form, and ``coverage_zip``/``present_zip`` from :func:`em_pin`.
+    over the units gather keeps (0 for the rest; ``hits_em`` its hits after the split), with
+    ``coverage_zi`` and ``present_zi`` from its zero-inflated form, and
+    ``coverage_zip``/``present_zip`` from :func:`em_pin`.
     ``copies_zi`` is present k-mers over an average member's kept k-mers (``pin_sum``), the
     member-equivalents present, and ``abundance_zi`` = ``coverage_zi`` x ``copies_zi``: for a
     unit whose members come from many genomes (a KO), total depth over its gene copies.
@@ -1248,6 +1448,22 @@ def profile(
     all hit units never held). ``kmers_out`` writes
     the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
 
+    Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
+    unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` = min(1, ``copies_zi``)^(1/k)
+    on the units gather keeps whenever ``_zi`` is fitted (``with_aai`` fits it), with a
+    closed-form 95% interval ``aai_lo``/``_hi`` (:func:`aai_interval`; no draws needed).
+    ``component`` labels the hit units linked by shared k-mers by their smallest unit id, so
+    the units that bracket a sample variant can be read together. ``min_aai`` drops rows
+    with ``aai_naive`` below it.
+
+    ``extra`` indexes (same k, alphabet and hash scheme) are queried jointly with ``index``:
+    their units compete with its units in gather, EM and the posterior, with ids offset by
+    the units of the indexes before, and a ``source`` column (0 = ``index``) in the output.
+
+    ``mask`` (:class:`~kmer_functional_profiler.mask.Mask`, built against ``index``) drops
+    masked sampled hashes before any lookup and subtracts the masked postings from the unit
+    rows' expected counts; ``masked_fraction`` and ``host_like`` are added.
+
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
     space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
@@ -1257,8 +1473,17 @@ def profile(
     counts = timer.counts
     # Format-1 indexes also record tier1_per_unit.
     params = IndexParams(**{f.name: index.meta["params"][f.name] for f in fields(IndexParams)})
+    joint = _Joint([index, *extra])
 
     def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
+        batches = unmasked(max_hash)
+        if mask is None:
+            return batches
+        return (
+            {c: v[keep] for c, v in b.items()} for b in batches for keep in [mask.keep(b["hash"])]
+        )
+
+    def unmasked(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         if index.meta.get("hash") == "sourmash":
             return sourmash_hits(r1, r2, params.k, max_hash, batch_reads)
         return _core.FastxHits(
@@ -1270,9 +1495,8 @@ def profile(
             frames=frames,
             max_hash=max_hash,
             batch_reads=batch_reads,
+            min_qual=min_qual,
         )
-
-    max_hash_g = index.units["max_hash_g"]
 
     def by_read(hits: pl.DataFrame) -> pl.DataFrame:
         return hits.group_by("unit", "hash", "read").agg(
@@ -1284,7 +1508,7 @@ def profile(
         also a hit's rows over its holders, so these are the first pass's rows for them."""
         wanted = np.sort(kmers).astype(np.uint64)
         parts = [pl.DataFrame(schema={"hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32})]
-        for b in stream(index.tier2.max_hash):
+        for b in stream(joint.max_hash("tier2")):
             at = np.minimum(np.searchsorted(wanted, b["hash"]), max(len(wanted) - 1, 0))
             keep = wanted[at] == b["hash"] if len(wanted) else np.zeros(len(at), dtype=bool)
             found = pl.DataFrame({"hash": b["hash"][keep], "read": b["read"][keep]})
@@ -1305,13 +1529,13 @@ def profile(
     batches, n_reads, subsample = [], 0, []
     # The posterior's per-read rows come from this pass, unless a dense tier's pass gives
     # them or ``low_memory`` re-reads the reads for the detected k-mers only.
-    keep_reads = draws > 0 and index.dense is None and not low_memory
+    keep_reads = draws > 0 and not joint.dense and not low_memory
     sampled = hit_kmers = hit_rows = 0
-    reads = iter(stream(index.tier2.max_hash))
+    reads = iter(stream(joint.max_hash("tier2")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
     while b is not None:
         with timer("lookup"):
-            hits = unit_hits(index.tier2, max_hash_g, b["hash"], b["read"])
+            hits = joint.hits("tier2", b["hash"], b["read"])
         with timer("aggregate"):
             pairs.add(hits.group_by("unit", "hash").agg(hits=pl.len(), **first))
             reads_summed.add(
@@ -1325,7 +1549,7 @@ def profile(
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
         sampled += len(b["hash"])
-        subsample.append(b["hash"][b["hash"] <= index.tier2.max_hash // DISTINCT_SAMPLE])
+        subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier2") // DISTINCT_SAMPLE])
         hit_rows += hits.height
         hit_kmers += round((1 / hits["holders"]).sum()) if hits.height else 0  # rows per hit
         with timer("hash"):
@@ -1344,14 +1568,19 @@ def profile(
         "hit_units": kmer_hits["unit"].n_unique(),
     }
     with timer("hit_units"):  # rows gathered from the unit columns, never the whole table
-        hit_info = index.units.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
-    if record:
-        with timer("components"):
-            (
-                counts["components"],
-                counts["largest_component_units"],
-                counts["largest_component_pairs"],
-            ) = components(kmer_hits)
+        hit_info = joint.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
+        if mask is not None:
+            hit_info = mask.adjust(hit_info)
+    with timer("components"):
+        component = component_labels(kmer_hits)
+        if record:
+            per_unit = component.group_by("component").len()
+            counts["components"] = per_unit.height
+            largest = per_unit.sort("len", "component", descending=[True, False]).row(0)
+            counts["largest_component_units"] = largest[1]
+            counts["largest_component_pairs"] = kmer_hits.join(
+                component.filter(pl.col("component") == largest[0]), on="unit"
+            ).height
     if kmers_out is not None:
         kmer_hits.write_parquet(kmers_out)
     # From here units are numbered 0.. in the hit units' order (``index`` keeps the index's
@@ -1364,7 +1593,7 @@ def profile(
     def renumber(df: pl.DataFrame) -> pl.DataFrame:
         return df.join(ids, on="unit").drop("unit").rename({"index": "unit"})
 
-    kmer_hits, unit_reads = renumber(kmer_hits), renumber(unit_reads)
+    kmer_hits, unit_reads, component = map(renumber, (kmer_hits, unit_reads, component))
     hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
     t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
@@ -1383,22 +1612,20 @@ def profile(
         .select("unit", "hash", "holders")
     )
     with timer("presence"):
-        present_prob = presence(own, t_g, n_reads, index.units.height, report=counts)
+        present_prob = presence(own, t_g, n_reads, joint.height, report=counts)
     del own
-    dense = index.dense
-    if dense is not None:
+    if joint.dense:
         # Second pass: every k-mer at the dense rate, for the detected units only.
-        max_hash_dense = index.units["max_hash_dense"]
         keep = assigned.select("unit")  # detected units are hit units, so renumber keeps all
         with timer("dense"):
             detected_reads = pl.concat(
                 [
                     by_read(
-                        renumber(unit_hits(dense, max_hash_dense, b["hash"], b["read"])).join(
+                        renumber(joint.hits("dense", b["hash"], b["read"])).join(
                             keep, on="unit", how="semi"
                         )
                     )
-                    for b in [{"hash": empty, "read": empty}, *stream(dense.max_hash)]
+                    for b in [{"hash": empty, "read": empty}, *stream(joint.max_hash("dense"))]
                 ]
             )
             detected = per_kmer(detected_reads)
@@ -1424,24 +1651,59 @@ def profile(
         plain = per_batch(lambda part: em(part, m_g, report=counts)).select(
             "unit", coverage_em="coverage"
         )
+        # Hits after the EM split (what the function x taxon table splits): coverage x m.
+        plain = plain.with_columns(hits_em=plain["coverage_em"] * m_g[plain["unit"].to_numpy()])
     fits = [plain]
-    if all_estimators or draws > 0:
+    if all_estimators or draws > 0 or with_aai:
         with timer("fit_zi"):
             inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
         copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
+        zi = inflated.join(
+            pl.DataFrame(
+                {
+                    "unit": np.arange(len(m_g), dtype=np.uint32),
+                    "m": m_g,
+                    "pin_sum": pin_sum,
+                    # sourmash imports have no n_kmers: windows taken as all kept (t = 1)
+                    "n_kmers": hit_info["n_kmers"] if "n_kmers" in hit_info.columns else m_g,
+                }
+            ),
+            on="unit",
+        )
+        # Clumping: a read covering a unit hits ~ Poisson(mu) of its kept k-mers, which inflates
+        # the variance of hit counts by 1 + mu. mu from tier-2 hits per hitting read (a
+        # zero-truncated mean), scaled to the fitted tier's k-mers.
+        ratio = (
+            kmer_hits.group_by("unit")
+            .agg(hits=pl.col("hits").sum())
+            .join(unit_reads, on="unit")
+            .select("unit", per_read=pl.col("hits") / pl.col("reads"))
+        )
+        mu = np.zeros(len(m_g))
+        mu[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
+        mu *= _div(m_g.astype(np.float64), hit_info["m_g"].to_numpy().astype(np.float64))
+        lo, hi = aai_interval(
+            zi["coverage"].to_numpy(),
+            zi["present"].to_numpy(),
+            zi["m"].to_numpy(),
+            zi["pin_sum"].to_numpy(),
+            zi["n_kmers"].to_numpy(),
+            params.k,
+            clumping=1 + mu[zi["unit"].to_numpy()],
+        )
+        point = aai(copies, pl.col("present") * pl.col("m"), pl.col("coverage"), params.k)
         fits.append(
-            inflated.join(
-                pl.DataFrame(
-                    {"unit": np.arange(len(m_g), dtype=np.uint32), "m": m_g, "pin_sum": pin_sum}
-                ),
-                on="unit",
-            ).select(
+            zi.with_columns(aai_lo=lo, aai_hi=hi).select(
                 "unit",
                 coverage_zi="coverage",
                 present_zi="present",
                 copies_zi=copies,
                 abundance_zi=pl.col("coverage") * copies,
+                aai=point,
+                # null with the point (too few k-mers or too little coverage to identify it)
+                aai_lo=pl.when(point.is_not_null()).then("aai_lo"),
+                aai_hi=pl.when(point.is_not_null()).then("aai_hi"),
             )
         )
     if all_estimators:
@@ -1459,6 +1721,16 @@ def profile(
                     "unit", coverage_zip="coverage", present_zip="present"
                 )
             )
+    with timer("aai"):
+        per_unit = (
+            kmer_hits.group_by("unit").agg(hits=pl.col("hits").sum(), kmers=pl.len()).sort("unit")
+        )
+        naive = aai_naive(
+            per_unit["hits"].to_numpy(),
+            per_unit["kmers"].to_numpy(),
+            hit_info["pin_sum"].to_numpy()[per_unit["unit"].to_numpy()],
+            params.k,
+        ).with_columns(unit=per_unit["unit"])
     unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
@@ -1470,9 +1742,13 @@ def profile(
             .join(unit_info, on="unit")
             .join(assigned, on="unit", how="left")
             .join(present_prob, on="unit", how="left")
+            .join(naive, on="unit")
+            .join(component, on="unit")
         )
         for fit in fits:
             result = result.join(fit, on="unit", how="left")
+    if detected.height == 0:  # nothing detected (e.g. host-only reads): no posterior to draw
+        draws = 0
     if draws > 0 and per_read is None:
         with timer("reread"):
             per_read = reread(detected["hash"].unique().to_numpy())
@@ -1491,7 +1767,7 @@ def profile(
                 len_cv=len_cv,
             )
         result = result.join(intervals, on="unit", how="left")
-    if dense is not None:
+    if joint.dense:
         result = result.join(
             detected.group_by("unit").agg(kmers_dense=pl.len().cast(pl.UInt32)),
             on="unit",
@@ -1516,15 +1792,17 @@ def profile(
             result = result.drop("_wta", "_ufirst")
     return (
         result.with_columns(
-            pl.col("^(coverage|present|copies|abundance)_(em|zi|zib|zip)(_lo|_hi)?$").fill_null(
-                0.0
-            ),
+            pl.col(
+                "^(coverage|present|copies|abundance|hits)_(em|zi|zib|zip)(_lo|_hi)?$"
+            ).fill_null(0.0),
             pl.col("present_prob").fill_null(0.0),
             containment=pl.col("kmers_hit") / pl.col("m_g"),
             coverage=pl.col("hits") / pl.col("m_g"),
             kmers_unique=pl.col("kmers_unique").fill_null(0),
         )
         .with_columns(unit=pl.col("index"))  # back to the index's unit ids
+        .with_columns(component=pl.col("unit").min().over("component"))
         .drop("index")
+        .filter(pl.col("aai_naive") >= min_aai)
         .sort("unit")
     )

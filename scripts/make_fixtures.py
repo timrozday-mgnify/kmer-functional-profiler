@@ -9,11 +9,15 @@ frame and amino-acid span.
 ``mini_release/`` holds a few MGnify90 clusters in the release's Parquet schemas, for
 testing ``workflows/mgnify-subset`` without the real release. ``mini_fmh/`` mimics the
 fmh-funprofiler benchmark inputs (Zenodo 10055954) for ``workflows/fmh-benchmark``: three
-genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches.
+genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches, plus
+``Pfam-mini.hmm``: Pfam-style HMMs (with GA cut-offs) built by ``hmmbuild`` from segments of
+some of those proteins, one of them carrying two, so Pfam truth has sub-gene domains.
 """
 
 import gzip
 import random
+import subprocess
+import tempfile
 from pathlib import Path
 
 import polars as pl
@@ -206,7 +210,129 @@ def mini_fmh(rng: random.Random) -> None:
         f.write("\n")
 
 
+def mini_pfam(rng: random.Random) -> None:
+    """Six single-sequence HMMs (``hmmbuild``, HMMER 3.4) from 40-80 aa segments of mini_fmh
+    proteins: two from one protein, the rest from five others (genes in several genomes).
+
+    Kept if present (delete the file to rebuild): hmmbuild's last digits differ between
+    platforms (macOS arm64 vs Linux x86_64), so the file cannot be byte-reproducible.
+    """
+    if (OUT / "mini_fmh" / "Pfam-mini.hmm").exists():
+        return
+    genes = pl.concat(
+        pl.read_csv(p, columns=["gene_name", "aa_sequence"])
+        for p in sorted((OUT / "mini_fmh" / "genomes_extracted_from_kegg").glob("*/*_mapping.csv"))
+    )
+    picked = genes.sample(6, seed=rng.randrange(2**31))["aa_sequence"].to_list()
+    segments = [(picked[0], 5, 55), (picked[0], 70, 120)]
+    for protein in picked[1:5]:
+        start = rng.randrange(len(protein) - 80)
+        segments.append((protein, start, start + rng.randint(40, 80)))
+    with tempfile.TemporaryDirectory() as tmp:
+        hmms = []
+        for i, (protein, start, end) in enumerate(segments, start=1):
+            sto = Path(tmp) / f"{i}.sto"
+            sto.write_text(
+                f"# STOCKHOLM 1.0\n#=GF ID Mini{i}\n#=GF AC PF9{i:04d}.1\n"
+                f"#=GF GA 25.00 25.00;\n#=GF TC 25.00 25.00;\n#=GF NC 24.00 24.00;\n"
+                f"seq{i} {protein[start:end]}\n//\n"
+            )
+            hmm = Path(tmp) / f"{i}.hmm"
+            subprocess.run(["hmmbuild", "--amino", "--seed", "1", str(hmm), str(sto)],
+                           check=True, capture_output=True)  # fmt: skip
+            # hmmbuild stamps the build date; drop it so reruns give the same bytes
+            hmms.append("".join(line for line in hmm.read_text().splitlines(keepends=True)
+                                if not line.startswith("DATE")))  # fmt: skip
+    (OUT / "mini_fmh" / "Pfam-mini.hmm").write_text("".join(hmms))
+
+
+def mini_host(rng: random.Random) -> None:
+    """A stand-in host for the fmh-benchmark test profile: 60 kb of random DNA (two
+    chromosomes) gzipped, the extra records (``chrM``, PhiX) plain, and the fixture proteins
+    gzipped as a decoy proteome."""
+    out = OUT / "mini_fmh"
+    chroms = "".join(f">chr{i}\n{''.join(rng.choices('ACGT', k=30_000))}\n" for i in (1, 2))
+    extra = f">NC_012920.1 mito\n{''.join(rng.choices('ACGT', k=2_000))}\n" + (
+        f">NC_001422.1 phiX\n{''.join(rng.choices('ACGT', k=1_000))}\n"
+    )
+    for name, text in (
+        ("host_mini.fa.gz", chroms),
+        ("decoy_mini.faa.gz", (OUT / "proteins.faa").read_text()),
+    ):
+        with (
+            (out / name).open("wb") as f,
+            gzip.GzipFile(filename="", mode="wb", fileobj=f, mtime=0) as gz,
+        ):
+            gz.write(text.encode())
+    (out / "host_extra.fa").write_text(extra)
+
+
+def mini_mgnify(rng: random.Random) -> None:
+    """A stand-in MGnify90 release for the mini_fmh genomes: for 24 of their proteins
+    (including every one with a Pfam-mini domain), a cluster whose representative is the
+    protein mutated to a known identity (100% to 70%) and whose two other members are the
+    representative mutated to 97%; plus 6 unrelated clusters. Members and Pfam tables in the
+    release's schemas (integer Pfam accessions: each cluster takes its source gene's
+    domains, found by ``hmmsearch --cut_ga``). ``mgnify_truth.tsv`` records each
+    representative's source gene and identity."""
+    out = OUT / "mini_fmh"
+    genes = pl.concat(
+        pl.read_csv(p, columns=["gene_name", "aa_sequence"])
+        for p in sorted((out / "genomes_extracted_from_kegg").glob("*/*_mapping.csv"))
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        faa = Path(tmp) / "p.faa"
+        faa.write_text("".join(f">{g}\n{s}\n" for g, s in genes.iter_rows()))
+        tbl = Path(tmp) / "d.tbl"
+        subprocess.run(["hmmsearch", "--cut_ga", "--domtblout", tbl, "-o", "/dev/null",
+                        out / "Pfam-mini.hmm", faa], check=True)  # fmt: skip
+        domains: dict[str, set[int]] = {}
+        for line in tbl.read_text().splitlines():
+            if not line.startswith("#"):
+                f = line.split()
+                domains.setdefault(f[0], set()).add(int(f[4][2:].split(".")[0]))
+    others = genes.filter(~pl.col("gene_name").is_in(list(domains)))
+    chosen = (
+        genes.filter(pl.col("gene_name").is_in(list(domains))).rows()
+        + others.sample(24 - len(domains), seed=rng.randrange(2**31)).rows()
+    )
+    identities = [1.0, 0.95, 0.9, 0.85, 0.8, 0.7]
+
+    def mutate(seq: str, identity: float) -> str:
+        out_seq = list(seq)
+        for i in rng.sample(range(len(seq)), round((1 - identity) * len(seq))):
+            out_seq[i] = rng.choice(AMINO_ACIDS.replace(seq[i], ""))
+        return "".join(out_seq)
+
+    members, truth, pfam, pid = [], [], [], 1
+    for n, (gene, protein) in enumerate(chosen):
+        identity = identities[n % len(identities)]
+        rep = mutate(protein, identity)
+        cluster = [(pid, pid, True, rep)] + [
+            (pid + i, pid, True, mutate(rep, 0.97)) for i in (1, 2)
+        ]
+        members += cluster
+        truth.append((pid, gene, identity))
+        pfam += [(m[0], acc) for m in cluster for acc in sorted(domains.get(gene, ()))]
+        pid += 3
+    for _ in range(6):
+        rep = "M" + "".join(rng.choices(AMINO_ACIDS, k=rng.randint(150, 300)))
+        members += [(pid, pid, True, rep), (pid + 1, pid, True, mutate(rep, 0.97))]
+        pid += 2
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(members, schema=schema, orient="row").write_parquet(out / "mgnify_members.parquet")
+    pl.DataFrame(truth, schema=["cluster_rep", "gene_name", "identity"], orient="row").write_csv(
+        out / "mgnify_truth.tsv", separator="\t"
+    )
+    pl.DataFrame(pfam, schema=["protein_id", "pfam_accession"], orient="row").write_parquet(
+        out / "mgnify_pfam.parquet"
+    )
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
     mini_fmh(random.Random(20260930))
+    mini_pfam(random.Random(20261001))
+    mini_host(random.Random(20261002))
+    mini_mgnify(random.Random(20261003))

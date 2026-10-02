@@ -35,7 +35,7 @@ def test_translate_frames(seq: bytes, code: int) -> None:
     st.lists(dna, max_size=4),
     alphabet_and_k(),
     st.sampled_from([11, 4]),
-    st.sampled_from(["stopfree", "all"]),
+    st.sampled_from(["stopfree", "all", "edges", "edges:3"]),
     thresholds,
 )
 def test_hash_dna(

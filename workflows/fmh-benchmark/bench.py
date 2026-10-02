@@ -6,8 +6,23 @@
   gene coordinates as ``genes.parquet``.
 - ``truth``: map simulated read pairs back to the sample with minimap2 (mappy); a KO is
   present if a primary alignment overlaps one of its genes, as in the paper's CAMISIM
-  ground truth. Writes ``ko_id``, ``n_reads``, ``bases`` (overlapping aligned bases) and
-  ``depth`` (bases / gene length, summed over the KO's genes: read depth times copies).
+  ground truth. Writes ``label`` (the KO), ``n_reads``, ``bases`` (overlapping aligned
+  bases) and ``depth`` (bases / gene length, summed over the KO's genes: read depth times
+  copies). With ``--domains``, also the Pfam truth (``--out-pfam``): the same over Pfam
+  domains' coordinates on the genome, not whole genes (Benchmark labels).
+- ``pfam-proteins``: every gene's protein from the genomes' mapping tables, as FASTA.
+- ``pfam-domains``: ``hmmsearch --domtblout`` -> ``domains.parquet`` (gene, Pfam, envelope
+  in aa) and ``pfam_members.parquet``, the domains as members of one unit per Pfam (the
+  Pfam analogue of the KO index).
+- ``reps``: the representative of every MGnify90 cluster in members tables, as FASTA.
+- ``mgnify-genes``: DIAMOND blastp of the genomes' proteins against those representatives ->
+  ``gene_units.parquet``: per gene its best and near-hit clusters, with identity and
+  coverage (the truth of unit-level detection and of containment AAI).
+- ``aai-score``: a unit profile against that truth: detection at the MGnify90 level (genes
+  whose best cluster passes ``--id``/``--cov``), recall of the nearest cluster beyond it, and
+  ``aai`` / ``aai_naive`` against the alignment identities (see :func:`aai_score`).
+- ``pfam-profile``: a profile against an index with Pfam labels (``unit_pfam.parquet``, e.g.
+  MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams.
 - ``score``: purity and completeness of one profile against a truth table, one row per
   count present (``kmers_hit``; ``kmers_unique`` after gather; ``kmers_wta`` and
   ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
@@ -28,13 +43,15 @@
 """
 
 import argparse
+import gzip
 import itertools
 import json
 import random
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from typing import IO
 
 import mappy
 import numpy as np
@@ -43,13 +60,18 @@ import polars as pl
 from kmer_functional_profiler import _core
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
-                  "end_position": pl.Int64}  # fmt: skip
+                  "end_position": pl.Int64, "strand": pl.String}  # fmt: skip
+
+
+def _open(path: str | Path) -> IO[str]:
+    """A text file, gzip-compressed if its name ends in .gz."""
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)  # noqa: SIM115
 
 
 def fasta(path: str | Path) -> Iterator[tuple[str, str]]:
     """(header, sequence) records; headers keep everything after ``>``."""
     header, chunks = None, []
-    with open(path) as f:
+    with _open(path) as f:
         for line in f:
             if line.startswith(">"):
                 if header is not None:
@@ -101,6 +123,7 @@ def sample(args: argparse.Namespace) -> None:
         contig=pl.col("genome") + "|" + pl.col("contig_id"),
         start=pl.min_horizontal("start_position", "end_position") - 1,  # 0-based, half-open
         end=pl.max_horizontal("start_position", "end_position"),
+        strand="strand",
     ).write_parquet("genes.parquet")
     Path("genomes.txt").write_text("\n".join(chosen) + "\n")
 
@@ -154,6 +177,48 @@ def _pairs(r1: str, r2: str, size: int = 10_000) -> Iterator[list[tuple[int, str
         yield chunk
 
 
+def _truth(aligned: pl.DataFrame, features: pl.DataFrame) -> pl.DataFrame:
+    """Per ``label``: reads, aligned bases and depth over ``features`` (``contig``, ``start``,
+    ``end``, ``label``) that primary alignments overlap; depth sums bases / feature length."""
+    # join_where on contig + ranges is a contig hash join then a filter (reads x genes per
+    # contig, billions of rows on complete genomes); joining on (contig, bin) keeps it local
+    overlaps = (
+        _binned(aligned, "r_start", "r_end")
+        .join(_binned(features.unique(), "start", "end"), on=["contig", "bin"])
+        .filter(pl.col("r_start") < pl.col("end"), pl.col("r_end") > pl.col("start"))
+        .drop("bin")
+        .unique()
+    )
+    return (
+        overlaps.with_columns(
+            bases=pl.min_horizontal("r_end", "end") - pl.max_horizontal("r_start", "start")
+        )
+        .group_by("label")
+        .agg(
+            n_reads=pl.col("read").n_unique(),
+            bases=pl.col("bases").sum(),
+            depth=(pl.col("bases") / (pl.col("end") - pl.col("start"))).sum(),
+        )
+        .sort("label")
+    )
+
+
+def domain_features(genes: pl.DataFrame, domains: pl.DataFrame) -> pl.DataFrame:
+    """Pfam domains (aa envelopes) of ``genes`` as genome intervals: on the reverse strand
+    residue i of a protein lies at [end - 3(i + 1), end - 3i)."""
+    forward = pl.col("strand") != "-"
+    return genes.join(domains, on="gene_name").select(
+        "contig",
+        start=pl.when(forward)
+        .then(pl.col("start") + 3 * pl.col("aa_start"))
+        .otherwise(pl.col("end") - 3 * pl.col("aa_end")),
+        end=pl.when(forward)
+        .then(pl.col("start") + 3 * pl.col("aa_end"))
+        .otherwise(pl.col("end") - 3 * pl.col("aa_start")),
+        label="pfam",
+    )
+
+
 def truth(args: argparse.Namespace) -> None:
     # mappy releases the GIL while aligning, so threads share one index instead of one per process
     aligner = mappy.Aligner(args.fna, preset="sr")
@@ -162,41 +227,322 @@ def truth(args: argparse.Namespace) -> None:
         hits = [h for part in parts for h in part]
     schema = {"read": pl.Int64, "contig": pl.String, "r_start": pl.Int64, "r_end": pl.Int64}
     aligned = pl.DataFrame(hits, schema=schema, orient="row")
-    # join_where on contig + ranges is a contig hash join then a filter (reads x genes per
-    # contig, billions of rows on complete genomes); joining on (contig, bin) keeps it local
-    overlaps = (
-        _binned(aligned, "r_start", "r_end")
-        .join(_binned(pl.read_parquet(args.genes), "start", "end"), on=["contig", "bin"])
-        .filter(pl.col("r_start") < pl.col("end"), pl.col("r_end") > pl.col("start"))
-        .drop("bin")
-        .unique()
+    genes = pl.read_parquet(args.genes)
+    kos = genes.join(read_kos(args.kos), left_on="gene_name", right_on="gene_id").select(
+        "contig", "start", "end", label="ko_id"
     )
+    _truth(aligned, kos).write_csv(args.out)
+    gene_features = genes.select("contig", "start", "end", label="gene_name")
+    _truth(aligned, gene_features).rename({"label": "gene_name"}).write_csv(args.out_genes)
+    if args.domains:
+        features = domain_features(genes, pl.read_parquet(args.domains))
+        _truth(aligned, features).write_csv(args.out_pfam)
+
+
+def read_profile(path: str | Path) -> pl.DataFrame:
+    """A profile TSV; an empty one (nothing detected) gets numeric columns, not strings."""
+    profile = pl.read_csv(path, separator="\t")
+    if profile.height:
+        return profile
+    strings = {"name", "cluster_rep"}
+    return profile.cast({c: pl.UInt32 if c == "unit" else pl.Float64
+                         for c in profile.columns if c not in strings})  # fmt: skip
+
+
+def mix(args: argparse.Namespace) -> None:
+    """A host spike-in sample at constant depth: each microbial pair kept with probability
+    1 - ``fraction``, then host pairs, ``fraction`` x the microbial pairs, from the start of
+    the host reads. Truth is recomputed on the mixed reads (host reads map to no genome)."""
+    rng = random.Random(args.seed)
+    n = 0
+    with (
+        gzip.open(args.r1, "rt") as m1, gzip.open(args.r2, "rt") as m2,
+        gzip.open("mixed_R1.fastq.gz", "wt", compresslevel=1) as o1,
+        gzip.open("mixed_R2.fastq.gz", "wt", compresslevel=1) as o2,
+    ):  # fmt: skip
+        for rec1, rec2 in zip(_records(m1), _records(m2), strict=True):
+            n += 1
+            if rng.random() >= args.fraction:
+                o1.write(rec1)
+                o2.write(rec2)
+        want = round(n * args.fraction)
+        with gzip.open(args.host_r1, "rt") as h1, gzip.open(args.host_r2, "rt") as h2:
+            got = 0
+            for rec1, rec2 in itertools.islice(zip(_records(h1), _records(h2), strict=True), want):
+                o1.write(rec1)
+                o2.write(rec2)
+                got += 1
+    if got < want:
+        raise ValueError(f"{got} host pairs, {want} wanted: simulate more host reads")
+
+
+def _records(f: Iterable[str]) -> Iterator[str]:
+    """FASTQ records (four lines each) as strings."""
+    lines = iter(f)
+    for header in lines:
+        yield header + next(lines) + next(lines) + next(lines)
+
+
+def host_abundance(args: argparse.Namespace) -> None:
+    """iss abundance file for a host genome: reads in proportion to record length, the
+    mitochondrion at ``--mito-copies`` copies and PhiX at ``--phix`` of the reads."""
+    lengths: dict[str, int] = {}
+    with _open(args.fasta) as f:
+        name = None
+        for line in f:
+            if line.startswith(">"):
+                name = line[1:].split()[0]
+                lengths[name] = 0
+            elif name is not None:
+                lengths[name] += len(line.strip())
+    weight = {n: n_bp * (args.mito_copies if n in MITO else 1) for n, n_bp in lengths.items()
+              if n not in PHIX}  # fmt: skip
+    total = sum(weight.values())
+    rows = [(n, (1 - args.phix) * w / total) for n, w in weight.items()]
+    rows += [(n, args.phix) for n in lengths if n in PHIX]
+    Path(args.out).write_text("".join(f"{n}\t{a}\n" for n, a in rows))
+
+
+MITO = {"chrM", "NC_012920.1"}
+PHIX = {"NC_001422.1"}
+
+
+def decoy_members(args: argparse.Namespace) -> None:
+    """A proteome as a members table, one unit per protein (decoy indexes)."""
+    rows = [(i, i, True, seq) for i, (_, seq) in enumerate(fasta(args.faa))]
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(args.out)
+
+
+def read_truth(path: str | Path) -> pl.DataFrame:
+    """A truth table, with ``label`` (truth files before Pfam called it ``ko_id``)."""
+    return pl.read_csv(path).rename({"ko_id": "label"}, strict=False)
+
+
+def pfam_proteins(args: argparse.Namespace) -> None:
+    """Every gene's protein, dealt round-robin into ``--chunks`` files for parallel search."""
+    outs = [open(f"proteins.{i}.faa", "w") for i in range(args.chunks)]  # noqa: SIM115
+    n = 0
+    for path in sorted(Path(args.genomes_dir).glob("*/*_mapping.csv")):
+        genes = pl.read_csv(path, columns=["gene_name", "aa_sequence"])
+        for name, seq in genes.unique("gene_name", maintain_order=True).drop_nulls().iter_rows():
+            outs[n % args.chunks].write(f">{name}\n{seq}\n")
+            n += 1
+    for out in outs:
+        out.close()
+
+
+def pfam_domains(args: argparse.Namespace) -> None:
+    rows = [
+        (f[0], f[4].split(".")[0], int(f[19]) - 1, int(f[20]))  # target, accession, envelope
+        for path in args.domtbl
+        for line in Path(path).read_text().splitlines()
+        if not line.startswith("#")
+        for f in [line.split()]
+    ]
+    schema = {"gene_name": pl.String, "pfam": pl.String, "aa_start": pl.Int64, "aa_end": pl.Int64}
+    domains = pl.DataFrame(rows, schema=schema, orient="row").unique().sort(list(schema))
+    domains.write_parquet(args.out)
+    proteins = pl.DataFrame(
+        [r for path in args.proteins for r in fasta(path)],
+        schema=["gene_name", "seq"],
+        orient="row",
+    )
+    domains.join(proteins, on="gene_name", maintain_order="left").select(
+        protein_id=pl.format("{}:{}-{}", "gene_name", "aa_start", "aa_end"),
+        cluster_rep="pfam",
+        full_length=pl.lit(True),
+        sequence=pl.col("seq").str.slice(pl.col("aa_start"), pl.col("aa_end") - pl.col("aa_start")),
+    ).write_parquet(args.out_members)
+
+
+def reps(args: argparse.Namespace) -> None:
+    """Cluster representatives (``protein_id == cluster_rep``) of members tables (files, or
+    directories of them, e.g. the MERGE buckets) as FASTA named by ``cluster_rep``."""
+    paths = [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in args.members]
+    # streamed: the whole release has ~1.7e9 clusters
+    pl.scan_parquet(paths).filter(pl.col("protein_id") == pl.col("cluster_rep")).select(
+        pl.format(">{}\n{}", "cluster_rep", "sequence")
+    ).sink_csv(args.out, include_header=False, quote_style="never")
+
+
+MGNIFY_HIT_COLUMNS = ["gene_name", "cluster_rep", "pident", "length", "qlen", "slen", "bitscore"]
+
+
+def mgnify_genes(args: argparse.Namespace) -> None:
+    """DIAMOND hits (outfmt 6 ``qseqid sseqid pident length qlen slen bitscore``) -> per gene
+    and cluster: identity (0-1), query and subject coverage, bitscore and rank (1 = best)."""
+    hits = pl.concat(
+        pl.read_csv(p, separator="\t", has_header=False, new_columns=MGNIFY_HIT_COLUMNS,
+                    schema_overrides={"gene_name": pl.String, "cluster_rep": pl.Int64})
+        for p in args.hits
+    )  # fmt: skip
     (
-        overlaps.with_columns(
-            bases=pl.min_horizontal("r_end", "end") - pl.max_horizontal("r_start", "start")
+        hits.group_by("gene_name", "cluster_rep")  # one row per pair: its best HSP
+        .agg(pl.all().sort_by("bitscore").last())
+        .select(
+            "gene_name",
+            "cluster_rep",
+            identity=pl.col("pident") / 100,
+            qcov=pl.col("length") / pl.col("qlen"),
+            scov=pl.col("length") / pl.col("slen"),
+            bitscore="bitscore",
         )
-        .join(read_kos(args.kos), left_on="gene_name", right_on="gene_id")
-        .group_by("ko_id")
+        .with_columns(
+            rank=pl.col("bitscore")
+            .rank("ordinal", descending=True)
+            .over("gene_name")
+            .cast(pl.UInt32)
+        )
+        .sort("gene_name", "rank")
+        .write_parquet(args.out)
+    )
+
+
+IDENTITY_BINS = ((0.95, 1.01), (0.9, 0.95), (0.8, 0.9), (0.7, 0.8), (0.5, 0.7))
+
+
+def aai_score(
+    profile: pl.DataFrame,
+    gene_units: pl.DataFrame,
+    genes: pl.DataFrame,
+    min_id: float = 0.9,
+    min_cov: float = 0.8,
+) -> dict[str, float | None]:
+    """Unit-level detection and containment AAI against alignment truth.
+
+    ``profile`` is a unit profile (``cluster_rep``, ``kmers_unique``, ``aai``, ``aai_lo``,
+    ``aai_hi``, ``aai_naive``); ``gene_units`` the hits of :func:`mgnify_genes`; ``genes``
+    the per-gene ``depth`` of the sample (genes with reads are present). A present gene's
+    best hit is its *nearest cluster*; it is *in* that cluster at the MGnify90 level if the
+    hit has identity >= ``min_id`` and both coverages >= ``min_cov``.
+
+    - ``completeness_90``, ``purity_nearest``: share of the clusters that hold a present
+      gene (at the 90% level) that are detected (``kmers_unique`` >= 1); share of detected
+      units that are some present gene's nearest cluster (``purity_near``: any hit). By the
+      nearest cluster's identity (``IDENTITY_BINS``, ``recall_<lo>``): share of present
+      genes whose nearest cluster is detected, also below 90% (resolution beyond it).
+    - ``aai_bias_<lo>``, ``aai_cover_<lo>``, ``aai_spearman``, ``aai_n``: detected units
+      with an ``aai``, against the depth-weighted identity of the present genes they are
+      nearest to (``aai_mixed``: units nearest to several genes).
+    - ``naive_bias_<lo>``, ``naive_within05_<lo>``, ``naive_spearman``, ``naive_n``: every
+      profiled unit some present gene hits, ``aai_naive`` against the best identity of a
+      present gene to it (near hits included).
+    """
+    present = genes.filter(pl.col("depth") > 0).select("gene_name", "depth")
+    hits = gene_units.join(present, on="gene_name").filter(pl.col("qcov") >= 0.5)
+    nearest = hits.filter(pl.col("rank") == 1)
+    in90 = nearest.filter(
+        pl.col("identity") >= min_id, pl.col("qcov") >= min_cov, pl.col("scov") >= min_cov
+    )
+    detected = set(profile.filter(pl.col("kmers_unique") >= 1)["cluster_rep"].to_list())
+    out: dict[str, float | None] = {
+        "genes_present": present.height,
+        "genes_with_hit": nearest.height,
+        "genes_in90": in90.height,
+    }
+    clusters90 = set(in90["cluster_rep"].to_list())
+    out["completeness_90"] = len(clusters90 & detected) / len(clusters90) if clusters90 else None
+    out["purity_nearest"] = (
+        len(detected & set(nearest["cluster_rep"].to_list())) / len(detected) if detected else None
+    )
+    out["purity_near"] = (
+        len(detected & set(hits["cluster_rep"].to_list())) / len(detected) if detected else None
+    )
+    for lo, hi in IDENTITY_BINS:
+        part = nearest.filter(pl.col("identity").is_between(lo, hi, closed="left"))
+        out[f"recall_{lo}"] = (
+            part["cluster_rep"].is_in(list(detected)).mean() if part.height else None  # type: ignore[assignment]
+        )
+    # aai of detected units, against the identity of the genes they are nearest to
+    truth = nearest.group_by("cluster_rep").agg(
+        true=(pl.col("identity") * pl.col("depth")).sum() / pl.col("depth").sum(),
+        genes=pl.len(),
+    )
+    if "aai" in profile.columns:
+        a = profile.filter(pl.col("kmers_unique") >= 1, pl.col("aai").is_not_null()).join(
+            truth, on="cluster_rep"
+        )
+        out["aai_n"] = a.height
+        out["aai_mixed"] = int((a["genes"] > 1).sum())
+        out["aai_spearman"] = (
+            a.select(pl.corr("aai", "true", method="spearman")).item() if a.height > 2 else None
+        )
+        for lo, hi in IDENTITY_BINS:
+            part = a.filter(pl.col("true").is_between(lo, hi, closed="left"))
+            out[f"aai_bias_{lo}"] = (part["aai"] - part["true"]).median() if part.height else None  # type: ignore[assignment]
+            out[f"aai_cover_{lo}"] = (
+                part.select(pl.col("true").is_between("aai_lo", "aai_hi").mean()).item()
+                if part.height and "aai_lo" in part.columns
+                else None
+            )
+    if "aai_naive" in profile.columns:
+        best = hits.group_by("cluster_rep").agg(true=pl.col("identity").max())
+        n = profile.join(best, on="cluster_rep")
+        out["naive_n"] = n.height
+        out["naive_spearman"] = (
+            n.select(pl.corr("aai_naive", "true", method="spearman")).item()
+            if n.height > 2
+            else None
+        )
+        for lo, hi in IDENTITY_BINS:
+            part = n.filter(pl.col("true").is_between(lo, hi, closed="left"))
+            err = part["aai_naive"] - part["true"]
+            out[f"naive_bias_{lo}"] = err.median() if part.height else None  # type: ignore[assignment]
+            out[f"naive_within05_{lo}"] = (err.abs() <= 0.05).mean() if part.height else None
+    return out
+
+
+def aai_score_step(args: argparse.Namespace) -> None:
+    row = aai_score(
+        read_profile(args.profile),
+        pl.read_parquet(args.gene_units),
+        pl.read_csv(args.genes),
+        args.min_id,
+        args.min_cov,
+    )
+    pl.DataFrame([{"sample": args.sample, "index": args.index, "arm": args.arm, **row}]).write_csv(
+        args.out, separator="\t"
+    )
+
+
+def pfam_profile(args: argparse.Namespace) -> None:
+    """Sum a unit profile per Pfam: counts and point estimates add over the units carrying
+    a Pfam; ``present_prob`` is the largest; intervals and per-unit columns are dropped."""
+    profile = read_profile(args.profile)
+    labels = pl.read_parquet(args.unit_pfam)
+    accession = pl.col("pfam_accession")
+    labels = labels.select(
+        "unit",
+        # MGnify stores the accession's number (1007 for PF01007); hmmsearch gives PF01007.23
+        name=("PF" + accession.cast(pl.String).str.zfill(5))
+        if labels.schema["pfam_accession"].is_integer()
+        else accession.str.replace(r"\.\d+$", ""),
+    )
+    summed = [c for pair in RULES for c in pair if c in profile.columns] + ["hits"]
+    (
+        profile.drop("name", strict=False)
+        .join(labels, on="unit")
+        .group_by("name")
         .agg(
-            n_reads=pl.col("read").n_unique(),
-            bases=pl.col("bases").sum(),
-            depth=(pl.col("bases") / (pl.col("end") - pl.col("start"))).sum(),
+            pl.col(list(dict.fromkeys(c for c in summed if c in profile.columns))).sum(),
+            *([pl.col("present_prob").max()] if "present_prob" in profile.columns else []),
         )
-        .sort("ko_id")
-        .write_csv(args.out)
+        .sort("name")
+        .write_csv(args.out, separator="\t")
     )
 
 
 def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, float | None]:
     """Spearman over true positives and L1 between relative abundances (0 to 2).
 
-    ``truth`` has ``ko_id`` and ``depth``; ``estimate`` has ``ko_id`` and ``estimate`` for
+    ``truth`` has ``label`` and ``depth``; ``estimate`` has ``label`` and ``estimate`` for
     the detected KOs. A KO missing from either side has abundance 0 there. If ``estimate``
     also has an interval (``lo``, ``hi``), ``ci_cover`` is the share of true positives whose
     depth, on the estimate's scale (times the median estimate / depth), lies inside it, and
     ``ci_width`` the median log(hi / lo).
     """
-    both = truth.select("ko_id", "depth").join(estimate, on="ko_id", how="full", coalesce=True)
+    both = truth.select("label", "depth").join(estimate, on="label", how="full", coalesce=True)
     both = both.fill_null(0.0)
     tp = both.filter(pl.col("depth") > 0, pl.col("estimate") > 0)
     rel = [both[c] / both[c].sum() if both[c].sum() > 0 else both[c] for c in ("depth", "estimate")]
@@ -218,7 +564,7 @@ def group_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, float
     """
     if "ambiguity_group" not in detected.columns:
         return {"fp_grouped": None, "group_cover": None}
-    d = detected.join(truth.select("ko_id", "depth"), left_on="name", right_on="ko_id", how="left")
+    d = detected.join(truth.select("label", "depth"), left_on="name", right_on="label", how="left")
     scale = (
         d.filter(pl.col("depth") > 0, pl.col("abundance_zi") > 0)
         .select((pl.col("abundance_zi") / pl.col("depth")).median())
@@ -249,11 +595,49 @@ def presence_scores(truth: pl.DataFrame, detected: pl.DataFrame) -> dict[str, fl
     share of each below 0.5 (``flag_tp``, ``flag_fp``)."""
     if "present_prob" not in detected.columns:
         return dict.fromkeys(("prob_tp", "prob_fp", "flag_tp", "flag_fp"))
-    d = detected.select("present_prob", tp=pl.col("name").is_in(truth["ko_id"].implode()))
+    d = detected.select("present_prob", tp=pl.col("name").is_in(truth["label"].implode()))
     out: dict[str, float | None] = {}
     for name, part in (("tp", d.filter("tp")), ("fp", d.filter(~pl.col("tp")))):
         out[f"prob_{name}"] = part["present_prob"].mean() if part.height else None  # type: ignore[assignment]
         out[f"flag_{name}"] = (part["present_prob"] < 0.5).mean() if part.height else None
+    return out
+
+
+def split_scores(
+    truth: pl.DataFrame, detected: pl.DataFrame, abundance: str | None
+) -> dict[str, float | None]:
+    """How the detected units' abundance is split within components (phase 7: k, alphabet).
+
+    ``split_l1``: per component with two or more detected units, the L1 between the
+    estimate's and the truth's shares of the component (0 to 2), averaged with the
+    component's true depth as weight; components with no true depth are left out.
+    ``group_size_mean``: mean ambiguity-group size of the detected units.
+    ``host_like_detected``: detected units flagged ``host_like`` (host mask arms).
+    """
+    out: dict[str, float | None] = dict.fromkeys(
+        ("split_l1", "group_size_mean", "host_like_detected")
+    )
+    if "host_like" in detected.columns:
+        out["host_like_detected"] = float(detected["host_like"].cast(pl.Boolean).sum())
+    if "group_size" in detected.columns and abundance == "abundance_zi":
+        out["group_size_mean"] = detected["group_size"].mean()  # type: ignore[assignment]
+    if not abundance or "component" not in detected.columns:
+        return out
+    units = (
+        detected.select("component", "name", estimate=abundance)
+        .join(truth.select(name="label", depth="depth"), on="name", how="left")
+        .with_columns(pl.col("depth").fill_null(0.0))
+        .filter(pl.len().over("component") >= 2)
+    )
+    share = lambda c: pl.col(c) / pl.col(c).sum().over("component")  # noqa: E731
+    per = (
+        units.filter((pl.col("depth").sum() > 0).over("component"))
+        .filter((pl.col("estimate").sum() > 0).over("component"))
+        .group_by("component")
+        .agg(l1=(share("estimate") - share("depth")).abs().sum(), weight=pl.col("depth").sum())
+    )
+    if per.height:
+        out["split_l1"] = float((per["l1"] * per["weight"]).sum() / per["weight"].sum())
     return out
 
 
@@ -268,8 +652,8 @@ def interval_scores(tp: pl.DataFrame) -> dict[str, float | None]:
 
 
 def score(args: argparse.Namespace) -> None:
-    truth = pl.read_csv(args.truth)
-    profile = pl.read_csv(args.profile, separator="\t")
+    truth = read_truth(args.truth)
+    profile = read_profile(args.profile)
     rows = []
     # Profiles from before an estimate existed are scored on detection alone.
     rules = list(dict.fromkeys((c, a if a in profile.columns else None) for c, a in RULES))
@@ -278,13 +662,15 @@ def score(args: argparse.Namespace) -> None:
             continue
         detected = profile.filter(pl.col(count) >= min_hits)
         predicted = set(detected["name"])
-        present = truth.with_columns(found=pl.col("ko_id").is_in(predicted))
+        present = truth.with_columns(found=pl.col("label").is_in(predicted))
         low = present.filter(pl.col("n_reads") <= pl.col("n_reads").quantile(0.25))
         tp = int(present["found"].sum())
         rows.append(
             {
                 "sample": args.sample,
+                "label": args.label,
                 "index": args.index,
+                "arm": args.arm,
                 "count": count,
                 "abundance": abundance,
                 "min_hits": min_hits,
@@ -300,7 +686,7 @@ def score(args: argparse.Namespace) -> None:
                     abundance_scores(
                         truth,
                         detected.select(
-                            ko_id="name",
+                            label="name",
                             estimate=abundance,
                             **(
                                 {"lo": f"{abundance}_lo", "hi": f"{abundance}_hi"}
@@ -322,6 +708,7 @@ def score(args: argparse.Namespace) -> None:
                     if abundance == "abundance_zi"
                     else dict.fromkeys(("prob_tp", "prob_fp", "flag_tp", "flag_fp"))
                 ),
+                **split_scores(truth, detected, abundance),
             }
         )
     pl.DataFrame(rows).write_csv(args.out, separator="\t")
@@ -332,8 +719,8 @@ DETECTED_COLUMNS = ("kmers_unique", "kmers_hit", "hits", "m_g", "n_members", "pr
 
 
 def detected(args: argparse.Namespace) -> None:
-    truth = pl.read_csv(args.truth)
-    profile = pl.read_csv(args.profile, separator="\t").filter(pl.col("kmers_unique") >= 1)
+    truth = read_truth(args.truth)
+    profile = read_profile(args.profile).filter(pl.col("kmers_unique") >= 1)
     kmers = pl.read_parquet(args.kmers).join(profile.select("unit"), on="unit", how="semi")
     meta = json.loads((Path(args.index_dir) / "meta.json").read_text())
     if meta["hash"] == "sourmash" or kmers.height == 0:
@@ -367,7 +754,7 @@ def detected(args: argparse.Namespace) -> None:
         .with_columns(
             sample=pl.lit(args.sample),
             index=pl.lit(args.index),
-            tp=pl.col("name").is_in(truth["ko_id"].implode()),
+            tp=pl.col("name").is_in(truth["label"].implode()),
         )
         .select(
             "sample",
@@ -484,7 +871,7 @@ def cost(args: argparse.Namespace) -> None:
 
 
 def summary(args: argparse.Namespace) -> None:
-    keys = ["index", "count", "abundance", "min_hits"]
+    keys = args.keys
     # A metric that is empty in one file (e.g. group_cover when no group formed) reads as
     # String there; every metric is numeric, so cast before stacking.
     scores = pl.concat(
@@ -507,7 +894,7 @@ def summary(args: argparse.Namespace) -> None:
         .sort(keys, nulls_last=True)
         .write_csv(args.out, separator="\t")
     )
-    scores.sort([*keys, "sample"], nulls_last=True).write_csv("scores.tsv", separator="\t")
+    scores.sort([*keys, "sample"], nulls_last=True).write_csv(args.scores_out, separator="\t")
 
 
 def iss(argv: list[str]) -> None:
@@ -554,10 +941,15 @@ def main() -> None:
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--out", default="truth.csv")
+    p.add_argument("--domains", help="domains.parquet (pfam-domains): also write Pfam truth")
+    p.add_argument("--out-pfam", default="truth_pfam.csv")
+    p.add_argument("--out-genes", default="truth_genes.csv", help="per-gene reads and depth")
     p = sub.add_parser("score")
     for name in ("truth", "profile", "sample", "index"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--min-hits", type=int, nargs="+", default=[1])
+    p.add_argument("--label", default="ko", help="what the truth and profile name: ko, pfam")
+    p.add_argument("--arm", default="", help="query arm (frames, read QC, host handling)")
     p.add_argument("--out", default="score.tsv")
     p = sub.add_parser("detected")
     for name in ("truth", "profile", "kmers", "index-dir", "fna", "sample", "index"):
@@ -571,16 +963,60 @@ def main() -> None:
     p.add_argument("--members", help="members.parquet (kmermaid)")
     p.add_argument("--scaled", type=int, default=1000, help="sketch scaled (fmh_funprofiler)")
     p.add_argument("--out", default="profile.tsv")
+    p = sub.add_parser("pfam-proteins")
+    p.add_argument("--genomes-dir", required=True)
+    p.add_argument("--chunks", type=int, default=1, help="writes proteins.{0..chunks-1}.faa")
+    p = sub.add_parser("pfam-domains")
+    p.add_argument("--domtbl", required=True, nargs="+", help="hmmsearch --domtblout files")
+    p.add_argument("--proteins", required=True, nargs="+")
+    p.add_argument("--out", default="domains.parquet")
+    p.add_argument("--out-members", default="pfam_members.parquet")
+    p = sub.add_parser("pfam-profile")
+    p.add_argument("--profile", required=True)
+    p.add_argument("--unit-pfam", required=True)
+    p.add_argument("--out", default="pfam_profile.tsv")
+    p = sub.add_parser("reps")
+    p.add_argument("--members", required=True, nargs="+", help="parquet files or directories")
+    p.add_argument("--out", default="reps.faa")
+    p = sub.add_parser("mgnify-genes")
+    p.add_argument("--hits", required=True, nargs="+")
+    p.add_argument("--out", default="gene_units.parquet")
+    p = sub.add_parser("aai-score")
+    for name in ("profile", "gene-units", "genes", "sample", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--arm", default="")
+    p.add_argument("--min-id", type=float, default=0.9)
+    p.add_argument("--min-cov", type=float, default=0.8)
+    p.add_argument("--out", default="aai_score.tsv")
+    p = sub.add_parser("mix")
+    for name in ("r1", "r2", "host-r1", "host-r2"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, required=True, help="host share of read pairs")
+    p.add_argument("--seed", type=int, default=0)
+    p = sub.add_parser("host-abundance")
+    p.add_argument("--fasta", required=True)
+    p.add_argument("--mito-copies", type=float, default=100)
+    p.add_argument("--phix", type=float, default=0.005, help="share of host reads")
+    p.add_argument("--out", default="abundance.txt")
+    p = sub.add_parser("decoy-members")
+    p.add_argument("--faa", required=True)
+    p.add_argument("--out", default="decoy_members.parquet")
     p = sub.add_parser("cost")
     p.add_argument("trace")
     p.add_argument("--out", default="cost.tsv")
     p = sub.add_parser("summary")
     p.add_argument("scores", nargs="+")
+    p.add_argument("--keys", nargs="+", default=["label", "index", "arm", "count", "abundance",
+                                                 "min_hits"])  # fmt: skip
     p.add_argument("--out", default="summary.tsv")
+    p.add_argument("--scores-out", default="scores.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
-             "cost": cost}  # fmt: skip
+             "cost": cost, "pfam-proteins": pfam_proteins, "pfam-domains": pfam_domains,
+             "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
+             "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
+             "aai-score": aai_score_step}  # fmt: skip
     steps[args.step](args)
 
 

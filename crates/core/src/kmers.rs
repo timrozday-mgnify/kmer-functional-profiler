@@ -244,17 +244,32 @@ impl DnaScanner {
     /// Appends the hits of one read's kept frames to `hits`.
     pub fn scan(&mut self, dna: &[u8], read: u64, mate: u8, hits: &mut Hits) {
         six_frames_into(dna, self.params.code, &mut self.rc, &mut self.frames);
-        let stop_free = self.params.frames == FrameMode::StopFree;
         for (frame, aa) in (0u8..).zip(&self.frames) {
-            if stop_free && aa.contains(&b'*') {
-                continue;
+            let mut emit = |segment: &[u8]| {
+                protein_kmers(segment, &self.params, |hash| {
+                    hits.read.push(read);
+                    hits.mate.push(mate);
+                    hits.frame.push(frame);
+                    hits.hash.push(hash);
+                });
+            };
+            let (first, last) = (
+                aa.iter().position(|&c| c == b'*'),
+                aa.iter().rposition(|&c| c == b'*'),
+            );
+            match (self.params.frames, first, last) {
+                (FrameMode::All, ..) | (_, None, _) => emit(aa),
+                (FrameMode::Edges { min_len }, Some(first), Some(last)) => {
+                    let min_len = usize::from(min_len);
+                    if first >= min_len {
+                        emit(&aa[..first]);
+                    }
+                    if aa.len() - last > min_len {
+                        emit(&aa[last + 1..]);
+                    }
+                }
+                _ => {} // stop-free: a frame with a stop is dropped
             }
-            protein_kmers(aa, &self.params, |hash| {
-                hits.read.push(read);
-                hits.mate.push(mate);
-                hits.frame.push(frame);
-                hits.hash.push(hash);
-            });
         }
     }
 }
@@ -319,6 +334,36 @@ mod tests {
         let filtered = scan(dna, params);
         assert!(all.frame.contains(&0));
         assert!(!filtered.frame.contains(&0));
+    }
+
+    #[test]
+    fn edges_keep_terminal_segments_only() {
+        let params = KmerParams::new(3, Alphabet::Protein).unwrap();
+        let edges = |m: u16| params.with_frames(FrameMode::Edges { min_len: m });
+        // Frame 0: MAWG * MAWGM * KKKK -> terminal segments MAWG (4 aa), KKKK (4 aa).
+        let dna = b"ATGGCCTGGGGCTAAATGGCCTGGGGCATGTAAAAAAAAAAAAAA";
+        let frame0 = |hits: Hits| -> Vec<u64> {
+            hits.frame
+                .iter()
+                .zip(hits.hash)
+                .filter(|(f, _)| **f == 0)
+                .map(|(_, h)| h)
+                .collect()
+        };
+        let mut expected = Vec::new();
+        protein_kmers(b"MAWG", &params, |h| expected.push(h));
+        protein_kmers(b"KKKK", &params, |h| expected.push(h));
+        assert_eq!(frame0(scan(dna, edges(4))), expected);
+        // MAWG and KKKK are shorter than 5: nothing is kept; the internal MAWGM never is.
+        assert!(frame0(scan(dna, edges(5))).is_empty());
+        // Stop-free frames hash as under StopFree.
+        let clean = b"ATGGCCTGGGGCAAAAAACCC";
+        assert_eq!(scan(clean, edges(20)), scan(clean, params));
+        assert_eq!(
+            "edges:15".parse::<FrameMode>().unwrap(),
+            FrameMode::Edges { min_len: 15 }
+        );
+        assert!("edges:x".parse::<FrameMode>().is_err());
     }
 
     /// Codons for each amino acid under genetic code 11.

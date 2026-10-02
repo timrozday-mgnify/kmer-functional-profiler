@@ -37,6 +37,9 @@ impl fmt::Debug for FastxHits {
 impl FastxHits {
     /// Opens `r1` and, for paired input, its mate file `r2`.
     ///
+    /// Bases with Phred quality below `min_qual` become `N` (0 = off; FASTA is unaffected),
+    /// so they remove only the k-mers spanning their codon and never create a stop.
+    ///
     /// # Errors
     /// [`Error::Fastx`] if a file cannot be opened or its format is not recognised.
     pub fn open(
@@ -44,6 +47,7 @@ impl FastxHits {
         r2: Option<&Path>,
         params: KmerParams,
         batch_reads: usize,
+        min_qual: u8,
     ) -> Result<Self, Error> {
         let mut r1_reader = parse_fastx_file(r1)?;
         let mut r2_reader = r2.map(parse_fastx_file).transpose()?;
@@ -75,7 +79,7 @@ impl FastxHits {
                             break;
                         }
                     };
-                    seqs.extend_from_slice(&rec1.seq());
+                    push_masked(&mut seqs, &rec1.seq(), rec1.qual(), min_qual);
                     ends.push(seqs.len());
 
                     if let Some(r2) = &mut r2_reader {
@@ -90,7 +94,7 @@ impl FastxHits {
                                 break;
                             }
                         };
-                        seqs.extend_from_slice(&rec2.seq());
+                        push_masked(&mut seqs, &rec2.seq(), rec2.qual(), min_qual);
                         ends.push(seqs.len());
                     }
                     n += 1;
@@ -176,6 +180,21 @@ impl FastxHits {
             hits.append(part);
         }
         Ok(Some(hits))
+    }
+}
+
+/// Appends `seq` to `out`, with bases of quality below `min_qual` (Phred+33) as `N`.
+fn push_masked(out: &mut Vec<u8>, seq: &[u8], qual: Option<&[u8]>, min_qual: u8) {
+    match qual {
+        Some(qual) if min_qual > 0 => {
+            let cut = min_qual.saturating_add(33);
+            out.extend(
+                seq.iter()
+                    .zip(qual)
+                    .map(|(&b, &q)| if q < cut { b'N' } else { b }),
+            );
+        }
+        _ => out.extend_from_slice(seq),
     }
 }
 
