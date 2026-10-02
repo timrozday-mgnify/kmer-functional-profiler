@@ -109,7 +109,14 @@ hash-range reduce counts exactly. A blocked Bloom filter of all candidate hashes
 to about 1.1 per candidate; GROUPS drops the false hits, so the index equals INDEX's on
 the same members (checked by `tests/python/test_partition.py` and the `test_build`
 profile). Hash ranges are cut at quantiles of the candidate hashes, so they hold about
-equal numbers of candidates. No dense tier yet (`--t-dense` must be 0).
+equal numbers of candidates.
+
+With `--t-dense` in `--index_args` the build also writes the dense tier, equal to
+INDEX's. A unit's candidates are then its k-mers up to its dense threshold
+(max(*t_dense*, *t_g*)), which include its tier-2 candidates, so the same reduce gives
+`n_groups` for both tiers. POSTINGS also writes each bucket's dense rows
+(`.dense.parquet`), and PACK_RANGE, DEDUP and CONCAT handle the dense table alongside tier 2
+(`.dense` files).
 
 ```bash
 nextflow run workflows/mgnify-subset -profile test,test_build   # two buckets, a few seconds
@@ -132,6 +139,18 @@ At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 
 row. Scaled to the whole release: a ~14 GB Bloom filter (about a minute to fill;
 memory-mapped by every PRESENCE job, so jobs on one node share it), ~140 GB
 of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB).
+
+A dense tier enlarges the candidate set, and with it the Bloom filter and presence
+files: roughly 3x at `--t-dense 0.1` (~40 GB filter; BLOOM needs its 64 GB retry), less at
+0.02. CONCAT holds the dense table as well (predicted +120 GB at 0.02, +250 GB at 0.1),
+so give it the memory up front rather than through retries, in a config passed with `-c`
+(`process { withName: 'CONCAT' { memory = 320.GB } }` at 0.1):
+
+```bash
+nextflow run workflows/mgnify-subset -profile slurm --biome root --sample 1 \
+    --shards 256 --buckets 256 --ranges 256 --index false --build true \
+    --index_args '--t-dense 0.1' --publish_mode link --outdir full-build-d10 -c dense.config
+```
 
 ### Query cost (phase 6, Q1)
 

@@ -251,7 +251,7 @@ process POSTINGS {
     path pfam
 
     output:
-    path "${members.baseName}.{final.parquet,final.json,postings.parquet,pfam.parquet}"
+    path "${members.baseName}.{final.parquet,final.json,postings.parquet,pfam.parquet,dense.parquet}"  // dense: with --t-dense
 
     script:
     """
@@ -296,7 +296,8 @@ process PACK_RANGE {
     tuple val(range), path("part${range}.*")
 
     script:
-    def prefixes = postings.collect { f -> f.name.replace('.postings.parquet', '') }.sort().join(' ')
+    def prefixes = postings.findAll { f -> f.name.endsWith('.postings.parquet') }
+        .collect { f -> f.name.replace('.postings.parquet', '') }.sort().join(' ')
     """
     ${params.python} ${projectDir}/mgnify_subset.py pack-range ${prefixes} --range ${range} \\
         --out part${range} ${params.index_args}
@@ -531,7 +532,7 @@ workflow {
         ch_posted = POSTINGS.out.flatten()
         UNITS(ch_posted.collect(), BLOOM.out)
         ch_range = channel.of(0..<(params.ranges as int))
-            .combine(ch_posted.filter { f -> f.name.endsWith('.postings.parquet') }.collect().toList())
+            .combine(ch_posted.filter { f -> f.name.endsWith('.postings.parquet') || f.name.endsWith('.dense.parquet') }.collect().toList())
             .combine(UNITS.out)
         PACK_RANGE(ch_range)
         ch_parts = PACK_RANGE.out.toSortedList { a, b -> a[0] <=> b[0] }

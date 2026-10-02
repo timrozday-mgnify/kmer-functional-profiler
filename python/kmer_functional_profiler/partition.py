@@ -6,6 +6,11 @@ holding a candidate k-mer, which feeds the score and the promiscuity cut. That i
 exactly by a hash-partitioned reduce, with a Bloom filter of all candidate hashes to keep
 the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``units``.
 
+With a dense tier (``t_dense`` > 0) a unit's candidates are its k-mers with hash <= its
+``max_hash_dense``, which contain its tier-2 candidates, so one reduce gives ``n_groups``
+for both tiers; ``postings`` keeps the tier-2 ones as before, and the dense rows go through
+``pack_range``, ``dedup`` and ``concat`` alongside tier 2 (files with a ``.dense`` infix).
+
 1. ``candidates`` (per bucket): pass 1, the unit table and the bucket's candidate hashes.
 2. ``bloom`` (once): a blocked Bloom filter (``_core.bloom_insert``) of every bucket's
    candidate hashes, and ``t_max``.
@@ -22,14 +27,14 @@ the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``uni
 8. ``dedup`` (per set-hash range): every part's value sets in that range, deduplicated.
 9. ``concat`` (once): the parts and deduplicated sets -> tier 2 and ``meta.json``.
 
-The result equals ``build_index`` on the concatenated members. No dense tier yet.
+The result equals ``build_index`` on the concatenated members.
 """
 
 import json
 import shutil
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 import polars as pl
@@ -43,6 +48,7 @@ from kmer_functional_profiler.index import (
     SetSlice,
     _kmers,
     _len_cv,
+    _max_hash_dense,
     _n_kmers,
     _prepare,
     _select_postings,
@@ -50,6 +56,8 @@ from kmer_functional_profiler.index import (
     _unit_pfam,
     _unit_table,
     dedup_sets,
+    dense_columns,
+    dense_rows,
     key_shift,
     packed_layout,
     unit_columns,
@@ -72,11 +80,21 @@ FINAL_COLUMNS: Final = (
     "pin_sum",
     "m_g",
 )
+# With a dense tier, as build_index writes them.
+DENSE_FINAL_COLUMNS: Final = (
+    *FINAL_COLUMNS[:6],
+    "len_cv_dense",
+    "max_hash_dense",
+    *FINAL_COLUMNS[6:],
+    "m_dense",
+    "pin_hist_dense",
+    "pin_sum_dense",
+)
 
 
-def _check(params: IndexParams) -> None:
-    if params.t_dense > 0:
-        raise ValueError("the partitioned build has no dense tier yet (t_dense must be 0)")
+def _threshold(columns: Collection[str]) -> str:
+    """The unit column bounding its candidates: the dense threshold if there is one."""
+    return "max_hash_dense" if "max_hash_dense" in columns else "max_hash_g"
 
 
 def _swap(table: pl.DataFrame, ids: pl.DataFrame, old: str, new: str) -> pl.DataFrame:
@@ -93,28 +111,33 @@ def _counting(members: pl.DataFrame, units: pl.DataFrame) -> pl.DataFrame:
 
 def candidates(members_path: str | Path, prefix: str, params: IndexParams) -> None:
     """Stage 1: ``{prefix}.units.parquet``, ``.candidates.npy`` and ``.stats.json``."""
-    _check(params)
     members, batches, stats = _prepare(members_path, params)
     units = _unit_table(members, _n_kmers(batches, params), params)
-    thresholds = units.select("unit", "max_hash_g")
-    t_max_hash = int(units["max_hash_g"].max() or 0)  # type: ignore[arg-type]
+    columns = list(UNIT_COLUMNS)
+    if params.t_dense > 0:
+        units = units.with_columns(max_hash_dense=_max_hash_dense(params))
+        columns.append("max_hash_dense")
+    bound = _threshold(columns)
+    thresholds = units.select("unit", bound)
+    t_max_hash = int(units[bound].max() or 0)  # type: ignore[arg-type]
     hashes = pl.concat(
         [
             _kmers(b, params, t_max_hash)
             .join(thresholds, on="unit")
-            .filter(pl.col("hash") <= pl.col("max_hash_g"))
+            .filter(pl.col("hash") <= pl.col(bound))
             .select("hash")
             .unique()
             for b in batches
         ]
     ).unique()
-    units.select(UNIT_COLUMNS).write_parquet(f"{prefix}.units.parquet")
+    units.select(columns).write_parquet(f"{prefix}.units.parquet")
     np.save(f"{prefix}.candidates.npy", np.sort(hashes["hash"].to_numpy()))
     Path(f"{prefix}.stats.json").write_text(json.dumps(stats) + "\n")
 
 
 def bloom(prefixes: Sequence[str], out: str | Path, bits_per_key: float = 10.0) -> None:
-    """Stage 2: ``{out}.npy`` (filter bits) and ``{out}.json`` (``t_max_hash``, sizes and
+    """Stage 2: ``{out}.npy`` (filter bits) and ``{out}.json`` (``t_max_hash``, the largest
+    candidate threshold, sizes and
     ``QUANTILES`` + 1 quantiles of the candidate hashes, where ``presence`` cuts ranges).
 
     Keys are counted per bucket, so hashes shared by buckets are counted more than once and
@@ -132,7 +155,7 @@ def bloom(prefixes: Sequence[str], out: str | Path, bits_per_key: float = 10.0) 
     t_max_hash = max(
         int(
             pl.scan_parquet(f"{p}.units.parquet")
-            .select(pl.col("max_hash_g").max())
+            .select(pl.col(_threshold(pl.read_parquet_schema(f"{p}.units.parquet"))).max())
             .collect()
             .item()
             or 0
@@ -170,29 +193,30 @@ def presence(
     quantiles of the candidate hashes so ranges hold about equal numbers of them.
 
     Rows: ``hash``, ``cluster_rep``, ``c``, ``candidate`` (hash <= the unit's own
-    ``max_hash_g``) and ``bucket``, for every distinct (unit, k-mer) at ``t_max`` that
-    passes the filter.
+    ``max_hash_g``, or ``max_hash_dense`` with a dense tier) and ``bucket``, for every
+    distinct (unit, k-mer) at ``t_max_hash`` that passes the filter.
     """
-    _check(params)
     meta = json.loads(Path(f"{bloom_prefix}.json").read_text())
     bits = np.load(f"{bloom_prefix}.npy", mmap_mode="r")  # shared page cache across jobs
     members, batches, _ = _prepare(members_path, params)
     units = _counting(members, pl.read_parquet(f"{prefix}.units.parquet"))
     rows = []
     for b in batches:
-        kmers = _kmers(b, params, meta["quantiles"][-1])  # no candidate lies above it
+        # Not the last quantile: that is the largest *sampled* candidate.
+        kmers = _kmers(b, params, meta["t_max_hash"])
         kmers = kmers.filter(_core.bloom_contains(bits, kmers["hash"].to_numpy()))
         rows.append(kmers.group_by("unit", "hash").agg(c=pl.col("counts").sum().cast(pl.UInt32)))
     q = meta["quantiles"]
     cuts = np.array([q[r * (len(q) - 1) // n_ranges] for r in range(1, n_ranges)], np.uint64)
+    bound = _threshold(units.columns)
     table = (
         pl.concat(rows)
-        .join(units.select("unit", "cluster_rep", "max_hash_g"), on="unit")
+        .join(units.select("unit", "cluster_rep", bound), on="unit")
         .select(
             "hash",
             "cluster_rep",
             "c",
-            candidate=pl.col("hash") <= pl.col("max_hash_g"),
+            candidate=pl.col("hash") <= pl.col(bound),
             bucket=pl.lit(bucket, dtype=pl.UInt32),
         )
     )
@@ -229,10 +253,10 @@ def postings(
     pfam_path: str | Path | None = None,
 ) -> None:
     """Stage 5: ``{prefix}.postings.parquet`` (sorted by hash), ``.final.parquet`` (units
-    with a posting and their index columns), ``.pfam.parquet`` (with ``pfam_path``) and
+    with a posting and their index columns), ``.pfam.parquet`` (with ``pfam_path``),
+    ``.dense.parquet`` (with a dense tier: those units' dense rows, sorted by hash) and
     ``.final.json`` (stage-1 stats and this stage's; inputs stay unchanged, as Nextflow
     stages them as links)."""
-    _check(params)
     members, batches, _ = _prepare(members_path, params)
     units = _counting(members, pl.read_parquet(f"{prefix}.units.parquet"))
     rows = (
@@ -257,9 +281,26 @@ def postings(
     )
     rep = units.select("unit", "cluster_rep")
     _swap(kept, rep, "unit", "cluster_rep").sort("hash").write_parquet(f"{prefix}.postings.parquet")
-    unit_columns(units, kept).filter(pl.col("m_g") > 0).select(FINAL_COLUMNS).write_parquet(
-        f"{prefix}.final.parquet"
-    )
+    final, columns = unit_columns(units, kept), list(FINAL_COLUMNS)
+    if params.t_dense > 0:
+        dense = dense_rows(rows, units, params)
+        final = dense_columns(
+            final.join(
+                _len_cv(batches, params, dense.select("unit", "hash"), members).rename(
+                    {"len_cv": "len_cv_dense"}
+                ),
+                on="unit",
+                how="left",
+                maintain_order="left",
+            ),
+            dense,
+        )
+        posted = final.filter(pl.col("m_g") > 0).select("unit")
+        _swap(dense.join(posted, on="unit", how="semi"), rep, "unit", "cluster_rep").sort(
+            "hash"
+        ).select("hash", "cluster_rep", "pin_q").write_parquet(f"{prefix}.dense.parquet")
+        columns = list(DENSE_FINAL_COLUMNS)
+    final.filter(pl.col("m_g") > 0).select(columns).write_parquet(f"{prefix}.final.parquet")
     if pfam_path is not None:
         _swap(_unit_pfam(pfam_path, members), rep, "unit", "cluster_rep").write_parquet(
             f"{prefix}.pfam.parquet"
@@ -277,19 +318,26 @@ def units(
     pfam: bool = False,
 ) -> None:
     """Stage 6: ``units.parquet``, ``unit_pfam.parquet`` (with ``pfam``) and ``pack.json``
-    (tier-2 layout, pack range bounds, stats) in ``out_dir``.
+    (tier-2 layout, pack range bounds, stats, and with a dense tier its layout and bounds
+    under ``dense``) in ``out_dir``.
 
     Pack ranges are cut at the candidate-hash quantiles, rounded down to key boundaries so
     that hashes sharing a key never fall in two ranges.
     """
-    _check(params)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     finals = [f"{p}.final.parquet" for p in prefixes]
-    max_m = pl.scan_parquet(finals).select(pl.col("m_g").max()).collect().item() or 0
-    hist = pl.Array(pl.Series(np.zeros(0, _smallest(max_m))).dtype, 2**PIN_BITS)
+    dense = params.t_dense > 0
+    # Each bucket sized its p_in histograms by its own largest count; use the overall one.
+    hists = {"pin_hist": "m_g", **({"pin_hist_dense": "m_dense"} if dense else {})}
+    casts = []
+    for name, count in hists.items():
+        max_m = pl.scan_parquet(finals).select(pl.col(count).max()).collect().item() or 0
+        casts.append(
+            pl.col(name).cast(pl.Array(pl.Series(np.zeros(0, _smallest(max_m))).dtype, 2**PIN_BITS))
+        )
     table = (
-        pl.concat([pl.read_parquet(f).with_columns(pl.col("pin_hist").cast(hist)) for f in finals])
+        pl.concat([pl.read_parquet(f).with_columns(casts) for f in finals])
         .sort("cluster_rep")
         .select(pl.int_range(pl.len(), dtype=pl.UInt32).alias("unit"), pl.all())
     )
@@ -310,24 +358,41 @@ def units(
         "t_max": float(table["t_g"].max() or 0.0),  # type: ignore[arg-type]
         "postings": n_postings,
     }
-    layout = packed_layout(int(table["max_hash_g"].max() or 0), params.fp_bits, n_postings)  # type: ignore[arg-type]
-    shift = key_shift(layout)
     q = json.loads(Path(f"{bloom_prefix}.json").read_text())["quantiles"]
-    cuts = [q[r * (len(q) - 1) // n_ranges] >> shift << shift for r in range(1, n_ranges)]
-    meta = {"layout": layout, "bounds": [0, *cuts, 2**64], "stats": stats}
+
+    def pack(max_hash: str, n: int) -> dict[str, object]:
+        layout = packed_layout(int(table[max_hash].max() or 0), params.fp_bits, n)  # type: ignore[arg-type]
+        shift = key_shift(layout)
+        cuts = [q[r * (len(q) - 1) // n_ranges] >> shift << shift for r in range(1, n_ranges)]
+        return {"layout": layout, "bounds": [0, *cuts, 2**64]}
+
+    meta = pack("max_hash_g", n_postings) | {"stats": stats}
+    if dense:
+        meta["dense"] = pack("max_hash_dense", int(table["m_dense"].sum()))
     (out / "pack.json").write_text(json.dumps(meta) + "\n")
 
 
 def pack_range(prefixes: Sequence[str], units_dir: str | Path, part: int, out_prefix: str) -> None:
     """Stage 7: postings with hash in pack range ``part`` -> ``PackedPart`` files at
-    ``out_prefix`` and ``{out_prefix}.json`` (postings and distinct hashes)."""
+    ``out_prefix`` and ``{out_prefix}.json`` (postings and distinct hashes); with a dense
+    tier, its rows in its own range ``part`` likewise at ``{out_prefix}.dense``."""
     meta = json.loads((Path(units_dir) / "pack.json").read_text())
+    _pack([f"{p}.postings.parquet" for p in prefixes], units_dir, meta, part, out_prefix)
+    if "dense" in meta:
+        files = [f"{p}.dense.parquet" for p in prefixes]
+        _pack(files, units_dir, meta["dense"], part, f"{out_prefix}.dense")
+
+
+def _pack(
+    files: list[str], units_dir: str | Path, meta: dict[str, Any], part: int, out_prefix: str
+) -> None:
+    """Rows of ``files`` in pack range ``part`` of ``meta`` (layout and bounds), packed."""
     lo, hi = meta["bounds"][part], meta["bounds"][part + 1]
     in_range = pl.col("hash") >= lo
     if hi < 2**64:
         in_range &= pl.col("hash") < hi
     rows = (
-        pl.scan_parquet([f"{p}.postings.parquet" for p in prefixes])
+        pl.scan_parquet(files)
         .filter(in_range)
         .select("hash", "cluster_rep", "pin_q")
         .join(
@@ -347,10 +412,13 @@ def pack_range(prefixes: Sequence[str], units_dir: str | Path, part: int, out_pr
 def dedup(part_prefixes: Sequence[str], index: int, n_ranges: int, out_prefix: str) -> None:
     """Stage 8: the parts' value sets whose first hash word lies in set-hash range
     ``index`` of ``n_ranges`` (equal widths; the hashes are uniform) -> ``SetSlice`` files
-    at ``out_prefix``."""
+    at ``out_prefix``; the dense parts' sets, if any, at ``{out_prefix}.dense``."""
     lo = index * 2**64 // n_ranges
     hi = None if index == n_ranges - 1 else (index + 1) * 2**64 // n_ranges
     dedup_sets([PackedPart.load(p) for p in part_prefixes], lo, hi).save(out_prefix)
+    if part_prefixes and Path(f"{part_prefixes[0]}.dense.json").exists():
+        dense = [PackedPart.load(f"{p}.dense") for p in part_prefixes]
+        dedup_sets(dense, lo, hi).save(f"{out_prefix}.dense")
 
 
 def concat(
@@ -368,14 +436,24 @@ def concat(
     counts = [json.loads(Path(f"{p}.json").read_text()) for p in part_prefixes]
     if sum(c["postings"] for c in counts) != meta["stats"]["postings"]:
         raise ValueError("pack ranges do not hold every posting")
-    tier2 = PackedTable.concat(
-        meta["layout"],
-        [PackedPart.load(p) for p in part_prefixes],
-        [SetSlice.load(p) for p in set_prefixes],
-    )
+    tables = {
+        "tier2": PackedTable.concat(
+            meta["layout"],
+            [PackedPart.load(p) for p in part_prefixes],
+            [SetSlice.load(p) for p in set_prefixes],
+        )
+    }
+    stats = meta["stats"] | {"distinct_hashes": sum(c["distinct_hashes"] for c in counts)}
+    if "dense" in meta:
+        dense = [json.loads(Path(f"{p}.dense.json").read_text())["postings"] for p in part_prefixes]
+        tables["dense"] = PackedTable.concat(
+            meta["dense"]["layout"],
+            [PackedPart.load(f"{p}.dense") for p in part_prefixes],
+            [SetSlice.load(f"{p}.dense") for p in set_prefixes],
+        )
+        stats |= {"dense_postings": sum(dense), "dense_bytes": tables["dense"].nbytes()}
     for name in ("units.parquet", "unit_pfam.parquet"):
         if (units_dir / name).exists() and units_dir.resolve() != out.resolve():
             shutil.copyfile(units_dir / name, out / name)
     write_unit_columns(out)
-    stats = meta["stats"] | {"distinct_hashes": sum(c["distinct_hashes"] for c in counts)}
-    return write_meta(out, params, {"tier2": tier2}, stats)
+    return write_meta(out, params, tables, stats)
