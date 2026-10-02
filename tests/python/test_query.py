@@ -672,6 +672,19 @@ def test_posterior_component_alone_or_batched(monkeypatch: pytest.MonkeyPatch) -
     assert both.filter(pl.col("unit") < 2).equals(alone)
 
 
+def test_posterior_batches_in_parallel_as_in_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Batches are seeded by their own units, so worker processes give the serial result.
+    monkeypatch.setattr(query, "POSTERIOR_BATCH_BYTES", 1)
+    kmer_units = [(h, [u]) for u in range(5) for h in range(u * 10, u * 10 + 6)]
+    kmer_units += [(h, [0, 1]) for h in (50, 51)]
+    rows = [(u, h, r, 1 + r % 2) for h, us in kmer_units for u in us for r in range(h % 3, 9, 2)]
+    schema = {"unit": pl.UInt32, "hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32}
+    hit_reads = pl.DataFrame(rows, schema=schema, orient="row")
+    m_g, pin_sum = np.full(5, 10), np.full(5, 10.0)
+    serial = posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30, workers=1)
+    assert posterior_zi(*by_hash(hit_reads), m_g, pin_sum, 30, workers=3).equals(serial)
+
+
 def test_em_reports_unconverged_components() -> None:
     # Two units sharing every k-mer split them slowly; with 3 iterations both are cut off.
     kmers = pl.DataFrame(
