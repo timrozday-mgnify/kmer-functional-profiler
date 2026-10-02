@@ -366,15 +366,22 @@ def reps(args: argparse.Namespace) -> None:
     ).sink_csv(args.out, include_header=False, quote_style="never")
 
 
-MGNIFY_HIT_COLUMNS = ["gene_name", "cluster_rep", "pident", "length", "qlen", "slen", "bitscore"]
+MGNIFY_HIT_SCHEMA = {
+    "gene_name": pl.String,
+    "cluster_rep": pl.Int64,
+    "pident": pl.Float64,
+    "length": pl.Int64,
+    "qlen": pl.Int64,
+    "slen": pl.Int64,
+    "bitscore": pl.Float64,  # DIAMOND prints e.g. `99.8`; never infer it from the first rows
+}
 
 
 def mgnify_genes(args: argparse.Namespace) -> None:
     """DIAMOND hits (outfmt 6 ``qseqid sseqid pident length qlen slen bitscore``) -> per gene
     and cluster: identity (0-1), query and subject coverage, bitscore and rank (1 = best)."""
     hits = pl.concat(
-        pl.read_csv(p, separator="\t", has_header=False, new_columns=MGNIFY_HIT_COLUMNS,
-                    schema_overrides={"gene_name": pl.String, "cluster_rep": pl.Int64})
+        pl.read_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
         for p in args.hits
     )  # fmt: skip
     (
