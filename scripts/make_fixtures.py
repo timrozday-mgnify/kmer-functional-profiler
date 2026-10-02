@@ -261,9 +261,72 @@ def mini_host(rng: random.Random) -> None:
     (out / "host_extra.fa").write_text(extra)
 
 
+def mini_mgnify(rng: random.Random) -> None:
+    """A stand-in MGnify90 release for the mini_fmh genomes: for 24 of their proteins
+    (including every one with a Pfam-mini domain), a cluster whose representative is the
+    protein mutated to a known identity (100% to 70%) and whose two other members are the
+    representative mutated to 97%; plus 6 unrelated clusters. Members and Pfam tables in the
+    release's schemas (integer Pfam accessions: each cluster takes its source gene's
+    domains, found by ``hmmsearch --cut_ga``). ``mgnify_truth.tsv`` records each
+    representative's source gene and identity."""
+    out = OUT / "mini_fmh"
+    genes = pl.concat(
+        pl.read_csv(p, columns=["gene_name", "aa_sequence"])
+        for p in sorted((out / "genomes_extracted_from_kegg").glob("*/*_mapping.csv"))
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        faa = Path(tmp) / "p.faa"
+        faa.write_text("".join(f">{g}\n{s}\n" for g, s in genes.iter_rows()))
+        tbl = Path(tmp) / "d.tbl"
+        subprocess.run(["hmmsearch", "--cut_ga", "--domtblout", tbl, "-o", "/dev/null",
+                        out / "Pfam-mini.hmm", faa], check=True)  # fmt: skip
+        domains: dict[str, set[int]] = {}
+        for line in tbl.read_text().splitlines():
+            if not line.startswith("#"):
+                f = line.split()
+                domains.setdefault(f[0], set()).add(int(f[4][2:].split(".")[0]))
+    others = genes.filter(~pl.col("gene_name").is_in(list(domains)))
+    chosen = (
+        genes.filter(pl.col("gene_name").is_in(list(domains))).rows()
+        + others.sample(24 - len(domains), seed=rng.randrange(2**31)).rows()
+    )
+    identities = [1.0, 0.95, 0.9, 0.85, 0.8, 0.7]
+
+    def mutate(seq: str, identity: float) -> str:
+        out_seq = list(seq)
+        for i in rng.sample(range(len(seq)), round((1 - identity) * len(seq))):
+            out_seq[i] = rng.choice(AMINO_ACIDS.replace(seq[i], ""))
+        return "".join(out_seq)
+
+    members, truth, pfam, pid = [], [], [], 1
+    for n, (gene, protein) in enumerate(chosen):
+        identity = identities[n % len(identities)]
+        rep = mutate(protein, identity)
+        cluster = [(pid, pid, True, rep)] + [
+            (pid + i, pid, True, mutate(rep, 0.97)) for i in (1, 2)
+        ]
+        members += cluster
+        truth.append((pid, gene, identity))
+        pfam += [(m[0], acc) for m in cluster for acc in sorted(domains.get(gene, ()))]
+        pid += 3
+    for _ in range(6):
+        rep = "M" + "".join(rng.choices(AMINO_ACIDS, k=rng.randint(150, 300)))
+        members += [(pid, pid, True, rep), (pid + 1, pid, True, mutate(rep, 0.97))]
+        pid += 2
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(members, schema=schema, orient="row").write_parquet(out / "mgnify_members.parquet")
+    pl.DataFrame(truth, schema=["cluster_rep", "gene_name", "identity"], orient="row").write_csv(
+        out / "mgnify_truth.tsv", separator="\t"
+    )
+    pl.DataFrame(pfam, schema=["protein_id", "pfam_accession"], orient="row").write_parquet(
+        out / "mgnify_pfam.parquet"
+    )
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
     mini_fmh(random.Random(20260930))
     mini_pfam(random.Random(20261001))
     mini_host(random.Random(20261002))
+    mini_mgnify(random.Random(20261003))

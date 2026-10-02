@@ -61,6 +61,8 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
         "--threads", "2")  # fmt: skip
     truth = pl.read_csv(tmp_path / "truth.csv")
     assert set(truth["label"]) == expected
+    per_gene = pl.read_csv(tmp_path / "truth_genes.csv")
+    assert set(per_gene["gene_name"]) == hit_genes and (per_gene["depth"] > 0).all()
     assert (truth["depth"] > 0).all()
 
     found = sorted(expected)[:2]
@@ -296,3 +298,41 @@ def test_split_scores() -> None:
     assert got["split_l1"] == pytest.approx(0.5)
     assert got["group_size_mean"] == pytest.approx(1.4)
     assert got["host_like_detected"] == 1
+
+
+def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    # g1: nearest cluster 10 at 96% (and a near hit, 11 at 80%); g2: nearest 20 at 85%;
+    # g3: absent from the sample. Two HSPs of one pair: the best counts.
+    hits = ("g1\t10\t96.0\t200\t200\t210\t380\ng1\t11\t80.0\t190\t200\t200\t250\n"
+            "g1\t11\t70.0\t50\t200\t200\t40\ng2\t20\t85.0\t300\t300\t300\t400\n"
+            "g3\t30\t99.0\t100\t100\t100\t200\n")  # fmt: skip
+    (tmp_path / "h.tsv").write_text(hits)
+    run(tmp_path, "mgnify-genes", "--hits", "h.tsv")
+    units = pl.read_parquet(tmp_path / "gene_units.parquet")
+    assert units.filter(gene_name="g1").select("cluster_rep", "rank", "identity").rows() == [
+        (10, 1, 0.96), (11, 2, 0.8)]  # fmt: skip
+    genes = pl.DataFrame({"gene_name": ["g1", "g2", "g3"], "depth": [3.0, 1.0, 0.0]})
+    profile = pl.DataFrame(
+        {
+            "cluster_rep": [10, 11, 20, 99],
+            "kmers_unique": [5, 0, 3, 2],  # 11 explained away; 99 a false detection
+            "aai": [0.95, None, 0.80, 0.9],
+            "aai_lo": [0.93, None, 0.70, 0.8],
+            "aai_hi": [0.99, None, 0.84, 0.95],
+            "aai_naive": [0.97, 0.79, 0.86, 0.9],
+        }
+    )
+    got = bench.aai_score(profile, units, genes)
+    assert (got["genes_present"], got["genes_in90"]) == (2, 1)
+    assert got["completeness_90"] == 1.0  # cluster 10 detected
+    assert got["purity_nearest"] == pytest.approx(2 / 3)  # 10 and 20 are nearest; 99 is not
+    assert got["recall_0.95"] == 1.0 and got["recall_0.8"] == 1.0  # g2 beyond 90%: 20 found
+    assert got["aai_bias_0.95"] == pytest.approx(-0.01) and got["aai_cover_0.95"] == 1.0
+    assert got["aai_bias_0.8"] == pytest.approx(-0.05) and got["aai_cover_0.8"] == 0.0
+    # aai_naive on every hit unit, near hits included: 11 against g1's 80%
+    assert got["naive_n"] == 3 and got["naive_bias_0.8"] == pytest.approx(
+        (0.86 - 0.85 + 0.79 - 0.8) / 2
+    )

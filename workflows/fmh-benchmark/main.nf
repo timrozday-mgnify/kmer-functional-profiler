@@ -89,6 +89,144 @@ process IMPORT_SKETCHES {
     "mkdir index_fmh_compat && touch index_fmh_compat/meta.json meta.json"
 }
 
+// ---- MGnify90-level truth (--mgnify_indexes with members): every genome protein searched
+// against the representatives of the index's clusters (DIAMOND blastp), so detection at the
+// 90% level, the nearest cluster beyond it and containment AAI can be checked.
+
+process MGNIFY_INDEX {
+    tag "${name}"
+    label 'process_high_memory'
+
+    input:
+    tuple val(name), val(args), path(members, stageAs: 'members/*'), path(pfam, stageAs: 'pfam/*')
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path("index_${name}"), emit: index
+
+    script:
+    "${params.kfp} index ${members} index_${name} ${pfam ? "--pfam ${pfam}" : ''} ${args}"
+
+    stub:
+    "mkdir index_${name}"
+}
+
+process MGNIFY_REPS {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(members, stageAs: 'members/*')
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('reps.faa'), emit: faa
+
+    script:
+    "${params.bench} reps --members ${members} --out reps.faa"
+
+    stub:
+    "touch reps.faa"
+}
+
+process MGNIFY_DB {
+    tag "${name}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
+
+    input:
+    tuple val(name), path(faa)
+
+    output:
+    tuple val(name), path("reps_${name}.dmnd"), emit: db
+
+    script:
+    "diamond makedb --in ${faa} --db reps_${name} --threads ${task.cpus}"
+
+    stub:
+    "touch reps_${name}.dmnd"
+}
+
+process MGNIFY_ANNOTATE {
+    tag "${name} ${faa.baseName}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
+
+    input:
+    tuple val(name), path(db), path(faa)
+
+    output:
+    tuple val(name), path("${faa.baseName}.hits.tsv"), emit: hits
+
+    script:
+    """
+    diamond blastp --db ${db} --query ${faa} --out ${faa.baseName}.hits.tsv --threads ${task.cpus} \\
+        --outfmt 6 qseqid sseqid pident length qlen slen bitscore ${params.mgnify_diamond_args}
+    """
+
+    stub:
+    "touch ${faa.baseName}.hits.tsv"
+}
+
+process MGNIFY_GENES {
+    tag "${name}"
+    label 'process_medium'
+    publishDir "${params.outdir}/mgnify", mode: 'copy', saveAs: { "${name}_gene_units.parquet" }
+
+    input:
+    tuple val(name), path(hits, stageAs: 'hits/*')
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('gene_units.parquet'), emit: genes
+
+    script:
+    "${params.bench} mgnify-genes --hits hits/* --out gene_units.parquet"
+
+    stub:
+    "touch gene_units.parquet"
+}
+
+process AAI_SCORE {
+    tag "seed ${sid} ${name}${arm ? '~' + arm : ''}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), val(arm), path(units), path(gene_units), path(genes)
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'aai_score.tsv', emit: score
+
+    script:
+    """
+    ${params.bench} aai-score --profile ${units} --gene-units ${gene_units} --genes ${genes} \\
+        --sample seed${sid} --index ${name} --arm '${arm}' --min-id ${params.mgnify_min_id} \\
+        --min-cov ${params.mgnify_min_cov}
+    """
+
+    stub:
+    "touch aai_score.tsv"
+}
+
+process AAI_SUMMARY {
+    label 'process_single'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path scores, stageAs: 'aai*.tsv'
+
+    output:
+    path 'aai_summary.tsv'
+    path 'aai_scores.tsv'
+
+    script:
+    "${params.bench} summary ${scores} --keys index arm --out aai_summary.tsv --scores-out aai_scores.tsv"
+
+    stub:
+    "touch aai_summary.tsv aai_scores.tsv"
+}
+
 // ---- Pfam labels (Benchmark labels in the plan): the genomes' proteins annotated with
 // Pfam-A (hmmsearch --cut_ga), domains as truth features and as members of Pfam units.
 
@@ -110,7 +248,7 @@ process PFAM_DB {
     "touch Pfam-A.hmm Pfam.version"
 }
 
-process PFAM_PROTEINS {
+process GENOME_PROTEINS {
     label 'process_single'
 
     input:
@@ -213,7 +351,7 @@ process SIMULATE {
 process TRUTH {
     tag "seed ${sid}"
     label 'process_medium'
-    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { f -> f == 'truth.csv' ? "seed${sid}.csv" : "seed${sid}_pfam.csv" }
+    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { f -> f == 'truth.csv' ? "seed${sid}.csv" : "seed${sid}_${f - 'truth_'}" }
 
     input:
     tuple val(sid), path(fna), path(genes), path(r1), path(r2)
@@ -224,6 +362,7 @@ process TRUTH {
     output:
     tuple val(sid), val('ko'), path('truth.csv'), emit: truth
     tuple val(sid), val('pfam'), path('truth_pfam.csv'), emit: pfam, optional: true
+    tuple val(sid), path('truth_genes.csv'), emit: genes
 
     script:
     """
@@ -232,7 +371,7 @@ process TRUTH {
     """
 
     stub:
-    "touch truth.csv ${domains ? 'truth_pfam.csv' : ''}"
+    "touch truth.csv truth_genes.csv ${domains ? 'truth_pfam.csv' : ''}"
 }
 
 process PROFILE {
@@ -250,6 +389,7 @@ process PROFILE {
 
     output:
     tuple val(sid), val(label), val(name), val(arm), path('profile.tsv'), path('kmers.parquet'), emit: profile
+    tuple val(sid), val(name), val(arm), path('units.tsv'), emit: units, optional: true
 
     script:
     // by_pfam: units carry Pfam labels (MGnify90 clusters), and the profile is summed per Pfam
@@ -263,7 +403,7 @@ process PROFILE {
     """
 
     stub:
-    "touch profile.tsv kmers.parquet"
+    "touch profile.tsv kmers.parquet ${by_pfam ? 'units.tsv' : ''}"
 }
 
 process SCORE {
@@ -792,11 +932,21 @@ workflow {
     }
     def ch_members = channel.of('ko').combine(MEMBERS.out.members)
     def ch_domains = channel.value([])
+    // MGnify90 indexes: [name, path] (built elsewhere) and/or [members, pfam, args] (built here);
+    // members (files or directories) also give the cluster representatives for annotation
+    def mgnify = params.mgnify_indexes.collect { cfg ->
+        [name: cfg.name, path: cfg.path ?: '', members: cfg.members ?: '', pfam: cfg.pfam ?: '', args: cfg.args ?: '']
+    }
+    if (mgnify.any { !it.path && !it.members }) {
+        error "Each mgnify_indexes entry needs a path or members"
+    }
+    if ('pfam' in labels || mgnify.any { it.members }) {
+        GENOME_PROTEINS(FETCH.out.genomes, bench_py)
+    }
     if ('pfam' in labels) {
         def ch_hmm = params.pfam_hmm ? channel.value(file(params.pfam_hmm)) : PFAM_DB().hmm
-        PFAM_PROTEINS(FETCH.out.genomes, bench_py)
-        PFAM_ANNOTATE(PFAM_PROTEINS.out.faa.flatten(), ch_hmm)
-        PFAM_DOMAINS(PFAM_ANNOTATE.out.domtbl.collect(), PFAM_PROTEINS.out.faa, bench_py)
+        PFAM_ANNOTATE(GENOME_PROTEINS.out.faa.flatten(), ch_hmm)
+        PFAM_DOMAINS(PFAM_ANNOTATE.out.domtbl.collect(), GENOME_PROTEINS.out.faa, bench_py)
         ch_domains = PFAM_DOMAINS.out.domains
         ch_members = ch_members.mix(channel.of('pfam').combine(PFAM_DOMAINS.out.members))
     }
@@ -812,8 +962,26 @@ workflow {
     ch_indexes = INDEX.out.index.mix(IMPORT_SKETCHES.out.index)
         .filter { it[0] in labels }
         .map { it + [false] }
-        .mix(channel.fromList(params.mgnify_indexes).filter { 'pfam' in labels }
-            .map { cfg -> ['pfam', cfg.name, file(cfg.path, checkIfExists: true), true] })
+    def ch_mgnify = channel.fromList(mgnify.findAll { it.path }).map { cfg -> [cfg.name, file(cfg.path, checkIfExists: true)] }
+    if (mgnify.any { !it.path }) {
+        MGNIFY_INDEX(
+            channel.fromList(mgnify.findAll { !it.path }).map { cfg ->
+                [cfg.name, cfg.args, files(cfg.members), cfg.pfam ? file(cfg.pfam, checkIfExists: true) : []]
+            },
+            ch_code,
+        )
+        ch_mgnify = ch_mgnify.mix(MGNIFY_INDEX.out.index)
+    }
+    // MGnify indexes are profiled whatever the labels: their unit profiles carry the AAI truth
+    ch_indexes = ch_indexes.mix(ch_mgnify.map { name, index -> ['pfam', name, index, true] })
+    def ch_gene_units = channel.empty()  // name, gene_units
+    if (mgnify.any { it.members }) {
+        MGNIFY_REPS(channel.fromList(mgnify.findAll { it.members }).map { cfg -> [cfg.name, files(cfg.members)] }, bench_py)
+        MGNIFY_DB(MGNIFY_REPS.out.faa)
+        MGNIFY_ANNOTATE(MGNIFY_DB.out.db.combine(GENOME_PROTEINS.out.faa.flatten()))
+        MGNIFY_GENES(MGNIFY_ANNOTATE.out.hits.groupTuple(), bench_py)
+        ch_gene_units = MGNIFY_GENES.out.genes
+    }
 
     // Query arms (phase 7): which reads (raw, fastp, hostile), extra query options, and
     // whether the host mask and the human-proteome decoy are used. Default: one plain arm.
@@ -855,7 +1023,8 @@ workflow {
         ch_domains,
         bench_py,
     )
-    ch_truth = TRUTH.out.truth.mix(TRUTH.out.pfam).filter { it[1] in labels }  // sid, label, truth
+    // sid, label, truth; MGnify profiles (label pfam) are scored on Pfam only with that label
+    ch_truth = TRUTH.out.truth.mix(TRUTH.out.pfam).filter { it[1] in labels }
 
     def ch_sid_reads = ch_reads.map { sid, _seed, r1, r2 -> [sid, r1, r2] }
     def ch_variants = ch_sid_reads.map { sid, r1, r2 -> ['raw', sid, r1, r2] }
@@ -968,6 +1137,16 @@ workflow {
         bench_py,
     )
     SUMMARY(SCORE.out.score.collect())
+    // unit-level detection and AAI of the MGnify indexes against the DIAMOND truth
+    AAI_SCORE(
+        PROFILE.out.units
+            .map { sid, name, arm, units -> [name, sid, arm, units] }
+            .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
+            .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }
+            .combine(TRUTH.out.genes, by: 0),
+        bench_py,
+    )
+    AAI_SUMMARY(AAI_SCORE.out.score.collect())
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and
     // workflow are read here: inside the handler, names resolve against the workflow metadata.

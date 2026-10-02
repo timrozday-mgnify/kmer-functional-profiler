@@ -12,8 +12,9 @@ FETCH            Zenodo 10055954 (CC-BY): KEGG genomes (9.1 GB zip), KEGG protei
                  gene -> KO table, KO sketches. Downloaded once into --data_dir.
 MEMBERS          proteins grouped by KO -> members.parquet
 PFAM_DB          Pfam-A.hmm from --pfam_url (or --pfam_hmm), once into --db_dir
-PFAM_PROTEINS, PFAM_ANNOTATE, PFAM_DOMAINS
-                 every genome's proteins, hmmsearch --cut_ga in --pfam_chunks jobs ->
+GENOME_PROTEINS  every genome's proteins, in --pfam_chunks FASTA files
+PFAM_ANNOTATE, PFAM_DOMAINS
+                 hmmsearch --cut_ga per chunk ->
                  pfam/domains.parquet (gene, Pfam, envelope) and the domains as members of
                  one unit per Pfam
 INDEX            kmer-functional-profiler index, one per --indexes entry and label (KO
@@ -25,8 +26,16 @@ TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a r
                  overlaps one of its genes (the paper's rule, on CAMISIM's alignments); its
                  depth is aligned bases / gene length, summed over its genes. The same over
                  Pfam domains (their nt span on the genome, either strand) -> truth/seedN_pfam.csv
+MGNIFY_INDEX, MGNIFY_REPS, MGNIFY_DB, MGNIFY_ANNOTATE, MGNIFY_GENES
+                 per --mgnify_indexes entry: the index (built here from members, or given),
+                 its cluster representatives, and every genome protein searched against them
+                 (DIAMOND blastp) -> mgnify/<name>_gene_units.parquet (MGnify90-level truth)
 PROFILE          kmer-functional-profiler query, every metagenome x every index; profiles of
                  --mgnify_indexes (Pfam-labelled units) are summed per Pfam
+AAI_SCORE, AAI_SUMMARY
+                 unit profiles of --mgnify_indexes against that truth: detection at the 90%
+                 level, nearest-cluster recall beyond it, aai and aai_naive against alignment
+                 identity -> aai_summary.tsv, aai_scores.tsv
 DETECTED         per KO gather keeps, true or false: its evidence and where its hit k-mers
                  come from (holders, hits, in the sample genomes or not) -> detected/,
                  detected.tsv (all samples)
@@ -148,7 +157,9 @@ mapping; MetaPhlAn vOct22_202403).
 | `--humann4_metaphlan_index` | `mpa_vOct22_CHOCOPhlAnSGB_202403` | MetaPhlAn database for HUMAnN 4 (the one it checks for) |
 | `--labels` | `ko,pfam` | Labels scored (see [Pfam](#pfam)) |
 | `--pfam_url`, `--pfam_hmm`, `--pfam_threshold`, `--pfam_chunks` | current release, `''`, `--cut_ga`, `64` | Pfam-A source (or a local file), hmmsearch inclusion, hmmsearch jobs |
-| `--mgnify_indexes` | `[]` | `[name:, path:]` maps of Pfam-labelled indexes, profiles summed per Pfam (config file only) |
+| `--mgnify_indexes` | `[]` | `[name:, path:, members:, pfam:, args:]` maps of MGnify90 indexes (config file only; see [MGnify90-level truth](#mgnify90-level-truth-unit-resolution-and-containment-aai)) |
+| `--mgnify_min_id`, `--mgnify_min_cov` | `0.9`, `0.8` | A gene is in its nearest cluster at this identity and coverage |
+| `--mgnify_diamond_args` | `--sensitive --max-target-seqs 25 --id 50 --query-cover 50` | Which near hits are kept |
 | `--query_arms` | one plain arm | `[name:, args:, reads:, mask:, decoy:]` maps (config file only; see [Ablations](#ablations)) |
 | `--host_fractions` | `0` | Host share of read pairs, comma-separated, e.g. `0,0.5,0.9,0.99` |
 | `--host_genome_url`, `--host_extra_url` | T2T-CHM13v2.0; rCRS chrM + PhiX174 (NCBI) | Host genome for spike-in reads and masks |
@@ -211,6 +222,46 @@ genome, and its depth is the sum over those domains of aligned bases / domain le
 Pfam release MGnify's `mgy_proteins_pfam` used, so the labels match (default: current
 release). Other tools are scored on KO only, for now.
 
+## MGnify90-level truth (unit resolution and containment AAI)
+
+KO and Pfam truth check functions; they cannot check which MGnify90 cluster a read came from,
+or the AAI the profile reports for it. For each `--mgnify_indexes` entry with `members`,
+every protein of the KEGG genomes is searched against the representatives of the index's
+clusters (`diamond blastp --sensitive`, up to 25 hits at ≥ 50% identity and ≥ 50% query
+coverage: `--mgnify_diamond_args`), giving per gene its *nearest cluster* (best bitscore) and
+its near hits, each with identity and coverage. A present gene (reads in the sample, from
+`truth/seedN_genes.csv`) is *in* its nearest cluster at the MGnify90 level if the hit has
+≥ `--mgnify_min_id` (0.9) identity and ≥ `--mgnify_min_cov` (0.8) query and subject coverage.
+
+`aai_summary.tsv` (means over seeds, per index and arm) and `aai_scores.tsv`:
+
+| Column | Meaning |
+| --- | --- |
+| `completeness_90` | Clusters holding a present gene at the 90% level that are detected (`kmers_unique` >= 1) |
+| `purity_nearest`, `purity_near` | Detected units that are some present gene's nearest cluster, or any of its hits |
+| `recall_<lo>` | Present genes whose nearest cluster is detected, by that hit's identity (0.95, 0.9, 0.8, 0.7, 0.5): resolution below 90% |
+| `aai_bias_<lo>`, `aai_cover_<lo>`, `aai_spearman`, `aai_n` | Detected units' `aai` against the depth-weighted identity of the present genes they are nearest to; `aai_cover` = share inside `aai_lo`–`aai_hi` |
+| `naive_bias_<lo>`, `naive_within05_<lo>`, `naive_spearman` | Every profiled unit a present gene hits (near hits included): `aai_naive` against the best identity of a present gene to it |
+
+The identity is to the cluster *representative*, which is what `aai` estimates (to the
+cluster's consensus; plan, phase 7, steps 7 and 9). Entries take either a built index and the
+members it came from, or members (with `pfam` and `args`) to build here:
+
+```groovy
+params.mgnify_indexes = [
+    [name: 'mgnify_1in100', path: '/shared/cost-nested/1in100/index',
+     members: '/shared/cost-nested/members.1in100.parquet'],
+]
+```
+
+`members` may be a directory of members tables (the full build's MERGE buckets). Annotating
+against a nested subset (1 in 100 or 1 000 clusters) is cheap; against the whole release's
+~1.7×10⁹ representatives it is ~10³–10⁴ CPU-hours. `ablations/aai.config` is a template for
+this run (`run_ablations.sh aai OUTDIR`). The test profile builds `mgnify_mini` from a
+fixture whose 24 clusters' representatives are mini-genome proteins mutated to 100-70%
+identity (`tests/data/mini_fmh/mgnify_truth.tsv`); DIAMOND recovers those identities to
+±0.01.
+
 ## Ablations
 
 Phase 7 measures each change against the phase-6 method on this benchmark (plan, phase 7).
@@ -228,6 +279,7 @@ sbatch workflows/fmh-benchmark/run_ablations.sh host  /shared/kfp-ablations/host
 | --- | --- | --- |
 | `index` | Base (k 11, 20 letters, *t_base* 1/1000, *n_min* 8) and one change each: *n_min* 0/4/16, *t_base* 1/100, dense tier 0.05/0.1/0.2, k 9/10/12, Murphy-10 k 13/15, Dayhoff k 17/20. Built per label (KO and Pfam units). | 31 indexes × 10 |
 | `reads` | On the base and *t_base* 1/100 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model. | 5 indexes × 11 arms × 10 |
+| `aai` | A MGnify90 index (nested subset; template) against the MGnify90-level truth, plain and edges arms | 2 arms × 10 |
 | `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy | 4 shares × (3 × 2 + 2 × 3) × 10 |
 
 Every profile is queried with `--all-estimators`, so the estimator ablations (EM against
