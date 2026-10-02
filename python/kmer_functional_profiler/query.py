@@ -24,7 +24,6 @@ import resource
 import sys
 import threading
 import time
-import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
@@ -35,6 +34,7 @@ import numpy as np
 import polars as pl
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components
+from scipy.stats import norm
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
@@ -994,7 +994,6 @@ def posterior_zi(
     level: float = 0.95,
     shared_evidence: float = 0.5,
     seed: int = 0,
-    k: int | None = None,
 ) -> pl.DataFrame:
     """Intervals and ambiguity groups for the zero-inflated model: resampled reads + Gibbs.
 
@@ -1030,8 +1029,7 @@ def posterior_zi(
     Returns per unit ``coverage_zi_lo``/``_hi``, ``abundance_zi_lo``/``_hi`` at ``level``,
     ``own_evidence``, and ``ambiguity_group`` (the group's smallest unit id; null when
     alone), ``group_size`` and the group totals ``group_coverage_zi_lo``/``_hi`` and
-    ``group_abundance_zi_lo``/``_hi``. With ``k``, also ``aai_lo``/``_hi``: the interval of
-    min(1, copies)^(1/k) over the draws in which the unit is given hits (:func:`aai`).
+    ``group_abundance_zi_lo``/``_hi``.
 
     Units in different components (linked by shared k-mers) never interact, so the draws run
     per batch of components (:func:`component_batches`) sized to ``POSTERIOR_BATCH_BYTES``,
@@ -1059,7 +1057,6 @@ def posterior_zi(
                 level=level,
                 shared_evidence=shared_evidence,
                 seed=seed,
-                k=k,
             )
             for part in parts
         ]
@@ -1103,7 +1100,6 @@ def _posterior_batch(
     level: float,
     shared_evidence: float,
     seed: int,
-    k: int | None = None,
 ) -> pl.DataFrame:
     """:func:`posterior_zi` on one batch of whole components."""
     # Sorted, so the seeded draws do not depend on row order (Polars group_by does not fix it).
@@ -1132,7 +1128,6 @@ def _posterior_batch(
     cv2 = np.zeros(n_units) if len_cv is None else len_cv[units] ** 2
     coverage = np.zeros((draws, n_units))
     abundance, group_coverage, group_abundance = (np.zeros_like(coverage) for _ in range(3))
-    identity = np.full_like(coverage, np.nan)  # AAI per draw, NaN where the unit got no hits
     evidence = np.zeros(len(row_s))  # hits allocated per (k-mer, unit) entry, all draws
     # Whole k-mers in blocks of about SWEEP_BLOCK_PAIRS entries, swept one block at a time.
     cuts = np.unique(np.r_[starts[row_s[::SWEEP_BLOCK_PAIRS]], len(row_s)])
@@ -1198,8 +1193,6 @@ def _posterior_batch(
         unhit_odds = pi * (1 - seen) / (1 - pi * seen)
         present = hit + rng.binomial(np.maximum(m - hit, 0).astype(np.int64), unhit_odds)
         copies = present / pin_sum[units]
-        if k is not None:
-            identity[b] = np.where(hit > 0, np.minimum(copies, 1.0) ** (1 / k), np.nan)
         sd = np.sqrt(np.log1p(cv2 / np.maximum(copies, 1.0)) + copies_error**2)
         scaled = lam * copies * np.exp(rng.normal(0.0, sd))
         # Group totals keep a dropped member's share: under absence its hits go to others.
@@ -1242,11 +1235,7 @@ def _posterior_batch(
     for name, x in (("coverage_zi", coverage), ("abundance_zi", abundance),
                     ("group_coverage_zi", total[0]), ("group_abundance_zi", total[1])):  # fmt: skip
         columns[f"{name}_lo"], columns[f"{name}_hi"] = np.quantile(x, tails, axis=0)
-    if k is not None:
-        with warnings.catch_warnings():  # all-NaN columns: units never given hits
-            warnings.simplefilter("ignore", RuntimeWarning)
-            columns["aai_lo"], columns["aai_hi"] = np.nanquantile(identity, tails, axis=0)
-    return pl.DataFrame(columns, nan_to_null=True).with_columns(
+    return pl.DataFrame(columns).with_columns(
         ambiguity_group=pl.when(pl.Series(size) > 1).then(pl.Series(group_unit.astype(np.uint32))),
         group_size=pl.Series(size.astype(np.uint32)),
         own_evidence=pl.Series(own),
@@ -1268,6 +1257,66 @@ def aai(copies: pl.Expr, present_kmers: pl.Expr, coverage: pl.Expr, k: int) -> p
         .then(pl.min_horizontal(copies, pl.lit(1.0)) ** (1 / k))
         .otherwise(None)
     )
+
+
+def aai_interval(
+    coverage: np.ndarray,
+    present: np.ndarray,
+    m: np.ndarray,
+    pin_sum: np.ndarray,
+    n_kmers: np.ndarray,
+    k: int,
+    clumping: np.ndarray | float = 1.0,
+    level: float = 0.95,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Closed-form ``level`` interval of :func:`aai` from a zero-inflated fit, no draws.
+
+    Copies c = present x m / ``pin_sum`` estimates a^k, the share of an average member's
+    kept k-mers that survive at identity a. Its variance adds three terms:
+
+    - *survival*: which k-mers a strain at identity a keeps depends on where its
+      substitutions fall. Over ``pin_sum`` kept windows, Var = c (1 - c) d / ``pin_sum``, with
+      d = 1 + 2 t sum_{j=1}^{k-1} (a^j - a^k) / (1 - a^k) for windows j apart, which both survive
+      with probability a^(k+j); t = m / ``n_kmers`` is the chance a nearby window is kept
+      too (d -> k for dense, unsampled windows near a = 1; -> 1 for sparse ones);
+    - *hit k-mers*: present = h / (m x seen), seen = 1 - exp(-coverage), with h ~
+      Binomial(present x m, seen) of the present k-mers hit;
+    - *coverage*: seen depends on the fitted coverage, whose zero-truncated Poisson MLE has
+      variance lambda (1 - e^-l)^2 / (h (1 - e^-l - l e^-l)) over h hit k-mers (delta method).
+
+    The last two treat k-mers as independent, but a read hits a run of neighbouring k-mers,
+    so they are scaled by ``clumping`` (1 + the unit's expected kept k-mers per covering
+    read, the variance inflation of Poisson clumps): at low depth the sample size is the
+    reads, not the k-mers. Without it a strain at 100% identity and depth ~1 got intervals
+    around 0.88-0.95 (phase 7, step 8).
+
+    The interval is a +- z sd_a, with sd_a = sd_c / (k c^((k-1)/k)) (delta method), clipped
+    to [0, 1], so a strain identical to the consensus can be covered (a Beta's quantiles
+    never reach 1, which left 73% of 100% strains outside). The survival variance uses a
+    Jeffreys-smoothed c, so it is not 0 at c = 0 or 1. Arrays are per unit.
+    """
+    lam = np.maximum(np.asarray(coverage, dtype=np.float64), 1e-9)
+    m = np.asarray(m, dtype=np.float64)
+    pin = np.maximum(np.asarray(pin_sum, dtype=np.float64), 1e-9)
+    pi = np.asarray(present, dtype=np.float64)
+    c = np.clip(pi * m / pin, 0.0, 1.0)
+    a = np.minimum(c ** (1 / k), 1 - 1e-9)
+    t = np.clip(_div(m, np.asarray(n_kmers, dtype=np.float64)), 0.0, 1.0)
+    j = np.arange(1, k)[:, None]
+    d = 1 + 2 * t * ((a**j - a**k) / (1 - a**k)).sum(axis=0)
+    n_eff = pin / d
+    smooth = (c * n_eff + 0.5) / (n_eff + 1)  # Jeffreys: c = 0 or 1 still has a variance
+    var = smooth * (1 - smooth) / n_eff
+    seen = -np.expm1(-lam)
+    b = np.maximum(np.asarray(clumping, dtype=np.float64), 1.0)
+    hit = pi * m * seen
+    # of the present k-mers, how many reads happened to hit (survival is counted above)
+    var += b * (pi * m + 0.5) * seen * (1 - seen) / (pin * seen) ** 2
+    info = _div(hit * (seen - lam * np.exp(-lam)), lam * seen**2)  # Fisher information on lambda
+    var += b * c**2 * (np.exp(-lam) / seen) ** 2 * _div(np.ones_like(info), info)
+    # On the AAI scale (delta method): symmetric in c it reached 0 at c ~ 0.17 (85% identity)
+    half = norm.ppf((1 + level) / 2) * np.sqrt(var) / (k * smooth ** ((k - 1) / k))
+    return np.clip(c ** (1 / k) - half, 0.0, 1.0), np.clip(c ** (1 / k) + half, 0.0, 1.0)
 
 
 def ztp_lambda(mean: np.ndarray, iterations: int = 50) -> np.ndarray:
@@ -1401,10 +1450,11 @@ def profile(
 
     Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
     unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` = min(1, ``copies_zi``)^(1/k)
-    on the units gather keeps whenever ``_zi`` is fitted (``with_aai`` fits it), with
-    ``aai_lo``/``_hi`` from the posterior. ``component`` labels the hit units linked by shared
-    k-mers by their smallest unit id, so the units that bracket a sample variant can be read
-    together. ``min_aai`` drops rows with ``aai_naive`` below it.
+    on the units gather keeps whenever ``_zi`` is fitted (``with_aai`` fits it), with a
+    closed-form 95% interval ``aai_lo``/``_hi`` (:func:`aai_interval`; no draws needed).
+    ``component`` labels the hit units linked by shared k-mers by their smallest unit id, so
+    the units that bracket a sample variant can be read together. ``min_aai`` drops rows
+    with ``aai_naive`` below it.
 
     ``extra`` indexes (same k, alphabet and hash scheme) are queried jointly with ``index``:
     their units compete with its units in gather, EM and the posterior, with ids offset by
@@ -1609,19 +1659,51 @@ def profile(
             inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
         copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
+        zi = inflated.join(
+            pl.DataFrame(
+                {
+                    "unit": np.arange(len(m_g), dtype=np.uint32),
+                    "m": m_g,
+                    "pin_sum": pin_sum,
+                    # sourmash imports have no n_kmers: windows taken as all kept (t = 1)
+                    "n_kmers": hit_info["n_kmers"] if "n_kmers" in hit_info.columns else m_g,
+                }
+            ),
+            on="unit",
+        )
+        # Clumping: a read covering a unit hits ~ Poisson(mu) of its kept k-mers, which inflates
+        # the variance of hit counts by 1 + mu. mu from tier-2 hits per hitting read (a
+        # zero-truncated mean), scaled to the fitted tier's k-mers.
+        ratio = (
+            kmer_hits.group_by("unit")
+            .agg(hits=pl.col("hits").sum())
+            .join(unit_reads, on="unit")
+            .select("unit", per_read=pl.col("hits") / pl.col("reads"))
+        )
+        mu = np.zeros(len(m_g))
+        mu[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
+        mu *= _div(m_g.astype(np.float64), hit_info["m_g"].to_numpy().astype(np.float64))
+        lo, hi = aai_interval(
+            zi["coverage"].to_numpy(),
+            zi["present"].to_numpy(),
+            zi["m"].to_numpy(),
+            zi["pin_sum"].to_numpy(),
+            zi["n_kmers"].to_numpy(),
+            params.k,
+            clumping=1 + mu[zi["unit"].to_numpy()],
+        )
+        point = aai(copies, pl.col("present") * pl.col("m"), pl.col("coverage"), params.k)
         fits.append(
-            inflated.join(
-                pl.DataFrame(
-                    {"unit": np.arange(len(m_g), dtype=np.uint32), "m": m_g, "pin_sum": pin_sum}
-                ),
-                on="unit",
-            ).select(
+            zi.with_columns(aai_lo=lo, aai_hi=hi).select(
                 "unit",
                 coverage_zi="coverage",
                 present_zi="present",
                 copies_zi=copies,
                 abundance_zi=pl.col("coverage") * copies,
-                aai=aai(copies, pl.col("present") * pl.col("m"), pl.col("coverage"), params.k),
+                aai=point,
+                # null with the point (too few k-mers or too little coverage to identify it)
+                aai_lo=pl.when(point.is_not_null()).then("aai_lo"),
+                aai_hi=pl.when(point.is_not_null()).then("aai_hi"),
             )
         )
     if all_estimators:
@@ -1683,7 +1765,6 @@ def profile(
                 draws,
                 present_prob=prob,
                 len_cv=len_cv,
-                k=params.k,
             )
         result = result.join(intervals, on="unit", how="left")
     if joint.dense:

@@ -1195,6 +1195,25 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - *Intervals are too narrow:* 0.54–0.56 coverage against an unbiased target. They carry the read-sampling uncertainty of the present k-mers, not the randomness of which k-mers survive a given identity (binomial at least, more with overlapping windows). The fix is a draw of the containment around *a*^k in each posterior draw; it waits for the calibration on the fmh divergence ladder, together with the gate (|bias| ≤ 0.01: met against the consensus; coverage ≥ 0.9: not met; Spearman ≥ 0.9: 0.85, over a ladder of only four identities and member noise).
     - `aai_naive`: +0.03 against the mean member, the same offset.
 
+* **Phase 7, step 8 — closed-form `aai_lo`/`aai_hi` (no draws).** `--draws` stays 0 by default, so AAI intervals no longer come from the posterior. `aai_interval` computes them from the zero-inflated fit. This supersedes step 2's posterior interval, which covered 0.55 in step 7. Copies *c* estimates *a*^k, and its variance adds three terms:
+  - *survival*: *c*(1 − *c*) *d* / `pin_sum`, from where a strain's substitutions fall. *d* = 1 + 2*t* Σ\_{j=1}^{k−1} (*a*^j − *a*^k)/(1 − *a*^k) for the correlation of windows *j* apart, with *t* = *m* / `n_kmers` the chance a neighbouring window is kept too. *d* → k for dense windows near *a* = 1 and → 1 for sparse ones; it is derived exactly, not fitted. A Monte Carlo test with random substitutions puts 92–98% of strains inside.
+  - *read sampling of the present k-mers*: Binomial(present × *m*, seen).
+  - *the coverage estimate*: the zero-truncated Poisson Fisher information, by the delta method.
+  - Both sampling terms are scaled by a clumping factor 1 + μ. A read hits a run of neighbouring kept k-mers, μ per covering read, recovered from tier-2 hits per hitting read (a zero-truncated mean) and scaled to the fitted tier. The interval is *a* ± z·sd on the AAI scale (delta method), clipped to [0, 1]. Null where `aai` is null.
+  - *How it got there* (`results/sim-aai-ci`, dense config, coverage against centroid identity at 85/90/95/100%):
+    - posterior draws (step 2): 0.55 overall;
+    - survival + imputation terms: 0.94/0.93/0.87/0.27. Strains at 100% identity and depth ~1 had `present_zi` 0.1–0.3: the k-mers hit come in runs from few reads, so the sample size is the reads;
+    - + read clumping: 100% strains still outside, because a Beta's quantiles never reach 1;
+    - normal on the containment scale: 0.93–0.99, but lower bounds of 0 at 85% (*c* ≈ 0.17);
+    - normal on the AAI scale: 0.96–1.0, too wide on dense tiers, because the hit-sampling term counted absent k-mers again; fixed to Binomial(present × *m*, seen);
+    - clumping as 1 + μ instead of hits per hitting read, which overstated it on sparse tier 2.
+  - **Result** (3 seeds, `gather_zi` true positives with an `aai`):
+    - coverage of the centroid identity: dense 0.97/0.99/0.93/0.87 at 85/90/95/100%, median width 0.12/0.09/0.07/0.03;
+    - `floor_d20`: 1.0/1.0/0.94/0.92, width 0.13/0.11/0.09/0.05;
+    - by coverage bin, 0.92–1.0 throughout, widest below 1× (0.17–0.19).
+    - Slightly conservative at high coverage, because the simulation places an exact number of substitutions, which varies less than the random-substitution model. Real substitutions cluster in variable regions, which pushes the other way. The floored index without a dense tier reports intervals too, wide as expected.
+  - Tests: the interval holds its point and stays within [0, 1] on the fixture profile; the survival variance matches simulated substitutions (92–98% inside); more kept windows give narrower intervals, and sparse windows narrower than dense ones at equal counts.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

@@ -160,7 +160,8 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     got = profile(index, *READS, draws=60, all_estimators=True)
     assert "coverage_zi_lo" not in plain.columns
     # intervals and groups change nothing else
-    assert got.drop("^.*_(lo|hi)$", "ambiguity_group", "group_size", "own_evidence").equals(plain)
+    posterior = ("^coverage_zi_(lo|hi)$", "^.*abundance_zi_(lo|hi)$", "^group_coverage.*$")
+    assert got.drop(*posterior, "ambiguity_group", "group_size", "own_evidence").equals(plain)
     assert got["own_evidence"].drop_nulls().is_between(0, 1).all()
     found = got.filter(pl.col("coverage_zi") > 0)
     assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
@@ -209,12 +210,38 @@ def test_aai_of_a_unit_explained_away(tmp_path: Path) -> None:
     assert half["aai_naive"] > 0.7  # its own hits still show it close (~1x: uncorrected)
 
 
-def test_posterior_aai_interval(members: Path) -> None:
+def test_aai_interval_without_draws(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
-    got = profile(index, *READS, draws=60).filter(pl.col("aai").is_not_null())
+    got = profile(index, *READS, with_aai=True).filter(pl.col("aai").is_not_null())
     assert got.height > 0
-    assert (got["aai_lo"] <= got["aai_hi"]).all()
-    assert got["aai"].is_between(got["aai_lo"] - 1e-3, got["aai_hi"] + 1e-3).mean() >= 0.9  # type: ignore[operator]
+    assert (got["aai_lo"] <= got["aai"] + 1e-12).all() and (
+        got["aai"] <= got["aai_hi"] + 1e-12
+    ).all()
+    assert got["aai_hi"].max() <= 1.0  # type: ignore[operator]
+
+
+def test_aai_interval_survival_variance() -> None:
+    # Substitutions at identity a over L positions: the share of the L - k + 1 windows that
+    # survive has variance c (1 - c) d / L, d the overlap factor aai_interval uses.
+    rng = np.random.default_rng(0)
+    k, length, a = 11, 400, 0.93
+    hit = rng.random((4000, length)) < a
+    windows = np.lib.stride_tricks.sliding_window_view(hit, k, axis=1).all(axis=2)
+    c = windows.mean(axis=1)
+    n = length - k + 1
+    lo, hi = query.aai_interval(
+        coverage=np.array([1e6]), present=np.array([a**k]), m=np.array([n]),
+        pin_sum=np.array([n]), n_kmers=np.array([n]), k=k,
+    )  # fmt: skip
+    # The interval of a from the survival term alone holds ~95% of simulated strains.
+    inside = ((c ** (1 / k) >= lo[0]) & (c ** (1 / k) <= hi[0])).mean()
+    assert 0.92 <= inside <= 0.98
+    # More kept windows, narrower; sparse sampling (t << 1) removes the overlap term.
+    args = {"coverage": np.full(3, 1e6), "present": np.full(3, a**k), "k": k}
+    lo, hi = query.aai_interval(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
+                                n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
+    width = hi - lo
+    assert width[0] > width[1] > width[2]
 
 
 def write_members(path: Path, seqs: list[str], first_rep: int = 0) -> Path:

@@ -131,8 +131,9 @@ def query(
     aai: Annotated[
         bool,
         typer.Option(
-            help="Containment AAI (aai, with intervals under --draws) of the detected units; "
-            "fits the zero-inflated EM. aai_naive is reported for every hit unit regardless"
+            help="Containment AAI of the detected units (aai, with a closed-form 95% interval "
+            "aai_lo/aai_hi; no --draws needed); fits the zero-inflated EM. aai_naive is "
+            "reported for every hit unit regardless"
         ),
     ] = False,
     min_aai: Annotated[
