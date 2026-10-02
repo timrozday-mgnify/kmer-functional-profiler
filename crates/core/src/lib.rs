@@ -14,7 +14,7 @@ mod translate;
 pub use alphabet::Alphabet;
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use error::Error;
-pub use fastx::FastxHits;
+pub use fastx::{BaseStats, FastxHits};
 pub use gather::{Gathered, gather};
 pub use kmers::{DnaScanner, Hits, KmerParams, distinct_kmers, hash_kmer, max_hash, protein_kmers};
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};

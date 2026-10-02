@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
@@ -7,8 +8,51 @@ use needletail::parse_fastx_file;
 
 use crate::{DnaScanner, Error, Hits, KmerParams, threads};
 
-/// A batch's concatenated sequences, the end of each, and its reads (pairs).
-type BatchResult = Result<(Vec<u8>, Vec<usize>, usize), Error>;
+/// A batch's concatenated sequences, the end of each, its reads (pairs) and base counts.
+type BatchResult = Result<(Vec<u8>, Vec<usize>, usize, BaseStats), Error>;
+
+/// Bases read, for converting k-mer depth into read bases and for the error thinning of
+/// k-mer counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BaseStats {
+    /// All bases, both mates.
+    pub bases: u64,
+    /// Bases that are not A, C, G or T after the quality mask: no k-mer spans them.
+    pub lost: u64,
+    /// Sum of Phred error probabilities over the other bases (0 for FASTA).
+    pub expected_errors: f64,
+}
+
+impl BaseStats {
+    fn add(&mut self, other: Self) {
+        self.bases += other.bases;
+        self.lost += other.lost;
+        self.expected_errors += other.expected_errors;
+    }
+
+    /// Counts the bases of `seq` (already masked) with their Phred+33 qualities.
+    fn count(&mut self, seq: &[u8], qual: Option<&[u8]>) {
+        self.bases += seq.len() as u64;
+        let called = |b: &u8| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
+        match qual {
+            Some(qual) => {
+                for (b, &q) in seq.iter().zip(qual) {
+                    if called(b) {
+                        self.expected_errors += PHRED_ERROR[q as usize];
+                    } else {
+                        self.lost += 1;
+                    }
+                }
+            }
+            None => self.lost += seq.iter().filter(|b| !called(b)).count() as u64,
+        }
+    }
+}
+
+/// Error probability of each Phred+33 quality byte.
+static PHRED_ERROR: LazyLock<[f64; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|q| 10f64.powf(-(q.saturating_sub(33) as f64) / 10.0).min(1.0))
+});
 
 /// Streams FASTA/FASTQ (plain, gzip or zstd; single or paired) as batches of k-mer hits.
 ///
@@ -22,6 +66,7 @@ pub struct FastxHits {
     scanner: DnaScanner,
     mates: u8,
     n_reads: u64,
+    base_stats: BaseStats,
 }
 
 impl fmt::Debug for FastxHits {
@@ -63,6 +108,7 @@ impl FastxHits {
                 let mut seqs = Vec::new();
                 let mut ends = Vec::new();
                 let mut n = 0;
+                let mut stats = BaseStats::default();
                 let mut error = None;
 
                 while n < batch_reads {
@@ -79,7 +125,9 @@ impl FastxHits {
                             break;
                         }
                     };
+                    let start = seqs.len();
                     push_masked(&mut seqs, &rec1.seq(), rec1.qual(), min_qual);
+                    stats.count(&seqs[start..], rec1.qual());
                     ends.push(seqs.len());
 
                     if let Some(r2) = &mut r2_reader {
@@ -94,7 +142,9 @@ impl FastxHits {
                                 break;
                             }
                         };
+                        let start = seqs.len();
                         push_masked(&mut seqs, &rec2.seq(), rec2.qual(), min_qual);
+                        stats.count(&seqs[start..], rec2.qual());
                         ends.push(seqs.len());
                     }
                     n += 1;
@@ -107,7 +157,7 @@ impl FastxHits {
                 if n == 0 {
                     break;
                 }
-                if tx.send(Ok((seqs, ends, n))).is_err() {
+                if tx.send(Ok((seqs, ends, n, stats))).is_err() {
                     break;
                 }
             }
@@ -119,6 +169,7 @@ impl FastxHits {
             scanner: DnaScanner::new(params),
             mates,
             n_reads: 0,
+            base_stats: BaseStats::default(),
         })
     }
 
@@ -127,9 +178,14 @@ impl FastxHits {
         self.n_reads
     }
 
+    /// Bases of the reads consumed so far.
+    pub fn base_stats(&self) -> BaseStats {
+        self.base_stats
+    }
+
     /// Reads and scans the next batch.
     fn next_batch(&mut self) -> Result<Option<Hits>, Error> {
-        let (seqs, ends, n) = match self.rx.recv() {
+        let (seqs, ends, n, stats) = match self.rx.recv() {
             Ok(Ok(batch)) => batch,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -175,6 +231,7 @@ impl FastxHits {
                 .collect()
         });
         self.n_reads += n as u64;
+        self.base_stats.add(stats);
         let mut hits = Hits::default();
         for part in parts {
             hits.append(part);
@@ -206,5 +263,22 @@ impl Iterator for FastxHits {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_batch().transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_stats_count_lost_bases_and_phred_errors() {
+        let mut stats = BaseStats::default();
+        // Q10 (+), Q20 (5), Q30 (?), and an N whose quality is ignored.
+        stats.count(b"ACGN", Some(b"+5?I"));
+        assert_eq!((stats.bases, stats.lost), (4, 1));
+        assert!((stats.expected_errors - (0.1 + 0.01 + 0.001)).abs() < 1e-12);
+        stats.count(b"acNNt", None); // FASTA: no errors known
+        assert_eq!((stats.bases, stats.lost), (9, 3));
+        assert!((stats.expected_errors - 0.111).abs() < 1e-12);
     }
 }

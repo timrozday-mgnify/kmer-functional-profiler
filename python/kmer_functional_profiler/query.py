@@ -1445,6 +1445,105 @@ class _Summed:
         return pl.concat(merged, rechunk=False)
 
 
+SENSE_CHANGE: Final = 0.75  # share of random base substitutions that change the amino acid
+
+
+def census_counts(
+    batch: dict[str, np.ndarray], hit_hashes: np.ndarray, census_max: int
+) -> tuple[int, int]:
+    """Census k-mers of a batch of sampled k-mers, and how many of them are in the index.
+
+    A census k-mer has hash <= ``census_max`` (a rate below which the index holds every
+    unit's k-mers) and comes from a mate with one hashed frame: if the mate is coding, that
+    frame is the coding one, so off-frame k-mers, which never hit, stay out. Frames are
+    counted from the batch's sampled k-mers, so a kept frame with none sampled is missed
+    (``census_frame_miss`` in :func:`sample_summary`). Counted per occurrence, as reads are.
+    ``hit_hashes`` holds the batch's hashes found in the index.
+    """
+    mate = batch["read"].astype(np.uint64) * 2 + batch["mate"]
+    frames = np.unique(mate * 8 + batch["frame"])
+    mates, n_frames = np.unique(frames // 8, return_counts=True)
+    take = (batch["hash"] <= np.uint64(census_max)) & np.isin(mate, mates[n_frames == 1])
+    census = batch["hash"][take]
+    return len(census), int(np.isin(census, hit_hashes).sum())
+
+
+def sample_summary(
+    result: pl.DataFrame,
+    k: int,
+    reads: int,
+    mates: int,
+    base_stats: dict[str, float] | None,
+    census: tuple[int, int] | None,
+    t_max: float,
+) -> dict[str, float | int | None]:
+    """How much of the sample the units explain (Phase 7, step 14), as sylph's
+    ``--estimate-unknown`` does for genomes.
+
+    ``explained_fraction`` (model-based): each detected unit's ``coverage_zi``, the depth
+    of its present k-mers, raised to base depth by ``rho`` = (L / 3) / ((L - 2) / 3 - k + 1)
+    (L the mean mate length in bases; a frame holds (L - 2) / 3 whole codons on average) and
+    by 1 / ``error_thinning``, times ``len_mean`` x 3 bases, summed
+    and divided by the sample's bases. Units below detection and non-coding reads count as
+    unknown; strain mixtures inflate it. ``error_thinning`` r = (1 - d)^(3k), with d the
+    per-base chance of losing a k-mer window: bases masked or not A/C/G/T, plus
+    ``SENSE_CHANGE`` x the mean Phred error probability. Errors clustered in read tails make
+    r too low, and the explained fraction too high.
+
+    ``census_containment`` (model-free): the fraction of census k-mers (:func:`census_counts`)
+    found in the index, over r and capped at 1: includes units below detection, but exact
+    k-mers only hit at ~80% AAI or more. ``census_frame_miss`` is the chance that a kept frame
+    of a mate has no sampled k-mer, so the mate passes as one-frame and its off-frame
+    k-mers lower the census.
+
+    ``result`` is :func:`profile`'s, with ``coverage_zi`` and ``len_mean``; ``base_stats``
+    is :attr:`FastxHits.base_stats` (None for sourmash-hashed queries); ``census`` the
+    summed (census k-mers, hits), None when the indexes do not support one. Values that
+    cannot be computed are None. The unknown fractions are 1 minus the others, floored at 0.
+    """
+    out: dict[str, float | int | None] = dict.fromkeys(
+        (
+            "bases", "lost_bases", "expected_errors", "mean_read_length", "error_thinning",
+            "explained_bases", "explained_fraction", "unknown_fraction", "census_kmers",
+            "census_hits", "census_containment", "census_unknown", "census_frame_miss",
+        )
+    )  # fmt: skip
+    out["reads"], out["mates"] = reads, mates
+    r = None
+    if base_stats is not None and base_stats["bases"] > 0 and reads > 0:
+        bases = base_stats["bases"]
+        mate_nt = bases / (reads * mates)
+        lost = (base_stats["lost"] + SENSE_CHANGE * base_stats["expected_errors"]) / bases
+        r = (1 - min(lost, 1.0)) ** (3 * k)
+        windows = (mate_nt - 2) / 3 - k + 1  # k-mer windows per frame
+        out |= {
+            "bases": int(bases),
+            "lost_bases": int(base_stats["lost"]),
+            "expected_errors": float(base_stats["expected_errors"]),
+            "mean_read_length": mate_nt,
+            "error_thinning": r,
+            "census_frame_miss": float((1 - t_max) ** max(windows, 0)),
+        }
+        if "len_mean" in result.columns and "coverage_zi" in result.columns and r > 0:
+            rho = mate_nt / 3 / windows if windows > 0 else None
+            depth = result.select(
+                (pl.col("coverage_zi") * 3 * pl.col("len_mean")).sum(),
+                pl.col("len_mean").is_not_null().any(),
+            ).row(0)
+            if rho is not None and depth[1]:
+                explained = float(depth[0]) * rho / r
+                out["explained_bases"] = explained
+                out["explained_fraction"] = explained / bases
+                out["unknown_fraction"] = max(0.0, 1 - explained / bases)
+    if census is not None:
+        out["census_kmers"], out["census_hits"] = census
+        if census[0] > 0 and r is not None and r > 0:
+            contained = min(1.0, census[1] / census[0] / r)
+            out["census_containment"] = contained
+            out["census_unknown"] = 1 - contained
+    return out
+
+
 def profile(
     index: Index,
     r1: str | Path,
@@ -1463,6 +1562,7 @@ def profile(
     min_aai: float = 0.0,
     extra: Sequence[Index] = (),
     mask: "Mask | None" = None,
+    summary: dict[str, float | int | None] | None = None,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -1513,6 +1613,10 @@ def profile(
     masked sampled hashes before any lookup and subtracts the masked postings from the unit
     rows' expected counts; ``masked_fraction`` and ``host_like`` are added.
 
+    ``summary``, if given, is filled with :func:`sample_summary`'s sample-level explained
+    and unknown fractions; it fits ``_zi``. The census needs every index to have a complete
+    base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash.
+
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
     space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
@@ -1523,6 +1627,18 @@ def profile(
     # Format-1 indexes also record tier1_per_unit.
     params = IndexParams(**{f.name: index.meta["params"][f.name] for f in fields(IndexParams)})
     joint = _Joint([index, *extra])
+    sources: list[_core.FastxHits] = []  # the read streams, for their base counts
+    census_max = (
+        min(
+            min(_core.max_hash(i.meta["params"]["t_base"]), int(i.tier2.max_hash))
+            for i in joint.indexes
+        )
+        if summary is not None
+        and index.meta.get("hash") != "sourmash"
+        and all(i.meta.get("base_stratum_complete") for i in joint.indexes)
+        else None
+    )
+    census = [0, 0]
 
     def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         batches = unmasked(max_hash)
@@ -1535,7 +1651,7 @@ def profile(
     def unmasked(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         if index.meta.get("hash") == "sourmash":
             return sourmash_hits(r1, r2, params.k, max_hash, batch_reads)
-        return _core.FastxHits(
+        source = _core.FastxHits(
             r1,
             r2,
             k=params.k,
@@ -1546,6 +1662,8 @@ def profile(
             batch_reads=batch_reads,
             min_qual=min_qual,
         )
+        sources.append(source)
+        return source
 
     def by_read(hits: pl.DataFrame) -> pl.DataFrame:
         return hits.group_by("unit", "hash", "read").agg(
@@ -1597,6 +1715,9 @@ def profile(
                 )
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
+            if census_max is not None:
+                got = census_counts(b, hits["hash"].unique().to_numpy(), census_max)
+                census = [census[0] + got[0], census[1] + got[1]]
         sampled += len(b["hash"])
         subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier2") // DISTINCT_SAMPLE])
         hit_rows += hits.height
@@ -1703,7 +1824,7 @@ def profile(
         # Hits after the EM split (what the function x taxon table splits): coverage x m.
         plain = plain.with_columns(hits_em=plain["coverage_em"] * m_g[plain["unit"].to_numpy()])
     fits = [plain]
-    if all_estimators or draws > 0 or with_aai:
+    if all_estimators or draws > 0 or with_aai or summary is not None:
         with timer("fit_zi"):
             inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
@@ -1839,7 +1960,7 @@ def profile(
                     (pl.col(f"_{rule}").fill_null(0) / pl.col("m_g")).alias(f"coverage_{rule}"),
                 )
             result = result.drop("_wta", "_ufirst")
-    return (
+    result = (
         result.with_columns(
             pl.col(
                 "^(coverage|present|copies|abundance|hits)_(em|zi|zib|zip)(_lo|_hi)?$"
@@ -1852,6 +1973,17 @@ def profile(
         .with_columns(unit=pl.col("index"))  # back to the index's unit ids
         .with_columns(component=pl.col("unit").min().over("component"))
         .drop("index")
-        .filter(pl.col("aai_naive") >= min_aai)
         .sort("unit")
     )
+    if summary is not None:  # over every unit, before min_aai drops rows
+        # The first stream is the full first pass over the reads.
+        summary |= sample_summary(
+            result,
+            params.k,
+            n_reads if not sources else sources[0].n_reads,
+            2 if r2 is not None else 1,
+            sources[0].base_stats if sources else None,
+            None if census_max is None else (census[0], census[1]),
+            joint.max_hash("tier2") / 2**64,
+        )
+    return result.filter(pl.col("aai_naive") >= min_aai)

@@ -35,6 +35,7 @@ from kmer_functional_profiler.query import (
     posterior_zi,
     presence,
     profile,
+    sample_summary,
     unit_hits,
 )
 
@@ -544,12 +545,15 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     out = tmp_path / "p.tsv"
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
-    result = runner.invoke(app, [*args, "--draws", "3", "--aai"])
+    summary = tmp_path / "summary.json"
+    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary)])
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
     assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
         table.columns
     )
+    sample = json.loads(summary.read_text())
+    assert sample["explained_fraction"] > 0 and 0 <= sample["census_containment"] <= 1
     got = json.loads(stats.read_text())
     assert {"load", "hash", "lookup", "gather", "fit_zi", "posterior", "total"} <= set(
         got["stages"]
@@ -937,3 +941,86 @@ def test_posterior_in_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
         want.select("unit", "ambiguity_group", "group_size")
     )
     assert np.allclose(got["coverage_zi_hi"], want["coverage_zi_hi"], rtol=0.3)
+
+
+CODONS = [
+    a + b + c
+    for a in "ACGT"
+    for b in "ACGT"
+    for c in "ACGT"
+    if a + b + c not in ("TAA", "TAG", "TGA")
+]
+
+
+def test_sample_summary_by_hand() -> None:
+    result = pl.DataFrame({"coverage_zi": [2.0, 0.0], "len_mean": [100.0, 50.0]})
+    stats = {"bases": 10_000.0, "lost": 0.0, "expected_errors": 0.0}
+    got = sample_summary(result, 11, 100, 1, stats, (200, 150), 0.2)
+    # 100 reads of 100 bp: 98 / 3 whole codons per frame, 98 / 3 - 10 windows; no errors.
+    rho = (100 / 3) / (98 / 3 - 10)
+    assert got["error_thinning"] == 1.0
+    assert got["explained_bases"] == pytest.approx(2.0 * 300 * rho)
+    assert got["explained_fraction"] == pytest.approx(600 * rho / 10_000)
+    assert got["unknown_fraction"] == pytest.approx(1 - 600 * rho / 10_000)
+    assert got["census_containment"] == pytest.approx(0.75)
+    assert got["census_frame_miss"] == pytest.approx(0.8 ** (98 / 3 - 10))
+    # Errors thin k-mer depth: per-base loss d gives r = (1 - d)^(3k), which both estimates
+    # divide out; masked bases count in full, Phred errors at SENSE_CHANGE.
+    noisy = sample_summary(
+        result, 11, 100, 1, stats | {"lost": 20.0, "expected_errors": 40.0}, (200, 150), 0.2
+    )
+    r = (1 - (20 + query.SENSE_CHANGE * 40) / 10_000) ** 33
+    assert noisy["error_thinning"] == pytest.approx(r)
+    assert noisy["explained_fraction"] == pytest.approx(got["explained_fraction"] / r)  # type: ignore[operator]
+    assert noisy["census_containment"] == pytest.approx(min(1.0, 0.75 / r))
+    # Without base counts (sourmash hashing) or a census, those values are None.
+    bare = sample_summary(result, 11, 100, 1, None, None, 0.2)
+    assert bare["explained_fraction"] is None and bare["census_containment"] is None
+
+
+def test_unknown_fraction_of_known_and_random_reads(tmp_path: Path) -> None:
+    # Five stop-free genes of 400 codons, each indexed as its own unit; half of the reads
+    # come from them (either strand), half are random DNA.
+    rng = np.random.default_rng(11)
+    genes = ["".join(rng.choice(CODONS, 400)) for _ in range(5)]
+    table = str.maketrans("ACGT", "TGCA")
+    members = tmp_path / "members.parquet"
+    pl.DataFrame(
+        [(i, i, True, _core.translate_frames(g.encode())[0].decode()) for i, g in enumerate(genes)],
+        schema=["protein_id", "cluster_rep", "full_length", "sequence"],
+        orient="row",
+    ).write_parquet(members)
+    build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=0.05))
+    index = Index.load(tmp_path / "idx")
+
+    def reads(n: int, source: list[str] | None) -> list[str]:
+        out = []
+        for _ in range(n):
+            if source is None:
+                out.append("".join(rng.choice(list("ACGT"), 150)))
+            else:
+                g = source[rng.integers(len(source))]
+                start = rng.integers(len(g) - 150 + 1)
+                read = g[start : start + 150]
+                out.append(read if rng.random() < 0.5 else read.translate(table)[::-1])
+        return out
+
+    def summary(seqs: list[str]) -> dict[str, float | int | None]:
+        path = tmp_path / "reads.fa"
+        path.write_text("".join(f">{i}\n{q}\n" for i, q in enumerate(seqs)))
+        got: dict[str, float | int | None] = {}
+        profile(index, path, summary=got)
+        return got
+
+    known, unknown = reads(400, genes), reads(400, None)
+    mixed = summary(known + unknown)
+    # Reads never cross the genes' ends here, so end k-mers are thinly covered, and taken as
+    # absent they lift coverage_zi: explained runs ~10% high on known reads.
+    assert mixed["bases"] == 800 * 150 and mixed["error_thinning"] == 1.0
+    assert mixed["explained_fraction"] == pytest.approx(0.5, abs=0.08)
+    only_known = summary(known)
+    assert only_known["explained_fraction"] == pytest.approx(1.0, abs=0.12)
+    assert only_known["census_containment"] > 0.85  # type: ignore[operator]
+    only_random = summary(unknown)
+    assert only_random["census_containment"] < 0.05  # type: ignore[operator]
+    assert (only_random["explained_fraction"] or 0.0) < 0.05

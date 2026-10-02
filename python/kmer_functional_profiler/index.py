@@ -14,7 +14,10 @@ Rust kernel, keeping only small tables in memory:
    ``log2(p_in / n_groups)``.
 
 Postings are candidates minus promiscuous k-mers (``n_groups > max_groups``); units whose
-``t_g`` was raised above ``t_base`` keep only their ``n_min`` best-scoring candidates. The
+``t_g`` was raised above ``t_base`` keep only their ``n_min`` best-scoring candidates, plus
+every candidate with hash <= ``t_base``, so that below ``t_base`` the index holds every
+unit's k-mers (the base stratum, which the query's census of known k-mers counts on;
+``meta.json`` marks it with ``base_stratum_complete``). The
 query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Tier 2
 maps each posting hash to its set of (unit, quantised ``p_in``), stored as bucketed
 fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can be hit, so
@@ -27,7 +30,8 @@ With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``
 promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
 ``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level,
 and ``pin_sum`` (``pin_sum_dense``) sums their ``p_in``: how many of them an average member
-holds, which turns present k-mers into member-equivalents (copies). ``len_cv``
+holds, which turns present k-mers into member-equivalents (copies). ``len_mean`` is the
+mean length (residues) of the counting members, which turns depth into read bases. ``len_cv``
 (``len_cv_dense``) is the coefficient of variation of kept k-mers over the counting
 members: how far one copy's k-mers can stray from ``pin_sum``.
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
@@ -639,6 +643,7 @@ def _unit_table(members: pl.DataFrame, n_kmers: pl.DataFrame, params: IndexParam
             n_members=pl.len().cast(pl.UInt32),
             n_full_length=pl.col("full_length").sum().cast(pl.UInt32),
             n_counting=pl.col("counts").sum().cast(pl.UInt32),
+            len_mean=pl.col("length").filter("counts").mean().cast(pl.Float32),
         )
         .join(n_kmers, on="unit", how="left")
         .with_columns(pl.col("n_kmers").fill_null(0).cast(pl.UInt32))
@@ -656,7 +661,7 @@ def _prepare(
     members_path: str | Path, params: IndexParams
 ) -> tuple[pl.DataFrame, list[pl.DataFrame], dict[str, object]]:
     """Load, mask and batch members; the returned members lose their sequences (the batches
-    hold the only copy)."""
+    hold the only copy) but keep their ``length``."""
     members = load_members(members_path)
     n_residues = int(members["sequence"].str.len_bytes().cast(pl.UInt64).sum())
     n_masked = 0
@@ -670,7 +675,8 @@ def _prepare(
         "n_residues": n_residues,
         "n_adapter_masked_proteins": n_masked,
     }
-    return members.drop("sequence"), batches, stats
+    lengths = pl.col("sequence").str.len_bytes().cast(pl.UInt32).alias("length")
+    return members.with_columns(lengths).drop("sequence"), batches, stats
 
 
 # Share of counting members holding a k-mer. One seen only in partial members gets half a
@@ -696,13 +702,18 @@ def _select_postings(
         )
         .select("hash", "unit", "p_in", "pin_q", "n_groups", "score")
     )
-    # Drop promiscuous k-mers, then keep the n_min best of each floored unit's candidates.
+    # Drop promiscuous k-mers, then keep the n_min best of each floored unit's candidates and
+    # its base stratum (hash <= t_base), so the base stratum is complete for every unit.
     floored = units.select("unit", floored=pl.col("t_g") > params.t_base)
     postings = (
         scored.filter(pl.col("n_groups") <= params.max_groups)
         .join(floored, on="unit")
         .sort(["unit", "score", "hash"], descending=[False, True, False])
-        .filter(~pl.col("floored") | (pl.int_range(pl.len()).over("unit") < params.n_min))
+        .filter(
+            ~pl.col("floored")
+            | (pl.int_range(pl.len()).over("unit") < params.n_min)
+            | (pl.col("hash") <= _core.max_hash(params.t_base))
+        )
         .drop("floored")
     )
     stats: dict[str, object] = {
@@ -851,6 +862,7 @@ def finish_index(
             "n_kmers",
             "t_g",
             "max_hash_g",
+            *(("len_mean",) if "len_mean" in units.columns else ()),
             "^len_cv.*$",
             *(("max_hash_dense",) if dense is not None else ()),
         )
@@ -958,6 +970,8 @@ def write_meta(
     meta = {
         "format": 2,
         "hash": hash_scheme,
+        # Every unit's k-mers with hash <= t_base are kept (the query's census relies on it).
+        "base_stratum_complete": True,
         "params": asdict(params),
         **{name: table.save(out, name) for name, table in tables.items()},
         "stats": stats,

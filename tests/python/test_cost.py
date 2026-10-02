@@ -43,11 +43,16 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
     assert cost["units"] == stats["n_clusters"] and cost["floored"] == stats["n_floored"]
     assert cost["t_max"] == stats["t_max"]
     for predicted, actual in (
-        (cost["postings"], stats["postings"]),
         (cost["dense"], stats["dense_postings"]),
-        (cost["tier2_bytes"], stats["tier2_bytes"]),
         (cost["with_postings"], stats["n_units"]),
     ):
         assert abs(predicted / actual - 1) < 0.05, (predicted, actual)  # type: ignore[operator]
+    # Floored units' base strata overlap their n_min best more than at random (ties go to low
+    # hashes), so postings, and the bytes they set, are bounded above.
+    for predicted, actual in (
+        (cost["postings"], stats["postings"]),
+        (cost["tier2_bytes"], stats["tier2_bytes"]),
+    ):
+        assert 1 <= predicted / actual < 1.1, (predicted, actual)  # type: ignore[operator]
     # Dense sets repeat at a different rate, so its bytes are only bounded.
     assert cost["dense_bytes"] >= stats["dense_bytes"]  # type: ignore[operator]
