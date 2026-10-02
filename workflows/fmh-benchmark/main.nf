@@ -96,6 +96,8 @@ process IMPORT_SKETCHES {
 process MGNIFY_INDEX {
     tag "${name}"
     label 'process_high_memory'
+    // hard links (same filesystem as the work dir): the query cost run reads them from here
+    publishDir "${params.outdir}/mgnify_index", mode: 'link', saveAs: { "${name}/index" }
 
     input:
     tuple val(name), val(args), path(members, stageAs: 'members/*'), path(pfam, stageAs: 'pfam/*')

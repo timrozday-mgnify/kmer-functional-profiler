@@ -146,7 +146,7 @@ To download them ahead of (or apart from) the benchmark, e.g. on a node with int
 | `--n_reads` | `6600000` | InSilicoSeq reads, both mates (~1 Gbp at 151 bp) |
 | `--iss_model` | `novaseq` | InSilicoSeq error model: `hiseq`, `novaseq` or `miseq` |
 | `--iss_mode` | `kde` | `perfect`: error-free 151 bp reads, to see which false positives come from read errors (run through `bench.py iss`, which patches iss 2.0.1's perfect model: it otherwise exits 0 without output, and makes 125 bp reads) |
-| `--draws` | `100` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups (0: none) |
+| `--draws` | `0` | Posterior draws for 95% intervals on `coverage_zi` / `abundance_zi` and ambiguity groups. Dropped (plan, 2026-10-02: confidence is to be closed-form), so 0 and `ci_cover`, `ci_width`, `group_size_mean` stay empty |
 | `--min_hits` | `1,2` | Distinct k-mers for a KO to count as detected; each value is scored from the same profiles |
 | `--diamond_min_hits` | `1,2,3,5,10,20,50,100` | Read pairs for a KO to count as detected by DIAMOND, in place of `--min_hits`: DIAMOND's purity/completeness curve, to compare at matched purity |
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
@@ -274,31 +274,83 @@ params.mgnify_indexes = [
 with the same `members` (e.g. sparse and dense builds of one subset) share one annotation,
 published as `mgnify/<first entry's name>_gene_units.parquet`. Annotating
 against a nested subset (1 in 100 or 1 000 clusters) is cheap; against the whole release's
-~1.7×10⁹ representatives it is ~10³–10⁴ CPU-hours. `ablations/aai.config` is a template for
-this run (`run_ablations.sh aai OUTDIR`). The test profile builds `mgnify_mini` from a
+~1.7×10⁹ representatives it is ~10³–10⁴ CPU-hours. `ablations/floor.config` is this run for
+a nested subset (`run_ablations.sh floor OUTDIR --aai_subset DIR`; `aai.config` is step 15's
+ladder). Built entries are published as `mgnify_index/<name>/index` (hard links), for
+`mgnify-subset --query`. The test profile builds `mgnify_mini` from a
 fixture whose 24 clusters' representatives are mini-genome proteins mutated to 100-70%
 identity (`tests/data/mini_fmh/mgnify_truth.tsv`); DIAMOND recovers those identities to
 ±0.01.
 
 ## Ablations
 
-Phase 7 measures each change against the phase-6 method on this benchmark (plan, phase 7).
-Three runs, each a config in `ablations/` on top of the site's `hpc.config`, with its own
-output and work directory, so they can run at once:
+Phase 7 measures each change against the phase-6 method on this benchmark (plan, phase 7,
+steps 6 and 19). Each run is a config in `ablations/` on top of the site's `hpc.config`,
+with its own output and work directory, so they can run at once. The databases in the shared
+`storeDir` (`--data_dir`, `--db_dir`) are fetched first, alone, so that parallel runs do not
+download into it at the same time:
 
 ```bash
-sbatch workflows/fmh-benchmark/run_ablations.sh index /shared/kfp-ablations/index
-sbatch workflows/fmh-benchmark/run_ablations.sh reads /shared/kfp-ablations/reads-novaseq
-sbatch workflows/fmh-benchmark/run_ablations.sh reads /shared/kfp-ablations/reads-miseq --iss_model miseq
-sbatch workflows/fmh-benchmark/run_ablations.sh host  /shared/kfp-ablations/host
+sbatch workflows/fmh-benchmark/run_hpc.sh --dbs_only --tools '' --dbs pfam,hostile,host,decoy \
+    --outdir /shared/kfp-ablations/dbs -w /shared/kfp-ablations/dbs/work
+```
+
+Then, together (`<subset>` holds the 1-in-100 subset's `members.parquet` and `pfam.parquet`):
+
+```bash
+a=workflows/fmh-benchmark/run_ablations.sh; o=/shared/kfp-ablations
+sbatch $a floor $o/floor-novaseq --aai_subset <subset>
+sbatch $a floor $o/floor-miseq   --aai_subset <subset> --iss_model miseq
+sbatch $a floor $o/floor-perfect --aai_subset <subset> --iss_mode perfect
+sbatch $a floor $o/floor-1.65M   --aai_subset <subset> --n_reads 1650000
+sbatch $a floor $o/floor-26.4M   --aai_subset <subset> --n_reads 26400000
+sbatch $a index $o/index
+sbatch $a reads $o/reads-novaseq
+sbatch $a reads $o/reads-miseq --iss_model miseq
+sbatch $a host  $o/host
+```
+
+When `floor-novaseq` has finished, the query cost of its six indexes (pooled gut sample, no
+draws):
+
+```bash
+nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
+    --query_indexes '/shared/kfp-ablations/floor-novaseq/mgnify_index/*/index' \
+    --query_run ERR7738575,ERR7746321 --query_ladder 4000000,40000000,100000000 \
+    --query_draws 0 --outdir /shared/kfp-ablations/floor-query-cost \
+    -w /shared/kfp-ablations/floor-query-cost/work
 ```
 
 | Run | Arms | Profiles (10 seeds) |
 | --- | --- | --- |
-| `index` | Base (k 11, 20 letters, *t_base* 1/1000, *n_min* 8) and one change each: *n_min* 0/4/16, *t_base* 1/100, dense tier 0.05/0.1/0.2, k 9/10/12, Murphy-10 k 13/15, Dayhoff k 17/20. Built per label (KO and Pfam units). | 31 indexes × 10 |
-| `reads` | On the base and *t_base* 1/100 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model. | 5 indexes × 11 arms × 10 |
-| `aai` | Sparse against dense at the MGnify90 level: one nested subset (1 in 100) built sparse and with *t_dense* 0.02/0.05/0.1, against one MGnify90-level truth; plain and edges arms. Detection and `aai_naive` are tier-2 only, so the ladder isolates the dense tier's effect on `aai`, its interval and Pfam abundance | 4 indexes × 2 arms × 10 |
-| `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy | 4 shares × (3 × 2 + 2 × 3) × 10 |
+| `floor` | MGnify90 level, one 1-in-100 subset, one DIAMOND truth: `sparse` (k 11, *t_base* 1/1000, *n_min* 8); `dense02` (+ *t_dense* 0.02); `tbase01`/`02`/`05` (raised density floor *t_base* 0.01/0.02/0.05); `tbase02_all` (*t_base* 0.02 and every candidate up to the current *t_g*: `dense02`'s k-mers in tier 2). Plain and edges20. Once per read model and depth: NovaSeq, MiSeq, error-free, 1.65 M and 26.4 M reads | 6 indexes × 2 arms × 10, × 5 runs |
+| `index` | Base (k 11, 20 letters, *t_base* 1/1000, *n_min* 8) and one change each: *n_min* 0/4/16; density floor *t_base* 0.01/0.02/0.05 and 0.02 with every candidate kept; dense tier 0.02/0.05/0.1; *t_cap* 0.05/0.1; k 9/10/12; Murphy-10 k 13/15; Dayhoff k 17/20. Built per label (KO and Pfam units) | 41 indexes × 10 |
+| `reads` | On the base and *t_base* 0.02 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model | 5 indexes × 11 arms × 10 |
+| `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy; on the base and *t_base* 0.02 indexes | 4 shares × 5 arms × 5 indexes × 10 (hostile, mask and decoy: built indexes only) |
+| `aai` | Step 15's sparse/dense ladder (run; superseded by `floor`) | 4 indexes × 2 arms × 10 |
+
+**Raised floor against the dense tier** (`floor`, and the floor/dense pairs of `index`,
+`reads`, `host`): *t_base* is a density floor, since every unit keeps all its k-mers with
+hash ≤ *t_base*. `tbase02_all` holds `dense02`'s k-mers in tier 2, so it measures where they
+sit (pass 1, so detection too, against pass 2 for detected units only); `tbase02` measures
+whether the plain floor is enough. Read `aai_summary.tsv` and `calibration/*_scores.tsv`
+(`aai_bias_<lo>`, `aai_cover_<lo>`, `aai_spearman`, `aai_n`, `completeness_90`,
+`recall_<lo>`, `purity_nearest`, `purity_near`) and Pfam rows of `summary.tsv` per index,
+index sizes (`du` of `mgnify_index/*/index`) and the query cost run's `query_cost.tsv`. The
+plan's step 19 has the decision rule.
+
+**Calibration transfer** (plan, step 17): every `floor` run fits an `aai` map per index and
+arm. A map fitted on one run is scored on another's held-out clusters with `--map`, e.g.
+NovaSeq to MiSeq for `tbase02`:
+
+```bash
+o=/shared/kfp-ablations
+python workflows/fmh-benchmark/bench.py aai-calibrate --map $o/floor-novaseq/calibration/tbase02.json \
+    --profiles $o/floor-miseq/units/seed{1..10}_tbase02.tsv \
+    --genes $o/floor-miseq/truth/seed{1..10}_genes.csv \
+    --gene-units $o/floor-miseq/mgnify/sparse_gene_units.parquet \
+    --index $o/floor-miseq/mgnify_index/tbase02/index --scores-out tbase02_novaseq_to_miseq.tsv
+```
 
 Every profile is queried with `--all-estimators`, so the estimator ablations (EM against
 gather, winner-take-all and uniqueness-first; zero inflation; *p_in* weighting) are the
@@ -306,11 +358,10 @@ gather, winner-take-all and uniqueness-first; zero inflation; *p_in* weighting) 
 `scores.tsv`, grouped by `label`, `index` and `arm`, at `min_hits` 1 and the shipped pair
 (`kmers_unique`, `abundance_zi`), Pfam first:
 
-- *every arm:* `purity`, `completeness`, `completeness_low25`, `l1`, `spearman_tp`,
-  `ci_cover`; cost per arm from `bench.py cost <outdir>/trace.tsv` (PROFILE rows are named
+- *every arm:* `purity`, `completeness`, `completeness_low25`, `l1`, `spearman_tp`; cost per arm from `bench.py cost <outdir>/trace.tsv` (PROFILE rows are named
   `index~arm`);
-- *index:* also `split_l1` (within-component share error, weighted by true depth) and
-  `group_size_mean` (ambiguity groups), which the function × taxon table depends on;
+- *index:* also `split_l1` (within-component share error, weighted by true depth), which the
+  function × taxon table depends on (`group_size_mean` needs the dropped draws);
 - *host:* also `n_pred - tp` (false detections) and `host_like_detected` per share and arm,
   and the mask's cost in `masks/<index>.json` (masked hashes and postings).
 
