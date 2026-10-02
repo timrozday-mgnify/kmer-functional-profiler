@@ -130,6 +130,8 @@ First run downloads: ~13 GB of Zenodo inputs into `--data_dir`; into `--db_dir`,
 HUMAnN 3.9 databases (ChocoPhlAn, UniRef90, utility mapping, MetaPhlAn vJun23) and ~70 GB
 of HUMAnN 4 ones (ChocoPhlAn v4 alpha, 45 GB compressed; EC-filtered UniRef90; utility
 mapping; MetaPhlAn vOct22_202403).
+To download them ahead of (or apart from) the benchmark, e.g. on a node with internet, run
+`sbatch workflows/fmh-benchmark/run_hpc.sh --dbs_only --tools humann,humann4,diamond,kmermaid --dbs pfam,hostile,host,decoy`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -147,6 +149,8 @@ mapping; MetaPhlAn vOct22_202403).
 | `--indexes` | four configs (see `nextflow.config`) | `[name:, args:]` maps of `index` options |
 | `--tools` | `diamond,fmh_funprofiler,kmermaid,humann,humann4` | Other tools to run and score; `''` for none |
 | `--db_dir` | `--data_dir` | Where tool databases are built once (DIAMOND, kMermaid model, HUMAnN) |
+| `--dbs_only` | `false` | Only fetch the Zenodo inputs and build the `--tools`' and `--dbs`' databases, then stop; later runs with the same `--data_dir`/`--db_dir` reuse them |
+| `--dbs` | `''` | With `--dbs_only`, also any of `pfam` (Pfam-A HMMs), `hostile` (hostile index), `host` (host genome), `decoy` (decoy proteome) |
 | `--sketch_scaled` | `1000` | Scaled of `--sketches`, for fmh-funprofiler |
 | `--diamond_args` | `''` | Extra `diamond blastx` options, e.g. `--sensitive` |
 | `--kmermaid_max_members` | `50` | Proteins sampled per KO to train kMermaid |

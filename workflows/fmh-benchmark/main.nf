@@ -920,7 +920,78 @@ def git(List cmd) {
     return (['git', '-C', projectDir.toString()] + cmd).execute().text.trim()
 }
 
+// `--tools ''` arrives as true: no tools
+def toolList() {
+    def tools = params.tools.toString() in ['', 'true', 'false'] ? [] : params.tools.toString().tokenize(',')*.trim()
+    def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann', 'humann4']
+    if (unknown) {
+        error "Unknown --tools: ${unknown.join(', ')}"
+    }
+    return tools
+}
+
+// HUMAnN 3.9 (~45 GB) and 4 alpha (~70 GB): ChocoPhlAn full, a UniRef90 DIAMOND database
+// (4 distributes only the EC-filtered one), utility mapping, and the MetaPhlAn index each uses.
+// Returns the HUMANN_DB and METAPHLAN_DB inputs of the HUMAnN versions in tools.
+def humannDbs(tools) {
+    def humann = [
+        humann:  [params.humann3_container, 'uniref90_diamond', params.metaphlan_index],
+        humann4: [params.humann4_container, 'uniref90_ec_filtered_diamond', params.humann4_metaphlan_index],
+    ].findAll { tool, _cfg -> tool in tools }
+    return [
+        humann.collectMany { tool, cfg ->
+            [[tool, cfg[0], 'chocophlan', 'full'], [tool, cfg[0], 'uniref', cfg[1]], [tool, cfg[0], 'utility_mapping', 'full']]
+        },
+        humann.collect { tool, cfg -> [tool, cfg[0], cfg[2]] },
+    ]
+}
+
+// Databases only: the --tools' databases and the --dbs ones into --db_dir (and the Zenodo
+// inputs, which fmh-funprofiler's sketches are, into --data_dir), for later runs with the
+// same dirs to reuse
+//   nextflow run workflows/fmh-benchmark --dbs_only --tools humann,humann4 --dbs pfam,hostile
+workflow DBS {
+    def tools = toolList()
+    def dbs = params.dbs.toString() in ['', 'true', 'false'] ? [] : params.dbs.toString().tokenize(',')*.trim()
+    if (dbs - ['pfam', 'hostile', 'host', 'decoy']) {
+        error "Unknown --dbs: ${(dbs - ['pfam', 'hostile', 'host', 'decoy']).join(', ')}"
+    }
+    if ('pfam' in dbs) {
+        PFAM_DB()
+    }
+    if ('hostile' in dbs) {
+        HOSTILE_DB()
+    }
+    if ('host' in dbs) {
+        HOST_GENOME()
+    }
+    if ('decoy' in dbs) {
+        DECOY_PROTEOME(channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect())
+    }
+    if (tools.any { it in ['diamond', 'fmh_funprofiler', 'kmermaid'] }) {
+        FETCH()
+    }
+    if ('diamond' in tools) {
+        DIAMOND_DB(FETCH.out.faa)
+    }
+    if ('kmermaid' in tools) {
+        MEMBERS(FETCH.out.faa, FETCH.out.kos)
+        KMERMAID_MODEL(MEMBERS.out.members)
+    }
+    def (humann_dbs, metaphlan_dbs) = humannDbs(tools)
+    HUMANN_DB(channel.fromList(humann_dbs))
+    METAPHLAN_DB(channel.fromList(metaphlan_dbs))
+}
+
 workflow {
+    if (params.dbs_only) {
+        DBS()
+    } else {
+        BENCHMARK()
+    }
+}
+
+workflow BENCHMARK {
     FETCH()
     MEMBERS(FETCH.out.faa, FETCH.out.kos)
     def bench_py = file("${projectDir}/bench.py")
@@ -1082,12 +1153,7 @@ workflow {
     )
     DETECTED.out.detected.collectFile(name: 'detected.tsv', keepHeader: true, storeDir: params.outdir)
 
-    // `--tools ''` arrives as true: no tools
-    def tools = params.tools.toString() in ['', 'true', 'false'] ? [] : params.tools.toString().tokenize(',')*.trim()
-    def unknown = tools - ['diamond', 'fmh_funprofiler', 'kmermaid', 'humann', 'humann4']
-    if (unknown) {
-        error "Unknown --tools: ${unknown.join(', ')}"
-    }
+    def tools = toolList()
     def ch_raw = channel.empty()
     def ch_tool_reads = SIMULATE.out.reads.filter { 0d in fractions }.map { seed, r1, r2 -> [seed.toString(), r1, r2] }
     if ('diamond' in tools) {
@@ -1102,17 +1168,10 @@ workflow {
         KMERMAID(ch_tool_reads, KMERMAID_MODEL(MEMBERS.out.members).model)
         ch_raw = ch_raw.mix(KMERMAID.out.raw)
     }
-    // HUMAnN 3.9 (~45 GB) and 4 alpha (~70 GB): ChocoPhlAn full, a UniRef90 DIAMOND database
-    // (4 distributes only the EC-filtered one), utility mapping, and the MetaPhlAn index each uses
-    def humann = [
-        humann:  [params.humann3_container, 'uniref90_diamond', params.metaphlan_index],
-        humann4: [params.humann4_container, 'uniref90_ec_filtered_diamond', params.humann4_metaphlan_index],
-    ].findAll { tool, _cfg -> tool in tools }
     def dbs = ['chocophlan', 'uniref', 'utility_mapping']
-    HUMANN_DB(channel.fromList(humann.collectMany { tool, cfg ->
-        [[tool, cfg[0], 'chocophlan', 'full'], [tool, cfg[0], 'uniref', cfg[1]], [tool, cfg[0], 'utility_mapping', 'full']]
-    }))
-    METAPHLAN_DB(channel.fromList(humann.collect { tool, cfg -> [tool, cfg[0], cfg[2]] }))
+    def (humann_dbs, metaphlan_dbs) = humannDbs(tools)
+    HUMANN_DB(channel.fromList(humann_dbs))
+    METAPHLAN_DB(channel.fromList(metaphlan_dbs))
     // tool -> [chocophlan, uniref, utility_mapping, metaphlan], as HUMANN and HUMANN4 take them
     def ch_humann_db = HUMANN_DB.out.db
         .groupTuple(size: dbs.size())
