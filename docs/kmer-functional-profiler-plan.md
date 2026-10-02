@@ -1245,6 +1245,13 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
   - *HPC:* `ablations/aai.config` is a template for a nested MGnify subset (`run_ablations.sh aai OUTDIR`). Stub-checked: 10 seeds × 2 arms profiled and scored. Annotating against the whole release (~1.7×10⁹ representatives) is possible but ~10³–10⁴ CPU-hours, so a 1-in-100 subset comes first.
   - Tests: `mgnify-genes` keeps the best HSP per pair and ranks hits; `aai_score` on a hand-built case (detection, purity, recall below 90%, `aai` bias and coverage, near-hit `aai_naive`); per-gene truth.
 
+* **Phase 7, step 11 — the posterior's batches in parallel.** The step 32 posterior cells (`draws` 100, ERR7738575) took 7.8 h at 40 M pairs and 10.4 h at 100 M, almost all in the posterior, on one core of the 8 the job has (`%cpu` ≈ 100). Posterior time followed detected units (5.1 → 6.9 M, ×1.33 time) more than pairs (×2.5). Taking that ratio to the pooled sample's detected units (11.3 M at 100 M, 13.7 M at 200 M; step 38) gives ~17 h and ~20 h serially, close to `QUERY`'s 24 h.
+  - **Change:** `posterior_zi` runs its component batches on `workers` processes (default `pl.thread_pool_size()`, so `POLARS_MAX_THREADS` = the task's CPUs), spawned, not forked (Polars' thread pool does not survive a fork), each with one Polars thread. The index-wide arrays go to each worker once (pool initializer), at most 2 × `workers` batches' read rows are built ahead, and the largest batches go first, because a giant component's batch is the critical path. One batch or one worker runs serially, as before.
+  - *Results are unchanged:* each batch already had its own generator (seed + smallest unit) and read weights keyed by read id, so the output is bit-identical to the serial run (`test_posterior_batches_in_parallel_as_in_series`).
+  - *Result (synthetic, 4 K units × 100 k-mers, 16 batches, 100 draws, laptop):* 41.0 s → 6.9 s on 8 workers, identical output.
+  - *Limits:* a component is still one batch on one core, so a giant one bounds the wall time (the pooled 200 M cell's largest component is 7.55 M pairs; E2 streams it but does not split it). The stage's `posterior_peak_*` are the parent's only; each worker adds about one batch (`POSTERIOR_BATCH_BYTES`, more for a giant component), which the job's trace `peak_rss` includes. Monkeypatched module constants (`READ_CHUNK`, `SWEEP_BLOCK_PAIRS`) do not reach spawned workers; the tests that set them run one batch, so serially.
+  - *To read from the next posterior run:* wall time of the posterior stage against 10.4 h at 100 M pairs, and the job's peak RSS against step 38's.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

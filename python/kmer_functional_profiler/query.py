@@ -19,14 +19,17 @@ hits give.
 import ctypes
 import itertools
 import json
+import multiprocessing
 import os
 import resource
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import fields
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
@@ -994,6 +997,7 @@ def posterior_zi(
     level: float = 0.95,
     shared_evidence: float = 0.5,
     seed: int = 0,
+    workers: int | None = None,
 ) -> pl.DataFrame:
     """Intervals and ambiguity groups for the zero-inflated model: resampled reads + Gibbs.
 
@@ -1035,32 +1039,77 @@ def posterior_zi(
     per batch of components (:func:`component_batches`) sized to ``POSTERIOR_BATCH_BYTES``,
     each with its own generator seeded by ``seed`` and the batch's smallest unit. A read's
     Poisson weight is a function of ``seed``, the draw and its id (:func:`_poisson1`), so
-    reads hitting several batches weigh the same in each.
+    reads hitting several batches weigh the same in each. So the batches run in parallel on
+    ``workers`` processes (default ``pl.thread_pool_size()``, i.e. ``POLARS_MAX_THREADS``)
+    with the same result as one after another.
     """
     per_pair = 1600 + 16 * draws  # bytes per (unit, hash) row at peak, measured (step 28)
     parts = component_batches(
         pairs.select("unit", "hash"), max(1, POSTERIOR_BATCH_BYTES // per_pair)
     )
-    return pl.concat(
-        [
-            _posterior_batch(
-                part,
-                # This batch's k-mers' rows: a scan per batch, no copy of all rows.
-                hash_reads.join(part.select("hash").unique(), on="hash", how="semi"),
-                m_g,
-                pin_sum,
-                draws,
-                present_prob=present_prob,
-                len_cv=len_cv,
-                copies_error=copies_error,
-                sweeps=sweeps,
-                level=level,
-                shared_evidence=shared_evidence,
-                seed=seed,
-            )
-            for part in parts
-        ]
-    ).sort("unit")
+    batch = partial(
+        _posterior_batch,
+        m_g=m_g,
+        pin_sum=pin_sum,
+        draws=draws,
+        present_prob=present_prob,
+        len_cv=len_cv,
+        copies_error=copies_error,
+        sweeps=sweeps,
+        level=level,
+        shared_evidence=shared_evidence,
+        seed=seed,
+    )
+
+    def rows(part: pl.DataFrame) -> pl.DataFrame:
+        """This batch's k-mers' rows: a scan per batch, no copy of all rows."""
+        return hash_reads.join(part.select("hash").unique(), on="hash", how="semi")
+
+    workers = min(workers or pl.thread_pool_size(), len(parts))
+    if workers <= 1:
+        return pl.concat([batch(part, rows(part)) for part in parts]).sort("unit")
+    # Spawn, not fork: Polars' thread pool does not survive a fork. Each worker is one core,
+    # so its Polars runs one thread (children read the environment when they start).
+    # ponytail: the stage's peak_rss/peak_anon are the parent's only; a worker adds about
+    # one batch (POSTERIOR_BATCH_BYTES, more for a larger component), which Slurm counts.
+    out: list[pl.DataFrame] = []
+    pending: set[Future[pl.DataFrame]] = set()
+    polars_threads = os.environ.get("POLARS_MAX_THREADS")
+    os.environ["POLARS_MAX_THREADS"] = "1"
+    try:
+        with ProcessPoolExecutor(
+            workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_posterior_worker_init,
+            initargs=(batch,),
+        ) as pool:
+            # Largest first: a giant component's batch is the critical path, so start it early.
+            for part in sorted(parts, key=lambda part: -part.height):
+                if len(pending) >= 2 * workers:  # a few batches' rows built ahead, not all
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    out += [f.result() for f in done]
+                pending.add(pool.submit(_posterior_worker_batch, part, rows(part)))
+            out += [f.result() for f in pending]
+    finally:
+        if polars_threads is None:
+            del os.environ["POLARS_MAX_THREADS"]
+        else:
+            os.environ["POLARS_MAX_THREADS"] = polars_threads
+    return pl.concat(out).sort("unit")
+
+
+_posterior_worker: Callable[[pl.DataFrame, pl.DataFrame], pl.DataFrame] | None = None
+
+
+def _posterior_worker_init(batch: Callable[[pl.DataFrame, pl.DataFrame], pl.DataFrame]) -> None:
+    """A worker's :func:`_posterior_batch` with posterior_zi's arguments, sent once."""
+    global _posterior_worker
+    _posterior_worker = batch
+
+
+def _posterior_worker_batch(part: pl.DataFrame, rows: pl.DataFrame) -> pl.DataFrame:
+    assert _posterior_worker is not None
+    return _posterior_worker(part, rows)
 
 
 POSTERIOR_BATCH_BYTES: Final = 2**29  # working memory of one batch of the posterior's draws
