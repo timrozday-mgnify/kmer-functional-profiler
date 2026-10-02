@@ -362,6 +362,23 @@ impl PyFastxHits {
             .unwrap_or_else(PoisonError::into_inner)
             .n_reads()
     }
+
+    /// Bases of the reads consumed so far: ``bases`` (both mates), ``lost`` (not A/C/G/T
+    /// after the quality mask) and ``expected_errors`` (summed Phred error probabilities of
+    /// the others; 0 for FASTA).
+    #[getter]
+    fn base_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .base_stats();
+        let dict = PyDict::new(py);
+        dict.set_item("bases", stats.bases)?;
+        dict.set_item("lost", stats.lost)?;
+        dict.set_item("expected_errors", stats.expected_errors)?;
+        Ok(dict)
+    }
 }
 
 #[pymodule]

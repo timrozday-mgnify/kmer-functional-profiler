@@ -150,6 +150,14 @@ def query(
         Path | None,
         typer.Option(help="Mask sidecar (from `mask`) of the first index: host k-mers dropped"),
     ] = None,
+    summary: Annotated[
+        Path | None,
+        typer.Option(
+            help="JSON of sample-level explained and unknown fractions: model-based "
+            "(explained_fraction) and a census of known k-mers (census_containment); fits "
+            "the zero-inflated EM"
+        ),
+    ] = None,
     all_estimators: Annotated[
         bool,
         typer.Option(
@@ -160,6 +168,7 @@ def query(
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     timer = Timer(stats, log=stats is not None)
+    sample: dict[str, float | int | None] | None = None if summary is None else {}
     with timer("total"):
         with timer("load"):
             loaded = Index.load(index_dir, mmap=not in_memory)
@@ -181,7 +190,10 @@ def query(
             min_aai=min_aai,
             extra=extra,
             mask=masked,
+            summary=sample,
         )
         result.write_csv(out, separator="\t")
+        if summary is not None:
+            summary.write_text(json.dumps(sample, indent=2) + "\n")
     timer.write()
     typer.echo(f"{result.height} units hit -> {out}", err=True)

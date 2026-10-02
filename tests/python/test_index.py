@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner
 
-from kmer_functional_profiler import index, reference
+from kmer_functional_profiler import _core, index, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
 
@@ -128,9 +128,12 @@ def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
     t_g = pl.Series(np.where(units["n_members"] > 1, expected_t, params.t_base))
     assert (units["t_g"] - t_g).abs().max() < 1e-12  # type: ignore[operator]
     floored = units.filter(pl.col("t_g") > params.t_base)
-    assert floored.height > 0 and (floored["m_g"] <= params.n_min).all()
     postings = pl.read_parquet(tmp_path / "a" / "postings.parquet").join(units, on="unit")
     assert (postings["hash"] <= postings["max_hash_g"]).all()
+    # Floored units keep n_min k-mers above the base stratum at most.
+    base = _core.max_hash(params.t_base)
+    above = postings.filter(pl.col("hash") > base).group_by("unit").len()
+    assert floored.height > 0 and (above["len"] <= params.n_min).all()
 
     # Unit-aligned batching does not change the result.
     build_index(
@@ -178,6 +181,40 @@ def test_floored_units_keep_best_scoring_kmers(tmp_path: Path) -> None:
     )
     assert set(postings.filter(pl.col("cluster_rep") == 1)["hash"]) <= kmers(X + D) - kmers(D)
     assert (postings["score"] == 0).all()
+
+
+def test_floored_units_keep_their_base_stratum(tmp_path: Path) -> None:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    # Floored units sample every k-mer and keep 2 by score, plus all with hash <= t_base.
+    params = IndexParams(k=K, t_base=0.3, n_min=2, t_cap=1.0, oversample=1000)
+    build_index(members, tmp_path / "idx", params, postings_parquet=True)
+    index = Index.load(tmp_path / "idx")
+    assert index.meta["base_stratum_complete"]
+    units = index.units.frame()
+    postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
+        units.select("unit", "cluster_rep"), on="unit"
+    )
+    base = _core.max_hash(params.t_base)
+    for rep in units.filter(pl.col("t_g") > params.t_base)["cluster_rep"]:
+        seqs = [seq for _, r, _, seq in HAND if r == rep]
+        wanted = {h for s in seqs for h in kmers(index_mask(s)) if h <= base}
+        kept = set(postings.filter(pl.col("cluster_rep") == rep)["hash"])
+        assert wanted and wanted <= kept
+        assert len(kept - wanted) <= params.n_min
+
+
+def index_mask(seq: str) -> str:
+    """``seq`` as the build hashes it (adapter peptides masked)."""
+    return str(pl.select(index.mask_adapters(pl.lit(seq))).item())
+
+
+def test_len_mean_over_counting_members(hand: tuple[Index, pl.DataFrame]) -> None:
+    units = hand[0].units.frame().sort("cluster_rep")
+    # Unit A: four full-length members of 60, 60, 60 and 80 residues; its fragment is not
+    # counted. The singleton S has 40.
+    a, s = units.row(0, named=True), units.row(2, named=True)
+    assert a["len_mean"] == pytest.approx(65.0)
+    assert s["len_mean"] == pytest.approx(40.0)
 
 
 def test_adapter_peptides_are_masked(tmp_path: Path) -> None:

@@ -81,20 +81,24 @@ def predict_cost(
     """Expected index size from ``n_members`` and ``n_kmers`` per cluster.
 
     A unit expects ``t_g * n_kmers * keep`` candidates, ``keep`` being the fraction that are
-    not promiscuous; floored units keep at most ``n_min`` of them. Table bytes assume one key
+    not promiscuous; floored units keep at most ``n_min`` of them, plus their base stratum
+    (``t_base * n_kmers * keep`` candidates, each taken as already among the ``n_min`` kept
+    with probability ``n_min`` / candidates). That overlap is a lower bound, so floored
+    postings are an upper bound: score ties are broken by ascending hash, so base-stratum
+    k-mers are kept among the ``n_min`` more often than at random. Table bytes assume one key
     per posting (an upper bound: shared k-mers share keys) and ``sets`` distinct one-value
     sets per key; the build stores each (unit, ``p_in`` level) set once, so ``sets`` < 1 is
     measured on built subsets (``tier2_sets / postings``).
     """
     candidates = pl.col("t_g") * pl.col("n_kmers") * keep
+    best = pl.min_horizontal(candidates, params.n_min)
+    base = params.t_base * pl.col("n_kmers") * keep
     floored = pl.col("t_g") > params.t_base
     dense_rate = pl.max_horizontal(pl.lit(params.t_dense), pl.col("t_g"))
     row = (
         clusters.with_columns(t_g=_t_g(params))
         .with_columns(
-            m=pl.when(floored)
-            .then(pl.min_horizontal(candidates, params.n_min))
-            .otherwise(candidates)
+            m=pl.when(floored).then(best + base * (1 - best / candidates)).otherwise(candidates)
         )
         .select(
             units=pl.len(),

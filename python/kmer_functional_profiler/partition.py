@@ -67,7 +67,15 @@ from kmer_functional_profiler.index import (
 
 QUANTILES: Final = 1024  # candidate-hash quantiles recorded for balanced hash ranges
 SAMPLE: Final = 1 << 20  # candidate hashes sampled for them
-UNIT_COLUMNS: Final = ("cluster_rep", "n_members", "n_counting", "n_kmers", "t_g", "max_hash_g")
+UNIT_COLUMNS: Final = (
+    "cluster_rep",
+    "n_members",
+    "n_counting",
+    "n_kmers",
+    "t_g",
+    "max_hash_g",
+    "len_mean",
+)
 # The index's unit table, as build_index writes it (with ``unit`` first).
 FINAL_COLUMNS: Final = (
     "cluster_rep",
@@ -75,6 +83,7 @@ FINAL_COLUMNS: Final = (
     "n_kmers",
     "t_g",
     "max_hash_g",
+    "len_mean",
     "len_cv",
     "pin_hist",
     "pin_sum",
@@ -82,10 +91,10 @@ FINAL_COLUMNS: Final = (
 )
 # With a dense tier, as build_index writes them.
 DENSE_FINAL_COLUMNS: Final = (
-    *FINAL_COLUMNS[:6],
+    *FINAL_COLUMNS[:7],
     "len_cv_dense",
     "max_hash_dense",
-    *FINAL_COLUMNS[6:],
+    *FINAL_COLUMNS[7:],
     "m_dense",
     "pin_hist_dense",
     "pin_sum_dense",
