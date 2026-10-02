@@ -212,7 +212,13 @@ def mini_fmh(rng: random.Random) -> None:
 
 def mini_pfam(rng: random.Random) -> None:
     """Six single-sequence HMMs (``hmmbuild``, HMMER 3.4) from 40-80 aa segments of mini_fmh
-    proteins: two from one protein, the rest from five others (genes in several genomes)."""
+    proteins: two from one protein, the rest from five others (genes in several genomes).
+
+    Kept if present (delete the file to rebuild): hmmbuild's last digits differ between
+    platforms (macOS arm64 vs Linux x86_64), so the file cannot be byte-reproducible.
+    """
+    if (OUT / "mini_fmh" / "Pfam-mini.hmm").exists():
+        return
     genes = pl.concat(
         pl.read_csv(p, columns=["gene_name", "aa_sequence"])
         for p in sorted((OUT / "mini_fmh" / "genomes_extracted_from_kegg").glob("*/*_mapping.csv"))
