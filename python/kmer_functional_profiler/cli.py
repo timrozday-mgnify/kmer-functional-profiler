@@ -8,9 +8,15 @@ import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
-from kmer_functional_profiler.index import Index, IndexParams, build_index, write_unit_columns
+from kmer_functional_profiler.index import (
+    AAI_CALIBRATION,
+    Index,
+    IndexParams,
+    build_index,
+    write_unit_columns,
+)
 from kmer_functional_profiler.mask import Mask, build_mask
-from kmer_functional_profiler.query import Timer, profile
+from kmer_functional_profiler.query import Timer, check_aai_calibration, profile
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULTS = IndexParams()
@@ -71,6 +77,29 @@ def import_sourmash(
 def unit_columns(index_dir: Path) -> None:
     """Write the unit table's numeric columns as .npy files, for an index built without them."""
     write_unit_columns(index_dir)
+
+
+@app.command()
+def calibrate_aai(
+    index_dir: Path,
+    calibration: Annotated[
+        Path | None,
+        typer.Argument(help="JSON from the benchmark's aai-calibrate; omit to remove the map"),
+    ] = None,
+) -> None:
+    """Attach an aai calibration to an index (``aai_calibration.json``): its queries then
+    report ``aai`` as alignment identity and keep the raw estimate as ``aai_raw``."""
+    target = index_dir / AAI_CALIBRATION
+    if calibration is None:
+        target.unlink(missing_ok=True)
+        return
+    cal = json.loads(calibration.read_text())
+    meta = json.loads((index_dir / "meta.json").read_text())
+    try:
+        check_aai_calibration(cal, meta["params"])
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    target.write_text(json.dumps(cal, indent=1) + "\n")
 
 
 @app.command(name="mask")

@@ -54,13 +54,14 @@ import sys
 from collections.abc import Iterable, Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import mappy
 import numpy as np
 import polars as pl
 
 from kmer_functional_profiler import _core
+from kmer_functional_profiler.query import AAI_CALIBRATION_PARAMS, calibrate_aai
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
                   "end_position": pl.Int64, "strand": pl.String}  # fmt: skip
@@ -533,7 +534,7 @@ def fit_aai_calibration(
     min_n: int = 20,
     level: float = 0.95,
     floor: float = 0.7,
-) -> dict[str, list[float] | float]:
+) -> dict[str, Any]:
     """Inverse calibration of ``aai`` against alignment identity (Sequence similarity).
 
     ``pairs`` has ``aai``, ``aai_lo``, ``aai_hi`` and ``true`` per unit. g(a), the median
@@ -544,7 +545,8 @@ def fit_aai_calibration(
     ``aai`` keeps the benchmark's identity distribution out of the map (a regression would
     pull every estimate toward the benchmark's mean identity). ``widen`` is the error the
     sampling interval misses: the ``level`` quantile, over units at identity >= ``floor``,
-    of how far ``true`` lies outside the mapped interval."""
+    of how far ``true`` lies outside the mapped interval. With fewer than two knots there
+    is no map: ``widen`` is None and ``calibrate-aai`` refuses it."""
     b = (
         pairs.group_by((pl.col("true") / step).floor().alias("bin"))
         .agg(mid=pl.col("true").mean(), med=pl.col("aai").median(), n=pl.len())
@@ -554,7 +556,9 @@ def fit_aai_calibration(
     g = isotonic(b["med"].to_numpy(), b["n"].to_numpy().astype(np.float64))
     knots, run = np.unique(g, return_inverse=True)
     identity = np.bincount(run, b["mid"].to_numpy()) / np.bincount(run)
-    cal: dict[str, list[float] | float] = {"aai": knots.tolist(), "identity": identity.tolist()}
+    cal: dict[str, Any] = {"aai": knots.tolist(), "identity": identity.tolist()}
+    if len(knots) < 2:  # too few units for a map (e.g. a test fixture)
+        return cal | {"widen": None}
     mapped = calibrate_aai(pairs.filter(pl.col("true") >= floor), {**cal, "widen": 0.0})
     miss = mapped.select(
         pl.max_horizontal(pl.col("aai_lo") - pl.col("true"), pl.col("true") - pl.col("aai_hi"), 0)
@@ -563,25 +567,12 @@ def fit_aai_calibration(
     return cal
 
 
-def calibrate_aai(profile: pl.DataFrame, cal: dict) -> pl.DataFrame:
-    """``aai``, ``aai_lo`` and ``aai_hi`` through :func:`fit_aai_calibration`'s map, the
-    interval widened by its ``widen`` and clipped to [0, 1]."""
-    xs, ys = np.asarray(cal["aai"]), np.asarray(cal["identity"])
-    widen = {"aai": 0.0, "aai_lo": -cal["widen"], "aai_hi": cal["widen"]}
-    return profile.with_columns(
-        pl.col(c)
-        .map_batches(lambda s: pl.Series(np.interp(s.to_numpy(), xs, ys)), return_dtype=pl.Float64)
-        .add(d)
-        .clip(0.0, 1.0)
-        .fill_nan(None)  # a null aai stays null
-        for c, d in widen.items()
-    )
-
-
 def aai_calibrate(args: argparse.Namespace) -> None:
     """Fit :func:`fit_aai_calibration` on half the clusters (by a hash of ``cluster_rep``) of
     every sample's unit profile and score ``aai`` raw and calibrated (:func:`aai_score`) on
-    the other half, so no cluster is in both (genes differ by sample, clusters recur)."""
+    the other half, so no cluster is in both (genes differ by sample, clusters recur). The
+    JSON is what ``kmer-functional-profiler calibrate-aai`` attaches to the index; profiles
+    of an index already calibrated are refitted on their raw ``aai``."""
     gene_units = pl.read_parquet(args.gene_units)
     parts = []
     for path, genes in zip(args.profiles, args.genes, strict=True):
@@ -590,6 +581,11 @@ def aai_calibrate(args: argparse.Namespace) -> None:
             truth.filter(pl.col("depth") > 0).select("gene_name", "depth"), on="gene_name"
         ).filter(pl.col("qcov") >= 0.5, pl.col("rank") == 1)
         profile = read_profile(path).filter(pl.col("kmers_unique") >= 1)
+        if "aai_raw" in profile.columns:  # an index already calibrated: refit on the raw aai
+            raw = ("aai_raw", "aai_raw_lo", "aai_raw_hi")
+            profile = profile.drop("aai", "aai_lo", "aai_hi").rename(
+                dict(zip(raw, ("aai", "aai_lo", "aai_hi"), strict=True))
+            )
         parts.append((profile, truth, nearest))
     # a hash, not cluster_rep's parity: nested subsets keep every n-th accession
     held_out = pl.col("cluster_rep").hash(0) % 2 == 1  # stable within a Polars version
@@ -600,11 +596,16 @@ def aai_calibrate(args: argparse.Namespace) -> None:
         for p, _, n in parts
     )
     cal = fit_aai_calibration(train)
-    Path(args.out).write_text(json.dumps({"n_train": train.height, **cal}, indent=1))
+    if args.index:  # the build parameters the map holds for (checked when it is attached)
+        params = json.loads((Path(args.index) / "meta.json").read_text())["params"]
+        cal["params"] = {p: params[p] for p in AAI_CALIBRATION_PARAMS}
+    cal["fit"] = {"n_train": train.height, "profiles": [Path(p).name for p in args.profiles]}
+    Path(args.out).write_text(json.dumps(cal, indent=1))
     rows = []
     for (profile, genes, _), path in zip(parts, args.profiles, strict=True):
         test = profile.filter(held_out)
-        for method, p in (("raw", test), ("calibrated", calibrate_aai(test, cal))):
+        fitted = [("calibrated", calibrate_aai(test, cal))] if cal["widen"] is not None else []
+        for method, p in [("raw", test), *fitted]:
             got = aai_score(p, gene_units, genes, args.min_id, args.min_cov)
             rows.append({"profile": Path(path).name, "method": method}
                         | {k: v for k, v in got.items() if k.startswith("aai_")})  # fmt: skip
@@ -1110,6 +1111,7 @@ def main() -> None:
     p.add_argument("--profiles", required=True, nargs="+", help="unit profiles (units.tsv)")
     p.add_argument("--genes", required=True, nargs="+", help="per-gene truth, one per profile")
     p.add_argument("--gene-units", required=True)
+    p.add_argument("--index", help="the profiles' index: records its build parameters")
     p.add_argument("--min-id", type=float, default=0.9)
     p.add_argument("--min-cov", type=float, default=0.8)
     p.add_argument("--out", default="aai_calibration.json")
