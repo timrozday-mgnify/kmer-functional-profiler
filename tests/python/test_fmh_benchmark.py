@@ -1,6 +1,7 @@
 """The fmh-benchmark steps on the mini fixture, with reads from known positions."""
 
 import gzip
+import json
 import math
 import random
 import shutil
@@ -362,3 +363,58 @@ def test_aai_calibration_inverts_a_biased_estimator() -> None:
     )
     nulls = bench.calibrate_aai(nulls, cal)
     assert nulls["aai"].null_count() == 1 and nulls["aai"][1] == pytest.approx(0.75, abs=0.01)
+
+
+def test_aai_calibrate_transfers_a_map_between_runs(tmp_path: Path) -> None:
+    # Two runs of one biased estimator (0.6 + 0.4 a) with different noise: a map fitted on
+    # run A, scored with --map on run B's held-out clusters, removes the bias there; a map
+    # from an index built at another k is refused.
+    n = 6000
+    rng = np.random.default_rng(0)
+    true = rng.uniform(0.7, 1.0, n)
+    reps = np.arange(n)
+    pl.DataFrame(
+        {
+            "gene_name": [f"g{i}" for i in reps],
+            "cluster_rep": reps,
+            "identity": true,
+            "qcov": 1.0,
+            "scov": 1.0,
+            "rank": 1,
+        }
+    ).write_parquet(tmp_path / "gene_units.parquet")
+    pl.DataFrame({"gene_name": [f"g{i}" for i in reps], "depth": 1.0}).write_csv(
+        tmp_path / "genes.csv"
+    )
+    params = {"k": 11, "alphabet": "protein", "t_base": 0.02, "n_min": 8, "t_cap": 0.2,
+              "t_dense": 0.0}  # fmt: skip
+    for run_name, seed, k in (("a", 1, 11), ("b", 2, 11), ("c", 3, 9)):
+        aai = 0.6 + 0.4 * true + np.random.default_rng(seed).normal(0, 0.01, n)
+        pl.DataFrame(
+            {
+                "cluster_rep": reps,
+                "kmers_unique": 5,
+                "aai": aai,
+                "aai_lo": aai - 0.005,
+                "aai_hi": aai + 0.005,
+                "aai_naive": aai,
+            }
+        ).write_csv(tmp_path / f"{run_name}.tsv", separator="\t")
+        (tmp_path / f"idx_{run_name}").mkdir()
+        (tmp_path / f"idx_{run_name}" / "meta.json").write_text(
+            json.dumps({"params": params | {"k": k}})
+        )
+    common = ["--genes", "genes.csv", "--gene-units", "gene_units.parquet"]
+    run(tmp_path, "aai-calibrate", "--profiles", "a.tsv", *common, "--index", "idx_a",
+        "--out", "a.json", "--scores-out", "a_scores.tsv")  # fmt: skip
+    run(tmp_path, "aai-calibrate", "--profiles", "b.tsv", *common, "--index", "idx_b",
+        "--map", "a.json", "--out", "unused.json", "--scores-out", "a_to_b.tsv")  # fmt: skip
+    assert not (tmp_path / "unused.json").exists()
+    scores = pl.read_csv(tmp_path / "a_to_b.tsv", separator="\t")
+    raw, cal = (scores.filter(method=m).row(0, named=True) for m in ("raw", "calibrated"))
+    assert raw["aai_bias_0.7"] > 0.1  # 0.6 + 0.4 * 0.75 reads 0.15 high
+    for lo in (0.7, 0.8, 0.9, 0.95):
+        assert abs(cal[f"aai_bias_{lo}"]) < 0.01 and cal[f"aai_cover_{lo}"] >= 0.9
+    with pytest.raises(subprocess.CalledProcessError):
+        run(tmp_path, "aai-calibrate", "--profiles", "c.tsv", *common, "--index", "idx_c",
+            "--map", "a.json", "--scores-out", "a_to_c.tsv")  # fmt: skip

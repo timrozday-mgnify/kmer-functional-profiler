@@ -61,7 +61,11 @@ import numpy as np
 import polars as pl
 
 from kmer_functional_profiler import _core
-from kmer_functional_profiler.query import AAI_CALIBRATION_PARAMS, calibrate_aai
+from kmer_functional_profiler.query import (
+    AAI_CALIBRATION_PARAMS,
+    calibrate_aai,
+    check_aai_calibration,
+)
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
                   "end_position": pl.Int64, "strand": pl.String}  # fmt: skip
@@ -572,7 +576,9 @@ def aai_calibrate(args: argparse.Namespace) -> None:
     every sample's unit profile and score ``aai`` raw and calibrated (:func:`aai_score`) on
     the other half, so no cluster is in both (genes differ by sample, clusters recur). The
     JSON is what ``kmer-functional-profiler calibrate-aai`` attaches to the index; profiles
-    of an index already calibrated are refitted on their raw ``aai``."""
+    of an index already calibrated are refitted on their raw ``aai``. With ``--map`` the
+    given map (fitted on another run) is scored on the same held-out half instead of a new
+    fit: the transfer test of plan, phase 7, steps 17 and 19."""
     gene_units = pl.read_parquet(args.gene_units)
     parts = []
     for path, genes in zip(args.profiles, args.genes, strict=True):
@@ -595,12 +601,19 @@ def aai_calibrate(args: argparse.Namespace) -> None:
         .select("aai", "aai_lo", "aai_hi", "true")
         for p, _, n in parts
     )
-    cal = fit_aai_calibration(train)
-    if args.index:  # the build parameters the map holds for (checked when it is attached)
+    params = {}
+    if args.index:
         params = json.loads((Path(args.index) / "meta.json").read_text())["params"]
-        cal["params"] = {p: params[p] for p in AAI_CALIBRATION_PARAMS}
-    cal["fit"] = {"n_train": train.height, "profiles": [Path(p).name for p in args.profiles]}
-    Path(args.out).write_text(json.dumps(cal, indent=1))
+    if args.map:
+        cal = json.loads(Path(args.map).read_text())
+        if cal["widen"] is not None:
+            check_aai_calibration(cal, params)  # a map from an index built otherwise is refused
+    else:
+        cal = fit_aai_calibration(train)
+        if params:  # the build parameters the map holds for (checked when it is attached)
+            cal["params"] = {p: params[p] for p in AAI_CALIBRATION_PARAMS}
+        cal["fit"] = {"n_train": train.height, "profiles": [Path(p).name for p in args.profiles]}
+        Path(args.out).write_text(json.dumps(cal, indent=1))
     rows = []
     for (profile, genes, _), path in zip(parts, args.profiles, strict=True):
         test = profile.filter(held_out)
@@ -1112,6 +1125,7 @@ def main() -> None:
     p.add_argument("--genes", required=True, nargs="+", help="per-gene truth, one per profile")
     p.add_argument("--gene-units", required=True)
     p.add_argument("--index", help="the profiles' index: records its build parameters")
+    p.add_argument("--map", help="score this map (another run's --out) instead of fitting one")
     p.add_argument("--min-id", type=float, default=0.9)
     p.add_argument("--min-cov", type=float, default=0.8)
     p.add_argument("--out", default="aai_calibration.json")
