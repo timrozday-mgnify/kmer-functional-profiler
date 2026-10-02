@@ -380,7 +380,7 @@ process PROFILE {
     // one saveAs for both outputs: without the per-file branch they overwrite each other
     publishDir params.outdir, mode: 'copy', saveAs: { f ->
         def id = "seed${sid}_${name}${arm ? '~' + arm : ''}"
-        f.endsWith('.parquet') ? "kmers/${id}.parquet" : "profiles/${id}.tsv"
+        f.endsWith('.parquet') ? "kmers/${id}.parquet" : f == 'units.tsv' ? "units/${id}.tsv" : "profiles/${id}.tsv"
     }
 
     input:
@@ -1047,11 +1047,18 @@ workflow BENCHMARK {
     ch_indexes = ch_indexes.mix(ch_mgnify.map { name, index -> ['pfam', name, index, true] })
     def ch_gene_units = channel.empty()  // name, gene_units
     if (mgnify.any { it.members }) {
-        MGNIFY_REPS(channel.fromList(mgnify.findAll { it.members }).map { cfg -> [cfg.name, files(cfg.members)] }, bench_py)
+        // Entries with the same members (e.g. sparse and dense builds of one subset) share one
+        // annotation, run under the first entry's name and handed to the others.
+        def sharing = mgnify.findAll { it.members }.groupBy { it.members.toString() }.values()
+            .collectEntries { cfgs -> [cfgs[0].name, cfgs*.name] }
+        MGNIFY_REPS(
+            channel.fromList(mgnify.findAll { it.name in sharing.keySet() }).map { cfg -> [cfg.name, files(cfg.members)] },
+            bench_py,
+        )
         MGNIFY_DB(MGNIFY_REPS.out.faa)
         MGNIFY_ANNOTATE(MGNIFY_DB.out.db.combine(GENOME_PROTEINS.out.faa.flatten()))
         MGNIFY_GENES(MGNIFY_ANNOTATE.out.hits.groupTuple(), bench_py)
-        ch_gene_units = MGNIFY_GENES.out.genes
+        ch_gene_units = MGNIFY_GENES.out.genes.flatMap { name, genes -> sharing[name].collect { n -> [n, genes] } }
     }
 
     // Query arms (phase 7): which reads (raw, fastp, hostile), extra query options, and

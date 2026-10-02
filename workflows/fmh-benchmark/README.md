@@ -258,7 +258,9 @@ params.mgnify_indexes = [
 ]
 ```
 
-`members` may be a directory of members tables (the full build's MERGE buckets). Annotating
+`members` may be a directory of members tables (the full build's MERGE buckets). Entries
+with the same `members` (e.g. sparse and dense builds of one subset) share one annotation,
+published as `mgnify/<first entry's name>_gene_units.parquet`. Annotating
 against a nested subset (1 in 100 or 1 000 clusters) is cheap; against the whole release's
 ~1.7×10⁹ representatives it is ~10³–10⁴ CPU-hours. `ablations/aai.config` is a template for
 this run (`run_ablations.sh aai OUTDIR`). The test profile builds `mgnify_mini` from a
@@ -283,7 +285,7 @@ sbatch workflows/fmh-benchmark/run_ablations.sh host  /shared/kfp-ablations/host
 | --- | --- | --- |
 | `index` | Base (k 11, 20 letters, *t_base* 1/1000, *n_min* 8) and one change each: *n_min* 0/4/16, *t_base* 1/100, dense tier 0.05/0.1/0.2, k 9/10/12, Murphy-10 k 13/15, Dayhoff k 17/20. Built per label (KO and Pfam units). | 31 indexes × 10 |
 | `reads` | On the base and *t_base* 1/100 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model. | 5 indexes × 11 arms × 10 |
-| `aai` | A MGnify90 index (nested subset; template) against the MGnify90-level truth, plain and edges arms | 2 arms × 10 |
+| `aai` | Sparse against dense at the MGnify90 level: one nested subset (1 in 100) built sparse and with *t_dense* 0.02/0.05/0.1, against one MGnify90-level truth; plain and edges arms. Detection and `aai_naive` are tier-2 only, so the ladder isolates the dense tier's effect on `aai`, its interval and Pfam abundance | 4 indexes × 2 arms × 10 |
 | `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy | 4 shares × (3 × 2 + 2 × 3) × 10 |
 
 Every profile is queried with `--all-estimators`, so the estimator ablations (EM against
