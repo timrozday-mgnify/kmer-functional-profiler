@@ -64,7 +64,8 @@ def test_scores_on_hand_built_clusters(hand: tuple[Index, pl.DataFrame]) -> None
     assert core.height == len(kmers(X))
     assert (core["p_in"] == 1).all() and (core["score"] == 0).all()
     assert (private["p_in"] == 0.25).all() and (private["score"] == -2).all()
-    assert (partial_only["p_in"] == 0).all() and (partial_only["score"] == -3).all()
+    # half a member of 4, not 0
+    assert (partial_only["p_in"] == 0.125).all() and (partial_only["score"] == -3).all()
     assert (shared["n_groups"] == 2).all() and (shared["score"] == -1).all()
     assert (rows_for(postings, 10, D)["score"] == -1).all()
 
@@ -75,9 +76,11 @@ def test_unit_table(hand: tuple[Index, pl.DataFrame]) -> None:
     a, b, s = units[1], units[10], units[20]
     assert a["n_members"] == 5
     assert a["n_kmers"] == len(set().union(*(kmers(r[3]) for r in HAND if r[1] == 1)))
-    # Kept k-mers per counting member: 3 x (X + D), 1 x (X + D + P); their mean is pin_sum.
+    # Kept k-mers per counting member: 3 x (X + D), 1 x (X + D + P); their mean is pin_sum,
+    # plus half a member's share (0.5 / 4) of each k-mer only the partial member 5 holds.
     held = np.array([len(kmers(X + D))] * 3 + [len(kmers(X + D + P))])
-    assert a["pin_sum"] == pytest.approx(held.mean())
+    partial_only = kmers(Q + X[:10]) - kmers(X + D + P)
+    assert a["pin_sum"] == pytest.approx(held.mean() + 0.125 * len(partial_only))
     assert a["len_cv"] == pytest.approx(held.std() / held.mean())
     assert b["len_cv"] == s["len_cv"] == 0
 

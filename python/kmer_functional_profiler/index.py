@@ -673,6 +673,11 @@ def _prepare(
     return members.drop("sequence"), batches, stats
 
 
+# Share of counting members holding a k-mer. One seen only in partial members gets half a
+# member, not 0: else a unit whose kept k-mers are all such has pin_sum 0 (infinite copies).
+P_IN: Final = pl.max_horizontal("c", 0.5) / pl.col("n_counting")
+
+
 def _select_postings(
     presence: pl.DataFrame, units: pl.DataFrame, params: IndexParams
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, object]]:
@@ -684,12 +689,9 @@ def _select_postings(
     scored = (
         presence.join(units.select("unit", "n_counting", "max_hash_g"), on="unit")
         .filter(pl.col("hash") <= pl.col("max_hash_g"))
-        .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
+        .with_columns(p_in=P_IN)
         .with_columns(
-            # k-mers seen only in partial members get half a member's weight in the score
-            score=(pl.max_horizontal("p_in", 0.5 / pl.col("n_counting")) / pl.col("n_groups")).log(
-                2
-            ),
+            score=(pl.col("p_in") / pl.col("n_groups")).log(2),
             pin_q=(pl.col("p_in") * (2**PIN_BITS - 1)).round().cast(pl.UInt64),
         )
         .select("hash", "unit", "p_in", "pin_q", "n_groups", "score")
@@ -927,7 +929,7 @@ def dense_rows(presence: pl.DataFrame, units: pl.DataFrame, params: IndexParams)
         presence.filter(pl.col("n_groups") <= params.max_groups)
         .join(units.select("unit", "n_counting", "max_hash_dense"), on="unit")
         .filter(pl.col("hash") <= pl.col("max_hash_dense"))
-        .with_columns(p_in=pl.col("c") / pl.col("n_counting"))
+        .with_columns(p_in=P_IN)
         .select(
             "hash",
             "unit",

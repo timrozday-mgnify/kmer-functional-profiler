@@ -154,6 +154,20 @@ def test_copies_count_member_equivalents(tmp_path: Path) -> None:
     assert (result["abundance_zi"] == 2 * result["coverage_zi"]).all()
 
 
+def test_copies_finite_when_kept_kmers_are_fragment_only(tmp_path: Path) -> None:
+    # The unit's full-length member is too short for a k-mer, so every kept k-mer comes from
+    # its fragment and has p_in 0: pin_sum was 0 and copies_zi infinite.
+    rows = [(0, 0, True, "MK"), (1, 0, False, max(proteins().values(), key=len))]
+    path = tmp_path / "frag.parquet"
+    schema = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    pl.DataFrame(rows, schema=schema, orient="row").write_parquet(path)
+    build_index(path, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    got = profile(Index.load(tmp_path / "idx"), *READS, all_estimators=True, with_aai=True)
+    assert got.height == 1
+    assert got.select(pl.col("copies_zi", "abundance_zi").is_finite().all()).row(0) == (True, True)
+    assert got["aai"].drop_nulls().is_between(0, 1).all()
+
+
 def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
     plain = profile(index, *READS, all_estimators=True)
