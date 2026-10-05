@@ -251,6 +251,10 @@ def read_profile(path: str | Path) -> pl.DataFrame:
     """A profile TSV; an empty one (nothing detected) gets numeric columns, not strings."""
     # whole-file inference: a run of 100+ empty aai cells would otherwise infer str
     profile = pl.read_csv(path, separator="\t", infer_schema_length=None)
+    # ponytail: the benchmark's only extra index is the host decoy, whose units are not
+    # predictions; drop this when `index --role decoy` (plan, phase 10) leaves them out itself
+    if "source" in profile.columns:
+        profile = profile.filter(pl.col("source") == 0)
     if profile.height:
         return profile
     strings = {"name", "cluster_rep"}
