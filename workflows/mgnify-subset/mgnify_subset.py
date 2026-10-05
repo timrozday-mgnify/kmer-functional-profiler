@@ -363,7 +363,8 @@ def main() -> None:
             if isinstance(f.default, bool):
                 p.add_argument(flag, action=argparse.BooleanOptionalAction, default=f.default)
             else:
-                p.add_argument(flag, type=type(f.default), default=f.default)
+                p.add_argument(flag, type=float if f.default is None else type(f.default),
+                               default=f.default)  # fmt: skip
     for name in ("candidates", "presence", "postings"):
         sub.choices[name].add_argument("--members", required=True)
         sub.choices[name].add_argument("--prefix", required=True)

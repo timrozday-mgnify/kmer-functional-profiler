@@ -616,7 +616,7 @@ def aai_calibrate(args: argparse.Namespace) -> None:
     else:
         cal = fit_aai_calibration(train)
         if params:  # the build parameters the map holds for (checked when it is attached)
-            cal["params"] = {p: params[p] for p in AAI_CALIBRATION_PARAMS}
+            cal["params"] = {p: params.get(p) for p in AAI_CALIBRATION_PARAMS}
         cal["fit"] = {"n_train": train.height, "profiles": [Path(p).name for p in args.profiles]}
         Path(args.out).write_text(json.dumps(cal, indent=1))
     rows = []

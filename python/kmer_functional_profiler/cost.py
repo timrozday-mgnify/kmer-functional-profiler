@@ -93,7 +93,7 @@ def predict_cost(
     candidates = pl.col("t_g") * pl.col("n_kmers") * keep
     best = pl.min_horizontal(candidates, params.n_min)
     base = params.t_base * pl.col("n_kmers") * keep
-    floored = pl.col("t_g") > params.t_base
+    floored = (pl.col("n_members") > 1) & (pl.col("t_g") > params.t_base)
     dense_rate = pl.max_horizontal(pl.lit(params.t_dense), pl.col("t_g"))
     row = (
         clusters.with_columns(t_g=_t_g(params))
