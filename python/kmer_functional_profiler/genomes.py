@@ -10,6 +10,9 @@ genomes at depths λ_G has expected raw unit hits Σ_G λ_G c_{G,u}. It writes, 
   so a fit reads the hit units' rows only;
 - ``genome_offsets.npy``, ``genome_hits.npy``: the same hits genome-major, which the
   zero-inflated fit needs over every unit of a candidate (hit or not);
+- ``genome_best.parquet``: per protein (``genome``, ``protein``: its number in the FASTA) its
+  best ``unit`` by ``containment`` (k-mers hit over its k-mers sampled at the unit's rate),
+  if ≥ ``BEST_MIN_CONTAINMENT``: which units each genome carries, for ``kfp-prior``;
 - ``genomes.tsv``: ``genome`` (row number), ``name``, ``path``, ``taxonomy`` (if given),
   ``proteins``, ``units``, ``hits`` (Σ_u c_{G,u});
 - ``unit_pfam.parquet``: the index's Pfam labels, if it has them, so the function × taxon
@@ -36,6 +39,9 @@ from kmer_functional_profiler.query import _div, _ranges, em, gather, unit_hits
 PROTEINS_PER_BATCH: Final = 20_000
 # ponytail: both defaults are guesses, to be tuned on the fmh benchmark's genome arm.
 MIN_CONTAINMENT: Final = 0.1  # screen: share of a genome's content on hit units
+# ponytail: guesses; a protein at ~90% identity keeps ~0.3 of its k = 11 k-mers.
+BEST_MIN_CONTAINMENT: Final = 0.2  # a protein's best unit, for carriage (kfp-prior)
+BEST_MIN_KMERS: Final = 2
 MIN_UNITS: Final = 10  # detection: hit units gather leaves to a genome
 AMBIGUOUS: Final = 0.95  # information cosine above which two genomes are one group
 GTDB_RANKS: Final = ("domain", "phylum", "class", "order", "family", "genus", "species")
@@ -70,29 +76,42 @@ def _batches(path: Path) -> Iterator[list[bytes]]:
         yield batch
 
 
-def genome_content(index: Index, proteins: Path) -> tuple[pl.DataFrame, int]:
+def genome_content(index: Index, proteins: Path) -> tuple[pl.DataFrame, pl.DataFrame, int]:
     """Per unit, the raw tier-2 ``hits`` of one genome's proteins and the distinct
-    ``kmers`` hit; and the number of proteins."""
+    ``kmers`` hit; per protein its best unit (:data:`BEST_MIN_CONTAINMENT`); and the number
+    of proteins."""
     params = index.meta["params"]
-    max_hash = int(index.tier2.max_hash)
-    parts, n = [], 0
+    k, max_hash = params["k"], int(index.tier2.max_hash)
+    parts, lengths, n = [], [], 0
     for batch in _batches(proteins):
-        n += len(batch)
-        hashes = _core.hash_proteins(
-            batch, params["k"], alphabet=params["alphabet"], max_hash=max_hash
-        )["hash"]
+        hashes = _core.hash_proteins(batch, k, alphabet=params["alphabet"], max_hash=max_hash)
         hits = unit_hits(
-            index.tier2, index.units["max_hash_g"], hashes, np.zeros(len(hashes), np.uint64)
+            index.tier2, index.units["max_hash_g"], hashes["hash"], hashes["seq"] + np.uint64(n)
         )
-        parts.append(hits.select("unit", "hash"))
-    hits = pl.concat([pl.DataFrame(schema={"unit": pl.UInt32, "hash": pl.UInt64}), *parts])
+        parts.append(hits.select("unit", "hash", protein="read"))
+        lengths += [max(len(p) - k + 1, 0) for p in batch]
+        n += len(batch)
+    empty = pl.DataFrame(schema={"unit": pl.UInt32, "hash": pl.UInt64, "protein": pl.UInt64})
+    hits = pl.concat([empty, *parts]).with_columns(pl.col("unit").cast(pl.UInt32))
     content = (
-        hits.with_columns(pl.col("unit").cast(pl.UInt32))
-        .group_by("unit")
+        hits.group_by("unit")
         .agg(hits=pl.len().cast(pl.UInt32), kmers=pl.col("hash").n_unique().cast(pl.UInt32))
         .sort("unit")
     )
-    return content, n
+    # Containment of a protein in a unit: k-mers hit over the protein's k-mers sampled at the
+    # unit's rate, so units at different rates compare.
+    per_pair = hits.group_by("protein", "unit").agg(kmers=pl.col("hash").n_unique())
+    sampled = np.asarray(lengths, dtype=np.float64)[per_pair["protein"].to_numpy()] * np.asarray(
+        index.units["t_g"][per_pair["unit"].to_numpy()], dtype=np.float64
+    )
+    best = (
+        per_pair.with_columns(containment=pl.col("kmers") / pl.Series(sampled))
+        .filter(pl.col("kmers") >= BEST_MIN_KMERS, pl.col("containment") >= BEST_MIN_CONTAINMENT)
+        .sort("protein", "containment", "unit", descending=[False, True, False])
+        .unique("protein", keep="first", maintain_order=True)
+        .select(pl.col("protein").cast(pl.UInt32), "unit", "containment")
+    )
+    return content, best, n
 
 
 def annotate_genomes(
@@ -112,12 +131,13 @@ def annotate_genomes(
     if table["genome"].n_unique() != table.height:
         raise ValueError("genome names must be unique")
     base = Path(genomes_tsv).parent
-    contents, proteins = [], []
+    contents, bests, proteins = [], [], []
     # ponytail: all content rows are held and sorted in memory (~16 B per row, ~8 GB for
     # 10^5 genomes); write per-genome shards and merge them if a node runs short.
     for g, path in enumerate(table["path"]):
-        content, n = genome_content(index, base / path)
+        content, best, n = genome_content(index, base / path)
         contents.append(content.with_columns(genome=pl.lit(g, pl.UInt32)))
+        bests.append(best.with_columns(genome=pl.lit(g, pl.UInt32)))
         proteins.append(n)
     rows = pl.concat(contents)  # genome-major
     out.mkdir(parents=True, exist_ok=True)
@@ -144,6 +164,9 @@ def annotate_genomes(
         "genome", "name", "path", *(["taxonomy"] if "taxonomy" in table.columns else []),
         "proteins", "units", "hits",
     ).write_csv(out / "genomes.tsv", separator="\t")  # fmt: skip
+    pl.concat(bests).select("genome", "protein", "unit", "containment").write_parquet(
+        out / "genome_best.parquet"
+    )
     if (index_dir / "unit_pfam.parquet").exists():
         pl.read_parquet(index_dir / "unit_pfam.parquet").write_parquet(out / "unit_pfam.parquet")
     meta = {
