@@ -103,11 +103,16 @@ def test_update(prior_index: tuple[Path, Path, Path]) -> None:
     tmp, gi, c = prior_index
     carriage = Carriage(c)
     profile = observed([0, 1, 2, 3, 4, 5, 6, 15])
-    # No genomes detected: every hit unit keeps its present_prob, nothing is imputed.
-    none = pl.DataFrame(schema={"genome": pl.Int64, "depth": pl.Float64, "present": pl.Float64})
+    # No genomes detected (an empty genomes.tsv reads as strings): every hit unit keeps
+    # its present_prob, nothing is imputed.
+    none = pl.DataFrame(schema={"genome": pl.Int64, "depth": pl.String, "present": pl.String})
     presence, _ = update(profile, none, gi, carriage)
     assert np.allclose(presence["present_prob_updated"], profile["present_prob"])
     assert presence.height == profile.height
+    # Nothing confidently present in the profile: zeros stay zeros, no division by zero.
+    genomes = pl.DataFrame({"genome": [0], "depth": [1.0], "present": [1.0]})
+    presence, _ = update(observed([0, 1], prob=0.0), genomes, gi, carriage)
+    assert presence.filter(pl.col("hits") > 0)["present_prob_updated"].to_list() == [0.0, 0.0]
     # Genome a1 detected. Units 7-9 have no hits: imputed at low depth (unit 9 less, since
     # a3 lacks it), confident absences at high depth.
     for depth, expect in ((1e-4, True), (1.0, False)):

@@ -268,12 +268,18 @@ def update(
         pl.col("unit").cast(pl.UInt32), pl.col("hits").cast(pl.Float64), "present_prob"
     ).filter(pl.col("hits") > 0)
     expected_present = float(observed["present_prob"].sum())
-    pi0 = expected_present / n_units
-    weight = genomes.select(
-        pl.col("genome").cast(pl.UInt32),
-        rate=pl.col("depth") * pl.col("present"),
-        p_g=pl.col("present_prob") if "present_prob" in genomes.columns else pl.lit(1.0),
-    ).filter(pl.col("rate") > 0)
+    # floored at one unit: a profile whose present_prob sums to 0 keeps its zeros (0 odds)
+    pi0 = min(max(expected_present, 1.0) / n_units, 1 - CLIP)
+    numeric = [c for c in ("depth", "present", "present_prob") if c in genomes.columns]
+    weight = (
+        genomes.cast(dict.fromkeys(numeric, pl.Float64))
+        .select(
+            pl.col("genome").cast(pl.UInt32),
+            rate=pl.col("depth") * pl.col("present"),
+            p_g=pl.col("present_prob") if "present_prob" in genomes.columns else pl.lit(1.0),
+        )
+        .filter(pl.col("rate") > 0)
+    )
     q = carriage.q(weight["genome"].to_list())
     content = _content(genome_index, np.unique(q["unit"].to_numpy()))
     best = pl.read_parquet(genome_index / "genome_best.parquet").select("genome", "unit").unique()
