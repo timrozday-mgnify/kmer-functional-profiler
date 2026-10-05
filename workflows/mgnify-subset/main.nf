@@ -251,7 +251,7 @@ process POSTINGS {
     path pfam
 
     output:
-    path "${members.baseName}.{final.parquet,final.json,postings.parquet,pfam.parquet,dense.parquet}"  // dense: with --t-dense
+    path "${members.baseName}.{final.parquet,final.json,postings.parquet,pfam.parquet,dense.parquet,promiscuous.npy}"  // dense: with --t-dense
 
     script:
     """
@@ -260,7 +260,7 @@ process POSTINGS {
     """
 
     stub:
-    "touch ${members.baseName}.final.parquet ${members.baseName}.final.json ${members.baseName}.postings.parquet ${members.baseName}.pfam.parquet"
+    "touch ${members.baseName}.final.parquet ${members.baseName}.final.json ${members.baseName}.postings.parquet ${members.baseName}.pfam.parquet ${members.baseName}.promiscuous.npy"
 }
 
 process UNITS {

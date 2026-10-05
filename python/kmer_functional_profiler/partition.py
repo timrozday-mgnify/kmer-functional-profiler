@@ -42,6 +42,7 @@ import polars as pl
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.index import (
     PIN_BITS,
+    PROMISCUOUS,
     IndexParams,
     PackedPart,
     PackedTable,
@@ -60,6 +61,7 @@ from kmer_functional_profiler.index import (
     dense_rows,
     key_shift,
     packed_layout,
+    promiscuous_base,
     unit_columns,
     write_meta,
     write_unit_columns,
@@ -263,7 +265,8 @@ def postings(
 ) -> None:
     """Stage 5: ``{prefix}.postings.parquet`` (sorted by hash), ``.final.parquet`` (units
     with a posting and their index columns), ``.pfam.parquet`` (with ``pfam_path``),
-    ``.dense.parquet`` (with a dense tier: those units' dense rows, sorted by hash) and
+    ``.dense.parquet`` (with a dense tier: those units' dense rows, sorted by hash),
+    ``.promiscuous.npy`` (:func:`~kmer_functional_profiler.index.promiscuous_base`) and
     ``.final.json`` (stage-1 stats and this stage's; inputs stay unchanged, as Nextflow
     stages them as links)."""
     members, batches, _ = _prepare(members_path, params)
@@ -282,6 +285,7 @@ def postings(
     )
     rows = rows.join(units.select("cluster_rep", "unit"), on="cluster_rep").drop("cluster_rep")
     _, kept, stats = _select_postings(rows, units, params)
+    np.save(f"{prefix}.{PROMISCUOUS}", promiscuous_base(rows, params))
     units = units.join(
         _len_cv(batches, params, kept.select("unit", "hash"), members),
         on="unit",
@@ -326,7 +330,8 @@ def units(
     out_dir: str | Path,
     pfam: bool = False,
 ) -> None:
-    """Stage 6: ``units.parquet``, ``unit_pfam.parquet`` (with ``pfam``) and ``pack.json``
+    """Stage 6: ``units.parquet``, ``unit_pfam.parquet`` (with ``pfam``),
+    ``promiscuous.npy`` (the buckets' merged) and ``pack.json``
     (tier-2 layout, pack range bounds, stats, and with a dense tier its layout and bounds
     under ``dense``) in ``out_dir``.
 
@@ -357,7 +362,9 @@ def units(
         _swap(pfams, rep, "cluster_rep", "unit").sort("unit", "pfam_accession").write_parquet(
             out / "unit_pfam.parquet"
         )
-    stats: dict[str, object] = {}
+    promiscuous = np.unique(np.concatenate([np.load(f"{p}.{PROMISCUOUS}") for p in prefixes]))
+    np.save(out / PROMISCUOUS, promiscuous)
+    stats: dict[str, object] = {"promiscuous_base": len(promiscuous)}
     for p in prefixes:
         for key, value in json.loads(Path(f"{p}.final.json").read_text()).items():
             stats[key] = stats.get(key, 0) + value
@@ -461,7 +468,7 @@ def concat(
             [SetSlice.load(f"{p}.dense") for p in set_prefixes],
         )
         stats |= {"dense_postings": sum(dense), "dense_bytes": tables["dense"].nbytes()}
-    for name in ("units.parquet", "unit_pfam.parquet"):
+    for name in ("units.parquet", "unit_pfam.parquet", PROMISCUOUS):
         if (units_dir / name).exists() and units_dir.resolve() != out.resolve():
             shutil.copyfile(units_dir / name, out / name)
     write_unit_columns(out)

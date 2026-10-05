@@ -1504,7 +1504,10 @@ SENSE_CHANGE: Final = 0.75  # share of random base substitutions that change the
 
 
 def census_counts(
-    batch: dict[str, np.ndarray], hit_hashes: np.ndarray, census_max: int
+    batch: dict[str, np.ndarray],
+    hit_hashes: np.ndarray,
+    census_max: int,
+    promiscuous: np.ndarray | None = None,
 ) -> tuple[int, int]:
     """Census k-mers of a batch of sampled k-mers, and how many of them are in the index.
 
@@ -1513,14 +1516,19 @@ def census_counts(
     frame is the coding one, so off-frame k-mers, which never hit, stay out. Frames are
     counted from the batch's sampled k-mers, so a kept frame with none sampled is missed
     (``census_frame_miss`` in :func:`sample_summary`). Counted per occurrence, as reads are.
-    ``hit_hashes`` holds the batch's hashes found in the index.
+    ``hit_hashes`` holds the batch's hashes found in the index; ``promiscuous`` (sorted)
+    known hashes with no posting, which count as found too.
     """
     mate = batch["read"].astype(np.uint64) * 2 + batch["mate"]
     frames = np.unique(mate * 8 + batch["frame"])
     mates, n_frames = np.unique(frames // 8, return_counts=True)
     take = (batch["hash"] <= np.uint64(census_max)) & np.isin(mate, mates[n_frames == 1])
     census = batch["hash"][take]
-    return len(census), int(np.isin(census, hit_hashes).sum())
+    known = np.isin(census, hit_hashes)
+    if promiscuous is not None and len(promiscuous):
+        at = np.searchsorted(promiscuous, census).clip(max=len(promiscuous) - 1)
+        known |= promiscuous[at] == census
+    return len(census), int(known.sum())
 
 
 def sample_summary(
@@ -1672,7 +1680,8 @@ def profile(
 
     ``summary``, if given, is filled with :func:`sample_summary`'s sample-level explained
     and unknown fractions; it fits ``_zi``. The census needs every index to have a complete
-    base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash.
+    base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash; an index
+    built without ``promiscuous.npy`` counts its promiscuous k-mers as unknown.
 
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
@@ -1696,6 +1705,17 @@ def profile(
         else None
     )
     census = [0, 0]
+    # Promiscuous base-stratum hashes are known but never hit (index.promiscuous_base).
+    promiscuous = (
+        None
+        if census_max is None
+        else np.unique(
+            np.concatenate(
+                [np.empty(0, np.uint64)]
+                + [i.promiscuous for i in joint.indexes if i.promiscuous is not None]
+            )
+        )
+    )
 
     def stream(max_hash: int) -> Iterable[dict[str, np.ndarray]]:
         batches = unmasked(max_hash)
@@ -1773,7 +1793,7 @@ def profile(
         if len(b["read"]):  # reads are numbered in input order; the last has sampled hashes
             n_reads = max(n_reads, int(b["read"].max()) + 1)
             if census_max is not None:
-                got = census_counts(b, hits["hash"].unique().to_numpy(), census_max)
+                got = census_counts(b, hits["hash"].unique().to_numpy(), census_max, promiscuous)
                 census = [census[0] + got[0], census[1] + got[1]]
         sampled += len(b["hash"])
         subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier2") // DISTINCT_SAMPLE])

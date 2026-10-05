@@ -17,7 +17,9 @@ Postings are candidates minus promiscuous k-mers (``n_groups > max_groups``); un
 ``t_g`` was raised above ``t_base`` keep only their ``n_min`` best-scoring candidates, plus
 every candidate with hash <= ``t_base``, so that below ``t_base`` the index holds every
 unit's k-mers (the base stratum, which the query's census of known k-mers counts on;
-``meta.json`` marks it with ``base_stratum_complete``). The
+``meta.json`` marks it with ``base_stratum_complete``). Promiscuous k-mers in the base
+stratum are known but posted nowhere, so their hashes are kept apart, sorted, in
+``promiscuous.npy`` for the census to count as known. The
 query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Tier 2
 maps each posting hash to its set of (unit, quantised ``p_in``), stored as bucketed
 fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can be hit, so
@@ -71,6 +73,7 @@ MASK_WIDTH: Final = 6
 
 
 AAI_CALIBRATION: Final = "aai_calibration.json"
+PROMISCUOUS: Final = "promiscuous.npy"
 
 
 @dataclass(frozen=True)
@@ -492,6 +495,7 @@ class Index:
     tier2: PackedTable
     dense: PackedTable | None = None
     aai_calibration: dict[str, Any] | None = None
+    promiscuous: NDArray[np.uint64] | None = None  # see promiscuous_base; None if not built
 
     @classmethod
     def load(cls, directory: str | Path, *, mmap: bool = True) -> Self:
@@ -502,7 +506,9 @@ class Index:
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
         calibration = directory / AAI_CALIBRATION
+        promiscuous = directory / PROMISCUOUS
         return cls(
+            promiscuous=np.load(promiscuous) if promiscuous.exists() else None,
             aai_calibration=json.loads(calibration.read_text()) if calibration.exists() else None,
             meta=meta,
             units=UnitTable(directory, mmap=mmap),
@@ -735,6 +741,19 @@ def _select_postings(
     return scored, postings, stats
 
 
+def promiscuous_base(presence: pl.DataFrame, params: IndexParams) -> NDArray[np.uint64]:
+    """Sorted distinct promiscuous hashes <= ``t_base`` of ``presence`` (``hash``,
+    ``n_groups``): known k-mers with no posting, which the query's census counts as known.
+
+    Only the base stratum is kept (~``t_base / t_cap`` of the promiscuous set), as only the
+    census needs them.
+    """
+    base = (pl.col("n_groups") > params.max_groups) & (
+        pl.col("hash") <= _core.max_hash(params.t_base)
+    )
+    return np.unique(presence.filter(base)["hash"].to_numpy())
+
+
 def _unit_pfam(pfam_path: str | Path, members: pl.DataFrame) -> pl.DataFrame:
     """Members per (``unit``, ``pfam_accession``).
 
@@ -787,7 +806,8 @@ def build_index(
         ]
     ).with_columns(n_groups=pl.len().over("hash").cast(pl.UInt32))
     _, postings, posting_stats = _select_postings(presence, units, params)
-    stats |= posting_stats
+    promiscuous = promiscuous_base(presence, params)
+    stats |= posting_stats | {"promiscuous_base": len(promiscuous)}
     units = units.join(
         _len_cv(batches, params, postings.select("unit", "hash"), members),
         on="unit",
@@ -820,6 +840,8 @@ def build_index(
             how="left",
             maintain_order="left",
         )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    np.save(Path(out_dir) / PROMISCUOUS, promiscuous)
     return finish_index(
         out_dir,
         params,
