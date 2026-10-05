@@ -643,7 +643,6 @@ class _Joint:
             for i, (index, offset, lo, hi) in enumerate(
                 zip(self.indexes, self.offsets[:-1], at[:-1], at[1:], strict=True)
             )
-            if hi > lo
         ]
         return pl.concat(parts, how="diagonal_relaxed")
 
