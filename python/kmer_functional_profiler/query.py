@@ -709,6 +709,7 @@ def em(
     tol: float = 1e-8,
     max_iter: int = 1000,
     report: dict[str, int] | None = None,
+    items_hit: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -735,12 +736,23 @@ def em(
 
     ``report`` collects ``em_iterations`` (the most any component took) and
     ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over calls.
+
+    A ``weight`` column (genome mode: holder = genome, item = unit, weight = the genome's
+    content on it) makes a holder's expected hits on an item coverage x weight, and
+    ``m_g`` its total weight over all items, hit or not; all weights 1 is the plain EM.
+    The zero-inflated present fraction then needs ``items_hit(holders, coverage)``: the
+    items each holder would have hit if all present, sum over its items of
+    1 - exp(-coverage x weight) (default ``m_g`` (1 - exp(-coverage))). ``prior`` is for
+    unweighted k-mers only.
     """
+    if prior is not None and (items_hit is not None or "weight" in kmers.columns):
+        raise ValueError("a present prior needs unweighted items")
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())
     hashes, row = _ids(kmers["hash"].to_numpy())
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
+    weight = kmers["weight"].to_numpy().astype(np.float64) if "weight" in kmers.columns else None
     del kmers, hashes  # the sorted copy is not needed through the fit
     m = m_g[units].astype(np.float64)
     lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
@@ -748,18 +760,23 @@ def em(
 
     def make_step(b: _Block) -> Step:
         h, mb, per_unit = hits[b.kmer], m[b.unit], len(b.unit)
+        wb = None if weight is None else weight[b.pairs]
 
         def over_units(x: np.ndarray) -> np.ndarray:  # per unit, sum of x over its k-mers
-            return np.bincount(b.c, weights=x[b.r], minlength=per_unit)
+            y = x[b.r] if wb is None else x[b.r] * wb
+            return np.bincount(b.c, weights=y, minlength=per_unit)
 
         def step(la: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             w = la * p
-            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer)) + b.offset
+            per_pair = w[b.c] if wb is None else w[b.c] * wb
+            mu = np.bincount(b.r, weights=per_pair, minlength=len(b.kmer)) + b.offset
             attributed = w * over_units(_div(h, mu))  # expected hits from each unit
             if zero_inflated:
                 kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
                 seen = -np.expm1(-la)  # chance a present k-mer is hit
-                if prior is None:
+                if items_hit is not None:
+                    new_p = np.minimum(1.0, _div(kmers_hit, items_hit(units[b.unit], la)))
+                elif prior is None:
                     new_p = np.minimum(1.0, _div(kmers_hit, mb * seen))
                 else:
                     # Unhit k-mers are present with odds p (1 - seen) : (1 - p).
@@ -781,7 +798,7 @@ def em(
         tol,
         max_iter,
         report,
-        pair_weight=lambda p: lam[col[p]] * pi[col[p]],
+        pair_weight=lambda p: lam[col[p]] * pi[col[p]] * (1.0 if weight is None else weight[p]),
     )
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0

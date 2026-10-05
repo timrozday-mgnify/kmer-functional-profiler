@@ -5,10 +5,17 @@ from dataclasses import fields, replace
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
+from kmer_functional_profiler.genomes import (
+    MIN_CONTAINMENT,
+    MIN_UNITS,
+    GenomeIndex,
+    genome_profile,
+)
 from kmer_functional_profiler.genomes import annotate_genomes as annotate
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
@@ -157,6 +164,36 @@ def annotate_genomes(
     """Annotate reference genomes with the index: each genome's raw tier-2 hits per unit,
     the content `genomes` fits a profile with."""
     typer.echo(json.dumps(annotate(index_dir, genomes, out_dir), indent=2))
+
+
+@app.command(name="genomes")
+def genomes_command(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    genome_index: Annotated[Path, typer.Argument(help="Output of `annotate-genomes`")],
+    out: Annotated[Path, typer.Argument(help="TSV of detected genomes")] = Path("genomes.tsv"),
+    summary: Annotated[
+        Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
+    ] = None,
+    index: Annotated[
+        Path | None,
+        typer.Option(help="The profile's index, checked against the one annotated with"),
+    ] = None,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+) -> None:
+    """Genomes present and their depths, from a profile's per-unit hits."""
+    gi = GenomeIndex(genome_index)
+    if index is not None:
+        try:
+            gi.check_index(index)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    table, sample = genome_profile(prof, gi, min_containment=min_containment, min_units=min_units)
+    table.write_csv(out, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(sample, indent=2) + "\n")
+    typer.echo(f"{table.height} genomes detected -> {out}", err=True)
 
 
 @app.command()
