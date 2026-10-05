@@ -77,6 +77,14 @@ def test_sample_truth_and_score(tmp_path: Path) -> None:
     assert (score["tp"], score["n_pred"]) == (2, 3)
     assert score["completeness"] == 2 / len(expected)
     assert score["spearman_tp"] is None  # no abundance column in this profile
+    # A joint query's extra-index (decoy) units are not predictions.
+    pl.DataFrame(
+        {"name": [*found, "ko:K99999", "7"], "kmers_hit": [3, 1, 5, 9], "source": [0, 0, 0, 1]}
+    ).write_csv(tmp_path / "p.tsv", separator="\t")
+    run(tmp_path, "score", "--truth", "truth.csv", "--profile", "p.tsv", "--sample", "s",
+        "--index", "i")  # fmt: skip
+    score = pl.read_csv(tmp_path / "score.tsv", separator="\t").row(0, named=True)
+    assert (score["tp"], score["n_pred"]) == (2, 3)
 
     # An exact abundance estimate scores perfectly.
     exact = truth.select(

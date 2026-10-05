@@ -41,7 +41,7 @@ from scipy.stats import norm
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
-from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable
+from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, base_rate
 
 if TYPE_CHECKING:
     from kmer_functional_profiler.mask import Mask
@@ -1308,7 +1308,17 @@ def aai(copies: pl.Expr, present_kmers: pl.Expr, coverage: pl.Expr, k: int) -> p
 
 
 # build parameters an aai calibration depends on: a map fitted under others does not apply
-AAI_CALIBRATION_PARAMS: Final = ("k", "alphabet", "t_base", "n_min", "t_cap", "t_dense")
+AAI_CALIBRATION_PARAMS: Final = (
+    "k", "alphabet", "t_base", "t_base_singleton", "n_min", "t_cap", "t_dense"
+)  # fmt: skip
+
+
+def _index_params(meta: dict[str, Any]) -> IndexParams:
+    """Build parameters from ``meta.json``; fields older indexes lack take their defaults
+    (format-1 indexes also record ``tier1_per_unit``, which is ignored)."""
+    return IndexParams(
+        **{f.name: meta["params"].get(f.name, f.default) for f in fields(IndexParams)}
+    )
 
 
 def check_aai_calibration(cal: dict[str, Any], params: dict[str, Any]) -> None:
@@ -1690,13 +1700,12 @@ def profile(
     record = timer is not None
     timer = timer or Timer()
     counts = timer.counts
-    # Format-1 indexes also record tier1_per_unit.
-    params = IndexParams(**{f.name: index.meta["params"][f.name] for f in fields(IndexParams)})
+    params = _index_params(index.meta)
     joint = _Joint([index, *extra])
     sources: list[_core.FastxHits] = []  # the read streams, for their base counts
     census_max = (
         min(
-            min(_core.max_hash(i.meta["params"]["t_base"]), int(i.tier2.max_hash))
+            min(_core.max_hash(base_rate(_index_params(i.meta))), int(i.tier2.max_hash))
             for i in joint.indexes
         )
         if summary is not None

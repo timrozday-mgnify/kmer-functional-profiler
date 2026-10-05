@@ -203,6 +203,31 @@ def test_floored_units_keep_their_base_stratum(tmp_path: Path) -> None:
         assert len(kept - wanted) <= params.n_min
 
 
+@pytest.mark.parametrize("t_single", [0.05, 0.6])
+def test_singletons_at_their_own_base_rate(tmp_path: Path, t_single: float) -> None:
+    members = write_members(tmp_path / "members.parquet", HAND)
+    params = IndexParams(k=K, t_base=0.3, t_base_singleton=t_single, n_min=2, t_cap=1.0)
+    build_index(members, tmp_path / "idx", params, postings_parquet=True)
+    units = Index.load(tmp_path / "idx").units.frame()
+    postings = pl.read_parquet(tmp_path / "idx" / "postings.parquet").join(
+        units.select("unit", "cluster_rep"), on="unit"
+    )
+    # The singleton keeps every k-mer up to its own rate, never cut to n_min.
+    single = units.filter(pl.col("cluster_rep") == 20).row(0, named=True)
+    assert single["t_g"] == t_single
+    want = {h for h in kmers(index_mask(S)) if h <= _core.max_hash(t_single)}
+    assert set(postings.filter(pl.col("cluster_rep") == 20)["hash"]) == want
+    assert index.base_rate(params) == min(0.3, t_single)
+    # Non-singletons are as without the option.
+    plain = IndexParams(k=K, t_base=0.3, n_min=2, t_cap=1.0)
+    build_index(members, tmp_path / "plain", plain, postings_parquet=True)
+    other = pl.read_parquet(tmp_path / "plain" / "postings.parquet").join(
+        Index.load(tmp_path / "plain").units.frame().select("unit", "cluster_rep"), on="unit"
+    )
+    rest = pl.col("cluster_rep") != 20
+    assert set(postings.filter(rest)["hash"]) == set(other.filter(rest)["hash"])
+
+
 def index_mask(seq: str) -> str:
     """``seq`` as the build hashes it (adapter peptides masked)."""
     return str(pl.select(index.mask_adapters(pl.lit(seq))).item())

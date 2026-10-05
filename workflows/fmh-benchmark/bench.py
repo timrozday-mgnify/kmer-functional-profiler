@@ -251,6 +251,10 @@ def read_profile(path: str | Path) -> pl.DataFrame:
     """A profile TSV; an empty one (nothing detected) gets numeric columns, not strings."""
     # whole-file inference: a run of 100+ empty aai cells would otherwise infer str
     profile = pl.read_csv(path, separator="\t", infer_schema_length=None)
+    # ponytail: the benchmark's only extra index is the host decoy, whose units are not
+    # predictions; drop this when `index --role decoy` (plan, phase 10) leaves them out itself
+    if "source" in profile.columns:
+        profile = profile.filter(pl.col("source") == 0)
     if profile.height:
         return profile
     strings = {"name", "cluster_rep"}
@@ -612,7 +616,7 @@ def aai_calibrate(args: argparse.Namespace) -> None:
     else:
         cal = fit_aai_calibration(train)
         if params:  # the build parameters the map holds for (checked when it is attached)
-            cal["params"] = {p: params[p] for p in AAI_CALIBRATION_PARAMS}
+            cal["params"] = {p: params.get(p) for p in AAI_CALIBRATION_PARAMS}
         cal["fit"] = {"n_train": train.height, "profiles": [Path(p).name for p in args.profiles]}
         Path(args.out).write_text(json.dumps(cal, indent=1))
     rows = []

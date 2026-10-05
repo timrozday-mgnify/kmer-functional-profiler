@@ -36,6 +36,9 @@ def index(
     k: int = DEFAULTS.k,
     alphabet: str = DEFAULTS.alphabet,
     t_base: float = DEFAULTS.t_base,
+    t_base_singleton: Annotated[
+        float | None, typer.Option(help="t_base for singleton clusters (default: t_base)")
+    ] = None,
     n_min: int = DEFAULTS.n_min,
     t_cap: float = DEFAULTS.t_cap,
     oversample: float = DEFAULTS.oversample,
@@ -51,6 +54,7 @@ def index(
         k=k,
         alphabet=alphabet,
         t_base=t_base,
+        t_base_singleton=t_base_singleton,
         n_min=n_min,
         t_cap=t_cap,
         oversample=oversample,

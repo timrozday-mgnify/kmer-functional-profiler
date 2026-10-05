@@ -7,25 +7,26 @@ Rust kernel, keeping only small tables in memory:
 
 1. all k-mers -> distinct k-mers per unit, ``n_kmers``;
 2. at ``t_max`` -> candidate hashes, i.e. (unit, k-mer) with hash <= the unit's threshold
-   ``t_g = max(t_base, min(t_cap, oversample * n_min / n_kmers))`` (``t_base`` for
-   singletons); ``t_cap`` bounds ``t_max`` and so the query's sampling rate;
+   ``t_g = max(t_base, min(t_cap, oversample * n_min / n_kmers))`` (``t_base_singleton``,
+   default ``t_base``, for singletons); ``t_cap`` bounds ``t_max`` and so the query's sampling rate;
 3. at ``t_max`` -> presence of candidate hashes in every unit, giving ``p_in`` (fraction of
    full-length members containing the k-mer), ``n_groups`` and the score
    ``log2(p_in / n_groups)``.
 
 Postings are candidates minus promiscuous k-mers (``n_groups > max_groups``); units whose
 ``t_g`` was raised above ``t_base`` keep only their ``n_min`` best-scoring candidates, plus
-every candidate with hash <= ``t_base``, so that below ``t_base`` the index holds every
-unit's k-mers (the base stratum, which the query's census of known k-mers counts on;
-``meta.json`` marks it with ``base_stratum_complete``). Promiscuous k-mers in the base
-stratum are known but posted nowhere, so their hashes are kept apart, sorted, in
-``promiscuous.npy`` for the census to count as known. The
-query stays consistent because any subset of k-mers with hash <= ``t_g`` may be kept. Tier 2
-maps each posting hash to its set of (unit, quantised ``p_in``), stored as bucketed
-fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can be hit, so
-only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep`` order, and
-each numeric column is also written as ``units.<column>.npy`` for the query to memory-map;
-``postings.parquet`` (every posting with its score) is written only for inspection.
+every candidate with hash <= ``t_base``, so that below ``base_rate`` (``t_base``, or
+``t_base_singleton`` if lower) the index holds every unit's k-mers (the base stratum, which
+the query's census of known k-mers counts on; ``meta.json`` marks it with
+``base_stratum_complete``). Promiscuous k-mers in the base stratum are known but posted
+nowhere, so their hashes are kept apart, sorted, in ``promiscuous.npy`` for the census to
+count as known. The query stays consistent because any subset of k-mers with hash <= ``t_g``
+may be kept. Tier 2 maps each posting hash to its set of (unit, quantised ``p_in``), stored
+as bucketed fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can
+be hit, so only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep``
+order, and each numeric column is also written as ``units.<column>.npy`` for the query to
+memory-map; ``postings.parquet`` (every posting with its score) is written only for
+inspection.
 
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
 ``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
@@ -83,6 +84,7 @@ class IndexParams:
     k: int = 11
     alphabet: str = "protein"
     t_base: float = 1 / 1000
+    t_base_singleton: float | None = None  # None: t_base
     n_min: int = 8
     t_cap: float = 0.2
     oversample: float = 4.0
@@ -614,6 +616,15 @@ def _len_cv(
     )
 
 
+def base_rate(params: IndexParams) -> float:
+    """The rate below which the index holds every unit's k-mers (the base stratum)."""
+    return min(params.t_base, singleton_rate(params))
+
+
+def singleton_rate(params: IndexParams) -> float:
+    return params.t_base if params.t_base_singleton is None else params.t_base_singleton
+
+
 def _t_g(params: IndexParams) -> pl.Expr:
     """Per-unit sampling rate from ``n_members`` and ``n_kmers``: floored for non-singletons."""
     raised = pl.min_horizontal(
@@ -622,7 +633,7 @@ def _t_g(params: IndexParams) -> pl.Expr:
     return (
         pl.when(pl.col("n_members") > 1)
         .then(pl.max_horizontal(pl.lit(params.t_base), raised))
-        .otherwise(pl.lit(params.t_base))
+        .otherwise(pl.lit(singleton_rate(params)))
         .clip(upper_bound=1.0)
     )
 
@@ -718,7 +729,9 @@ def _select_postings(
     )
     # Drop promiscuous k-mers, then keep the n_min best of each floored unit's candidates and
     # its base stratum (hash <= t_base), so the base stratum is complete for every unit.
-    floored = units.select("unit", floored=pl.col("t_g") > params.t_base)
+    floored = units.select(
+        "unit", floored=(pl.col("n_members") > 1) & (pl.col("t_g") > params.t_base)
+    )
     postings = (
         scored.filter(pl.col("n_groups") <= params.max_groups)
         .join(floored, on="unit")
@@ -1000,7 +1013,7 @@ def write_meta(
     meta = {
         "format": 2,
         "hash": hash_scheme,
-        # Every unit's k-mers with hash <= t_base are kept (the query's census relies on it).
+        # Every unit's k-mers with hash <= base_rate are kept (the query's census relies on it).
         "base_stratum_complete": True,
         "params": asdict(params),
         **{name: table.save(out, name) for name, table in tables.items()},
