@@ -249,7 +249,8 @@ def truth(args: argparse.Namespace) -> None:
 
 def read_profile(path: str | Path) -> pl.DataFrame:
     """A profile TSV; an empty one (nothing detected) gets numeric columns, not strings."""
-    profile = pl.read_csv(path, separator="\t")
+    # whole-file inference: a run of 100+ empty aai cells would otherwise infer str
+    profile = pl.read_csv(path, separator="\t", infer_schema_length=None)
     if profile.height:
         return profile
     strings = {"name", "cluster_rep"}
