@@ -291,6 +291,8 @@ def test_joint_query_equals_one_index_of_the_union(
     alone = profile(a, *READS)
     with_unrelated = profile(a, *READS, extra=[Index.load(unrelated)])
     assert with_unrelated.filter(pl.col("source") == 1).height == 0
+    # Nothing hit in any index: an empty profile, not an error.
+    assert profile(Index.load(unrelated), *READS, extra=[Index.load(unrelated)]).height == 0
     keep = [c for c in alone.columns if c != "present_prob"]
     assert with_unrelated.select(keep).equals(alone.select(keep))
 
