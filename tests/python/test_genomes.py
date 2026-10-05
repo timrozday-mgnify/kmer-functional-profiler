@@ -1,5 +1,6 @@
 """Genome mode (phase 11): annotation, the genome fit and the function x taxon table."""
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -8,9 +9,9 @@ import pytest
 from typer.testing import CliRunner
 
 from kmer_functional_profiler.cli import app
-from kmer_functional_profiler.genomes import GenomeIndex, annotate_genomes
+from kmer_functional_profiler.genomes import GenomeIndex, annotate_genomes, genome_profile
 from kmer_functional_profiler.index import Index, IndexParams, build_index
-from kmer_functional_profiler.query import profile
+from kmer_functional_profiler.query import em, profile
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 K = 7
@@ -92,6 +93,9 @@ def test_reads_at_depth_hit_units_in_proportion_to_content(tmp_path: Path, index
     ratio = prof.join(c, on="unit").select(pl.col("hits") / pl.col("c"))["hits"].to_numpy()
     assert len(ratio) == len(members)
     assert np.allclose(ratio, 44, rtol=1e-3)
+    table, summary = genome_profile(prof, gi, min_units=3)
+    assert np.allclose(table["depth"], 44, rtol=1e-3) and np.isclose(table["present"][0], 1.0)
+    assert summary["explained_fraction"] > 0.999
 
 
 def test_annotate_genomes_cli(tmp_path: Path, index_dir: Path) -> None:
@@ -101,3 +105,73 @@ def test_annotate_genomes_cli(tmp_path: Path, index_dir: Path) -> None:
                                    str(tmp_path / "out")])  # fmt: skip
     assert got.exit_code == 0, got.output
     assert GenomeIndex(tmp_path / "out").genomes["units"].to_list() == [2]
+
+
+def test_weighted_em_with_unit_weights_equals_em() -> None:
+    rng = np.random.default_rng(1)
+    pairs = pl.DataFrame({"unit": rng.integers(0, 6, 60), "hash": rng.integers(0, 25, 60)}).unique()
+    kmers = pairs.with_columns(hits=pl.Series(rng.integers(1, 9, pairs.height)))
+    kmers = kmers.with_columns(pl.col("hits").first().over("hash"))  # hits are per k-mer
+    m_g = np.full(6, 30)
+    for zi in (False, True):
+        plain = em(kmers, m_g, zero_inflated=zi)
+        weighted = em(kmers.with_columns(weight=pl.lit(1.0)), m_g, zero_inflated=zi)
+        assert np.allclose(plain["coverage"], weighted["coverage"])
+        assert np.allclose(plain["present"], weighted["present"])
+
+
+def synthetic(
+    gi: GenomeIndex, depth: dict[int, float], units: set[int] | None = None
+) -> pl.DataFrame:
+    """A profile whose raw unit hits are exactly Σ_G depth_G c_{G,u} (on ``units`` only)."""
+    c = gi.content(np.arange(20)).filter(pl.col("genome").is_in(list(depth)))
+    if units is not None:
+        c = c.filter(pl.col("unit").is_in(list(units)))
+    weights = pl.DataFrame({"genome": list(depth), "d": list(depth.values())})
+    return (
+        c.with_columns(pl.col("genome").cast(pl.Int64))
+        .join(weights, on="genome")
+        .group_by("unit")
+        .agg(hits=(pl.col("d") * pl.col("hits")).sum().round())
+        .sort("unit")
+    )
+
+
+def test_disjoint_genomes_recover_their_depths(tmp_path: Path, index_dir: Path) -> None:
+    genomes = {"a": list(range(10)), "b": list(range(10, 20)), "x": [0, 1, 2, 10, 11]}
+    gi = annotate(tmp_path, index_dir, genomes, "gi")
+    table, summary = genome_profile(synthetic(gi, {0: 3.0, 1: 7.0}), gi, min_units=5)
+    assert table["name"].to_list() == ["b", "a"]  # x: explained away by gather
+    assert np.allclose(table["depth"], [7.0, 3.0], rtol=0.01)
+    assert np.allclose(table["present"], 1.0, atol=0.01)
+    assert summary["explained_fraction"] > 0.99
+    assert np.isclose(summary["genome_equivalents"], 10.0, rtol=0.01)
+
+
+def test_relative_missing_content_gets_present_below_one(tmp_path: Path, index_dir: Path) -> None:
+    """The sample's strain is a relative of genome a lacking 3 of its 10 units."""
+    gi = annotate(tmp_path, index_dir, {"a": list(range(10))}, "gi")
+    table, _ = genome_profile(synthetic(gi, {0: 5.0}, set(range(7))), gi, min_units=5)
+    assert table["name"].to_list() == ["a"]
+    assert 0.6 < table["present"][0] < 0.8
+    assert abs(table["depth"][0] - 5.0) / 5.0 < 0.2
+
+
+def test_unexplained_hits_and_cli(tmp_path: Path, index_dir: Path) -> None:
+    gi = annotate(tmp_path, index_dir, {"a": list(range(10))}, "gi")
+    prof = pl.concat(
+        [
+            synthetic(gi, {0: 2.0}),
+            pl.DataFrame({"unit": [15], "hits": [100.0]}).cast({"unit": pl.UInt32}),
+        ]
+    )
+    prof.write_csv(tmp_path / "p.tsv", separator="\t")
+    args = ["genomes", str(tmp_path / "p.tsv"), str(tmp_path / "gi"), str(tmp_path / "g.tsv")]
+    args += ["--summary", str(tmp_path / "s.json"), "--index", str(index_dir), "--min-units", "5"]
+    got = CliRunner().invoke(app, args)
+    assert got.exit_code == 0, got.output
+    summary = json.loads((tmp_path / "s.json").read_text())
+    hits = summary["hits"]
+    assert np.isclose(summary["explained_fraction"], (hits - 100) / hits, rtol=0.01)
+    bad = CliRunner().invoke(app, [*args[:6], "--index", str(tmp_path / "gi")])
+    assert bad.exit_code != 0
