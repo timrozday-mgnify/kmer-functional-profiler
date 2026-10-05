@@ -21,8 +21,9 @@
 - ``aai-score``: a unit profile against that truth: detection at the MGnify90 level (genes
   whose best cluster passes ``--id``/``--cov``), recall of the nearest cluster beyond it, and
   ``aai`` / ``aai_naive`` against the alignment identities (see :func:`aai_score`). With
-  ``--alpha`` or ``--min-aai-kmers``, ``aai`` is first re-estimated from the profile's
-  zero-inflated fit under that survival model and mask (:func:`reestimate_aai`).
+  ``--model`` (an ``aai_model.json``) or ``--min-aai-kmers``, ``aai`` is first re-estimated
+  from the profile's zero-inflated fit under that survival model and mask
+  (:func:`reestimate_aai`).
 - ``aai-calibrate``: an inverse map from ``aai`` to alignment identity, fitted on half of
   the clusters of several samples' unit profiles and scored on the other half (see
   :func:`fit_aai_calibration`).
@@ -69,8 +70,10 @@ from kmer_functional_profiler.query import (
     aai_columns,
     calibrate_aai,
     check_aai_calibration,
+    unit_windows,
     ztp_lambda,
 )
+from kmer_functional_profiler.survival import SurvivalModel
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
                   "end_position": pl.Int64, "strand": pl.String}  # fmt: skip
@@ -550,10 +553,10 @@ def union_truth(hits: pl.DataFrame, k: int = 11) -> pl.DataFrame:
 
 
 def reestimate_aai(
-    profile: pl.DataFrame, k: int = 11, alpha: float | None = None, min_kmers: float = MIN_AAI_KMERS
+    profile: pl.DataFrame, model: SurvivalModel, min_kmers: float = MIN_AAI_KMERS
 ) -> pl.DataFrame:
     """``aai``, ``aai_lo``, ``aai_hi`` and ``aai_kmers`` recomputed from a profile's
-    zero-inflated fit as the query would report them with survival model ``alpha`` and
+    zero-inflated fit as the query would report them with survival model ``model`` and
     ``--min-aai-kmers`` ``min_kmers``, without rerunning it (offline reruns of archived
     profiles, plan, phase 7, step 23). ``pin_sum`` is present x m / ``copies_zi``; the
     clumping is the query's, from tier-2 hits per read; m is ``m_dense`` with a dense tier.
@@ -567,7 +570,7 @@ def reestimate_aai(
     mu *= m / profile["m_g"].to_numpy()
     est = aai_columns(
         profile["coverage_zi"].to_numpy(), present, m, pin_sum,
-        profile["n_kmers"].to_numpy(), k, alpha, 1 + mu, min_kmers,
+        profile["n_kmers"].to_numpy(), unit_windows(profile, model.k), model, 1 + mu, min_kmers,
     )  # fmt: skip
     est = est.with_columns(
         pl.when(pl.Series(fitted)).then(pl.col(c)).alias(c) for c in ("aai", "aai_lo", "aai_hi")
@@ -697,9 +700,10 @@ def aai_calibrate(args: argparse.Namespace) -> None:
 
 def aai_score_step(args: argparse.Namespace) -> None:
     profile = read_profile(args.profile)
-    if args.alpha is not None or args.min_aai_kmers is not None:
+    if args.model is not None or args.min_aai_kmers is not None:
         mask = MIN_AAI_KMERS if args.min_aai_kmers is None else args.min_aai_kmers
-        profile = reestimate_aai(profile, args.k, args.alpha, mask)
+        fitted = None if args.model is None else json.loads(Path(args.model).read_text())
+        profile = reestimate_aai(profile, SurvivalModel.from_json(fitted, args.k), mask)
     row = aai_score(
         profile,
         pl.read_parquet(args.gene_units),
@@ -1195,7 +1199,7 @@ def main() -> None:
     p.add_argument("--min-id", type=float, default=0.9)
     p.add_argument("--min-cov", type=float, default=0.8)
     p.add_argument("--k", type=int, default=11, help="the index's k")
-    p.add_argument("--alpha", type=float, help="re-estimate aai under this survival model")
+    p.add_argument("--model", help="re-estimate aai under this aai_model.json")
     p.add_argument("--min-aai-kmers", type=float, help="re-estimate aai with this mask")
     p.add_argument("--out", default="aai_score.tsv")
     p = sub.add_parser("aai-calibrate")

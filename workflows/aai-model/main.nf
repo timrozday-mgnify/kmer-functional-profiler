@@ -1,5 +1,5 @@
-// aai-alpha: the shape alpha of the k-mer survival model aai inverts (plan, phase 7, step 23),
-// fitted on MGnify protein pairs. Steps are in alpha.py.
+// aai-model: the parameters of the k-mer survival model aai inverts (plan, phase 7, step 25),
+// fitted on MGnify protein pairs. Steps are in fit_model.py.
 
 process QUERIES {
     label 'process_medium'
@@ -12,7 +12,7 @@ process QUERIES {
     path 'queries_*.faa', emit: queries
 
     script:
-    "${params.alpha} queries --members ${members} --n ${params.n_queries} --chunks ${params.chunks} --seed ${params.seed}"
+    "${params.fit_model} queries --members ${members} --n ${params.n_queries} --chunks ${params.chunks} --seed ${params.seed}"
 
     stub:
     "touch reps.faa queries_000.faa queries_001.faa"
@@ -67,7 +67,7 @@ process PAIRS {
     path 'pairs.parquet'
 
     script:
-    "${params.alpha} pairs --hits ${hits} --per-bin ${params.per_bin} --min-cov ${params.min_cov} --seed ${params.seed}"
+    "${params.fit_model} pairs --hits ${hits} --per-bin ${params.per_bin} --min-cov ${params.min_cov} --seed ${params.seed}"
 
     stub:
     "touch pairs.parquet"
@@ -84,7 +84,7 @@ process SURVIVAL {
     path 'survival.parquet'
 
     script:
-    "${params.alpha} survival --pairs ${pairs} --members ${members} --k ${params.k} --alphabet ${params.alphabet}"
+    "${params.fit_model} survival --pairs ${pairs} --members ${members} --k ${params.k} --alphabet ${params.alphabet}"
 
     stub:
     "touch survival.parquet"
@@ -98,14 +98,14 @@ process FIT {
     path survival
 
     output:
-    path 'alpha.json'
-    path 'alpha_strata.tsv'
+    path 'aai_model.json'
+    path 'model_strata.tsv'
 
     script:
-    "${params.alpha} fit --survival ${survival} --k ${params.k} --alphabet ${params.alphabet}"
+    "${params.fit_model} fit --survival ${survival} --k ${params.k} --alphabet ${params.alphabet}"
 
     stub:
-    "touch alpha.json alpha_strata.tsv"
+    "touch aai_model.json model_strata.tsv"
 }
 
 workflow {

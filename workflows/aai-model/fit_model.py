@@ -1,25 +1,32 @@
-"""Steps of the aai-alpha workflow (``main.nf``): the shape ``alpha`` of the k-mer survival
-model that ``aai`` inverts (plan, phase 7, step 23), fitted on MGnify protein pairs.
+"""Steps of the aai-model workflow (``main.nf``): the parameters of the k-mer survival model
+that ``aai`` inverts (``survival.SurvivalModel``: gamma rate ``shape`` and mean ``region``
+length of a Markov chain of rates along the sequence; plan, phase 7, step 25), fitted on
+MGnify protein pairs.
 
 A pair is a protein P and an MGnify90 cluster C it aligns to. Its survival is P's k-mers
 found in the union of C's members' k-mers over ``pin_sum``, C's average member's k-mers:
 what the query measures when P's gene is in a sample. Its identity is DIAMOND's, P against
-C's representative. ``alpha`` is the least-squares fit of survival against
-``query.survival``(identity; alpha) over the pairs.
+C's representative. Survival against identity fixes how much survival exceeds a^k; it
+cannot by itself tell a strong rate contrast over short regions from a weaker one over long
+regions. Co-survival does: for lags j in ``LAGS``, the share of P's window pairs j apart
+whose k-mers are both in C's union, against the model's B_j.
 
-- ``queries``: ``--n`` random members (seeded) as FASTA in ``--chunks`` files, and every
-  cluster's representative as ``reps.faa``.
+- ``queries``: ``--n`` random members (seeded) whose sequences hold only the 20 standard
+  residues (so a k-mer's emission order is its window position), as FASTA in ``--chunks``
+  files, and every cluster's representative as ``reps.faa``.
 - ``pairs``: DIAMOND hits (outfmt 6 ``qseqid sseqid pident length qlen slen bitscore``) ->
   one row per (P, C), its best HSP, with both coverages >= ``--min-cov``, P not C's
   representative, at most ``--per-bin`` pairs per identity bin of ``--bin`` from
   ``--min-id``: identities spread evenly, so no band dominates the fit.
-- ``survival``: per pair, P's k-mers in C's union and ``pin_sum``, every k-mer (no hash
+- ``survival``: per pair, P's k-mers in C's union and ``pin_sum``, and co-survival by lag
+  (``both_<j>``, ``window_survival``: P's windows in C's union), every k-mer (no hash
   threshold: sampling under it is unbiased, all k-mers are more precise). When P is one of
-  C's members it is left out of both (a gene new to the index). Clusters are processed in
+  C's members it is left out of C (a gene new to the index). Clusters are processed in
   batches of about ``--batch-residues`` member residues.
-- ``fit``: ``alpha.json`` (``survival``, ``alpha``, ``k``, ``alphabet``, ``fit``), what
-  ``kmer-functional-profiler aai-model`` attaches to an index, and ``alpha_strata.tsv``,
-  alpha refitted per identity band and per cluster size, to check that one parameter holds.
+- ``fit``: ``aai_model.json`` (``survival``, ``shape``, ``region``, ``categories``, ``k``,
+  ``alphabet``, ``fit``), what ``kmer-functional-profiler aai-model`` attaches to an index,
+  and ``model_strata.tsv``, the model refitted per identity band and per cluster size, to
+  check that one parameter pair holds.
 """
 
 import argparse
@@ -30,10 +37,10 @@ from typing import Any
 
 import numpy as np
 import polars as pl
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize
 
 from kmer_functional_profiler import _core
-from kmer_functional_profiler.query import survival
+from kmer_functional_profiler.survival import CATEGORIES, SurvivalModel
 
 HIT_SCHEMA = {
     "protein_id": pl.Int64,
@@ -47,6 +54,8 @@ HIT_SCHEMA = {
 MEMBER_COLUMNS = ["protein_id", "cluster_rep", "full_length", "sequence"]
 IDENTITY_BANDS = ((0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01))
 SIZE_BANDS = ((2, 4), (4, 11), (11, 101), (101, 2**62))  # members, P left out
+LAGS = (1, 3, 6, 11, 20, 40, 80, 150)  # co-survival lags, windows
+STANDARD = "^[ACDEFGHIKLMNPQRSTVWY]+$"
 
 
 def _members(paths: list[str]) -> pl.LazyFrame:
@@ -66,9 +75,10 @@ def queries(args: argparse.Namespace) -> None:
     reps.select(pl.format(">{}\n{}", "cluster_rep", "sequence")).sink_csv(
         "reps.faa", include_header=False, quote_style="never"
     )
-    ids = members.select("protein_id").collect()["protein_id"].to_list()
+    standard = members.filter(pl.col("sequence").str.contains(STANDARD))
+    ids = standard.select("protein_id").collect()["protein_id"].to_list()
     chosen = sorted(random.Random(args.seed).sample(ids, min(args.n, len(ids))))
-    picked = members.filter(pl.col("protein_id").is_in(chosen)).collect()
+    picked = standard.filter(pl.col("protein_id").is_in(chosen)).collect()
     for i, part in enumerate(np.array_split(np.arange(picked.height), args.chunks)):
         _fasta(picked[part], "protein_id", f"queries_{i:03d}.faa")
 
@@ -98,29 +108,38 @@ def pairs(args: argparse.Namespace) -> None:
     )
 
 
+def _hashes(df: pl.DataFrame, k: int, alphabet: str) -> pl.DataFrame:
+    """(``protein_id``, ``pos``, ``hash``): every k-mer of each sequence in emission order,
+    which is its window position for sequences of standard residues."""
+    got = _core.hash_proteins([s.encode() for s in df["sequence"]], k, alphabet=alphabet)
+    rows = df.select("protein_id", row=pl.int_range(pl.len(), dtype=pl.UInt64))
+    return (
+        pl.DataFrame({"row": got["seq"], "hash": got["hash"]})
+        .with_columns(pos=pl.int_range(pl.len()).over("row"))
+        .join(rows, on="row")
+        .drop("row")
+    )
+
+
 def pair_survival(
     pairs: pl.DataFrame, members: pl.DataFrame, k: int, alphabet: str
 ) -> pl.DataFrame:
     """``pairs`` (``protein_id`` P, ``cluster_rep`` C, ``identity``) with ``shared`` (P's
-    distinct k-mers in C's union), ``pin_sum`` and ``n_members``, P left out of C when it is
-    a member; ``members`` holds C's members and every P. ``pin_sum`` averages over the members
-    ``p_in`` counts (full-length ones, or all when none is), as the index does.
+    distinct k-mers in C's union), ``pin_sum``, ``n_members`` and ``survival``, P left out of
+    C when it is a member; and, over P's windows in order, ``window_survival`` (the share in
+    C's union) and ``both_<j>`` (the share of window pairs j apart both in it). ``members``
+    holds C's members and every P. ``pin_sum`` averages over the members ``p_in`` counts
+    (full-length ones, or all when none is), as the index does.
     ponytail: no P_IN floor for k-mers only fragments hold; it moves pin_sum by < 1 k-mer."""
-
-    def kmers(df: pl.DataFrame) -> pl.DataFrame:
-        got = _core.hash_proteins([s.encode() for s in df["sequence"]], k, alphabet=alphabet)
-        rows = df.select("protein_id", row=pl.int_range(pl.len(), dtype=pl.UInt64))
-        return (
-            pl.DataFrame({"row": got["seq"], "hash": got["hash"]})
-            .unique()
-            .join(rows, on="row")
-            .drop("row")
-        )
-
     in_c = members.join(pairs.select("cluster_rep").unique(), on="cluster_rep").with_columns(
         counted=pl.col("full_length") | ~pl.col("full_length").any().over("cluster_rep")
     )
-    member_kmers = kmers(in_c).join(in_c.select("protein_id", "cluster_rep"), on="protein_id")
+    member_kmers = (
+        _hashes(in_c, k, alphabet)
+        .select("protein_id", "hash")
+        .unique()
+        .join(in_c.select("protein_id", "cluster_rep"), on="protein_id")
+    )
     holders = member_kmers.group_by("cluster_rep", "hash").agg(n=pl.len())
     sizes = (
         member_kmers.group_by("protein_id")
@@ -142,23 +161,37 @@ def pair_survival(
         own_counted=pl.col("counted").fill_null(False),
     )
     query = members.join(pairs.select("protein_id").unique(), on="protein_id")
-    shared = (
+    windows = (
         pairs.select("protein_id", "cluster_rep")
-        .join(kmers(query), on="protein_id")
-        .join(holders, on=["cluster_rep", "hash"])
+        .join(_hashes(query, k, alphabet), on="protein_id")
+        .join(holders, on=["cluster_rep", "hash"], how="left")
         .join(own, on=["protein_id", "cluster_rep"])
-        .filter(pl.col("n") > pl.col("member").cast(pl.UInt32))
-        .group_by("protein_id", "cluster_rep")
-        .agg(shared=pl.len())
+        .with_columns(found=pl.col("n").fill_null(0) > pl.col("member").cast(pl.UInt32))
+        .sort("protein_id", "cluster_rep", "pos")
+    )
+    key = ["protein_id", "cluster_rep"]
+    shared = (
+        windows.filter("found").select(*key, "hash").unique().group_by(key).agg(shared=pl.len())
+    )
+    lagged = windows.group_by(key, maintain_order=True).agg(
+        window_survival=pl.col("found").mean(),
+        **{
+            f"both_{j}": pl.when(pl.col("found").shift(-j).is_not_null())
+            .then(pl.col("found") & pl.col("found").shift(-j))
+            .mean()
+            for j in LAGS
+        },
     )
     return (
-        pairs.join(own, on=["protein_id", "cluster_rep"])
+        pairs.join(own, on=key)
         .join(totals, on="cluster_rep")
-        .join(shared, on=["protein_id", "cluster_rep"], how="left")
+        .join(shared, on=key, how="left")
+        .join(lagged, on=key, how="left")
         .select(
-            "protein_id",
-            "cluster_rep",
+            *key,
             "identity",
+            "window_survival",
+            *(f"both_{j}" for j in LAGS),
             shared=pl.col("shared").fill_null(0),
             pin_sum=(pl.col("total") - pl.col("own_kmers"))
             / (pl.col("counted") - pl.col("own_counted").cast(pl.UInt32)),
@@ -173,12 +206,15 @@ def survival_step(args: argparse.Namespace) -> None:
     pairs_df = pl.read_parquet(args.pairs)
     clusters = pairs_df["cluster_rep"].unique()
     wanted = pl.concat([clusters, pairs_df["protein_id"].unique()]).unique()
-    lazy = _members(args.members)
     # every member of C, and P wherever it sits
-    members = lazy.filter(
-        pl.col("cluster_rep").is_in(clusters.implode())
-        | pl.col("protein_id").is_in(wanted.implode())
-    ).collect()
+    members = (
+        _members(args.members)
+        .filter(
+            pl.col("cluster_rep").is_in(clusters.implode())
+            | pl.col("protein_id").is_in(wanted.implode())
+        )
+        .collect()
+    )
     residues = (
         members.filter(pl.col("cluster_rep").is_in(clusters.implode()))
         .group_by("cluster_rep")
@@ -198,15 +234,47 @@ def survival_step(args: argparse.Namespace) -> None:
     pl.concat(parts).write_parquet(args.out)
 
 
-def fit_alpha(identity: np.ndarray, observed: np.ndarray, k: int) -> tuple[float, float]:
-    """(alpha, RMSE) of the least-squares fit of ``observed`` survival against
-    survival(``identity``; alpha), alpha in [0.05, 1000] (a log-scale search)."""
+def predicted(model: SurvivalModel, identity: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """S and B_j (pairs x ``LAGS``) at each identity under ``model``."""
+    tab = model.tables
+    rows = np.interp(identity, tab["a"][::-1], np.arange(len(tab["a"]))[::-1].astype(float))
+    row = np.rint(rows).astype(int)
+    surv = tab["S"][row]
+    rho = tab["rho"][row][:, [j - 1 for j in LAGS]]
+    return surv, surv[:, None] ** 2 + rho * (surv * (1 - surv))[:, None]
 
-    def sse(log_alpha: float) -> float:
-        return float(((observed - survival(identity, k, float(np.exp(log_alpha)))) ** 2).sum())
 
-    best: Any = minimize_scalar(sse, bounds=(np.log(0.05), np.log(1000.0)), method="bounded")
-    return float(np.exp(best.x)), float(np.sqrt(best.fun / max(len(observed), 1)))
+def fit_model(df: pl.DataFrame, k: int, categories: int = CATEGORIES) -> dict[str, float]:
+    """Least squares of survival and co-survival (``both_<j>``) against the model, over
+    (log shape, log region); with ``rmse`` of each and ``rmse_independent`` (a^k)."""
+    a = df["identity"].to_numpy()
+    s = df["survival"].to_numpy()
+    both = df.select(f"both_{j}" for j in LAGS).to_numpy()
+    ok = ~np.isnan(both)
+
+    def residuals(model: SurvivalModel) -> tuple[np.ndarray, np.ndarray]:
+        surv, pair = predicted(model, a)
+        return s - surv, np.where(ok, both - pair, 0.0)
+
+    def loss(x: np.ndarray) -> float:
+        model = SurvivalModel(k, float(np.exp(x[0])), 1 + float(np.exp(x[1])), categories)
+        r_s, r_b = residuals(model)
+        return float((r_s**2).sum() + (r_b**2).sum() / len(LAGS))
+
+    best: Any = min(
+        (minimize(loss, x0, method="Nelder-Mead", options={"xatol": 1e-3, "fatol": 1e-9})
+         for x0 in ([0.0, np.log(10)], [np.log(0.3), np.log(50)], [np.log(3), np.log(3)])),
+        key=lambda r: r.fun,
+    )  # fmt: skip
+    model = SurvivalModel(k, float(np.exp(best.x[0])), 1 + float(np.exp(best.x[1])), categories)
+    r_s, r_b = residuals(model)
+    return {
+        "shape": model.shape or 0.0,
+        "region": model.region,
+        "rmse": float(np.sqrt((r_s**2).mean())),
+        "rmse_both": float(np.sqrt((r_b[ok] ** 2).mean())) if ok.any() else float("nan"),
+        "rmse_independent": float(np.sqrt(((s - a**k) ** 2).mean())),
+    }
 
 
 def fit(args: argparse.Namespace) -> None:
@@ -227,18 +295,16 @@ def fit(args: argparse.Namespace) -> None:
     for name, where in strata:
         part = pairs_df.filter(where)
         if name == "all" or part.height >= args.min_stratum:
-            a, s = part["identity"].to_numpy(), part["survival"].to_numpy()
-            alpha, rmse = fit_alpha(a, s, args.k)
-            independent = float(np.sqrt(((s - a**args.k) ** 2).mean()))
-            rows.append({"stratum": name, "n": part.height, "alpha": alpha, "rmse": rmse,
-                         "rmse_independent": independent})  # fmt: skip
+            rows.append({"stratum": name, "n": part.height, **fit_model(part, args.k)})
     pl.DataFrame(rows).write_csv(args.strata_out, separator="\t")
     model = {
-        "survival": "regional_gamma",
-        "alpha": rows[0]["alpha"],
+        "survival": "markov_gamma",
+        "shape": rows[0]["shape"],
+        "region": rows[0]["region"],
+        "categories": CATEGORIES,
         "k": args.k,
         "alphabet": args.alphabet,
-        "fit": {key: rows[0][key] for key in ("n", "rmse", "rmse_independent")},
+        "fit": {key: rows[0][key] for key in ("n", "rmse", "rmse_both", "rmse_independent")},
     }
     Path(args.out).write_text(json.dumps(model, indent=1) + "\n")
 
@@ -271,8 +337,8 @@ def main() -> None:
     p.add_argument("--k", type=int, default=11)
     p.add_argument("--alphabet", default="protein")
     p.add_argument("--min-stratum", type=int, default=200)
-    p.add_argument("--out", default="alpha.json")
-    p.add_argument("--strata-out", default="alpha_strata.tsv")
+    p.add_argument("--out", default="aai_model.json")
+    p.add_argument("--strata-out", default="model_strata.tsv")
     args = parser.parse_args()
     {"queries": queries, "pairs": pairs, "survival": survival_step, "fit": fit}[args.step](args)
 
