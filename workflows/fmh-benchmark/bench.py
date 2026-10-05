@@ -25,7 +25,16 @@
   the clusters of several samples' unit profiles and scored on the other half (see
   :func:`fit_aai_calibration`).
 - ``pfam-profile``: a profile against an index with Pfam labels (``unit_pfam.parquet``, e.g.
-  MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams.
+  MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams; several
+  label tables for a joint query (``--extra-index``), in the query's index order.
+- ``study-proteins``: the study ladder's study (phase 10): the proteins of a random
+  ``--fraction`` of a sample's genomes, as FASTA, with their Pfam domains.
+- ``study-rebuild``: the members and Pfam tables of a rebuild that includes the study: base
+  members plus the study's proteins, each in its nearest MGnify90 cluster where it passes
+  ``--min-id``/``--min-cov``, else in its own linclust cluster.
+- ``study-ladder``: base, base + study index and rebuild scores side by side, the share of
+  the rebuild's completeness gain the joint query recovers, and whether base units the
+  study does not touch changed.
 - ``score``: purity and completeness of one profile against a truth table, one row per
   count present (``kmers_hit``; ``kmers_unique`` after gather; ``kmers_wta`` and
   ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
@@ -638,19 +647,33 @@ def aai_score_step(args: argparse.Namespace) -> None:
     )
 
 
-def pfam_profile(args: argparse.Namespace) -> None:
-    """Sum a unit profile per Pfam: counts and point estimates add over the units carrying
-    a Pfam; ``present_prob`` is the largest; intervals and per-unit columns are dropped."""
-    profile = read_profile(args.profile)
-    labels = pl.read_parquet(args.unit_pfam)
+def pfam_names(labels: pl.DataFrame) -> pl.DataFrame:
+    """``unit`` and ``name`` (``PF01007``) of a ``unit_pfam`` table."""
     accession = pl.col("pfam_accession")
-    labels = labels.select(
+    return labels.select(
         "unit",
         # MGnify stores the accession's number (1007 for PF01007); hmmsearch gives PF01007.23
         name=("PF" + accession.cast(pl.String).str.zfill(5))
         if labels.schema["pfam_accession"].is_integer()
         else accession.str.replace(r"\.\d+$", ""),
     )
+
+
+def pfam_profile(args: argparse.Namespace) -> None:
+    """Sum a unit profile per Pfam: counts and point estimates add over the units carrying
+    a Pfam; ``present_prob`` is the largest; intervals and per-unit columns are dropped."""
+    profile = read_profile(args.profile)
+    # several tables: a joint query, whose unit ids are offset by the units of the indexes
+    # before (each table's units.parquet beside it)
+    offsets = itertools.accumulate(
+        (pl.scan_parquet(Path(p).with_name("units.parquet")).select(pl.len()).collect().item()
+         for p in args.unit_pfam[:-1]),
+        initial=0,
+    )  # fmt: skip
+    labels = pl.concat(
+        pfam_names(pl.read_parquet(p)).with_columns(pl.col("unit").cast(pl.Int64) + offset)
+        for p, offset in zip(args.unit_pfam, offsets, strict=True)
+    ).cast({"unit": profile.schema["unit"]})
     summed = [c for pair in RULES for c in pair if c in profile.columns] + ["hits"]
     (
         profile.drop("name", strict=False)
@@ -663,6 +686,132 @@ def pfam_profile(args: argparse.Namespace) -> None:
         .sort("name")
         .write_csv(args.out, separator="\t")
     )
+
+
+def study_proteins(args: argparse.Namespace) -> None:
+    """A study for the study ladder: ``--fraction`` of the sample's genomes (at least one),
+    drawn with ``--seed``, as if recovered as MAGs. Writes their proteins (``study.faa``,
+    named by gene), Pfam domains (``study_pfam.parquet``: ``protein_id``,
+    ``pfam_accession``) and names (``study_genomes.txt``)."""
+    genomes = sorted(
+        pl.read_parquet(args.genes)["contig"].str.split("|").list.first().unique().to_list()
+    )
+    n = max(1, round(args.fraction * len(genomes)))
+    chosen = sorted(random.Random(args.seed).sample(genomes, n))
+    proteins = pl.concat(
+        pl.read_csv(Path(args.genomes_dir) / g / f"{g}_mapping.csv",
+                    columns=["gene_name", "aa_sequence"], schema_overrides=GENOME_COLUMNS)
+        for g in chosen
+    ).drop_nulls().unique("gene_name", keep="first", maintain_order=True)  # fmt: skip
+    with open(args.out, "w") as out:
+        for name, seq in proteins.iter_rows():
+            out.write(f">{name}\n{seq}\n")
+    (
+        pl.read_parquet(args.domains)
+        .filter(pl.col("gene_name").is_in(proteins["gene_name"].implode()))
+        .select(protein_id="gene_name", pfam_accession="pfam")
+        .unique()
+        .sort("protein_id", "pfam_accession")
+        .write_parquet(args.out_pfam)
+    )
+    Path(args.out_genomes).write_text("\n".join(chosen) + "\n")
+
+
+def _member_paths(paths: list[str]) -> list[str]:
+    return [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in paths]
+
+
+def study_rebuild(args: argparse.Namespace) -> None:
+    """Members and Pfam tables of the base plus the study (``study-ladder``'s rebuild arm).
+    A study protein joins its best MGnify90 cluster (``gene_units`` rank 1) where identity
+    and both coverages pass ``--min-id``/``--min-cov``, as a member of that cluster would;
+    otherwise it stays in its linclust cluster. Ids become strings, as the study's are."""
+    columns = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    base = pl.scan_parquet(_member_paths(args.members)).select(columns)
+    nearest = (
+        pl.read_parquet(args.gene_units)
+        .filter(
+            pl.col("rank") == 1,
+            pl.col("identity") >= args.min_id,
+            pl.col("qcov") >= args.min_cov,
+            pl.col("scov") >= args.min_cov,
+        )
+        .select(protein_id="gene_name", nearest=pl.col("cluster_rep").cast(pl.String))
+    )
+    study = (
+        pl.read_parquet(args.study_members)
+        .join(nearest, on="protein_id", how="left")
+        .with_columns(cluster_rep=pl.coalesce("nearest", "cluster_rep"))
+        .select(columns)
+    )
+    pl.concat(
+        [base.with_columns(pl.col("protein_id", "cluster_rep").cast(pl.String)), study.lazy()]
+    ).sink_parquet(args.out)
+    pfam = pl.read_parquet(args.pfam, columns=["protein_id", "pfam_accession"])
+    pl.concat(
+        [
+            pfam_names(pfam.rename({"protein_id": "unit"})).select(
+                protein_id=pl.col("unit").cast(pl.String), pfam_accession="name"
+            ),
+            pl.read_parquet(args.study_pfam),
+        ]
+    ).write_parquet(args.out_pfam)
+
+
+def study_ladder(args: argparse.Namespace) -> None:
+    """The study ladder's gate (plan, Additional references: Evaluation). From the scores of
+    the plain arm (base), ``study`` (base + study index, joint) and ``rebuild`` per sample,
+    index, count, estimate and threshold: each arm's completeness and purity, and
+    ``recovered`` = (joint - base) / (rebuild - base) completeness (null without a gain)."""
+    keys = ["sample", "index", "count", "abundance", "min_hits"]
+    scores = pl.concat(
+        [pl.read_csv(p, separator="\t", schema_overrides={"arm": pl.String}) for p in args.scores],
+        how="diagonal_relaxed",
+    ).with_columns(pl.col("arm").fill_null(""))
+    arms = {"": "base", "study": "joint", "rebuild": "rebuild"}
+    wide = None
+    for arm, tag in arms.items():
+        part = scores.filter(pl.col("arm") == arm).select(
+            *keys, pl.col("completeness").alias(f"completeness_{tag}"),
+            pl.col("purity").alias(f"purity_{tag}"),
+        )  # fmt: skip
+        wide = part if wide is None else wide.join(part, on=keys, how="inner", nulls_equal=True)
+    assert wide is not None
+    gain = pl.col("completeness_rebuild") - pl.col("completeness_base")
+    wide = wide.with_columns(
+        recovered=pl.when(gain > 0).then(
+            (pl.col("completeness_joint") - pl.col("completeness_base")) / gain
+        )
+    )
+    wide.sort(keys).write_csv(args.out, separator="\t")
+
+
+def study_unrelated(args: argparse.Namespace) -> None:
+    """From a base and a joint (base + study) unit profile: base units whose components in
+    the joint query (tier 2 and dense) hold no study unit (``unrelated``), and how many changed
+    ``hits``, ``kmers_unique`` or ``coverage_em`` (``unrelated_changed``; should be 0)."""
+    alone, joint = read_profile(args.base), read_profile(args.joint)
+    # linked in tier 2 (gather) or, with a dense tier, in the dense hits the EM is fitted on
+    links = [c for c in ("component", "component_dense") if c in joint.columns]
+    study = joint.filter(pl.col("source") > 0)
+    own = joint.filter(
+        pl.col("source") == 0,
+        *(
+            ~pl.col(c).is_in(study[c].drop_nulls().unique().implode()).fill_null(True)
+            for c in links
+        ),
+    )
+    compared = ["hits", "kmers_unique", "coverage_em"]
+    both = own.select("unit", *compared).join(
+        alone.select("unit", *compared), on="unit", how="left", suffix="_alone"
+    )
+    diff = [
+        (pl.col(c) - pl.col(f"{c}_alone")).abs() > 1e-9 * (1 + pl.col(c).abs()) for c in compared
+    ]
+    changed = int(both.select(pl.any_horizontal(d.fill_null(True) for d in diff).sum()).item())
+    pl.DataFrame(
+        {"run": [args.run], "unrelated": [own.height], "unrelated_changed": [changed]}
+    ).write_csv(args.out, separator="\t")
 
 
 def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, float | None]:
@@ -1105,8 +1254,31 @@ def main() -> None:
     p.add_argument("--out-members", default="pfam_members.parquet")
     p = sub.add_parser("pfam-profile")
     p.add_argument("--profile", required=True)
-    p.add_argument("--unit-pfam", required=True)
+    p.add_argument("--unit-pfam", required=True, nargs="+", help="one per index, query order")
     p.add_argument("--out", default="pfam_profile.tsv")
+    p = sub.add_parser("study-proteins")
+    for name in ("genomes-dir", "genes", "domains"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, default=1.0, help="share of the sample's genomes")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--out", default="study.faa")
+    p.add_argument("--out-pfam", default="study_pfam.parquet")
+    p.add_argument("--out-genomes", default="study_genomes.txt")
+    p = sub.add_parser("study-rebuild")
+    p.add_argument("--members", required=True, nargs="+", help="base members: files or dirs")
+    for name in ("pfam", "study-members", "study-pfam", "gene-units"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--min-id", type=float, default=0.9)
+    p.add_argument("--min-cov", type=float, default=0.8)
+    p.add_argument("--out", default="members.parquet")
+    p.add_argument("--out-pfam", default="pfam.parquet")
+    p = sub.add_parser("study-ladder")
+    p.add_argument("--scores", required=True, nargs="+")
+    p.add_argument("--out", default="study_ladder.tsv")
+    p = sub.add_parser("study-unrelated")
+    for name in ("base", "joint", "run"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--out", default="study_unrelated.tsv")
     p = sub.add_parser("reps")
     p.add_argument("--members", required=True, nargs="+", help="parquet files or directories")
     p.add_argument("--out", default="reps.faa")
@@ -1158,7 +1330,9 @@ def main() -> None:
              "cost": cost, "pfam-proteins": pfam_proteins, "pfam-domains": pfam_domains,
              "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
              "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
-             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate}  # fmt: skip
+             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate,
+             "study-proteins": study_proteins, "study-rebuild": study_rebuild,
+             "study-ladder": study_ladder, "study-unrelated": study_unrelated}  # fmt: skip
     steps[args.step](args)
 
 

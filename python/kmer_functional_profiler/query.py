@@ -1639,7 +1639,9 @@ def profile(
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
-    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
+    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit, and
+    ``component_dense`` labels the components the EM is fitted on (units linked by shared
+    dense hits, which tier 2 may not have sampled; null for units gather drops).
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
     present rather than hit by background, from the tier-2 k-mers gather gave it; units
@@ -2002,6 +2004,10 @@ def profile(
             on="unit",
             how="left",
         ).with_columns(pl.col("kmers_dense").fill_null(0))
+        dense_components = component_labels(detected.select("unit", "hash"))
+        result = result.join(
+            dense_components.rename({"component": "component_dense"}), on="unit", how="left"
+        )
     if all_estimators:
         rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
         with timer("baselines"):
@@ -2034,6 +2040,12 @@ def profile(
         .drop("index")
         .sort("unit")
     )
+    if joint.dense:
+        result = result.with_columns(
+            component_dense=pl.when(pl.col("component_dense").is_not_null()).then(
+                pl.col("unit").min().over("component_dense")
+            )
+        )
     result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.

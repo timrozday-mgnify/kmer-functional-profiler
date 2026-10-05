@@ -377,6 +377,42 @@ Not here: the divergence ladder and containment-AAI calibration (truth needs hel
 genomes with relatives at known identity; the simulation benchmark has them), and the
 other tools on Pfam.
 
+## Study ladder (phase 10)
+
+`--study_ladder` asks whether a study's own proteins, as an index queried with the base
+(`--extra-index`), do nearly as well as rebuilding the base with them (plan: Additional
+references, Evaluation). Per seed and per `--mgnify_indexes` entry built from members:
+
+```text
+STUDY_FAA             --study_fraction of the sample's genomes (as if recovered as MAGs):
+                      their proteins and Pfam domains (PFAM_DOMAINS)
+STUDY_CLUSTER, STUDY_MEMBERS, STUDY_INDEX_BUILD
+                      workflows/study-index's steps: linclust (--study_cluster_args) and
+                      `index --like` the MGnify index -> study/seed<N>_<name>/
+STUDY_REBUILD_TABLES, REBUILD_INDEX
+                      the MGnify members plus the study's proteins, each in its nearest
+                      MGnify90 cluster where the DIAMOND truth puts it (--mgnify_min_id,
+                      --mgnify_min_cov), else in its linclust cluster; built --like the base
+                      (kept in work/ only)
+PROFILE               arms study (base + study index; profiles summed per Pfam over both
+                      indexes' labels) and rebuild, beside the plain arm (base alone)
+STUDY_LADDER          study_ladder.tsv: per sample, index, count and threshold, completeness
+                      and purity of each arm and recovered = (study - base) / (rebuild - base)
+                      completeness (null when the rebuild gains nothing)
+STUDY_UNRELATED       study_unrelated.tsv: base units whose components in the joint query
+                      (tier 2 and, with a dense tier, component_dense) hold no study unit,
+                      and how many changed hits, kmers_unique or coverage_em
+```
+
+The gate: `recovered` ≥ 0.9 and `unrelated_changed` 0. Ablation config:
+`ablations/study.config` (`hpc/kfp-ablations/study-ladder`). Locally:
+
+```bash
+nextflow run workflows/fmh-benchmark -profile test,docker --study_ladder true --tools '' --outdir results-test-ladder
+```
+
+The fixture saturates completeness (1.0 in every arm), so it checks the plumbing only.
+
 ## Other tools
 
 Each tool profiles the same 10 metagenomes and is scored against the same truth; its rows
