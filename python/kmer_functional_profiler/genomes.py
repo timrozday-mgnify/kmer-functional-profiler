@@ -465,7 +465,8 @@ def function_taxon(
     r_{G,u} ∝ λ_G π_G c_{G,u}; the rest, and all of units no detected genome carries, is
     ``unclassified``. Genomes roll up by :func:`taxon_labels` over their ambiguity
     ``groups`` (:func:`uncertainty`); units roll up to the genome
-    index's Pfam labels (each label counts its units in full), or else to the profile's
+    index's Pfam labels (each label counts its units in full; accessions without version,
+    ``PF01007``), or else to the profile's
     ``name``. Long format: ``function``, ``rank`` (``total`` and each reported rank),
     ``taxon``, ``hits_em``; per function and rank, rows sum to its ``total``.
     """
@@ -485,7 +486,14 @@ def function_taxon(
     names = _names(gi)
     labels = taxon_labels(groups.join(names, on="genome"))
     if gi.unit_pfam is not None:
-        functions = gi.unit_pfam.select(pl.col("unit").cast(pl.UInt32), function="pfam_accession")
+        accession = pl.col("pfam_accession")
+        functions = gi.unit_pfam.select(
+            pl.col("unit").cast(pl.UInt32),
+            # MGnify stores the accession's number (1007 for PF01007); hmmsearch PF01007.23
+            function=("PF" + accession.cast(pl.String).str.zfill(5))
+            if gi.unit_pfam.schema["pfam_accession"].is_integer()
+            else accession.str.replace(r"\.\d+$", ""),
+        )
     elif "name" in split.columns:
         functions = split.select("unit", function=pl.col("name").cast(pl.String))
     else:
