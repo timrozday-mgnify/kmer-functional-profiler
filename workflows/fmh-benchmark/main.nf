@@ -18,7 +18,8 @@ process FETCH {
     """
     Z=https://zenodo.org/records/10055954/files
     curl -fsSL -o genomes.zip "\$Z/genomes_extracted_from_kegg.zip?download=1"
-    unzip -q genomes.zip -x '*.DS_Store' '__MACOSX/*' && rm genomes.zip
+    # Debian unzip flags this Zenodo archive as overlapping (false-positive zip bomb)
+    UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -q genomes.zip -x '*.DS_Store' '__MACOSX/*' && rm genomes.zip
     for f in protein_ref_db_giant.faa present_genes_and_koids.csv ${params.sketches}; do
         curl -fsSL -o "\$f" "\$Z/\$f?download=1"
     done
