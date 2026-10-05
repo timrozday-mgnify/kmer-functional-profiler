@@ -742,8 +742,11 @@ def em(
     ``m_g`` its total weight over all items, hit or not; all weights 1 is the plain EM.
     The zero-inflated present fraction then needs ``items_hit(holders, coverage)``: the
     items each holder would have hit if all present, sum over its items of
-    1 - exp(-coverage x weight) (default ``m_g`` (1 - exp(-coverage))). ``prior`` is for
-    unweighted k-mers only.
+    1 - exp(-coverage x weight) (default ``m_g`` (1 - exp(-coverage))); with it, a hit
+    item counts as present in a holder with its posterior probability given the item's hits
+    (the other holders at their means), not by the holder's share of its hits, so items
+    many holders carry (core genes) do not lower each one's present fraction. ``prior``
+    is for unweighted k-mers only.
     """
     if prior is not None and (items_hit is not None or "weight" in kmers.columns):
         raise ValueError("a present prior needs unweighted items")
@@ -775,7 +778,19 @@ def em(
                 kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
                 seen = -np.expm1(-la)  # chance a present k-mer is hit
                 if items_hit is not None:
-                    new_p = np.minimum(1.0, _div(kmers_hit, items_hit(units[b.unit], la)))
+                    # A hit item is present in a holder with its posterior given the item's
+                    # hits, the other holders at their means; not by its share of the hits,
+                    # which would count an item two holders both carry as half present.
+                    own = la[b.c] if wb is None else la[b.c] * wb
+                    others = np.maximum(mu[b.r] - p[b.c] * own, 0.0)
+                    log_lr = np.full(len(own), np.inf)  # sole holder of a hit item: present
+                    np.divide(own, others, out=log_lr, where=others > 0)
+                    log_lr = h[b.r] * np.log1p(log_lr) - own
+                    q = p[b.c]
+                    odds_out = (1 - q) * np.exp(np.minimum(-log_lr, 700.0))
+                    post = _div(q, q + odds_out)
+                    present = np.bincount(b.c, weights=post, minlength=per_unit)
+                    new_p = np.minimum(1.0, _div(present, items_hit(units[b.unit], la)))
                 elif prior is None:
                     new_p = np.minimum(1.0, _div(kmers_hit, mb * seen))
                 else:

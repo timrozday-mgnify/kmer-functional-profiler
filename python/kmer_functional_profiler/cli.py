@@ -174,6 +174,13 @@ def genomes_command(
     summary: Annotated[
         Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
     ] = None,
+    function_taxon: Annotated[
+        Path,
+        typer.Option(
+            help="TSV of each function's split hits (hits_em) per taxon and rank, with "
+            "unclassified and the total (Pfam if the genome index has labels, else unit name)"
+        ),
+    ] = Path("function_taxon.tsv"),
     index: Annotated[
         Path | None,
         typer.Option(help="The profile's index, checked against the one annotated with"),
@@ -189,7 +196,13 @@ def genomes_command(
         except ValueError as e:
             raise typer.BadParameter(str(e)) from e
     prof = pl.read_csv(profile_tsv, separator="\t")
-    table, sample = genome_profile(prof, gi, min_containment=min_containment, min_units=min_units)
+    table, sample, stratified = genome_profile(
+        prof, gi, min_containment=min_containment, min_units=min_units
+    )
+    if stratified is None:
+        typer.echo("profile has no hits_em: no function x taxon table", err=True)
+    else:
+        stratified.write_csv(function_taxon, separator="\t")
     table.write_csv(out, separator="\t")
     if summary is not None:
         summary.write_text(json.dumps(sample, indent=2) + "\n")

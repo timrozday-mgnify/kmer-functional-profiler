@@ -93,7 +93,7 @@ def test_reads_at_depth_hit_units_in_proportion_to_content(tmp_path: Path, index
     ratio = prof.join(c, on="unit").select(pl.col("hits") / pl.col("c"))["hits"].to_numpy()
     assert len(ratio) == len(members)
     assert np.allclose(ratio, 44, rtol=1e-3)
-    table, summary = genome_profile(prof, gi, min_units=3)
+    table, summary, _ = genome_profile(prof, gi, min_units=3)
     assert np.allclose(table["depth"], 44, rtol=1e-3) and np.isclose(table["present"][0], 1.0)
     assert summary["explained_fraction"] > 0.999
 
@@ -140,7 +140,7 @@ def synthetic(
 def test_disjoint_genomes_recover_their_depths(tmp_path: Path, index_dir: Path) -> None:
     genomes = {"a": list(range(10)), "b": list(range(10, 20)), "x": [0, 1, 2, 10, 11]}
     gi = annotate(tmp_path, index_dir, genomes, "gi")
-    table, summary = genome_profile(synthetic(gi, {0: 3.0, 1: 7.0}), gi, min_units=5)
+    table, summary, _ = genome_profile(synthetic(gi, {0: 3.0, 1: 7.0}), gi, min_units=5)
     assert table["name"].to_list() == ["b", "a"]  # x: explained away by gather
     assert np.allclose(table["depth"], [7.0, 3.0], rtol=0.01)
     assert np.allclose(table["present"], 1.0, atol=0.01)
@@ -151,7 +151,7 @@ def test_disjoint_genomes_recover_their_depths(tmp_path: Path, index_dir: Path) 
 def test_relative_missing_content_gets_present_below_one(tmp_path: Path, index_dir: Path) -> None:
     """The sample's strain is a relative of genome a lacking 3 of its 10 units."""
     gi = annotate(tmp_path, index_dir, {"a": list(range(10))}, "gi")
-    table, _ = genome_profile(synthetic(gi, {0: 5.0}, set(range(7))), gi, min_units=5)
+    table, _, _ = genome_profile(synthetic(gi, {0: 5.0}, set(range(7))), gi, min_units=5)
     assert table["name"].to_list() == ["a"]
     assert 0.6 < table["present"][0] < 0.8
     assert abs(table["depth"][0] - 5.0) / 5.0 < 0.2
@@ -175,3 +175,71 @@ def test_unexplained_hits_and_cli(tmp_path: Path, index_dir: Path) -> None:
     assert np.isclose(summary["explained_fraction"], (hits - 100) / hits, rtol=0.01)
     bad = CliRunner().invoke(app, [*args[:6], "--index", str(tmp_path / "gi")])
     assert bad.exit_code != 0
+
+
+def stratified_profile(
+    gi: GenomeIndex, depth: dict[int, float], extra: dict[int, float]
+) -> pl.DataFrame:
+    """:func:`synthetic` with ``hits_em`` = ``hits`` and ``extra`` hits on other units."""
+    prof = pl.concat(
+        [
+            synthetic(gi, depth),
+            pl.DataFrame({"unit": list(extra), "hits": list(extra.values())}).cast(
+                {"unit": pl.UInt32}
+            ),
+        ]
+    )
+    return prof.with_columns(hits_em=pl.col("hits"), name=pl.col("unit").cast(pl.String))
+
+
+def test_function_taxon_table(tmp_path: Path, index_dir: Path) -> None:
+    # a: units 0-8, b: units 10-18 and unit 0; units 9 and 19 carried by neither.
+    genomes = {"a": list(range(9)), "b": [0, *range(10, 19)]}
+    gi = annotate(tmp_path, index_dir, genomes, "gi")
+    c = gi.content(np.arange(20))
+    prof = stratified_profile(gi, {0: 1.0, 1: 3.0}, {19: 50.0})
+    table, _, ft = genome_profile(prof, gi, min_units=5)
+    assert ft is not None
+    assert np.allclose(table.sort("genome")["depth"], [1.0, 3.0], rtol=0.01)
+    assert table["group"].n_unique() == 2
+    assert ((table["depth_lo"] <= table["depth"]) & (table["depth"] <= table["depth_hi"])).all()
+
+    def pf(u: int) -> str:  # the fixture's labels: two units per Pfam
+        return f"PF{u // 2:05d}"
+
+    sp = ft.filter(pl.col("rank") == "species")
+    # A unit of a alone (unit 2, PF00001 with unit 3, also a's) goes to a whole.
+    one = sp.filter(pl.col("function") == pf(2))
+    assert one["taxon"].to_list() == ["s__a"]
+    # Unit 0 (shared, PF00000 with a's unit 1) splits 1:3 between a and b.
+    c0 = c.filter(pl.col("unit") == 0)["hits"][0]
+    c1 = c.filter(pl.col("unit") == 1)["hits"][0]
+    got = dict(sp.filter(pl.col("function") == pf(0)).select("taxon", "hits_em").iter_rows())
+    assert np.isclose(got["s__a"], 1.0 * c0 + c1, rtol=0.01)
+    assert np.isclose(got["s__b"], 3.0 * c0, rtol=0.01)
+    # Unit 19 (PF00009 with unit 18, b's) is carried by no genome: unclassified.
+    got = dict(sp.filter(pl.col("function") == pf(19)).select("taxon", "hits_em").iter_rows())
+    assert np.isclose(got["unclassified"], 50.0)
+    # Every rank's rows sum to the total.
+    totals = ft.filter(pl.col("rank") == "total").select("function", total="hits_em")
+    sums = (
+        ft.filter(pl.col("rank") != "total")
+        .group_by("function", "rank")
+        .agg(pl.col("hits_em").sum())
+    )
+    check = sums.join(totals, on="function")
+    assert set(sums["rank"]) == {"family", "genus", "species", "genome"}
+    assert np.allclose(check["hits_em"], check["total"])
+
+
+def test_identical_genomes_form_a_group_reported_at_their_common_rank(
+    tmp_path: Path, index_dir: Path
+) -> None:
+    gi = annotate(tmp_path, index_dir, {"a1": list(range(10)), "a2": list(range(10))}, "gi")
+    prof = stratified_profile(gi, {0: 4.0}, {})
+    table, summary, ft = genome_profile(prof, gi, min_units=5)
+    assert ft is not None and summary["ambiguity_groups"] == 1
+    assert np.allclose(table["depth"], 4.0, rtol=0.01)
+    low = ft.filter(pl.col("rank").is_in(["species", "genome"]))["taxon"].unique()
+    assert low.to_list() == ["g__a"]  # genus shared; species and genome differ
+    assert table["ambiguous"].to_list() == [1]  # a2, explained away by gather
