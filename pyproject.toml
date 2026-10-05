@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 kmer-functional-profiler = "kmer_functional_profiler.cli:app"
+kfp-prior = "kfp_prior.cli:app"
 
 [dependency-groups]
 bench = ["insilicoseq>=2.0.1", "mappy>=2.31"]
@@ -38,6 +39,9 @@ build-backend = "maturin"
 manifest-path = "crates/py/Cargo.toml"
 python-source = "python"
 module-name = "kmer_functional_profiler._core"
+python-packages = [
+  "kfp_prior",
+] # the companion (plan: Genome-informed unit presence)
 features = ["pyo3/extension-module"]
 profile = "release"
 

@@ -243,3 +243,11 @@ def test_identical_genomes_form_a_group_reported_at_their_common_rank(
     low = ft.filter(pl.col("rank").is_in(["species", "genome"]))["taxon"].unique()
     assert low.to_list() == ["g__a"]  # genus shared; species and genome differ
     assert table["ambiguous"].to_list() == [1]  # a2, explained away by gather
+
+
+def test_best_unit_per_protein(tmp_path: Path, index_dir: Path) -> None:
+    gi = annotate(tmp_path, index_dir, {"a": [3, 1, 4]}, "gi")
+    best = pl.read_parquet(tmp_path / "gi" / "genome_best.parquet")
+    assert best["unit"].to_list() == [3, 1, 4] and best["protein"].to_list() == [0, 1, 2]
+    assert (best["containment"] > 0.8).all()  # members of their own units
+    assert gi.genomes["units"].to_list() == [3]
