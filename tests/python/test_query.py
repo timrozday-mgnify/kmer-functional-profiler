@@ -1,7 +1,9 @@
 """Query counts against an index built from the fixture proteins."""
 
+import dataclasses
 import itertools
 import json
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -237,14 +239,14 @@ def test_aai_interval_without_draws(members: Path) -> None:
 
 def test_aai_interval_survival_variance() -> None:
     # Substitutions at identity a over L positions: the share of the L - k + 1 windows that
-    # survive has variance c (1 - c) d / L, d the overlap factor aai_interval uses.
+    # survive has variance c (1 - c) d / L, d the overlap factor aai_fit uses.
     rng = np.random.default_rng(0)
     k, length, a = 11, 400, 0.93
     hit = rng.random((4000, length)) < a
     windows = np.lib.stride_tricks.sliding_window_view(hit, k, axis=1).all(axis=2)
     c = windows.mean(axis=1)
     n = length - k + 1
-    lo, hi = query.aai_interval(
+    _, lo, hi, _ = query.aai_fit(
         coverage=np.array([1e6]), present=np.array([a**k]), m=np.array([n]),
         pin_sum=np.array([n]), n_kmers=np.array([n]), k=k,
     )  # fmt: skip
@@ -253,10 +255,112 @@ def test_aai_interval_survival_variance() -> None:
     assert 0.92 <= inside <= 0.98
     # More kept windows, narrower; sparse sampling (t << 1) removes the overlap term.
     args = {"coverage": np.full(3, 1e6), "present": np.full(3, a**k), "k": k}
-    lo, hi = query.aai_interval(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
-                                n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
+    _, lo, hi, _ = query.aai_fit(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
+                                 n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
     width = hi - lo
     assert width[0] > width[1] > width[2]
+
+
+def test_survival_model_inverts_and_tends_to_a_power_k() -> None:
+    a = np.linspace(0.5, 1.0, 11)
+    for alpha in (0.7, 1.5, 4.0):
+        s = query.survival(a, 11, alpha)
+        assert (s >= a**11 - 1e-12).all()  # regional rates keep more k-mers
+        assert query.survival_identity(s, 11, alpha) == pytest.approx(a)
+        step = 1e-6
+        slope = query.survival(a[1:] + step, 11, alpha) - query.survival(a[1:] - step, 11, alpha)
+        assert query.survival_slope(a[1:], 11, alpha) == pytest.approx(slope / (2 * step), rel=1e-4)
+    assert query.survival(a, 11, 1e6) == pytest.approx(a**11, rel=1e-3)
+    assert query.survival_identity(a**11, 11) == pytest.approx(a)
+
+
+def test_aai_fit_recovers_identity_under_regional_rates() -> None:
+    # Each window survives at its own gamma rate r: P = exp(-k r t), a = E exp(-r t).
+    rng = np.random.default_rng(1)
+    k, alpha, n, units = 11, 1.5, 400, 200
+    for a in (0.7, 0.8, 0.9, 0.95):
+        t = alpha * (a ** (-1 / alpha) - 1)
+        rates = rng.gamma(alpha, 1 / alpha, size=(units, n))
+        present = (rng.random((units, n)) < np.exp(-k * rates * t)).mean(axis=1)
+        full = np.full(units, float(n))
+        args = {"coverage": np.full(units, 20.0), "present": present, "m": full,
+                "pin_sum": full, "n_kmers": 10 * full, "k": k}  # fmt: skip
+        point, lo, hi, _ = query.aai_fit(alpha=alpha, **args)
+        assert np.median(point) == pytest.approx(a, abs=0.01)
+        assert ((lo <= a) & (a <= hi)).mean() >= 0.9
+        # a^k reads these strains as far closer than they are
+        assert np.median(query.aai_fit(**args)[0]) > a + 0.005
+
+
+def test_truncated_binomial_removes_selection_bias_at_few_hits() -> None:
+    # Units are reported only if hit: at ~1.5-2 hits per reported unit h / n reads 20-70%
+    # high; the truncated MLE is off by half that or less (and reads 0 at h = 1, which the
+    # mask on hit k-mers hides).
+    rng = np.random.default_rng(2)
+    n = 300.0
+    for p in (0.003, 0.006):
+        h = rng.binomial(int(n), p, 200_000)
+        h = h[h >= 1]
+        naive, mle = (h / n).mean(), query.truncated_binomial_p(h, np.full(h.size, n)).mean()
+        assert naive > 1.15 * p
+        assert abs(mle - p) < 0.6 * (naive - p)
+    got = query.truncated_binomial_p(np.array([0.5, 1.0, 400.0]), np.full(3, n))
+    assert got.tolist() == [0.0, 0.0, 1.0]
+    mean = 5.0
+    p = query.truncated_binomial_p(np.array([mean]), np.array([n]))[0]
+    assert n * p / (1 - (1 - p) ** n) == pytest.approx(mean)
+
+
+def test_min_aai_kmers_nulls_aai_but_keeps_its_kmers(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, with_aai=True, min_aai_kmers=1e9)
+    assert (
+        got.select("aai", "aai_lo", "aai_hi", "aai_naive").null_count().row(0) == (got.height,) * 4
+    )
+    assert (got.filter(pl.col("kmers_unique") > 0)["aai_kmers"] > 0).all()
+    assert profile(index, *READS, with_aai=True, min_aai_kmers=0)["aai"].null_count() < got.height
+
+
+def test_aai_model_sidecar_changes_the_estimate(members: Path, tmp_path: Path) -> None:
+    build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    plain = profile(Index.load(tmp_path / "idx"), *READS, with_aai=True)
+    model = {"survival": "regional_gamma", "alpha": 1.0, "k": K}
+    runner, attach = CliRunner(), ["aai-model", str(tmp_path / "idx")]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(model | {"k": K + 1}))
+    assert runner.invoke(app, [*attach, str(bad)]).exit_code != 0  # fitted at another k
+    good = tmp_path / "model.json"
+    good.write_text(json.dumps(model))
+    assert runner.invoke(app, [*attach, str(good)]).exit_code == 0
+    index = Index.load(tmp_path / "idx")
+    assert index.aai_model == model
+    got = plain.join(profile(index, *READS, with_aai=True), on="unit")
+    got = got.filter(pl.col("aai").is_not_null())
+    assert got.height > 0 and (got["aai_kmers"] == got["aai_kmers_right"]).all()
+    # the same survival read under regional rates is a lower identity
+    assert (got["aai_right"] <= got["aai"] + 1e-12).all()
+    assert runner.invoke(app, attach).exit_code == 0  # no file: removed
+    assert Index.load(tmp_path / "idx").aai_model is None
+
+
+def test_benchmark_reestimates_aai_as_the_query(shared: Path) -> None:
+    # bench.py's offline rerun of archived profiles (step 23) gives what the query reports
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "workflows" / "fmh-benchmark"))
+    import bench
+
+    index = build(shared, t_base=1.0, fp_bits=64)
+    for alpha, mask in ((None, 5), (1.5, 2)):
+        modelled = dataclasses.replace(
+            index,
+            aai_model=None if alpha is None else {"survival": "regional_gamma", "alpha": alpha},
+        )
+        got = profile(modelled, *READS, with_aai=True, min_aai_kmers=mask)
+        assert got["aai"].drop_nulls().len() > 0
+        again = bench.reestimate_aai(
+            got.drop("aai", "aai_lo", "aai_hi", "aai_kmers"), K, alpha, mask
+        )
+        for c in ("aai", "aai_lo", "aai_hi", "aai_kmers"):
+            assert again[c].fill_null(-1).to_list() == pytest.approx(got[c].fill_null(-1).to_list())
 
 
 def write_members(path: Path, seqs: list[str], first_rep: int = 0) -> Path:

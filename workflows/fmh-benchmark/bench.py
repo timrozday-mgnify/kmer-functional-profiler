@@ -20,7 +20,9 @@
   coverage (the truth of unit-level detection and of containment AAI).
 - ``aai-score``: a unit profile against that truth: detection at the MGnify90 level (genes
   whose best cluster passes ``--id``/``--cov``), recall of the nearest cluster beyond it, and
-  ``aai`` / ``aai_naive`` against the alignment identities (see :func:`aai_score`).
+  ``aai`` / ``aai_naive`` against the alignment identities (see :func:`aai_score`). With
+  ``--alpha`` or ``--min-aai-kmers``, ``aai`` is first re-estimated from the profile's
+  zero-inflated fit under that survival model and mask (:func:`reestimate_aai`).
 - ``aai-calibrate``: an inverse map from ``aai`` to alignment identity, fitted on half of
   the clusters of several samples' unit profiles and scored on the other half (see
   :func:`fit_aai_calibration`).
@@ -63,8 +65,11 @@ import polars as pl
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.query import (
     AAI_CALIBRATION_PARAMS,
+    MIN_AAI_KMERS,
+    aai_columns,
     calibrate_aai,
     check_aai_calibration,
+    ztp_lambda,
 )
 
 GENOME_COLUMNS = {"gene_name": pl.String, "contig_id": pl.String, "start_position": pl.Int64,
@@ -420,6 +425,7 @@ def mgnify_genes(args: argparse.Namespace) -> None:
 
 
 IDENTITY_BINS = ((0.95, 1.01), (0.9, 0.95), (0.8, 0.9), (0.7, 0.8), (0.5, 0.7))
+AAI_KMER_BINS = ((0, 3), (3, 5), (5, 10), (10, float("inf")))  # aai_kmers: 1-2, 3-4, 5-9, 10+
 
 
 def aai_score(
@@ -428,6 +434,7 @@ def aai_score(
     genes: pl.DataFrame,
     min_id: float = 0.9,
     min_cov: float = 0.8,
+    k: int = 11,
 ) -> dict[str, float | None]:
     """Unit-level detection and containment AAI against alignment truth.
 
@@ -445,6 +452,12 @@ def aai_score(
     - ``aai_bias_<lo>``, ``aai_cover_<lo>``, ``aai_spearman``, ``aai_n``: detected units
       with an ``aai``, against the depth-weighted identity of the present genes they are
       nearest to (``aai_mixed``: units nearest to several genes).
+    - ``aai_bias_union_<lo>``, ``aai_cover_union_<lo>``, ``aai_cover_union``: the same against
+      the union truth of every present gene hitting the unit (:func:`union_truth`), binned
+      by it; the interval coverage over all units is the primary ``aai`` metric (step 23).
+    - ``aai_bias_kmers<lo>``, ``aai_cover_kmers<lo>``, ``aai_n_kmers<lo>``: against the union
+      truth, by the hit k-mers the estimate rests on (``aai_kmers``, ``AAI_KMER_BINS``):
+      near the detection limit the reported units are the lucky draws.
     - ``naive_bias_<lo>``, ``naive_within05_<lo>``, ``naive_spearman``, ``naive_n``: every
       profiled unit some present gene hits, ``aai_naive`` against the best identity of a
       present gene to it (near hits included).
@@ -477,22 +490,37 @@ def aai_score(
     # aai of detected units, against the identity of the genes they are nearest to
     truth = aai_truth(nearest)
     if "aai" in profile.columns:
-        a = profile.filter(pl.col("kmers_unique") >= 1, pl.col("aai").is_not_null()).join(
-            truth, on="cluster_rep"
+        a = (
+            profile.filter(pl.col("kmers_unique") >= 1, pl.col("aai").is_not_null())
+            .join(truth, on="cluster_rep")
+            .join(union_truth(hits, k), on="cluster_rep")
         )
         out["aai_n"] = a.height
         out["aai_mixed"] = int((a["genes"] > 1).sum())
         out["aai_spearman"] = (
             a.select(pl.corr("aai", "true", method="spearman")).item() if a.height > 2 else None
         )
-        for lo, hi in IDENTITY_BINS:
-            part = a.filter(pl.col("true").is_between(lo, hi, closed="left"))
-            out[f"aai_bias_{lo}"] = (part["aai"] - part["true"]).median() if part.height else None  # type: ignore[assignment]
-            out[f"aai_cover_{lo}"] = (
-                part.select(pl.col("true").is_between("aai_lo", "aai_hi").mean()).item()
+
+        def bias_cover(part: pl.DataFrame, true: str, key: str) -> None:
+            out[f"aai_bias_{key}"] = (part["aai"] - part[true]).median() if part.height else None  # type: ignore[assignment]
+            out[f"aai_cover_{key}"] = (
+                part.select(pl.col(true).is_between("aai_lo", "aai_hi").mean()).item()
                 if part.height and "aai_lo" in part.columns
                 else None
             )
+
+        for true, prefix in (("true", ""), ("true_union", "union_")):
+            for lo, hi in IDENTITY_BINS:
+                bias_cover(
+                    a.filter(pl.col(true).is_between(lo, hi, closed="left")), true, f"{prefix}{lo}"
+                )
+        bias_cover(a, "true_union", "union")
+        del out["aai_bias_union"]  # over every identity it says little; its coverage does
+        if "aai_kmers" in a.columns:
+            for lo, hi in AAI_KMER_BINS:
+                part = a.filter(pl.col("aai_kmers").is_between(lo, hi, closed="left"))
+                out[f"aai_n_kmers{lo}"] = part.height
+                bias_cover(part, "true_union", f"kmers{lo}")
     if "aai_naive" in profile.columns:
         best = hits.group_by("cluster_rep").agg(true=pl.col("identity").max())
         n = profile.join(best, on="cluster_rep")
@@ -508,6 +536,43 @@ def aai_score(
             out[f"naive_bias_{lo}"] = err.median() if part.height else None  # type: ignore[assignment]
             out[f"naive_within05_{lo}"] = (err.abs() <= 0.05).mean() if part.height else None
     return out
+
+
+def union_truth(hits: pl.DataFrame, k: int = 11) -> pl.DataFrame:
+    """Per cluster, the identity whose k-mer survival a^k equals that of the union of every
+    present gene hitting it (``true_union``): 1 - prod_g (1 - a_g^k), inverted. Reads from
+    several genes put their k-mers in one unit, which the nearest-gene truth ignores (plan,
+    phase 7, step 23). a^k, not the fitted survival model, so the truth does not depend on
+    the model it scores."""
+    return hits.group_by("cluster_rep").agg(
+        true_union=(1 - (1 - pl.col("identity") ** k).log().sum().exp()) ** (1 / k)
+    )
+
+
+def reestimate_aai(
+    profile: pl.DataFrame, k: int = 11, alpha: float | None = None, min_kmers: float = MIN_AAI_KMERS
+) -> pl.DataFrame:
+    """``aai``, ``aai_lo``, ``aai_hi`` and ``aai_kmers`` recomputed from a profile's
+    zero-inflated fit as the query would report them with survival model ``alpha`` and
+    ``--min-aai-kmers`` ``min_kmers``, without rerunning it (offline reruns of archived
+    profiles, plan, phase 7, step 23). ``pin_sum`` is present x m / ``copies_zi``; the
+    clumping is the query's, from tier-2 hits per read; m is ``m_dense`` with a dense tier.
+    Units without a fit (``copies_zi`` 0) get a null ``aai`` and ``aai_kmers`` 0."""
+    m = profile["m_dense" if "m_dense" in profile.columns else "m_g"].to_numpy().astype(np.float64)
+    present = profile["present_zi"].to_numpy()
+    copies = profile["copies_zi"].to_numpy()
+    fitted = copies > 0
+    pin_sum = np.where(fitted, present * m / np.where(fitted, copies, 1.0), 0.0)
+    mu = ztp_lambda((profile["hits"] / profile["reads"]).to_numpy())
+    mu *= m / profile["m_g"].to_numpy()
+    est = aai_columns(
+        profile["coverage_zi"].to_numpy(), present, m, pin_sum,
+        profile["n_kmers"].to_numpy(), k, alpha, 1 + mu, min_kmers,
+    )  # fmt: skip
+    est = est.with_columns(
+        pl.when(pl.Series(fitted)).then(pl.col(c)).alias(c) for c in ("aai", "aai_lo", "aai_hi")
+    )
+    return profile.drop("aai", "aai_lo", "aai_hi", "aai_kmers", strict=False).hstack(est)
 
 
 def aai_truth(nearest: pl.DataFrame) -> pl.DataFrame:
@@ -631,12 +696,17 @@ def aai_calibrate(args: argparse.Namespace) -> None:
 
 
 def aai_score_step(args: argparse.Namespace) -> None:
+    profile = read_profile(args.profile)
+    if args.alpha is not None or args.min_aai_kmers is not None:
+        mask = MIN_AAI_KMERS if args.min_aai_kmers is None else args.min_aai_kmers
+        profile = reestimate_aai(profile, args.k, args.alpha, mask)
     row = aai_score(
-        read_profile(args.profile),
+        profile,
         pl.read_parquet(args.gene_units),
         pl.read_csv(args.genes),
         args.min_id,
         args.min_cov,
+        args.k,
     )
     pl.DataFrame([{"sample": args.sample, "index": args.index, "arm": args.arm, **row}]).write_csv(
         args.out, separator="\t"
@@ -1124,6 +1194,9 @@ def main() -> None:
     p.add_argument("--arm", default="")
     p.add_argument("--min-id", type=float, default=0.9)
     p.add_argument("--min-cov", type=float, default=0.8)
+    p.add_argument("--k", type=int, default=11, help="the index's k")
+    p.add_argument("--alpha", type=float, help="re-estimate aai under this survival model")
+    p.add_argument("--min-aai-kmers", type=float, help="re-estimate aai with this mask")
     p.add_argument("--out", default="aai_score.tsv")
     p = sub.add_parser("aai-calibrate")
     p.add_argument("--profiles", required=True, nargs="+", help="unit profiles (units.tsv)")

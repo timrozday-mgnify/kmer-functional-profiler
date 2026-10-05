@@ -10,13 +10,20 @@ from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
+    AAI_MODEL,
     Index,
     IndexParams,
     build_index,
     write_unit_columns,
 )
 from kmer_functional_profiler.mask import Mask, build_mask
-from kmer_functional_profiler.query import Timer, check_aai_calibration, profile
+from kmer_functional_profiler.query import (
+    MIN_AAI_KMERS,
+    Timer,
+    check_aai_calibration,
+    check_aai_model,
+    profile,
+)
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULTS = IndexParams()
@@ -106,6 +113,29 @@ def calibrate_aai(
     target.write_text(json.dumps(cal, indent=1) + "\n")
 
 
+@app.command()
+def aai_model(
+    index_dir: Path,
+    model: Annotated[
+        Path | None,
+        typer.Argument(help="JSON from the aai-alpha workflow; omit to remove the model"),
+    ] = None,
+) -> None:
+    """Attach a k-mer survival model to an index (``aai_model.json``): its queries then
+    estimate ``aai`` under it (regional-gamma rates of shape ``alpha``) instead of a^k."""
+    target = index_dir / AAI_MODEL
+    if model is None:
+        target.unlink(missing_ok=True)
+        return
+    fitted = json.loads(model.read_text())
+    meta = json.loads((index_dir / "meta.json").read_text())
+    try:
+        check_aai_model(fitted, meta["params"])
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    target.write_text(json.dumps(fitted, indent=1) + "\n")
+
+
 @app.command(name="mask")
 def mask_command(
     genome: Annotated[Path, typer.Argument(help="Host genome FASTA (plain or gzip)")],
@@ -170,8 +200,16 @@ def query(
         ),
     ] = False,
     min_aai: Annotated[
-        float, typer.Option(help="Drop units with aai_naive below this (0 = keep all)")
+        float,
+        typer.Option(help="Drop units with aai_naive below this, or null (0 = keep all)"),
     ] = 0.0,
+    min_aai_kmers: Annotated[
+        float,
+        typer.Option(
+            help="aai, aai_lo, aai_hi (and aai_naive) null below this many hit k-mers "
+            "(aai_kmers, kmers_hit), which are still reported"
+        ),
+    ] = MIN_AAI_KMERS,
     extra_index: Annotated[
         list[Path] | None,
         typer.Option(
@@ -221,6 +259,7 @@ def query(
             low_memory=low_memory,
             with_aai=aai,
             min_aai=min_aai,
+            min_aai_kmers=min_aai_kmers,
             extra=extra,
             mask=masked,
             summary=sample,
