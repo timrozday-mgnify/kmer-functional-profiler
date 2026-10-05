@@ -814,6 +814,7 @@ process GENOME_FIT {
 
     output:
     tuple val(sid), val(label), val(name), path('genomes.tsv'), path('function_taxon.tsv'), emit: fit
+    tuple val(sid), val(name), path(profile), path(genome_index), path('genomes.tsv'), emit: prior
     path 'summary.json'
 
     script:
@@ -911,6 +912,90 @@ process GENOME_SCORE {
 
     stub:
     "touch genome_score.tsv"
+}
+
+process SUBSAMPLE {
+    tag "seed ${seed} x${fraction}"
+    label 'process_single'
+
+    input:
+    tuple val(seed), path(r1), path(r2), val(fraction)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    tuple val("${seed}d${fraction}"), val(seed), path('sub_R1.fastq.gz'), path('sub_R2.fastq.gz'), val(fraction), emit: reads
+
+    script:
+    "${params.bench} subsample --r1 ${r1} --r2 ${r2} --fraction ${fraction} --seed ${seed}"
+
+    stub:
+    "touch sub_R1.fastq.gz sub_R2.fastq.gz"
+}
+
+process PRIOR_BUILD {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(genome_index)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(name), path("carriage_${name}"), emit: carriage
+
+    script:
+    "${params.kfp_prior} build ${genome_index} carriage_${name}"
+
+    stub:
+    "mkdir carriage_${name}"
+}
+
+process PRIOR_UPDATE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/prior", mode: 'copy', saveAs: { f -> "seed${sid}_${name}_${f}" }
+
+    input:
+    tuple val(sid), val(name), path(profile), path(genome_index), path(genomes), path(carriage)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), val(name), path(genome_index), path('presence.tsv'), path('pfam_presence.tsv'), emit: presence
+
+    script:
+    // pfam_presence.tsv only with Pfam labels: an empty file otherwise
+    """
+    ${params.kfp_prior} update ${profile} ${genomes} ${genome_index} ${carriage} \\
+        --out presence.tsv --pfam-out pfam_presence.tsv
+    touch pfam_presence.tsv
+    """
+
+    stub:
+    "touch presence.tsv pfam_presence.tsv"
+}
+
+process PRIOR_SCORE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), path(genome_index), path(presence), path(pfam_presence), val(fraction), path(truth_genomes), path(genes)
+    path domains  // [] without Pfam
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'prior_score.tsv', emit: score
+    path 'prior_calibration.tsv', emit: calibration
+
+    script:
+    def pfam = pfam_presence.size() > 0 && domains ? "--pfam-presence ${pfam_presence} --genes ${genes} --domains ${domains}" : ''
+    """
+    ${params.bench} prior-score --presence ${presence} --genome-index ${genome_index} \\
+        --truth-genomes ${truth_genomes} --fraction ${fraction} --sample seed${sid} --index ${name} ${pfam}
+    """
+
+    stub:
+    "touch prior_score.tsv prior_calibration.tsv"
 }
 
 process DIAMOND_DB {
@@ -1378,6 +1463,18 @@ workflow BENCHMARK {
 
     def ch_sid_reads = ch_reads.map { sid, _seed, r1, r2 -> [sid, r1, r2] }
     def ch_variants = ch_sid_reads.map { sid, r1, r2 -> ['raw', sid, r1, r2] }
+    // Depth ladder (kfp-prior; README, Genome mode): subsampled plain samples, queried raw and
+    // used by genome mode only (no truth is mapped for them, so nothing else scores them)
+    def ladder_fractions = params.depth_ladder.toString().tokenize(',')*.trim()*.toDouble()
+    def ch_ladder = channel.empty()  // sid, seed, fraction
+    if (ladder_fractions) {
+        if (!params.genome_mode) {
+            error "--depth_ladder needs --genome_mode"
+        }
+        SUBSAMPLE(SIMULATE.out.reads.filter { 0d in fractions }.combine(channel.fromList(ladder_fractions)), bench_py)
+        ch_variants = ch_variants.mix(SUBSAMPLE.out.reads.map { sid, _seed, r1, r2, _f -> ['raw', sid, r1, r2] })
+        ch_ladder = SUBSAMPLE.out.reads.map { sid, seed, _r1, _r2, f -> [sid, seed.toString(), f] }
+    }
     if ('fastp' in kinds) {
         FASTP(ch_sid_reads)
         ch_variants = ch_variants.mix(FASTP.out.reads)
@@ -1570,7 +1667,7 @@ workflow BENCHMARK {
             .filter { it[3] == '' && !(it[2] in by_pfam) }
             .map { sid, label, name, _arm, profile, _kmers -> [name, sid, label, profile] }
             .mix(PROFILE.out.units.filter { it[2] == '' }.map { sid, name, _arm, units -> [name, sid, 'pfam', units] })
-            .filter { _name, sid, _label, _profile -> sid ==~ /\d+/ }  // not host spike-ins
+            .filter { _name, sid, _label, _profile -> sid ==~ /\d+(d[\d.]+)?/ }  // not host spike-ins
         GENOME_FIT(
             ch_unit_profiles.combine(ANNOTATE_GENOMES.out.index, by: 0)
                 .map { name, sid, label, profile, gi -> [sid, label, name, profile, gi] },
@@ -1590,6 +1687,29 @@ workflow BENCHMARK {
             bench_py,
         )
         GENOME_SCORE.out.score.collectFile(name: 'genome_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+        // kfp-prior on every fitted sample (full samples at fraction 1, and the ladder's rungs)
+        PRIOR_BUILD(ANNOTATE_GENOMES.out.index, ch_code)
+        PRIOR_UPDATE(
+            GENOME_FIT.out.prior.map { sid, name, profile, gi, genomes -> [name, sid, profile, gi, genomes] }
+                .combine(PRIOR_BUILD.out.carriage, by: 0)
+                .map { name, sid, profile, gi, genomes, carriage -> [sid, name, profile, gi, genomes, carriage] },
+            ch_code,
+        )
+        def ch_rungs = ch_ladder.mix(ch_reads.filter { sid, seed, _r1, _r2 -> sid == seed.toString() }
+            .map { sid, seed, _r1, _r2 -> [sid, seed.toString(), 1.0d] })
+        def ch_seed_truth = GENOME_TRUTH.out.truth.map { sid, genomes, _functions -> [sid, genomes] }
+            .join(SAMPLE.out.sample.map { seed, _fna, genes -> [seed.toString(), genes] })  // seed, truth, genes
+        PRIOR_SCORE(
+            PRIOR_UPDATE.out.presence
+                .combine(ch_rungs, by: 0)  // sid, name, gi, presence, pfam, seed, fraction
+                .map { sid, name, gi, presence, pfam, seed, f -> [seed, sid, name, gi, presence, pfam, f] }
+                .combine(ch_seed_truth, by: 0)
+                .map { _seed, sid, name, gi, presence, pfam, f, truth, genes -> [sid, name, gi, presence, pfam, f, truth, genes] },
+            ch_domains,
+            bench_py,
+        )
+        PRIOR_SCORE.out.score.collectFile(name: 'prior_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+        PRIOR_SCORE.out.calibration.collectFile(name: 'prior_calibration.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
     }
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and

@@ -55,6 +55,9 @@
   of the record as protein FASTA for ``annotate-genomes``; per-sample genome and
   (genome, function) truth from the per-gene truth; and a genome fit (or sylph) scored
   against it.
+- ``subsample``, ``prior-score``: kfp-prior's depth ladder (phase 11): read pairs kept at
+  a fraction; unit and Pfam presence, observed vs updated, by carrier depth, and the
+  calibration of zero-hit units.
 - ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
@@ -67,7 +70,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Final
 
 import mappy
 import numpy as np
@@ -1321,6 +1324,126 @@ def genome_score(args: argparse.Namespace) -> None:
     pl.DataFrame([row]).write_csv(args.out, separator="\t")
 
 
+def subsample(args: argparse.Namespace) -> None:
+    """A rung of the depth ladder (phase 11, kfp-prior): each read pair kept with
+    probability ``--fraction``, drawn with ``--seed``, so every genome's depth scales by it."""
+    rng = random.Random(args.seed)
+    with (
+        gzip.open(args.r1, "rt") as i1, gzip.open(args.r2, "rt") as i2,
+        gzip.open("sub_R1.fastq.gz", "wt", compresslevel=1) as o1,
+        gzip.open("sub_R2.fastq.gz", "wt", compresslevel=1) as o2,
+    ):  # fmt: skip
+        for rec1, rec2 in zip(_records(i1), _records(i2), strict=True):
+            if rng.random() < args.fraction:
+                o1.write(rec1)
+                o2.write(rec2)
+
+
+DEPTH_BINS: Final = [0.0, 0.05, 0.1, 0.3, 1.0, 3.0, float("inf")]
+PROB_BINS: Final = [i / 10 for i in range(11)]
+
+
+def _accession(col: str) -> pl.Expr:
+    """Pfam accessions as ``PF01007``, from MGnify's numbers or versioned names."""
+    return (
+        pl.col(col)
+        .cast(pl.String)
+        .str.replace(r"\.\d+$", "")
+        .map_elements(
+            lambda a: a if a.startswith("PF") else f"PF{int(a):05d}", return_dtype=pl.String
+        )
+    )
+
+
+def _by_depth(truth: pl.DataFrame, predicted: set, level: str) -> list[dict[str, Any]]:
+    """Completeness per bin of the depth of the deepest sample genome carrying each true
+    item (``item``, ``depth``), observed and updated (``predicted``: {kind: items})."""
+    binned = truth.with_columns(
+        bin=pl.col("depth").cut(DEPTH_BINS[1:-1], left_closed=True).cast(pl.String)
+    )
+    rows = []
+    for (label,), part in binned.group_by("bin"):
+        items = set(part["item"].to_list())
+        rows.append({"level": level, "bin": label, "n_truth": len(items)}
+                    | {f"completeness_{k}": len(items & v) / len(items)
+                       for k, v in predicted.items()})  # fmt: skip
+    every = set(truth["item"].to_list())
+    rows.append({"level": level, "bin": "all", "n_truth": len(every)}
+                | {f"completeness_{k}": len(every & v) / max(len(every), 1)
+                   for k, v in predicted.items()}
+                | {f"purity_{k}": len(every & v) / max(len(v), 1) for k, v in predicted.items()}
+                | {f"n_pred_{k}": len(v) for k, v in predicted.items()})  # fmt: skip
+    return rows
+
+
+def prior_score(args: argparse.Namespace) -> None:
+    """kfp-prior on a depth-ladder rung against what the sample's genomes carry: units
+    (their proteins' best units in the genome index) and, with ``--pfam-presence``, Pfams
+    (their genes' domains). Completeness per bin of carrier depth (the full sample's
+    genome depth x ``--fraction``) for the observed (``present_prob`` >= 0.5 with hits) and
+    updated (``present_prob_updated`` >= 0.5) calls, and purity over all; and, in
+    ``--out-calibration``, the units with zero hits per bin of ``present_prob_updated``:
+    their mean prediction and the share truly carried."""
+    gi = Path(args.genome_index)
+    names = pl.read_csv(gi / "genomes.tsv", separator="\t").select("genome", "name")
+    depth = pl.read_csv(args.truth_genomes).select(
+        name="genome", depth=pl.col("depth") * args.fraction
+    )
+    sample = names.join(depth, on="name")
+    units = (
+        pl.read_parquet(gi / "genome_best.parquet")
+        .join(sample.cast({"genome": pl.UInt32}), on="genome")
+        .group_by("unit")
+        .agg(pl.col("depth").max())
+        .select(item=pl.col("unit").cast(pl.Int64), depth="depth")
+    )
+    presence = pl.read_csv(args.presence, separator="\t")
+    called = {
+        "observed": set(presence.filter((pl.col("hits") > 0) & (pl.col("present_prob") >= 0.5))
+                        ["unit"].to_list()),
+        "updated": set(presence.filter(pl.col("present_prob_updated") >= 0.5)["unit"].to_list()),
+    }  # fmt: skip
+    rows = _by_depth(units, called, "unit")
+    if args.pfam_presence:
+        genome_of = pl.read_parquet(args.genes).select(
+            "gene_name", name=pl.col("contig").str.split("|").list.first()
+        )
+        pfams = (
+            pl.read_parquet(args.domains)
+            .join(genome_of, on="gene_name")
+            .join(depth, on="name")
+            .group_by("pfam")
+            .agg(pl.col("depth").max())
+            .select(item=_accession("pfam"), depth="depth")
+        )
+        pp = pl.read_csv(args.pfam_presence, separator="\t").with_columns(
+            item=_accession("pfam_accession")
+        )
+        called = {
+            "observed": set(pp.filter(pl.col("present_prob_observed") >= 0.5)["item"].to_list()),
+            "updated": set(pp.filter(pl.col("present_prob_updated") >= 0.5)["item"].to_list()),
+        }
+        rows += _by_depth(pfams, called, "pfam")
+    keys = {"sample": args.sample, "fraction": args.fraction, "index": args.index}
+    pl.DataFrame([keys | r for r in rows]).write_csv(args.out, separator="\t")
+    zero = presence.filter(pl.col("hits") == 0).with_columns(
+        carried=pl.col("unit").is_in(units["item"].implode()),
+        bin=pl.col("present_prob_updated").cut(PROB_BINS[1:-1], left_closed=True).cast(pl.String),
+    )
+    (
+        zero.group_by("bin")
+        .agg(
+            n=pl.len(),
+            predicted=pl.col("present_prob_updated").mean(),
+            carried=pl.col("carried").mean(),
+        )  # fmt: skip
+        .with_columns(**{k: pl.lit(v) for k, v in keys.items()})
+        .select(*keys, "bin", "n", "predicted", "carried")
+        .sort("bin")
+        .write_csv(args.out_calibration, separator="\t")
+    )
+
+
 def main() -> None:
     if sys.argv[1:2] == ["iss"]:  # iss parses its own arguments
         iss(sys.argv[2:])
@@ -1458,6 +1581,20 @@ def main() -> None:
     p.add_argument("--function-taxon")
     p.add_argument("--truth-functions")
     p.add_argument("--out", default="genome_score.tsv")
+    p = sub.add_parser("subsample")
+    for name in ("r1", "r2"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p = sub.add_parser("prior-score")
+    for name in ("presence", "genome-index", "truth-genomes", "sample", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, default=1.0)
+    p.add_argument("--pfam-presence")
+    p.add_argument("--genes", help="the sample's genes.parquet (with --pfam-presence)")
+    p.add_argument("--domains", help="domains.parquet (with --pfam-presence)")
+    p.add_argument("--out", default="prior_score.tsv")
+    p.add_argument("--out-calibration", default="prior_calibration.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
@@ -1468,7 +1605,8 @@ def main() -> None:
              "study-proteins": study_proteins, "study-rebuild": study_rebuild,
              "study-ladder": study_ladder, "study-unrelated": study_unrelated,
              "genome-set": genome_set, "genome-truth": genome_truth,
-             "genome-score": genome_score}  # fmt: skip
+             "genome-score": genome_score, "subsample": subsample,
+             "prior-score": prior_score}  # fmt: skip
     steps[args.step](args)
 
 

@@ -440,8 +440,33 @@ genomes carry no taxonomy, so the table is scored at genome rank. Ablation confi
 `ablations/genomes.config` (`hpc/kfp-ablations/genome-mode`). Locally:
 
 ```bash
-nextflow run workflows/fmh-benchmark -profile test,docker --genome_mode true --tools '' --outdir results-test-genomes
+nextflow run workflows/fmh-benchmark -profile test,docker --genome_mode true --depth_ladder 0.3 --tools '' --outdir results-test-genomes
 ```
+
+### kfp-prior and the depth ladder
+
+With genome mode on, `kfp-prior` runs on every fitted sample, and `--depth_ladder`
+(e.g. `0.01,0.03,0.1,0.3`) adds each plain sample subsampled to those read-pair fractions
+(queried raw and used by genome mode only):
+
+```text
+SUBSAMPLE      read pairs kept at each fraction -> sample <seed>d<fraction>
+PRIOR_BUILD    `kfp-prior build` per genome index -> carriage_<name>/
+PRIOR_UPDATE   `kfp-prior update` per fitted sample -> prior/seed<sid>_<name>_{presence,pfam_presence}.tsv
+PRIOR_SCORE    prior_scores.tsv: unit and Pfam completeness, observed (present_prob >= 0.5 with
+               hits) vs updated (present_prob_updated >= 0.5), per bin of carrier depth (the
+               deepest sample genome carrying it: full-sample depth x fraction), and purity;
+               prior_calibration.tsv: zero-hit units per bin of present_prob_updated, mean
+               prediction vs share truly carried
+```
+
+Truth: units are the sample genomes' proteins' best units in the genome index; Pfams their
+genes' domains (MGnify indexes only, which carry Pfam labels). The gate: at 0.1-1x, Pfam
+completeness +10 points at <= 2 points of purity; calibration error <= 0.05; no change
+when no genomes are detected. Caveat: the record's genomes have no taxonomy, and each
+sample genome is itself in the reference set, so the prior is that genome's own carriage
+shrunk towards all genomes: the optimistic case. The plan's hold-out arm (relatives only)
+is not built yet.
 
 On the fixture (2000 reads) the low-abundance genome of each sample has fewer than
 `MIN_UNITS` (10) hit units and is missed; the Pfam-unit indexes detect none. It checks the
