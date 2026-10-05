@@ -3,6 +3,7 @@
 // detection by other tools (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4).
 // See README.md.
 
+include { STUDY_CLUSTER; STUDY_MEMBERS; STUDY_INDEX_BUILD; STUDY_INDEX_BUILD as REBUILD_INDEX } from '../study-index/main.nf'
 
 process FETCH {
     label 'process_single'
@@ -420,7 +421,9 @@ process PROFILE {
     script:
     // by_pfam: units carry Pfam labels (MGnify90 clusters), and the profile is summed per Pfam
     def out = by_pfam ? 'units.tsv' : 'profile.tsv'
-    def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet"
+    // a labelled extra index (the study ladder's study index) adds its labels, offset
+    def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet" +
+        (decoy ? ' \$(ls decoy/unit_pfam.parquet 2>/dev/null)' : '')
     def extra = (mask ? ' --mask mask' : '') + (decoy ? ' --extra-index decoy' : '')
     """
     ${params.kfp} query ${index} ${r1} ${r2} --out ${out} --draws ${params.draws} --kmers kmers.parquet \\
@@ -667,6 +670,91 @@ process DECOY_INDEX {
 
     stub:
     "mkdir decoy_${cfg}"
+}
+
+// ---- Study ladder (phase 10; README, Study ladder): part of each sample's genomes as a
+// study index queried with an MGnify index, against a rebuild that includes them.
+
+process STUDY_FAA {
+    tag "seed ${seed}"
+    label 'process_single'
+
+    input:
+    tuple val(seed), path(genes)
+    path genomes
+    path domains
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(seed), path('study.faa'), path('study_pfam.parquet'), emit: study
+    path 'study_genomes.txt'
+
+    script:
+    """
+    ${params.bench} study-proteins --genomes-dir ${genomes} --genes ${genes} --domains ${domains} \
+        --fraction ${params.study_fraction} --seed ${seed}
+    """
+
+    stub:
+    "touch study.faa study_pfam.parquet study_genomes.txt"
+}
+
+process STUDY_REBUILD_TABLES {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(members, stageAs: 'members/*'), path(pfam, stageAs: 'pfam/*'), path(study_members), path(study_pfam), path(gene_units)
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('members.parquet'), path('pfam.parquet'), emit: tables
+
+    script:
+    """
+    ${params.bench} study-rebuild --members ${members} --pfam ${pfam} --study-members ${study_members} \
+        --study-pfam ${study_pfam} --gene-units ${gene_units} --min-id ${params.mgnify_min_id} \
+        --min-cov ${params.mgnify_min_cov}
+    """
+
+    stub:
+    "touch members.parquet pfam.parquet"
+}
+
+process STUDY_UNRELATED {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), path(base, stageAs: 'base.tsv'), path(joint, stageAs: 'joint.tsv')
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'study_unrelated.tsv', emit: unrelated
+
+    script:
+    "${params.bench} study-unrelated --base base.tsv --joint joint.tsv --run seed${sid}_${name}"
+
+    stub:
+    "touch study_unrelated.tsv"
+}
+
+process STUDY_LADDER {
+    label 'process_single'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path scores, stageAs: 'score*.tsv'
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'study_ladder.tsv'
+
+    script:
+    "${params.bench} study-ladder --scores ${scores}"
+
+    stub:
+    "touch study_ladder.tsv"
 }
 
 // ---- Other tools (--tools). Each writes its raw output to raw/; TOOL_PROFILE turns it into
@@ -941,6 +1029,13 @@ process SUMMARY {
     "touch summary.tsv scores.tsv"
 }
 
+// [seed, MGnify index name] of a study ladder run, seed<N>_<name>[_rebuild]
+def studyRun(String run) {
+    def m = run =~ /^seed(\d+)_(.+?)(_rebuild)?$/
+    m.find()
+    return [m.group(1), m.group(2)]
+}
+
 // Output of a git command in the pipeline's checkout (for run.json).
 def git(List cmd) {
     return (['git', '-C', projectDir.toString()] + cmd).execute().text.trim()
@@ -1172,6 +1267,56 @@ workflow BENCHMARK {
             [sid, r1, r2, label, name, index, by_pfam, arm.name, arm.args, arm.mask ? mask : [], arm.decoy ? decoy : []]
         }
 
+    // Study ladder: per seed and MGnify index built from members, a study index of part of the
+    // sample's genomes queried jointly (arm study) and a rebuild including them (arm rebuild)
+    def ladder = params.study_ladder ? mgnify.findAll { it.members } : []
+    if (params.study_ladder) {
+        if (!('pfam' in labels)) error '--study_ladder needs the pfam label (the study is scored on Pfam)'
+        if (!ladder || ladder.any { !it.pfam }) error '--study_ladder needs mgnify_indexes built from members, with pfam'
+        STUDY_FAA(SAMPLE.out.sample.map { seed, _fna, genes -> [seed, genes] }, FETCH.out.genomes, ch_domains, bench_py)
+        def ch_faa = STUDY_FAA.out.study.map { seed, faa, _pfam -> ["seed${seed}".toString(), faa] }
+        STUDY_CLUSTER(ch_faa, params.study_cluster_args)
+        STUDY_MEMBERS(ch_faa.join(STUDY_CLUSTER.out.clusters))
+        // seed, study members, study pfam
+        def ch_study = STUDY_MEMBERS.out.members
+            .join(STUDY_FAA.out.study.map { seed, _faa, pfam -> ["seed${seed}".toString(), pfam] })
+            .map { name, members, pfam -> [name - 'seed', members, pfam] }
+        def ch_base = ch_mgnify.filter { name, _index -> name in ladder*.name }
+        STUDY_INDEX_BUILD(
+            ch_study.combine(ch_base).map { seed, members, pfam, name, index -> ["seed${seed}_${name}", members, pfam, index] },
+            '',
+        )
+        STUDY_REBUILD_TABLES(
+            ch_study.combine(channel.fromList(ladder).map { cfg -> [cfg.name, files(cfg.members), file(cfg.pfam)] })
+                .map { seed, members, pfam, name, base_members, base_pfam -> [name, seed, base_members, base_pfam, members, pfam] }
+                .combine(ch_gene_units, by: 0)
+                .map { name, seed, base_members, base_pfam, members, pfam, gene_units ->
+                    ["seed${seed}_${name}", base_members, base_pfam, members, pfam, gene_units] },
+            bench_py,
+        )
+        REBUILD_INDEX(
+            STUDY_REBUILD_TABLES.out.tables
+                .map { run, members, pfam -> studyRun(run).reverse() + [members, pfam] }
+                .combine(ch_base, by: 0)
+                .map { name, seed, members, pfam, index -> ["seed${seed}_${name}_rebuild", members, pfam, index] },
+            '',
+        )
+        // the plain samples (no host spike-in): sid is the seed
+        def ch_plain = ch_reads.filter { sid, seed, _r1, _r2 -> sid == seed.toString() }
+            .map { sid, _seed, r1, r2 -> [sid, r1, r2] }
+        def ch_joint = STUDY_INDEX_BUILD.out.index
+            .map { run, study -> studyRun(run).reverse() + [study] }
+            .combine(ch_base, by: 0)
+            .map { name, seed, study, base -> [seed, name, study, base] }
+        def ch_rebuilt = REBUILD_INDEX.out.index.map { run, index -> studyRun(run) + [index] }
+        ch_runs = ch_runs.mix(
+            ch_plain.combine(ch_joint, by: 0)
+                .map { sid, r1, r2, name, study, base -> [sid, r1, r2, 'pfam', name, base, true, 'study', '', [], study] },
+            ch_plain.combine(ch_rebuilt, by: 0)
+                .map { sid, r1, r2, name, index -> [sid, r1, r2, 'pfam', name, index, true, 'rebuild', '', [], []] },
+        )
+    }
+
     PROFILE(ch_runs, ch_code)
     // sid, label, name, arm, profile, kmers, truth
     ch_scored = PROFILE.out.profile.combine(ch_truth, by: [0, 1])
@@ -1229,8 +1374,18 @@ workflow BENCHMARK {
         bench_py,
     )
     SUMMARY(SCORE.out.score.collect())
+    if (params.study_ladder) {
+        STUDY_LADDER(SCORE.out.score.collect(), bench_py)
+        STUDY_UNRELATED(
+            PROFILE.out.units.filter { it[2] == '' }.map { sid, name, _arm, units -> [sid, name, units] }
+                .join(PROFILE.out.units.filter { it[2] == 'study' }.map { sid, name, _arm, units -> [sid, name, units] }, by: [0, 1]),
+            bench_py,
+        )
+        STUDY_UNRELATED.out.unrelated.collectFile(name: 'study_unrelated.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+    }
     // unit-level detection and AAI of the MGnify indexes against the DIAMOND truth
     def ch_aai = PROFILE.out.units
+        .filter { it[2] !in ['study', 'rebuild'] }  // the ladder's indexes have other units
         .map { sid, name, arm, units -> [name, sid, arm, units] }
         .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
         .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }

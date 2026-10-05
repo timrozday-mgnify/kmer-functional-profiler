@@ -418,3 +418,46 @@ def test_aai_calibrate_transfers_a_map_between_runs(tmp_path: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         run(tmp_path, "aai-calibrate", "--profiles", "c.tsv", *common, "--index", "idx_c",
             "--map", "a.json", "--scores-out", "a_to_c.tsv")  # fmt: skip
+
+
+def test_study_rebuild_and_ladder(tmp_path: Path) -> None:
+    # Base: two MGnify clusters with integer ids and Pfam numbers.
+    base = {"protein_id": [1, 2], "cluster_rep": [1, 1], "full_length": [True, True],
+            "sequence": ["MAAA", "MAAC"]}  # fmt: skip
+    pl.DataFrame(base).write_parquet(tmp_path / "base.parquet")
+    pl.DataFrame({"protein_id": [1], "pfam_accession": [1007]}).write_parquet(
+        tmp_path / "bp.parquet"
+    )
+    # Study: g1 is 95% identical to cluster 1, g2 only 80%, g3 has no hit; linclust put all
+    # three in g1's cluster.
+    pl.DataFrame({"protein_id": ["g1", "g2", "g3"], "cluster_rep": ["g1", "g1", "g1"],
+                  "full_length": [True, True, False], "sequence": ["MAAD", "MAAE", "MAAF"]}
+                 ).write_parquet(tmp_path / "sm.parquet")  # fmt: skip
+    pl.DataFrame({"protein_id": ["g3"], "pfam_accession": ["PF00042"]}).write_parquet(
+        tmp_path / "sp.parquet"
+    )
+    pl.DataFrame({"gene_name": ["g1", "g2", "g1"], "cluster_rep": [1, 1, 2],
+                  "identity": [0.95, 0.8, 0.95], "qcov": [1.0, 1.0, 1.0], "scov": [1.0, 1.0, 1.0],
+                  "rank": [1, 1, 2]}).write_parquet(tmp_path / "gu.parquet")  # fmt: skip
+    run(tmp_path, "study-rebuild", "--members", "base.parquet", "--pfam", "bp.parquet",
+        "--study-members", "sm.parquet", "--study-pfam", "sp.parquet", "--gene-units",
+        "gu.parquet")  # fmt: skip
+    members = pl.read_parquet(tmp_path / "members.parquet")
+    assert members.select("protein_id", "cluster_rep").rows() == [
+        ("1", "1"), ("2", "1"), ("g1", "1"), ("g2", "g1"), ("g3", "g1")
+    ]  # fmt: skip
+    assert pl.read_parquet(tmp_path / "pfam.parquet").rows() == [
+        ("1", "PF01007"),
+        ("g3", "PF00042"),
+    ]
+
+    # The joint query recovers 3/4 of the rebuild's completeness gain.
+    keys = {"index": "m", "count": "kmers_unique", "abundance": "coverage_em", "min_hits": 1,
+            "label": "pfam", "sample": "seed1"}  # fmt: skip
+    for i, (arm, completeness) in enumerate((("", 0.5), ("study", 0.65), ("rebuild", 0.7))):
+        pl.DataFrame([keys | {"arm": arm, "completeness": completeness, "purity": 0.9}]).write_csv(
+            tmp_path / f"s{i}.tsv", separator="\t"
+        )
+    run(tmp_path, "study-ladder", "--scores", "s0.tsv", "s1.tsv", "s2.tsv")
+    ladder = pl.read_csv(tmp_path / "study_ladder.tsv", separator="\t")
+    assert ladder["recovered"].to_list() == pytest.approx([0.75])
