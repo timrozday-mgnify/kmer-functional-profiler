@@ -9,6 +9,7 @@ import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
+from kmer_functional_profiler.genomes import annotate_genomes as annotate
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
     Index,
@@ -139,6 +140,23 @@ def mask_command(
 ) -> None:
     """Build a mask sidecar: the index's k-mers in the six-frame translated genome."""
     typer.echo(json.dumps(build_mask(genome, index_dir, out_dir), indent=2))
+
+
+@app.command()
+def annotate_genomes(
+    index_dir: Path,
+    genomes: Annotated[
+        Path,
+        typer.Argument(
+            help="TSV: genome (name), path (protein FASTA, relative to the TSV), optional "
+            "taxonomy (GTDB-style d__;p__;...;s__)"
+        ),
+    ],
+    out_dir: Path,
+) -> None:
+    """Annotate reference genomes with the index: each genome's raw tier-2 hits per unit,
+    the content `genomes` fits a profile with."""
+    typer.echo(json.dumps(annotate(index_dir, genomes, out_dir), indent=2))
 
 
 @app.command()
