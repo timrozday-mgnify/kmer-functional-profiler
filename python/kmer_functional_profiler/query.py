@@ -1666,6 +1666,8 @@ def profile(
     ``extra`` indexes (same k, alphabet and hash scheme) are queried jointly with ``index``:
     their units compete with its units in gather, EM and the posterior, with ids offset by
     the units of the indexes before, and a ``source`` column (0 = ``index``) in the output.
+    An index built with ``role: decoy`` in its ``meta.json`` competes the same way, but its
+    units are reported as one row (:func:`collapse_decoys`).
 
     ``mask`` (:class:`~kmer_functional_profiler.mask.Mask`, built against ``index``) drops
     masked sampled hashes before any lookup and subtracts the masked postings from the unit
@@ -2045,4 +2047,32 @@ def profile(
             None if census_max is None else (census[0], census[1]),
             joint.max_hash("tier2") / 2**64,
         )
-    return result.filter(pl.col("aai_naive") >= min_aai)
+    result = result.filter(pl.col("aai_naive") >= min_aai)
+    decoys = [i for i, ix in enumerate(joint.indexes) if ix.meta.get("role") == "decoy"]
+    return collapse_decoys(result, decoys) if decoys and "source" in result.columns else result
+
+
+def collapse_decoys(result: pl.DataFrame, decoys: list[int]) -> pl.DataFrame:
+    """Replace the units of each decoy index (``source`` in ``decoys``) by one row named
+    ``decoy``: ``hits``, ``hits_em``, ``kmers_hit``, ``reads`` and ``m_g`` summed over its
+    hit units (``reads`` counts a read once per unit it hits), ``coverage`` and
+    ``coverage_em`` over that ``m_g``, and ``decoy_units`` (units hit) and
+    ``decoy_detected`` (units given hits by the EM). Decoy units have already competed in
+    gather and the EM; this only keeps them out of the unit and label tables."""
+    is_decoy = pl.col("source").is_in(decoys)
+    rows = (
+        result.filter(is_decoy)
+        .group_by("source")
+        .agg(
+            pl.col("hits", "hits_em", "kmers_hit", "reads", "m_g").sum(),
+            decoy_units=pl.len().cast(pl.UInt32),
+            decoy_detected=(pl.col("hits_em") > 0).sum().cast(pl.UInt32),
+        )
+        .with_columns(
+            name=pl.lit("decoy"),
+            coverage=pl.col("hits") / pl.col("m_g"),
+            coverage_em=pl.col("hits_em") / pl.col("m_g"),
+        )
+        .sort("source")
+    )
+    return pl.concat([result.filter(~is_decoy), rows], how="diagonal_relaxed")
