@@ -1414,6 +1414,7 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - *Calibration transfer:* for the winning index, a map fitted on the NovaSeq run and scored with `--map` on each other run keeps bias within ±0.01 at 70–100% and coverage ≥ 0.9 (step 17's criterion, for the read axes; genome sets and subset density remain).
   - *Workflow changes:* `ablations/floor.config` (new); `index.config`, `reads.config` and `host.config` as above; `MGNIFY_INDEX` publishes its index (hard links, so the work directory must share the outdir's filesystem, as `run_ablations.sh`'s does); `run_ablations.sh` accepts `floor`.
   - *Checked:* stub runs of `floor`, `index`, `reads` and `host` on the test profile (with a resource cap for the laptop: the HPC overrides ask for 32–64 GB) give 24, 82 (+4 from the test profile's own MGnify indexes), 154 and 208 profiles over 2 seeds. `floor` publishes all six indexes and a map per index and arm.
+  - *Run directories:* `hpc/kfp-ablations/`, one per run (`00-dbs`, five `floor`, `index`, two `reads`, `host`, `floor-query-cost`), each a `run.sh` submitted from its own directory, with relative paths to the repo, the 1-in-100 subset, the Singularity cache and a shared `fmh-benchmark-data` storeDir (layout in its README), and the EBI Slurm settings in `site.config`. Work and outdir sit together in each run directory, as the hard-linked index publishing needs. Checked by a dry run of every script in a simulated layout and `nextflow config` on the merged configs.
   - Results: pending on HPC.
 
 ## Libraries

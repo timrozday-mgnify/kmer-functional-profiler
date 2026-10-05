@@ -288,7 +288,8 @@ Phase 7 measures each change against the phase-6 method on this benchmark (plan,
 steps 6 and 19). Each run is a config in `ablations/` on top of the site's `hpc.config`,
 with its own output and work directory, so they can run at once. The databases in the shared
 `storeDir` (`--data_dir`, `--db_dir`) are fetched first, alone, so that parallel runs do not
-download into it at the same time:
+download into it at the same time. `hpc/kfp-ablations/` has every run below as a ready-to-submit directory
+(relative paths, EBI Slurm settings; its README has the layout); the commands are:
 
 ```bash
 sbatch workflows/fmh-benchmark/run_hpc.sh --dbs_only --tools '' --dbs pfam,hostile,host,decoy \
