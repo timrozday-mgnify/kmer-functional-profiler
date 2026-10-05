@@ -17,13 +17,8 @@ from kmer_functional_profiler.index import (
     write_unit_columns,
 )
 from kmer_functional_profiler.mask import Mask, build_mask
-from kmer_functional_profiler.query import (
-    MIN_AAI_KMERS,
-    Timer,
-    check_aai_calibration,
-    check_aai_model,
-    profile,
-)
+from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
+from kmer_functional_profiler.survival import check_aai_model
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULTS = IndexParams()
@@ -118,11 +113,12 @@ def aai_model(
     index_dir: Path,
     model: Annotated[
         Path | None,
-        typer.Argument(help="JSON from the aai-alpha workflow; omit to remove the model"),
+        typer.Argument(help="JSON from the aai-model workflow; omit to remove the model"),
     ] = None,
 ) -> None:
     """Attach a k-mer survival model to an index (``aai_model.json``): its queries then
-    estimate ``aai`` under it (regional-gamma rates of shape ``alpha``) instead of a^k."""
+    estimate ``aai`` under it (Markov-modulated gamma rates, ``survival.SurvivalModel``)
+    instead of a^k."""
     target = index_dir / AAI_MODEL
     if model is None:
         target.unlink(missing_ok=True)

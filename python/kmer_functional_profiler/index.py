@@ -507,7 +507,8 @@ class Index:
         False. ``aai_calibration.json``, if present, is the map the query applies to ``aai``
         (attached after the build, see ``query.check_aai_calibration``; a sidecar, so
         ``meta.json`` and the hashes recorded of it stay as built); ``aai_model.json``, if
-        present, the k-mer survival model ``aai`` inverts (``query.survival``; same reason)."""
+        present, the k-mer survival model ``aai`` inverts (``survival.SurvivalModel``; a
+        sidecar for the same reason)."""
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
         calibration = directory / AAI_CALIBRATION
