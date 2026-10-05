@@ -27,6 +27,8 @@ cd kfp-ablations/floor-query-cost && sbatch run.sh
 # release tiers (plan, phase 7, step 21), then their query cost when tiers-novaseq has finished:
 cd kfp-ablations/tiers-novaseq && sbatch run.sh
 cd kfp-ablations/tiers-query-cost && sbatch run.sh
+# aai survival model (plan, phase 7, step 23), independent of the rest; no 00-dbs needed:
+cd kfp-ablations/aai-alpha && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
