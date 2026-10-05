@@ -45,8 +45,17 @@ def index(
     t_dense: float = DEFAULTS.t_dense,
     batch_residues: int = DEFAULTS.batch_residues,
     postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
+    role: Annotated[
+        str | None,
+        typer.Option(
+            help="decoy: when queried as an --extra-index, its units compete but are "
+            "reported as one row (host or contaminant proteomes)"
+        ),
+    ] = None,
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
+    if role not in (None, "decoy"):
+        raise typer.BadParameter("role must be decoy")
     params = IndexParams(
         k=k,
         alphabet=alphabet,
@@ -60,7 +69,11 @@ def index(
         t_dense=t_dense,
         batch_residues=batch_residues,
     )
-    typer.echo(json.dumps(build_index(members, out_dir, params, pfam, postings), indent=2))
+    stats = build_index(members, out_dir, params, pfam, postings)
+    if role is not None:
+        meta = json.loads((out_dir / "meta.json").read_text())
+        (out_dir / "meta.json").write_text(json.dumps(meta | {"role": role}, indent=2) + "\n")
+    typer.echo(json.dumps(stats, indent=2))
 
 
 @app.command()

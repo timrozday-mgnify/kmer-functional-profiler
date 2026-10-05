@@ -295,6 +295,36 @@ def test_joint_query_equals_one_index_of_the_union(
     assert with_unrelated.select(keep).equals(alone.select(keep))
 
 
+def test_decoy_index_competes_and_reports_one_row(tmp_path: Path) -> None:
+    seqs = list(proteins().values())
+    half = len(seqs) // 2
+    a = write_members(tmp_path / "a.parquet", seqs[:half])
+    b = write_members(tmp_path / "b.parquet", seqs[half:], half)
+    opts = ["--k", str(K), "--t-base", "1.0"]
+    runner = CliRunner()
+    for args in (
+        [str(a), str(tmp_path / "a")],
+        [str(b), str(tmp_path / "b")],
+        [str(b), str(tmp_path / "decoy"), "--role", "decoy"],
+        [str(a), str(tmp_path / "a_decoy"), "--role", "decoy"],
+    ):
+        assert runner.invoke(app, ["index", *args, *opts]).exit_code == 0
+    base, plain, decoy, a_decoy = (Index.load(tmp_path / n) for n in ("a", "b", "decoy", "a_decoy"))
+    assert decoy.meta["role"] == "decoy" and "role" not in plain.meta
+    joint = profile(base, *READS, extra=[plain])
+    with_decoy = profile(base, *READS, extra=[decoy])
+    own = joint.filter(pl.col("source") == 0)
+    assert with_decoy.filter(pl.col("source") == 0).select(own.columns).equals(own)
+    (row,) = with_decoy.filter(pl.col("source") == 1).iter_rows(named=True)
+    theirs = joint.filter(pl.col("source") == 1)
+    assert row["name"] == "decoy" and row["unit"] is None
+    assert row["hits"] == theirs["hits"].sum() and row["decoy_units"] == theirs.height
+    assert row["hits_em"] == pytest.approx(theirs["hits_em"].sum())
+    # Gather breaks ties by unit id: a decoy identical to the base gets nothing.
+    copied = profile(base, *READS, extra=[a_decoy])
+    assert copied.filter(pl.col("source") == 1)["hits_em"].to_list() == [0.0]
+
+
 def test_joint_query_rejects_a_different_scheme(tmp_path: Path) -> None:
     seqs = list(proteins().values())[:3]
     path = write_members(tmp_path / "m.parquet", seqs)
