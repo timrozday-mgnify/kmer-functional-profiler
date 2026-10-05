@@ -1,6 +1,7 @@
 """Prototype CLI; mirrors the planned Rust one."""
 
 import json
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Annotated
 
@@ -45,6 +46,13 @@ def index(
     t_dense: float = DEFAULTS.t_dense,
     batch_residues: int = DEFAULTS.batch_residues,
     postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
+    like: Annotated[
+        Path | None,
+        typer.Option(
+            help="An index whose build parameters to copy (all but --batch-residues), so "
+            "the new one can be queried jointly with it"
+        ),
+    ] = None,
     role: Annotated[
         str | None,
         typer.Option(
@@ -56,19 +64,27 @@ def index(
     """Build an index from a members table; print its stats as JSON."""
     if role not in (None, "decoy"):
         raise typer.BadParameter("role must be decoy")
-    params = IndexParams(
-        k=k,
-        alphabet=alphabet,
-        t_base=t_base,
-        n_min=n_min,
-        t_cap=t_cap,
-        oversample=oversample,
-        mask_adapters=mask_adapters,
-        max_groups=max_groups,
-        fp_bits=fp_bits,
-        t_dense=t_dense,
-        batch_residues=batch_residues,
+    if like is not None:
+        base = json.loads((like / "meta.json").read_text())
+        if base.get("hash") != "kfp":
+            raise typer.BadParameter("--like needs an index built by `index` (kfp hash)")
+    params = (
+        IndexParams(**{f.name: base["params"][f.name] for f in fields(IndexParams)})
+        if like is not None
+        else IndexParams(
+            k=k,
+            alphabet=alphabet,
+            t_base=t_base,
+            n_min=n_min,
+            t_cap=t_cap,
+            oversample=oversample,
+            mask_adapters=mask_adapters,
+            max_groups=max_groups,
+            fp_bits=fp_bits,
+            t_dense=t_dense,
+        )
     )
+    params = replace(params, batch_residues=batch_residues)
     stats = build_index(members, out_dir, params, pfam, postings)
     if role is not None:
         meta = json.loads((out_dir / "meta.json").read_text())
