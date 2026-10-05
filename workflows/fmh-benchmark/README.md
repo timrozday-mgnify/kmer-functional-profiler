@@ -413,6 +413,40 @@ nextflow run workflows/fmh-benchmark -profile test,docker --study_ladder true --
 
 The fixture saturates completeness (1.0 in every arm), so it checks the plumbing only.
 
+## Genome mode (phase 11)
+
+`--genome_mode` asks which genomes a function profile comes from (plan: Genome mode,
+Evaluation). Every genome of the Zenodo record is the reference set, so each sample's
+genomes compete with all the others as distractors:
+
+```text
+GENOME_SET        every genome's proteins (from its mapping table) + genomes.tsv
+ANNOTATE_GENOMES  `annotate-genomes` per kfp-hashed index (not fmh_compat) -> genomes_<name>/
+GENOME_FIT        `genomes` per plain-arm unit profile of a plain sample (MGnify indexes:
+                  units.tsv) -> genomes/seed<N>_<name>_{genomes.tsv,function_taxon.tsv,
+                  summary.json}
+GENOME_TRUTH      per genome its read depth over its genes and relative abundance (cells),
+                  per (genome, KO or Pfam) the depth of its genes carrying it
+SYLPH_DB, SYLPH   sylph (DNA) on the same genomes, --sylph_c subsampling -> the baseline
+GENOME_SCORE      genome_scores.tsv: purity, completeness, F1, L1 of relative abundances,
+                  Spearman over true positives; and for kfp the function x genome table:
+                  ft_f1 over (genome, function) pairs, ft_l1 between shares (unclassified
+                  counts against), ft_right (classified hits on true pairs), ft_unclassified
+```
+
+The gate: F1 and L1 within 0.05 of sylph's; the table no worse than HUMAnN 3.9's stratified
+output (not scored yet: KEGG genomes need mapping to HUMAnN's species). The record's
+genomes carry no taxonomy, so the table is scored at genome rank. Ablation config:
+`ablations/genomes.config` (`hpc/kfp-ablations/genome-mode`). Locally:
+
+```bash
+nextflow run workflows/fmh-benchmark -profile test,docker --genome_mode true --tools '' --outdir results-test-genomes
+```
+
+On the fixture (2000 reads) the low-abundance genome of each sample has fewer than
+`MIN_UNITS` (10) hit units and is missed; the Pfam-unit indexes detect none. It checks the
+plumbing only.
+
 ## Other tools
 
 Each tool profiles the same 10 metagenomes and is scored against the same truth; its rows

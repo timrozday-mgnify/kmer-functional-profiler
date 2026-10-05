@@ -51,6 +51,10 @@
 - ``summary``: mean and sd of the scores per index, count and threshold.
 - ``cost``: wall time, CPU time and peak memory per step and index or tool, from the raw
   Nextflow trace.
+- ``genome-set``, ``genome-truth``, ``genome-score``: genome mode (phase 11): every genome
+  of the record as protein FASTA for ``annotate-genomes``; per-sample genome and
+  (genome, function) truth from the per-gene truth; and a genome fit (or sylph) scored
+  against it.
 - ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
@@ -1203,6 +1207,120 @@ def iss(argv: list[str]) -> None:
     iss.app.main()
 
 
+def genome_set(args: argparse.Namespace) -> None:
+    """Genome mode's reference set (phase 11): every genome of the record, the samples'
+    and all others as distractors, as protein FASTA (``--out-dir``/``{genome}.faa``, from
+    its mapping table) and ``genomes.tsv`` (``genome``, ``path``) for ``annotate-genomes``."""
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    root = Path(args.genomes_dir)
+    names = sorted(p.name for p in root.iterdir() if (p / f"{p.name}.fasta").exists())
+    for g in names:
+        proteins = (
+            pl.read_csv(root / g / f"{g}_mapping.csv", columns=["gene_name", "aa_sequence"],
+                        schema_overrides=GENOME_COLUMNS)
+            .drop_nulls()
+            .unique("gene_name", keep="first", maintain_order=True)
+        )  # fmt: skip
+        with open(out / f"{g}.faa", "w") as f:
+            for name, seq in proteins.iter_rows():
+                f.write(f">{name}\n{seq}\n")
+    (out / "genomes.tsv").write_text("genome\tpath\n" + "".join(f"{g}\t{g}.faa\n" for g in names))
+
+
+def genome_truth(args: argparse.Namespace) -> None:
+    """Genome mode's truth for one sample, from the per-gene truth (``truth --out-genes``):
+    per genome its read ``depth`` (aligned bases over gene bases, all its genes) and
+    ``relative_abundance`` (share of Σ depth: cells, not reads), written to ``--out``; and
+    per (genome, KO) and (genome, Pfam) the summed depth of its genes carrying it
+    (``kind``, ``genome``, ``label``, ``depth``) to ``--out-functions``."""
+    genes = pl.read_parquet(args.genes).select(
+        "gene_name", genome=pl.col("contig").str.split("|").list.first(),
+        length=pl.col("end") - pl.col("start"),
+    )  # fmt: skip
+    covered = genes.join(pl.read_csv(args.truth_genes), on="gene_name", how="left").with_columns(
+        pl.col("bases", "depth").fill_null(0)
+    )
+    per_genome = covered.group_by("genome").agg(
+        depth=pl.col("bases").sum() / pl.col("length").sum()
+    )
+    per_genome.with_columns(relative_abundance=pl.col("depth") / pl.col("depth").sum()).sort(
+        "genome"
+    ).write_csv(args.out)
+    labels = [read_kos(args.kos).select(gene_name="gene_id", label="ko_id", kind=pl.lit("ko"))]
+    if args.domains:
+        domains = pl.read_parquet(args.domains).select("gene_name", label="pfam")
+        labels.append(domains.unique().with_columns(kind=pl.lit("pfam")))
+    (
+        covered.join(pl.concat(labels), on="gene_name")
+        .group_by("kind", "genome", "label")
+        .agg(pl.col("depth").sum())
+        .filter(pl.col("depth") > 0)
+        .sort("kind", "genome", "label")
+        .write_csv(args.out_functions)
+    )
+
+
+def _f1(tp: int, n_pred: int, n_truth: int) -> dict[str, float]:
+    purity, completeness = tp / max(n_pred, 1), tp / max(n_truth, 1)
+    f1 = 2 * purity * completeness / (purity + completeness) if tp else 0.0
+    return {"purity": purity, "completeness": completeness, "f1": f1}
+
+
+def genome_score(args: argparse.Namespace) -> None:
+    """Genome detection and abundance of one fit (``genomes`` output, or a sylph profile
+    with ``--tool sylph``) against ``genome-truth``: purity, completeness and F1 over the
+    genomes with reads; L1 between relative abundances over their union; Spearman over the
+    true positives. With ``--function-taxon``, the function x genome table against the
+    (genome, ``--label``) truth: L1 between shares (ours over the total, so unclassified
+    costs), F1 over (genome, function) pairs, ``ft_right`` (the share of classified hits
+    on true pairs) and ``ft_unclassified``. Genomes of an ambiguity group reported
+    together (names joined by commas) match no truth genome."""
+    from scipy.stats import spearmanr
+
+    if args.tool == "sylph":
+        raw = pl.read_csv(args.genomes, separator="\t")
+        pred = raw.select(
+            name=pl.col("Genome_file").str.split("/").list.last().str.replace(r"\.fasta$", ""),
+            relative_abundance=pl.col("Taxonomic_abundance") / 100,
+        )
+    else:
+        types = {"name": pl.String, "relative_abundance": pl.Float64}  # typed when empty
+        pred = pl.read_csv(args.genomes, separator="\t", schema_overrides=types).select(*types)
+    truth = pl.read_csv(args.truth).filter(pl.col("depth") > 0)
+    both = truth.select("genome", t="relative_abundance").join(
+        pred.select(genome="name", p="relative_abundance"), on="genome", how="full",
+        coalesce=True,
+    ).fill_null(0.0)  # fmt: skip
+    tp = both.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+    row: dict[str, object] = {
+        "sample": args.sample, "label": args.label, "index": args.index,
+        "n_truth": truth.height, "n_pred": pred.height, "tp": tp.height,
+        **_f1(tp.height, pred.height, truth.height),
+        "l1": float((both["t"] - both["p"]).abs().sum()),
+        "spearman": float(spearmanr(tp["t"], tp["p"]).statistic) if tp.height > 2 else None,
+    }  # fmt: skip
+    if args.function_taxon:
+        ft = pl.read_csv(args.function_taxon, separator="\t",
+                         schema_overrides={"taxon": pl.String, "hits_em": pl.Float64})  # fmt: skip
+        total = float(ft.filter(pl.col("rank") == "total")["hits_em"].sum())
+        genome = ft.filter(pl.col("rank") == "genome")
+        ours = genome.filter(pl.col("taxon") != "unclassified").select(
+            genome="taxon", label="function", p=pl.col("hits_em") / max(total, 1e-300)
+        )
+        want = pl.read_csv(args.truth_functions).filter(pl.col("kind") == args.label)
+        want = want.select("genome", "label", t=pl.col("depth") / pl.col("depth").sum())
+        pairs = want.join(ours, on=["genome", "label"], how="full", coalesce=True).fill_null(0.0)
+        hit = pairs.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+        classified = float(ours["p"].sum())
+        row |= {f"ft_{k}": v for k, v in _f1(hit.height, ours.height, want.height).items()} | {
+            "ft_l1": float((pairs["t"] - pairs["p"]).abs().sum()),
+            "ft_right": float(hit["p"].sum()) / classified if classified else None,
+            "ft_unclassified": 1 - classified if total else None,
+        }
+    pl.DataFrame([row]).write_csv(args.out, separator="\t")
+
+
 def main() -> None:
     if sys.argv[1:2] == ["iss"]:  # iss parses its own arguments
         iss(sys.argv[2:])
@@ -1324,6 +1442,22 @@ def main() -> None:
                                                  "min_hits"])  # fmt: skip
     p.add_argument("--out", default="summary.tsv")
     p.add_argument("--scores-out", default="scores.tsv")
+    p = sub.add_parser("genome-set")
+    p.add_argument("--genomes-dir", required=True)
+    p.add_argument("--out-dir", default="genome_set")
+    p = sub.add_parser("genome-truth")
+    for name in ("genes", "truth-genes", "kos"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--domains", help="domains.parquet: also (genome, Pfam) truth")
+    p.add_argument("--out", default="truth_genomes.csv")
+    p.add_argument("--out-functions", default="truth_function_genome.csv")
+    p = sub.add_parser("genome-score")
+    for name in ("genomes", "truth", "sample", "label", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--tool", default="kfp", choices=["kfp", "sylph"])
+    p.add_argument("--function-taxon")
+    p.add_argument("--truth-functions")
+    p.add_argument("--out", default="genome_score.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
@@ -1332,7 +1466,9 @@ def main() -> None:
              "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
              "aai-score": aai_score_step, "aai-calibrate": aai_calibrate,
              "study-proteins": study_proteins, "study-rebuild": study_rebuild,
-             "study-ladder": study_ladder, "study-unrelated": study_unrelated}  # fmt: skip
+             "study-ladder": study_ladder, "study-unrelated": study_unrelated,
+             "genome-set": genome_set, "genome-truth": genome_truth,
+             "genome-score": genome_score}  # fmt: skip
     steps[args.step](args)
 
 

@@ -762,6 +762,157 @@ process STUDY_LADDER {
 // (-profile docker or singularity); the kMermaid and HUMAnN images are built by
 // containers/build.sh.
 
+// ---- Genome mode (phase 11; README, Genome mode): every genome of the record (the samples'
+// and the rest as distractors) annotated with each kfp-hashed index, a genome fit per
+// plain-arm profile of a plain sample, scored against the read-origin truth; sylph on the same
+// genomes as the DNA baseline.
+
+process GENOME_SET {
+    label 'process_single'
+
+    input:
+    path genomes
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'genome_set', emit: set
+
+    script:
+    "${params.bench} genome-set --genomes-dir ${genomes}"
+
+    stub:
+    "mkdir genome_set && touch genome_set/genomes.tsv"
+}
+
+process ANNOTATE_GENOMES {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(index)
+    path genome_set
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(name), path("genomes_${name}"), emit: index
+
+    script:
+    "${params.kfp} annotate-genomes ${index} ${genome_set}/genomes.tsv genomes_${name}"
+
+    stub:
+    "mkdir genomes_${name}"
+}
+
+process GENOME_FIT {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/genomes", mode: 'copy', saveAs: { f -> "seed${sid}_${name}_${f}" }
+
+    input:
+    tuple val(sid), val(label), val(name), path(profile), path(genome_index)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), val(label), val(name), path('genomes.tsv'), path('function_taxon.tsv'), emit: fit
+    path 'summary.json'
+
+    script:
+    """
+    ${params.kfp} genomes ${profile} ${genome_index} genomes.tsv --summary summary.json \\
+        --function-taxon function_taxon.tsv
+    """
+
+    stub:
+    "touch genomes.tsv function_taxon.tsv summary.json"
+}
+
+process GENOME_TRUTH {
+    tag "seed ${sid}"
+    label 'process_single'
+    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { f -> "seed${sid}_${f}" }
+
+    input:
+    tuple val(sid), path(genes), path(truth_genes)
+    path kos
+    path domains  // [] without Pfam
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), path('truth_genomes.csv'), path('truth_function_genome.csv'), emit: truth
+
+    script:
+    """
+    ${params.bench} genome-truth --genes ${genes} --truth-genes ${truth_genes} --kos ${kos} \\
+        ${domains ? "--domains ${domains}" : ''}
+    """
+
+    stub:
+    "touch truth_genomes.csv truth_function_genome.csv"
+}
+
+process SYLPH_DB {
+    label 'process_medium'
+    container params.sylph_container
+
+    input:
+    path genomes
+
+    output:
+    path 'genomes.syldb', emit: db
+
+    script:
+    "sylph sketch -t ${task.cpus} -c ${params.sylph_c} -o genomes -g ${genomes}/*/*.fasta"
+
+    stub:
+    "touch genomes.syldb"
+}
+
+process SYLPH {
+    tag "seed ${sid}"
+    label 'process_medium'
+    container params.sylph_container
+    publishDir "${params.outdir}/genomes", mode: 'copy', saveAs: { "seed${sid}_sylph.tsv" }
+
+    input:
+    tuple val(sid), path(r1), path(r2)
+    path db
+
+    output:
+    tuple val(sid), path('sylph.tsv'), emit: profile
+
+    script:
+    """
+    sylph sketch -t ${task.cpus} -c ${params.sylph_c} -1 ${r1} -2 ${r2} -d reads
+    sylph profile -t ${task.cpus} ${db} reads/*.sylsp > sylph.tsv
+    """
+
+    stub:
+    "touch sylph.tsv"
+}
+
+process GENOME_SCORE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(label), val(name), path(genomes, stageAs: 'pred/*'), path(function_taxon, stageAs: 'ft/*'), path(truth), path(truth_functions)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'genome_score.tsv', emit: score
+
+    script:
+    def tool = name == 'sylph' ? '--tool sylph' : ''
+    def ft = function_taxon ? "--function-taxon ${function_taxon} --truth-functions ${truth_functions}" : ''
+    """
+    ${params.bench} genome-score --genomes ${genomes} --truth ${truth} --sample seed${sid} \\
+        --label ${label} --index ${name} ${tool} ${ft}
+    """
+
+    stub:
+    "touch genome_score.tsv"
+}
+
 process DIAMOND_DB {
     label 'process_medium'
     storeDir "${params.db_dir}/diamond"
@@ -1404,6 +1555,42 @@ workflow BENCHMARK {
             .combine(ch_mgnify, by: 0),  // name, arm, units, genes, gene_units, index
         bench_py,
     )
+
+    // Genome mode (phase 11): kfp-hashed indexes (not fmh_compat), plain arm, plain samples;
+    // MGnify indexes' unit profiles (units.tsv), not the per-Pfam sums
+    if (params.genome_mode) {
+        GENOME_SET(FETCH.out.genomes, bench_py)
+        ANNOTATE_GENOMES(
+            ch_indexes.filter { it[1] != 'fmh_compat' }.map { label, name, index, _by_pfam -> [name, index] },
+            GENOME_SET.out.set,
+            ch_code,
+        )
+        def by_pfam = mgnify*.name
+        def ch_unit_profiles = PROFILE.out.profile
+            .filter { it[3] == '' && !(it[2] in by_pfam) }
+            .map { sid, label, name, _arm, profile, _kmers -> [name, sid, label, profile] }
+            .mix(PROFILE.out.units.filter { it[2] == '' }.map { sid, name, _arm, units -> [name, sid, 'pfam', units] })
+            .filter { _name, sid, _label, _profile -> sid ==~ /\d+/ }  // not host spike-ins
+        GENOME_FIT(
+            ch_unit_profiles.combine(ANNOTATE_GENOMES.out.index, by: 0)
+                .map { name, sid, label, profile, gi -> [sid, label, name, profile, gi] },
+            ch_code,
+        )
+        GENOME_TRUTH(
+            SAMPLE.out.sample.map { seed, _fna, genes -> [seed.toString(), genes] }.join(TRUTH.out.genes),
+            FETCH.out.kos,
+            ch_domains,
+            bench_py,
+        )
+        SYLPH(ch_tool_reads, SYLPH_DB(FETCH.out.genomes).db)
+        GENOME_SCORE(
+            GENOME_FIT.out.fit
+                .mix(SYLPH.out.profile.map { sid, profile -> [sid, 'dna', 'sylph', profile, []] })
+                .combine(GENOME_TRUTH.out.truth, by: 0),
+            bench_py,
+        )
+        GENOME_SCORE.out.score.collectFile(name: 'genome_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+    }
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and
     // workflow are read here: inside the handler, names resolve against the workflow metadata.
