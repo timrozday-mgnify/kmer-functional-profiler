@@ -83,6 +83,7 @@ def test_partitioned_build_equals_single(tmp_path: Path, t_dense: float) -> None
         tmp_path / "members.parquet", tmp_path / "single", params, tmp_path / "pfam.parquet", True
     )
     assert single["promiscuous_dropped"] > 0  # type: ignore[operator]
+    assert single["promiscuous_base"] > 0  # type: ignore[operator]
     if t_dense:  # the dense tier holds more than tier 2, and the reduce must count them
         assert single["dense_postings"] > 2 * single["postings"]  # type: ignore[operator]
 

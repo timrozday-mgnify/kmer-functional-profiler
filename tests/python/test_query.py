@@ -1028,6 +1028,30 @@ def test_unknown_fraction_of_known_and_random_reads(tmp_path: Path) -> None:
     assert (only_random["explained_fraction"] or 0.0) < 0.05
 
 
+def test_census_counts_promiscuous_kmers_as_known(tmp_path: Path) -> None:
+    # Gene 0 is in three units, so with max_groups=2 its k-mers are promiscuous and posted
+    # nowhere; they are still known, and reads from gene 0 should not lower the census.
+    rng = np.random.default_rng(12)
+    genes = ["".join(rng.choice(CODONS, 400)) for _ in range(3)]
+    members = tmp_path / "members.parquet"
+    pl.DataFrame(
+        [
+            (i, i, True, _core.translate_frames(g.encode())[0].decode())
+            for i, g in enumerate([genes[0]] * 3 + genes[1:])
+        ],
+        schema=["protein_id", "cluster_rep", "full_length", "sequence"],
+        orient="row",
+    ).write_parquet(members)
+    stats = build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=0.05, max_groups=2))
+    assert stats["promiscuous_base"] > 0  # type: ignore[operator]
+    starts = rng.integers(0, len(genes[0]) - 150 + 1, 300)
+    path = tmp_path / "reads.fa"
+    path.write_text("".join(f">{i}\n{genes[0][s : s + 150]}\n" for i, s in enumerate(starts)))
+    got: dict[str, float | int | None] = {}
+    profile(Index.load(tmp_path / "idx"), path, summary=got)
+    assert got["census_kmers"] > 0 and got["census_containment"] > 0.95  # type: ignore[operator]
+
+
 def test_aai_calibration_attached_and_applied_per_index(tmp_path: Path) -> None:
     seqs = list(proteins().values())
     half = len(seqs) // 2
