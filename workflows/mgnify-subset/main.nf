@@ -427,16 +427,19 @@ process LADDER {
 }
 
 process QUERY {
-    tag "${pairs} pairs, ${name}, draws ${draws}"
+    tag "${pairs} pairs, ${name}, draws ${draws}${start ? ', EM start ' + start : ''}"
     publishDir "${params.outdir}/query", mode: 'copy', pattern: '*.json'
 
     input:
-    tuple val(pairs), path(r1), path(r2), val(name), path(index), val(draws)
+    tuple val(pairs), path(r1), path(r2), val(name), path(index), val(draws), val(start)
 
     output:
-    path "${name}.${pairs}.${draws}.json"
+    path "${cell}.json", emit: stats
+    tuple val(draws), path("${cell}.profile.tsv"), emit: profile
 
     script:
+    // start 0 is the usual EM start; others are seeds of random starts (--em-start)
+    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '')
     def scratch_dir = params.query_scratch.toString() in ['', 'true', 'false'] ? '' : params.query_scratch  // CLI passes strings
     """
     export POLARS_MAX_THREADS=${task.cpus} OMP_NUM_THREADS=${task.cpus} OPENBLAS_NUM_THREADS=${task.cpus}
@@ -458,12 +461,32 @@ process QUERY {
         cat \$idx/tier2.*.npy > /dev/null
         echo "preload: \$(du -chL \$idx/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
     fi
-    ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out profile.tsv ${params.query_args} \\
-        --stats ${name}.${pairs}.${draws}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''}
+    ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out ${cell}.profile.tsv ${params.query_args} \\
+        --em-start ${start} --stats ${cell}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''}
     """
 
     stub:
-    "touch ${name}.${pairs}.${draws}.json"
+    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '')
+    "touch ${cell}.json ${cell}.profile.tsv"
+}
+
+process EM_STARTS {
+    // the EM fits of one query cell from several starts, compared (plan, phase 7, step 30)
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path profiles
+
+    output:
+    path 'em_starts.tsv'
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py em-starts ${profiles}
+    """
+
+    stub:
+    "touch em_starts.tsv"
 }
 
 process QUERY_COST {
@@ -590,10 +613,15 @@ workflow {
         // draws 0 everywhere; posterior draws on query_draws_on ('' = every index), at query_draws_at cells.
         def draws_at = params.query_draws_at.toString() in ['', 'true', 'false'] ? [] : params.query_draws_at.toString().tokenize(',').collect { n -> n as long }
         def draws_on = params.query_draws_on.toString() in ['', 'true', 'false'] ? '' : params.query_draws_on.toString()
-        ch_query = ch_cells.map { c -> c + [0] }
+        // EM starts: 0 (the usual start) and seeds of random ones, on the draws-0 cells only
+        def starts = params.query_starts.toString().tokenize(',').collect { n -> n as int }
+        ch_query = ch_cells.map { c -> c + [0] }.combine(channel.fromList(starts))
             .mix(ch_cells.filter { c -> (params.query_draws as int) > 0 && (!draws_on || c[3] == draws_on) && (!draws_at || c[0] in draws_at) }
-                .map { c -> c + [params.query_draws] })
+                .map { c -> c + [params.query_draws, 0] })
         QUERY(ch_query)
-        QUERY_COST(QUERY.out.collect())
+        QUERY_COST(QUERY.out.stats.collect())
+        if (starts.size() > 1) {
+            EM_STARTS(QUERY.out.profile.filter { r -> r[0] == 0 }.map { r -> r[1] }.collect())
+        }
     }
 }

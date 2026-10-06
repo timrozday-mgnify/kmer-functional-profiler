@@ -34,6 +34,8 @@ cd kfp-ablations/standard-query-cost && sbatch run.sh
 cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one after another
 # EM convergence fix (plan, phase 7, step 29), once tiers-novaseq's indexes exist:
 cd kfp-ablations/em-query-cost && sbatch run.sh
+# EM convergence from 5 starts on two deep soil metagenomes (step 30), as em-query-cost:
+cd kfp-ablations/em-starts-soil && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
