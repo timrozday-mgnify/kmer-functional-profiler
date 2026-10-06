@@ -125,10 +125,10 @@ def query(
     frames: Annotated[
         str,
         typer.Option(
-            help="Frames hashed: stopfree; edges (also the terminal segments, >= 20 aa, of "
+            help="Frames hashed: stopfree; edges (also the terminal segments, >= 30 aa, of "
             "frames with stops; edges:M sets the length); all"
         ),
-    ] = "stopfree",
+    ] = "edges:30",
     min_qual: Annotated[
         int, typer.Option(help="Mask bases below this Phred quality as N (0 = off)")
     ] = 0,

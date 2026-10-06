@@ -1709,7 +1709,7 @@ def profile(
     r2: str | Path | None = None,
     *,
     genetic_code: int = 11,
-    frames: str = "stopfree",
+    frames: str = "edges:30",  # plan, phase 7, step 31
     min_qual: int = 0,
     batch_reads: int = 100_000,
     draws: int = 0,

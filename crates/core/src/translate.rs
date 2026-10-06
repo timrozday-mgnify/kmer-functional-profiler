@@ -69,7 +69,7 @@ pub enum FrameMode {
 }
 
 /// Default `min_len` of [`FrameMode::Edges`].
-pub const EDGES_MIN_LEN: u16 = 20;
+pub const EDGES_MIN_LEN: u16 = 30;
 
 impl FromStr for FrameMode {
     type Err = Error;
