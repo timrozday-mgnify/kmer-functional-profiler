@@ -348,6 +348,35 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     )
 
 
+def test_aai_score_by_gene_length() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    # four genes at 100/200/400/700 aa, each alone in its own cluster at 98%; the 700-aa
+    # one undetected; coverage over depth 2, 2, 1: the short genes read high
+    genes = pl.DataFrame({"gene_name": ["a", "b", "c", "d"], "depth": [3.0, 3.0, 3.0, 3.0]})
+    genes = genes.with_columns(bases=pl.col("depth") * 3 * pl.Series([100, 200, 400, 700]))
+    units = pl.DataFrame(
+        {
+            "gene_name": ["a", "b", "c", "d"],
+            "cluster_rep": [1, 2, 3, 4],
+            "identity": 0.98,
+            "qcov": 1.0,
+            "scov": 1.0,
+            "rank": 1,
+        }
+    )
+    profile = pl.DataFrame(
+        {"cluster_rep": [1, 2, 3], "kmers_unique": [5, 5, 5], "coverage_em": [6.0, 6.0, 3.0]}
+    )
+    got = bench.aai_score(profile, units, genes)
+    assert [got[f"completeness_90_len{lo}"] for lo in (0, 150, 300, 600)] == [1.0, 1.0, 1.0, 0.0]
+    # log2 ratios 1, 1, 0 around their median 1
+    assert (got["abund_bias_len0"], got["abund_bias_len150"]) == (0.0, 0.0)
+    assert got["abund_bias_len300"] == -1.0 and got["abund_err_len300"] == 1.0
+    assert got["abund_bias_len600"] is None
+
+
 def test_aai_calibration_inverts_a_biased_estimator() -> None:
     sys.path.insert(0, str(SCRIPT.parent))
     import bench

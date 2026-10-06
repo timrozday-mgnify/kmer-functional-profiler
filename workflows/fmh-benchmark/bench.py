@@ -420,6 +420,7 @@ def mgnify_genes(args: argparse.Namespace) -> None:
 
 
 IDENTITY_BINS = ((0.95, 1.01), (0.9, 0.95), (0.8, 0.9), (0.7, 0.8), (0.5, 0.7))
+LENGTH_BINS = ((0, 150), (150, 300), (300, 600), (600, float("inf")))  # gene length, aa
 
 
 def aai_score(
@@ -442,6 +443,12 @@ def aai_score(
       units that are some present gene's nearest cluster (``purity_near``: any hit). By the
       nearest cluster's identity (``IDENTITY_BINS``, ``recall_<lo>``): share of present
       genes whose nearest cluster is detected, also below 90% (resolution beyond it).
+    - ``completeness_90_len<lo>``, ``abund_bias_len<lo>``, ``abund_err_len<lo>``: by gene
+      length (``LENGTH_BINS``, aa; needs ``bases`` in ``genes``), the share of present genes
+      in their cluster at the 90% level whose cluster is detected; and, for detected units
+      that are the 90%-level cluster of exactly one present gene and nearest to no other,
+      the median and median absolute log2 error of ``coverage_em`` / depth after removing
+      the sample's median log2 ratio (a scale-free length bias).
     - ``aai_bias_<lo>``, ``aai_cover_<lo>``, ``aai_spearman``, ``aai_n``: detected units
       with an ``aai``, against the depth-weighted identity of the present genes they are
       nearest to (``aai_mixed``: units nearest to several genes).
@@ -474,6 +481,33 @@ def aai_score(
         out[f"recall_{lo}"] = (
             part["cluster_rep"].is_in(list(detected)).mean() if part.height else None  # type: ignore[assignment]
         )
+    # by gene length (aa; depth is bases per nt of gene): the stop filter's end loss falls on
+    # short genes (plan, Translation and frame detection)
+    if "bases" in genes.columns:
+        length = genes.filter(pl.col("depth") > 0).select(
+            "gene_name", aa=pl.col("bases") / pl.col("depth") / 3
+        )
+        g90 = in90.join(length, on="gene_name")
+        one = (  # units that are one present gene's 90%-level cluster and nearest to no other
+            g90.join(nearest.group_by("cluster_rep").len(), on="cluster_rep").filter(
+                pl.col("len") == 1
+            )
+        )
+        if "coverage_em" in profile.columns:
+            one = one.join(
+                profile.filter(pl.col("kmers_unique") >= 1).select("cluster_rep", "coverage_em"),
+                on="cluster_rep",
+            ).with_columns(ratio=(pl.col("coverage_em") / pl.col("depth")).log(2))
+            one = one.with_columns(err=pl.col("ratio") - pl.col("ratio").median())
+        for lo, hi in LENGTH_BINS:
+            part = g90.filter(pl.col("aa").is_between(lo, hi, closed="left"))
+            out[f"completeness_90_len{lo}"] = (
+                part["cluster_rep"].is_in(list(detected)).mean() if part.height else None  # type: ignore[assignment]
+            )
+            if "err" in one.columns:
+                e = one.filter(pl.col("aa").is_between(lo, hi, closed="left"))["err"]
+                out[f"abund_bias_len{lo}"] = e.median() if e.len() else None  # type: ignore[assignment]
+                out[f"abund_err_len{lo}"] = e.abs().median() if e.len() else None  # type: ignore[assignment]
     # aai of detected units, against the identity of the genes they are nearest to
     truth = aai_truth(nearest)
     if "aai" in profile.columns:

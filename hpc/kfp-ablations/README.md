@@ -27,6 +27,11 @@ cd kfp-ablations/floor-query-cost && sbatch run.sh
 # release tiers (plan, phase 7, step 21), then their query cost when tiers-novaseq has finished:
 cd kfp-ablations/tiers-novaseq && sbatch run.sh
 cd kfp-ablations/tiers-query-cost && sbatch run.sh
+# standard tier at ~120 GB and frame mode on the release tiers (plan, phase 7, step 28), all at once:
+for r in standard-novaseq frames-novaseq frames-miseq; do (cd kfp-ablations/$r && sbatch run.sh); done
+# then, each when its NovaSeq run has finished:
+cd kfp-ablations/standard-query-cost && sbatch run.sh
+cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one after another
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
