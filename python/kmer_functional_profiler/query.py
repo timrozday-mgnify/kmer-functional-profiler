@@ -976,7 +976,7 @@ def presence(
     clump: float = CLUMP,
     max_iter: int = 500,
     tol: float = 1e-9,
-    report: dict[str, int] | None = None,
+    report: dict[str, float] | None = None,
 ) -> pl.DataFrame:
     """Probability that each unit gather keeps is present rather than hit by background.
 
