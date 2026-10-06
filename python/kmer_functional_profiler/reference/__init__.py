@@ -95,7 +95,7 @@ def _segments(aa: bytes, frames: str) -> list[bytes]:
         return [aa]
     if frames == "stopfree":
         return []
-    min_len = int(frames.partition(":")[2] or 20)  # "edges" or "edges:M"
+    min_len = int(frames.partition(":")[2] or 30)  # "edges" or "edges:M"
     parts = aa.split(b"*")
     return [seg for seg in (parts[0], parts[-1]) if len(seg) >= min_len]
 

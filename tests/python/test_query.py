@@ -82,8 +82,8 @@ def build(members: Path, **params: object) -> Index:
 
 def test_dense_counts_match_direct_intersection(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
-    result = profile(index, *READS, all_estimators=True)
-    hits = list(_core.FastxHits(*READS, k=K))
+    result = profile(index, *READS, frames="stopfree", all_estimators=True)
+    hits = list(_core.FastxHits(*READS, k=K, frames="stopfree"))
     hashes = [h for b in hits for h in b["hash"].tolist()]
     reads = [r for b in hits for r in b["read"].tolist()]
     expected = {}
@@ -586,7 +586,7 @@ def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path:
     assert runner.invoke(app, build_args).exit_code == 0
     hits = {}
     for name, extra in {
-        "stopfree": [],
+        "stopfree": ["--frames", "stopfree"],
         "edges": ["--frames", "edges:5"],
         "masked": ["--min-qual", "41"],  # above every fixture quality: everything is N
         "joint": ["--extra-index", str(idx)],  # itself: every unit twice, each half the hits
