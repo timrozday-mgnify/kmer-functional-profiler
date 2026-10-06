@@ -27,7 +27,10 @@ One subcommand per pipeline step (``main.nf``):
 - ``ladder``: nested read subsets of a paired run (``--pairs`` sizes): the pairs ranked
   below n in one shuffle seeded by ``--seed``, so each subset holds the smaller ones.
 - ``query-cost``: ``kmer-functional-profiler query --stats`` files named
-  ``{index}.{pairs}.{draws}.json`` -> ``query_cost.tsv``, one row per query.
+  ``{index}.{pairs}.{draws}[.s{seed}].json`` -> ``query_cost.tsv``, one row per query
+  (``em_start``: the ``--em-start`` seed, 0 for the usual start).
+- ``em-starts``: the profiles of query cells fitted from several EM starts ->
+  ``em_starts.tsv``, how far they agree (:func:`em_starts`).
 
 ``--release`` is a local directory or an https prefix (DuckDB reads it remotely).
 """
@@ -282,18 +285,130 @@ def ladder(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
 def query_cost(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     rows = []
     for path in map(Path, args.paths):
-        index, pairs, draws = path.name.removesuffix(".json").split(".")
+        index, pairs, draws, *start = path.name.removesuffix(".json").split(".")
         stats = json.loads(path.read_text())
-        row = {"index": index, "pairs": int(pairs), "draws": int(draws), **stats["counts"]}
+        row = {"index": index, "pairs": int(pairs), "draws": int(draws)}
+        row |= {"em_start": int(start[0][1:]) if start else 0, **stats["counts"]}
         for stage, cost in stats["stages"].items():
             row |= {f"{stage}_{k}": v for k, v in cost.items()}
         rows.append(row)
-    table = pl.DataFrame(rows, infer_schema_length=None).sort("index", "pairs", "draws")
+    table = pl.DataFrame(rows, infer_schema_length=None).sort("index", "pairs", "draws", "em_start")
     if "em_max_change" in table.columns:  # against tol 1e-8: 3 decimals would read 0.000
         table = table.with_columns(
             pl.col("em_max_change").map_elements(lambda x: f"{x:.2e}", return_dtype=pl.String)
         )
     table.write_csv("query_cost.tsv", separator="\t", float_precision=3)
+
+
+# Estimates em-starts compares: relative spread for coverages and abundances, absolute for
+# the bounded ones (presence, aai)
+START_RELATIVE = ("coverage_em", "coverage_zi", "abundance_zi", "coverage_zip")
+START_ABSOLUTE = ("present_zi", "aai")
+START_BINS = ((1, 3), (3, 10), (10, None))  # kmers_unique bins
+
+
+def em_starts(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
+    """Agreement of one query cell's EM fits from several starts (plan, phase 7, step 30).
+
+    Profiles are named ``{index}.{pairs}.{draws}[.s{seed}].profile.tsv`` (no seed: the usual
+    start); cells are (index, pairs). Over the units gather keeps (``kmers_unique`` >= 1 in
+    the usual start), each estimate's spread across starts: max - min over the mean for
+    coverages and abundances, max - min for presence and ``aai``. Rows by ``level`` (``unit``,
+    and ``component``: summed over the hit units linked by shared k-mers, so coverage moved
+    between units that share their k-mers cancels) and ``stratum`` (``all`` and
+    ``kmers_unique`` bins): ``n``; the share of units within 0.1%, 1% and 10% (0.001, 0.01,
+    0.1 for absolute spreads), and ``weighted_within_1pct`` by mean value; ``max_spread``;
+    and ``l1_max``, the largest total-variation distance (half L1) of a start's normalised
+    profile from the usual start's. Units disagreeing while their components agree are
+    unidentifiable splits; components disagreeing are fits that did not converge.
+    """
+    cells: dict[tuple[str, int], dict[int, Path]] = {}
+    for path in map(Path, args.paths):
+        index, pairs, _draws, *rest = path.name.removesuffix(".profile.tsv").split(".")
+        cells.setdefault((index, int(pairs)), {})[int(rest[0][1:]) if rest else 0] = path
+    rows = []
+    for (index, pairs), by_start in sorted(cells.items()):
+        if len(by_start) < 2 or 0 not in by_start:
+            continue
+        starts = sorted(by_start)
+        frames = []
+        for s in starts:
+            p = pl.read_csv(by_start[s], separator="\t", infer_schema_length=None)
+            keep = [c for c in (*START_RELATIVE, *START_ABSOLUTE) if c in p.columns]
+            frames.append(p.select("unit", *keep).rename({c: f"{c}.{s}" for c in keep}))
+        usual = pl.read_csv(by_start[0], separator="\t", infer_schema_length=None)
+        kept = usual.filter(pl.col("kmers_unique") >= 1).select("unit", "component", "kmers_unique")
+        joined = kept
+        for f in frames:
+            joined = joined.join(f, on="unit", how="left")
+        for name in (*START_RELATIVE, *START_ABSOLUTE):
+            cols = [f"{name}.{s}" for s in starts]
+            if not all(c in joined.columns for c in cols):
+                continue
+            relative = name in START_RELATIVE
+            values = joined.select("unit", "component", "kmers_unique", *cols).with_columns(
+                pl.col(cols).fill_null(0.0) if relative else pl.col(cols)
+            )
+            levels = [("unit", values)]
+            if relative:
+                levels.append(
+                    (
+                        "component",
+                        values.group_by("component").agg(
+                            pl.col("kmers_unique").sum(), pl.col(cols).sum()
+                        ),
+                    )
+                )
+            for level, table in levels:
+                table = table.drop_nulls(cols).with_columns(
+                    mean=pl.mean_horizontal(cols),
+                    spread=pl.max_horizontal(cols) - pl.min_horizontal(cols),
+                )
+                if relative:
+                    table = table.filter(pl.col("mean") > 0).with_columns(
+                        spread=pl.col("spread") / pl.col("mean")
+                    )
+                strata = [("all", table)] + [
+                    (
+                        f"kmers_unique {lo}-{hi - 1}" if hi else f"kmers_unique {lo}+",
+                        table.filter(pl.col("kmers_unique") >= lo)
+                        if hi is None
+                        else table.filter(pl.col("kmers_unique").is_between(lo, hi - 1)),
+                    )
+                    for lo, hi in START_BINS
+                ]
+                l1 = None
+                if relative and level == "unit":
+                    share = table.select(pl.col(cols) / pl.col(cols).sum())
+                    l1 = max(0.5 * float((share[c] - share[cols[0]]).abs().sum()) for c in cols[1:])
+                for stratum, part in strata:
+                    if part.height == 0:
+                        continue
+                    scale = 1.0 if relative else 0.1
+                    weights = part["mean"] / part["mean"].sum() if relative else None
+                    rows.append(
+                        {
+                            "index": index,
+                            "pairs": pairs,
+                            "starts": len(starts),
+                            "estimate": name,
+                            "level": level,
+                            "stratum": stratum,
+                            "n": part.height,
+                            **{
+                                f"within_{lab}": float((part["spread"] <= t * scale).mean())  # type: ignore[operator]
+                                for lab, t in (("0.1pct", 0.001), ("1pct", 0.01), ("10pct", 0.1))
+                            },
+                            "weighted_within_1pct": None
+                            if weights is None
+                            else float(weights.filter(part["spread"] <= 0.01).sum()),
+                            "max_spread": float(part["spread"].max()),  # type: ignore[arg-type]
+                            "l1_max": l1 if stratum == "all" else None,
+                        }
+                    )
+    pl.DataFrame(rows, infer_schema_length=None).write_csv(
+        "em_starts.tsv", separator="\t", float_precision=6
+    )
 
 
 def main() -> None:
@@ -408,6 +523,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1)
     p = sub.add_parser("query-cost")
     p.add_argument("paths", nargs="+")
+    p = sub.add_parser("em-starts")
+    p.add_argument("paths", nargs="+", help="{index}.{pairs}.{draws}[.s{seed}].profile.tsv")
     args = parser.parse_args()
     steps = {
         "membership": membership,
@@ -419,6 +536,7 @@ def main() -> None:
         **dict.fromkeys(build_steps, build),
         "ladder": ladder,
         "query-cost": query_cost,
+        "em-starts": em_starts,
     }
     steps[args.step](connect(args), args)
 

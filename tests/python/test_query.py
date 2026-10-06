@@ -911,6 +911,26 @@ def test_blockwise_em_matches_whole(monkeypatch: pytest.MonkeyPatch) -> None:
     assert zi.height == whole.height and np.isfinite(zi["coverage"].to_numpy()).all()
 
 
+def test_random_em_starts_reach_one_fixed_point() -> None:
+    # Starts drawn far from the usual one (coverage x0.4-2.7, presence 0.3-1) converge to the
+    # same coverages: what the soil multi-start check (step 30) relies on where there is no truth.
+    kmers, m_g = _families(200)
+    for zero_inflated in (False, True):
+        fits = [
+            em(kmers, m_g, zero_inflated=zero_inflated, start=np.random.default_rng(s))
+            for s in (1, 2, 3)
+        ]
+        usual = em(kmers, m_g, zero_inflated=zero_inflated)["coverage"].to_numpy()
+        for fit in fits:
+            assert np.allclose(fit["coverage"].to_numpy(), usual, rtol=0, atol=1e-5)
+    with_pin = kmers.with_columns(pin_q=pl.lit(8, dtype=pl.UInt8))  # every k-mer at one level
+    hist = np.zeros((len(m_g), 16), dtype=np.int64)
+    hist[:, 8] = m_g
+    usual = em_pin(with_pin, hist)["coverage"].to_numpy()
+    moved = em_pin(with_pin, hist, start=np.random.default_rng(1))["coverage"].to_numpy()
+    assert np.allclose(moved, usual, rtol=0, atol=1e-5)
+
+
 def test_blockwise_em_does_not_stop_short(monkeypatch: pytest.MonkeyPatch) -> None:
     # At the default tol, blocks cut by unit id crept along a slow direction and passed the
     # round test with three units ~0.1 short of the fixed point; blocks in graph order, with
