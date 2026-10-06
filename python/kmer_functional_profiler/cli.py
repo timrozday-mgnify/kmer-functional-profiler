@@ -198,6 +198,13 @@ def query(
             "weighted EM; winner-take-all, uniqueness-first); coverage_em is the default"
         ),
     ] = False,
+    em_start: Annotated[
+        int,
+        typer.Option(
+            help="Seed for random EM starting points (0 = the usual start): profiles from "
+            "several seeds agree where the EM converged, a check needing no truth"
+        ),
+    ] = 0,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     timer = Timer(stats, log=stats is not None)
@@ -224,6 +231,7 @@ def query(
             extra=extra,
             mask=masked,
             summary=sample,
+            em_start=em_start,
         )
         result.write_csv(out, separator="\t")
         if summary is not None:

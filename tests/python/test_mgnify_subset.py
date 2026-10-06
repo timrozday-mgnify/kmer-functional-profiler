@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "workflows" / "mgnify-subset" / "mgnify_subset.py"
@@ -147,3 +148,25 @@ def test_ladder_nests_read_subsets(tmp_path: Path) -> None:
         assert len(names(small, 1)) == small
         assert set(names(small, 1)) < set(names(large, 1))
     assert names(20, 1) == names(20, 2)
+
+
+def test_em_starts_tells_unidentifiable_splits_from_unconverged_fits(tmp_path: Path) -> None:
+    # Units 0 and 1 share a component and swap coverage between starts (their sum holds: an
+    # unidentifiable split); unit 2 alone moves 50% (a fit that did not converge); unit 3
+    # agrees; unit 4 is not kept by gather (kmers_unique 0) and is ignored.
+    base = {"unit": [0, 1, 2, 3, 4], "component": [0, 0, 2, 3, 4], "kmers_unique": [2, 2, 5, 20, 0]}
+    starts = {"i.10.0": [3.0, 1.0, 2.0, 4.0, 9.0], "i.10.0.s1": [1.0, 3.0, 3.0, 4.0, 1.0]}
+    for name, cov in starts.items():
+        pl.DataFrame({**base, "coverage_em": cov}).write_csv(
+            tmp_path / f"{name}.profile.tsv", separator="\t"
+        )
+    run(tmp_path, "em-starts", "i.10.0.profile.tsv", "i.10.0.s1.profile.tsv")
+    got = pl.read_csv(tmp_path / "em_starts.tsv", separator="\t").filter(stratum="all")
+    unit = got.filter(level="unit").row(0, named=True)
+    component = got.filter(level="component").row(0, named=True)
+    assert (unit["n"], unit["within_1pct"]) == (4, 0.25)  # only unit 3 agrees
+    assert component["n"] == 3 and component["within_1pct"] == pytest.approx(2 / 3, abs=1e-6)
+    assert component["max_spread"] == pytest.approx(1 / 2.5)  # unit 2 alone: 2 vs 3, over 2.5
+    # half L1 between the normalised profiles: (3,1,2,4)/10 against (1,3,3,4)/11
+    want = 0.5 * sum(abs(a / 10 - b / 11) for a, b in zip([3, 1, 2, 4], [1, 3, 3, 4], strict=True))
+    assert unit["l1_max"] == pytest.approx(want, abs=1e-6)

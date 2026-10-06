@@ -765,6 +765,13 @@ def _div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     return out
 
 
+# Random EM starts (``query --em-start``), to check convergence where there is no truth:
+# coverages times a log-normal factor of this sd (x 0.37-2.7 at one sd), and presence or
+# scale uniform on [START_PRESENT_MIN, 1].
+START_SPREAD: Final = 1.0
+START_PRESENT_MIN: Final = 0.3
+
+
 def em(
     kmers: pl.DataFrame,
     m_g: np.ndarray,
@@ -774,6 +781,7 @@ def em(
     tol: float = 1e-8,
     max_iter: int = 1000,
     report: dict[str, float] | None = None,
+    start: np.random.Generator | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -798,6 +806,9 @@ def em(
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
     or small ``m_g``; ``present`` is then updated by EM over the unhit k-mers' presence.
 
+    ``start`` draws the starting coverages and ``present`` at random instead (see
+    :data:`START_SPREAD`): fits from several starts agree where the fit converged.
+
     ``report`` collects ``em_iterations`` (the most any component took),
     ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over
     calls, and ``em_max_change`` (how far the furthest of those was from converging: see
@@ -812,6 +823,10 @@ def em(
     m = m_g[units].astype(np.float64)
     lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
     pi = np.ones(len(units))
+    if start is not None:  # a random starting point (:data:`START_SPREAD`)
+        lam *= np.exp(start.normal(0.0, START_SPREAD, len(units)))
+        if zero_inflated:
+            pi = start.uniform(START_PRESENT_MIN, 1.0, len(units))
 
     def make_step(b: _Block) -> Step:
         h, mb, per_unit = hits[b.kmer], m[b.unit], len(b.unit)
@@ -872,6 +887,7 @@ def em_pin(
     *,
     tol: float = 1e-8,
     max_iter: int = 1000,
+    start: np.random.Generator | None = None,
 ) -> pl.DataFrame:
     """Zero-inflated EM where each k-mer's presence follows its ``p_in``.
 
@@ -889,7 +905,7 @@ def em_pin(
     presence), and s_g is expected present k-mers over the sum of p_in. Like :func:`em`, a
     hit k-mer counts as present for a unit by its share of the hits. Returns ``unit``,
     ``coverage`` and ``present`` (expected fraction of kept k-mers present); units explained
-    away get coverage 0.
+    away get coverage 0. ``start`` draws a random starting point, as in :func:`em`.
     """
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())
@@ -903,6 +919,9 @@ def em_pin(
     levels = hist.shape[1]
     m, expected = hist.sum(axis=1), hist @ PIN_P  # kept k-mers; present ones at s_g = 1
     lam, scale = np.bincount(col, weights=hits[row], minlength=n) / m, np.ones(n)
+    if start is not None:  # a random starting point, as in :func:`em`
+        lam *= np.exp(start.normal(0.0, START_SPREAD, n))
+        scale = start.uniform(START_PRESENT_MIN, 1.0, n)
 
     def make_step(b: _Block) -> Step:
         h, lv, hs, ex = hits[b.kmer], level[b.pairs], hist[b.unit], expected[b.unit]
@@ -1703,6 +1722,7 @@ def profile(
     extra: Sequence[Index] = (),
     mask: "Mask | None" = None,
     summary: dict[str, float | int | None] | None = None,
+    em_start: int = 0,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -1759,6 +1779,10 @@ def profile(
     and unknown fractions; it fits ``_zi``. The census needs every index to have a complete
     base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash; an index
     built without ``promiscuous.npy`` counts its promiscuous k-mers as unknown.
+
+    ``em_start`` > 0 seeds random starting points for the EM fits (:func:`em`,
+    :func:`em_pin`; not the posterior's): profiles from several starts agree where the fits
+    converged, a check that needs no truth (phase 7, step 30).
 
     ``timer`` records each stage's time and peak RSS and the counts the query's cost
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
@@ -1961,6 +1985,7 @@ def profile(
     if record:
         with timer("links"):
             counts |= link_cuts(detected)
+    start = np.random.default_rng(em_start) if em_start else None
     with timer("fit_em"):
         # Fits stop per component, so batches of components give the same units' results.
         parts = component_batches(detected)
@@ -1971,7 +1996,7 @@ def profile(
 
         counts["fit_batches"] = len(parts)
         counts["fit_largest_batch_pairs"] = max(part.height for part in parts)
-        plain = per_batch(lambda part: em(part, m_g, report=counts)).select(
+        plain = per_batch(lambda part: em(part, m_g, report=counts, start=start)).select(
             "unit", coverage_em="coverage"
         )
         # Hits after the EM split (what the function x taxon table splits): coverage x m.
@@ -1979,7 +2004,7 @@ def profile(
     fits = [plain]
     if all_estimators or draws > 0 or with_aai or summary is not None:
         with timer("fit_zi"):
-            inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True))
+            inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True, start=start))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
         copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
         zi = inflated.join(
@@ -2033,14 +2058,14 @@ def profile(
         with timer("fit_zib"):
             prior = fit_present_prior(inflated)
             fitted = (
-                per_batch(lambda part: em(part, m_g, zero_inflated=True, prior=prior))
+                per_batch(lambda part: em(part, m_g, zero_inflated=True, prior=prior, start=start))
                 if prior
                 else inflated
             )
             fits.append(fitted.select("unit", coverage_zib="coverage", present_zib="present"))
         with timer("fit_zip"):
             fits.append(
-                per_batch(lambda part: em_pin(part, pin_hist)).select(
+                per_batch(lambda part: em_pin(part, pin_hist, start=start)).select(
                     "unit", coverage_zip="coverage", present_zip="present"
                 )
             )
