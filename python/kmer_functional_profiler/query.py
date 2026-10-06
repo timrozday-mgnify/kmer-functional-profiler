@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 import numpy as np
 import polars as pl
 from scipy.sparse import coo_array
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, reverse_cuthill_mckee
 from scipy.stats import norm
 
 from kmer_functional_profiler import _core
@@ -108,7 +108,7 @@ class Timer:
 
     def __init__(self, path: Path | None = None, *, log: bool = False) -> None:
         self.stages: dict[str, dict[str, float]] = {}
-        self.counts: dict[str, int] = {}
+        self.counts: dict[str, float] = {}
         self.path, self.log, self.running = path, log, ""
         self.start = time.perf_counter()
         self.peak_anon = anon_rss()
@@ -380,7 +380,7 @@ def _fit_components(
     make_step: Callable[[_Block], Step],
     tol: float,
     max_iter: int,
-    report: dict[str, int] | None = None,
+    report: dict[str, float] | None = None,
     other_max: float = 1.0,
     pair_weight: PairWeight | None = None,
     offset: np.ndarray | None = None,
@@ -403,6 +403,12 @@ def _fit_components(
     With ``pair_weight``, a component of more than ``MAX_FIT_PAIRS`` pairs is fitted
     block-wise (:func:`_fit_blockwise`). Only units with pairs are fitted; ``offset`` (per
     k-mer ``row``) and ``pair_ids`` (each pair's index in the caller's pairs) serve the blocks.
+    ``report`` gains ``em_iterations``, ``em_unconverged_units`` and ``em_max_change``: how
+    far the furthest component stopped at ``max_iter`` was from the test, as its last
+    change (the larger of the coverage change over its largest coverage and the ``other``
+    change; ``tol`` passes; 0 if none stopped). Components that stop there are mostly
+    units sharing all their hit k-mers, whose coverage drifts slowly between them along a
+    nearly flat likelihood (phase 7, step 29).
     """
     n = len(lam)
     label = _unit_components(col, row, n)
@@ -425,7 +431,7 @@ def _fit_components(
             )
             for c in np.flatnonzero(size > MAX_FIT_PAIRS):
                 pairs = np.flatnonzero(label[col] == c)
-                args = (col, row, lam, other, make_step, tol, max_iter, report, other_max)
+                args = (col, row, lam, other, make_step, tol, report, other_max)
                 attributed += _fit_blockwise(pairs, pair_weight, *args)
             return attributed
     attributed = np.zeros(n)
@@ -436,6 +442,7 @@ def _fit_components(
     pair_start = np.r_[0, np.cumsum(np.bincount(col, minlength=n))]
     local = np.empty(n, dtype=col.dtype)
     step_max = np.ones(len(seg))  # per component, kept through compactions
+    change = np.zeros(len(seg))  # per component, its last change against the test
     it = 0
     while len(active) and it < max_iter:
         pairs = by_unit[_ranges(pair_start[active], np.diff(pair_start)[active])]
@@ -459,10 +466,14 @@ def _fit_components(
             else:
                 it += 1
                 new, new_se, att = step(la, se)
-            converged = (
-                np.maximum.reduceat(np.abs(new - la), starts)
-                <= tol * np.maximum.reduceat(new, starts)
-            ) & (np.maximum.reduceat(np.abs(new_se - se), starts) <= tol)
+            change = np.maximum(
+                _div(
+                    np.maximum.reduceat(np.abs(new - la), starts),
+                    np.maximum.reduceat(new, starts),
+                ),
+                np.maximum.reduceat(np.abs(new_se - se), starts),
+            )
+            converged = change <= tol
             la, se = new, new_se
             now = np.repeat(converged, seg) & ~done
             lam[active[now]], other[active[now]], attributed[active[now]] = (
@@ -479,10 +490,29 @@ def _fit_components(
         )
         moving = ~done[starts]
         active, seg, step_max = active[np.repeat(moving, seg)], seg[moving], step_max[moving]
+        change = change[moving]
     if report is not None:  # units still moving here stopped at max_iter, not converged
         report["em_iterations"] = max(report.get("em_iterations", 0), it)
         report["em_unconverged_units"] = report.get("em_unconverged_units", 0) + len(active)
+        stopped = float(change.max()) if len(active) else 0.0
+        report["em_max_change"] = max(report.get("em_max_change", 0.0), stopped)
     return attributed
+
+
+def _unit_order(col: np.ndarray, row: np.ndarray, units: np.ndarray) -> np.ndarray:
+    """``units`` (sorted) in reverse Cuthill-McKee order of their graph (linked by shared
+    k-mers ``row``), so units that share k-mers sit near each other in the order."""
+    local = np.searchsorted(units, col)
+    order = np.argsort(row, kind="stable")
+    by_kmer = local[order]
+    same = row[order][1:] == row[order][:-1]  # each unit linked to the k-mer's next holder
+    n = len(units)
+    graph = coo_array(
+        (np.ones(int(same.sum()), dtype=np.int32), (by_kmer[:-1][same], by_kmer[1:][same])),
+        shape=(n, n),
+    ).tocsr()
+    ordered: np.ndarray = units[reverse_cuthill_mckee(graph, symmetric_mode=False)]
+    return ordered
 
 
 def _fit_blockwise(
@@ -494,36 +524,42 @@ def _fit_blockwise(
     other: np.ndarray,
     make_step: Callable[[_Block], Step],
     tol: float,
-    max_iter: int,
-    report: dict[str, int] | None,
+    report: dict[str, float] | None,
     other_max: float,
 ) -> np.ndarray:
     """Fit one component (its ``pairs``) in blocks of units of at most ``MAX_FIT_PAIRS``
-    pairs, so a step's working memory is one block's. Each round takes ``BLOCK_STEPS`` EM
-    steps on each block in turn, with the weight of its k-mers' other holders held fixed (an
-    ``offset`` per k-mer); rounds repeat until no unit's parameters move by more than
-    :func:`_fit_components`' test. At convergence that is the whole component's fixed point.
-    Few steps per block, not a fit to convergence: a block fitted alone can drive a unit
-    towards 0 that the others' next round would need back, and EM is slow to bring it back.
+    pairs, so a step's working memory is one block's. A round takes ``BLOCK_STEPS`` EM steps
+    on each block in turn, with the weight of its k-mers' other holders held fixed (an
+    ``offset`` per k-mer). Few steps per block, not a fit to convergence: a block fitted
+    alone can drive a unit towards 0 that the others' next round would need back, and EM is
+    slow to bring it back. At convergence that is the whole component's fixed point.
+
+    Two things keep the rounds few (phase 7, step 29). Blocks are runs of units in reverse
+    Cuthill-McKee order (:func:`_unit_order`), so units sharing k-mers mostly fall in one
+    block and fewer k-mers are held fixed across blocks. And rounds are accelerated as
+    :func:`_squarem` accelerates steps: two rounds, a squared extrapolation along them
+    (coverages kept above 1e-3 x the second round's, ``other`` in [0, ``other_max``]), and a
+    round from there, falling back to the two plain rounds if that round moves more than
+    the first did. Without both, block-wise EM crept along slow directions and its round
+    test could pass ~0.1 short of the fixed point. It stops when the last round changes no
+    unit's parameters by more than :func:`_fit_components`' test, or at ``MAX_BLOCK_ROUNDS``.
+
     ``report`` gains ``em_block_rounds`` (the most rounds a component took) and counts
-    ``em_iterations`` as rounds x ``BLOCK_STEPS``; a component still moving after
-    ``MAX_BLOCK_ROUNDS`` counts as unconverged.
+    ``em_iterations`` as rounds x ``BLOCK_STEPS``; a component still moving after the last
+    round counts as unconverged, with its last change in ``em_max_change``.
     """
     units, per_unit = np.unique(col[pairs], return_counts=True)
-    # ponytail: blocks are runs of unit ids, not a graph partition; partition the unit graph
-    # (fewer k-mers across blocks, fewer rounds) if em_block_rounds is high.
+    ordered = _unit_order(col[pairs], row[pairs], units)
+    count = per_unit[np.searchsorted(units, ordered)]
     chunk = np.zeros(len(lam), dtype=np.int64)
-    chunk[units] = (np.cumsum(per_unit) - per_unit) // MAX_FIT_PAIRS
+    chunk[ordered] = (np.cumsum(count) - count) // MAX_FIT_PAIRS
     pair_chunk = chunk[col[pairs]]
     order = np.argsort(pair_chunk, kind="stable")
     blocks = np.split(pairs[order], np.flatnonzero(np.diff(pair_chunk[order])) + 1)
     n_rows = int(row[pairs].max()) + 1
     attributed = np.zeros(len(lam))
-    converged = False
-    rounds = 0
-    while not converged and rounds < MAX_BLOCK_ROUNDS:
-        rounds += 1
-        before_lam, before_other = lam[units], other[units]
+
+    def one_round() -> tuple[np.ndarray, np.ndarray]:
         total = np.bincount(row[pairs], weights=pair_weight(pairs), minlength=n_rows)
         for b in blocks:
             total -= np.bincount(row[b], weights=pair_weight(b), minlength=n_rows)
@@ -543,16 +579,45 @@ def _fit_blockwise(
             own = np.unique(col[b])
             attributed[own] = att[own]
             total += np.bincount(row[b], weights=pair_weight(b), minlength=n_rows)
-        converged = bool(
-            np.abs(lam[units] - before_lam).max() <= tol * lam[units].max()
-            and np.abs(other[units] - before_other).max() <= tol
+        return lam[units].copy(), other[units].copy()
+
+    def moved(la: np.ndarray, se: np.ndarray, la0: np.ndarray, se0: np.ndarray) -> float:
+        return max(
+            float(np.abs(la - la0).max() / max(la.max(), 1e-300)), float(np.abs(se - se0).max())
         )
+
+    step_max, change, rounds = 1.0, np.inf, 0
+    while change > tol and rounds + 3 <= MAX_BLOCK_ROUNDS:
+        l0, s0 = lam[units].copy(), other[units].copy()
+        l1, s1 = one_round()
+        l2, s2 = one_round()
+        att2 = attributed[units].copy()
+        r_l, r_s = l1 - l0, s1 - s0
+        v_l, v_s = l2 - l1 - r_l, s2 - s1 - r_s
+        rr = float((r_l**2).sum() + (r_s**2).sum())
+        vv = float((v_l**2).sum() + (v_s**2).sum())
+        alpha = min(max(-np.sqrt(rr / vv) if vv > 0 else -1.0, -step_max), -1.0)
+        if alpha <= -step_max:
+            step_max *= 4
+        lx = np.maximum(l0 - 2 * alpha * r_l + alpha**2 * v_l, 1e-3 * l2)
+        sx = np.clip(s0 - 2 * alpha * r_s + alpha**2 * v_s, 0.0, other_max)
+        lam[units], other[units] = lx, sx
+        l3, s3 = one_round()
+        rounds += 3
+        if float(((l3 - lx) ** 2).sum() + ((s3 - sx) ** 2).sum()) > rr:
+            step_max = 1.0  # back to the two plain rounds
+            lam[units], other[units], attributed[units] = l2, s2, att2
+            change = moved(l2, s2, l1, s1)
+        else:
+            change = moved(l3, s3, lx, sx)
     if report is not None:
         report["em_iterations"] = max(report.get("em_iterations", 0), rounds * BLOCK_STEPS)
         report["em_block_rounds"] = max(report.get("em_block_rounds", 0), rounds)
+        stopped = change > tol
         report["em_unconverged_units"] = report.get("em_unconverged_units", 0) + (
-            0 if converged else len(units)
+            len(units) if stopped else 0
         )
+        report["em_max_change"] = max(report.get("em_max_change", 0.0), change if stopped else 0.0)
     return attributed
 
 
@@ -708,7 +773,7 @@ def em(
     prior: tuple[float, float] | None = None,
     tol: float = 1e-8,
     max_iter: int = 1000,
-    report: dict[str, int] | None = None,
+    report: dict[str, float] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -733,8 +798,10 @@ def em(
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
     or small ``m_g``; ``present`` is then updated by EM over the unhit k-mers' presence.
 
-    ``report`` collects ``em_iterations`` (the most any component took) and
-    ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over calls.
+    ``report`` collects ``em_iterations`` (the most any component took),
+    ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over
+    calls, and ``em_max_change`` (how far the furthest of those was from converging: see
+    :func:`_fit_components`).
     """
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())

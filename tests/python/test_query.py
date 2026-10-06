@@ -711,11 +711,13 @@ def test_em_reports_unconverged_components() -> None:
         {"unit": [0, 0, 1, 1, 2], "hash": [1, 2, 1, 2, 3], "hits": [5, 7, 5, 7, 4]},
         schema={"unit": pl.UInt32, "hash": pl.UInt64, "hits": pl.UInt32},
     )
-    report: dict[str, int] = {}
+    report: dict[str, float] = {}
     em(kmers, np.array([4, 6, 2]), max_iter=3, report=report)
-    assert report == {"em_iterations": 3, "em_unconverged_units": 2}
-    em(kmers, np.array([4, 6, 2]), report=report)
+    stopped = report["em_max_change"]
+    assert (report["em_iterations"], report["em_unconverged_units"]) == (3, 2) and stopped > 1e-8
+    em(kmers, np.array([4, 6, 2]), report=report)  # converges: the stopped change stays
     assert report["em_unconverged_units"] == 2 and report["em_iterations"] > 3
+    assert report["em_max_change"] == stopped
 
 
 def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -901,12 +903,25 @@ def test_blockwise_em_matches_whole(monkeypatch: pytest.MonkeyPatch) -> None:
     assert query.components(kmers)[0] == 1
     whole = em(kmers, m_g, tol=1e-10)
     monkeypatch.setattr(query, "MAX_FIT_PAIRS", 300)
-    report: dict[str, int] = {}
+    report: dict[str, float] = {}
     blocks = em(kmers, m_g, tol=1e-10, report=report)
     assert report["em_block_rounds"] > 1 and report["em_unconverged_units"] == 0
     assert np.allclose(blocks["coverage"], whole["coverage"], rtol=0, atol=1e-6)
     zi = em(kmers, m_g, zero_inflated=True)
     assert zi.height == whole.height and np.isfinite(zi["coverage"].to_numpy()).all()
+
+
+def test_blockwise_em_does_not_stop_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    # At the default tol, blocks cut by unit id crept along a slow direction and passed the
+    # round test with three units ~0.1 short of the fixed point; blocks in graph order, with
+    # rounds extrapolated, reach it.
+    kmers, m_g = _families(60, chained=True)
+    whole = em(kmers, m_g, tol=1e-12, max_iter=100_000)
+    monkeypatch.setattr(query, "MAX_FIT_PAIRS", 300)
+    report: dict[str, float] = {}
+    blocks = em(kmers, m_g, report=report)
+    assert report["em_unconverged_units"] == 0 and report["em_max_change"] == 0
+    assert np.allclose(blocks["coverage"], whole["coverage"], rtol=0, atol=1e-4)
 
 
 def test_link_cuts_on_largest_component() -> None:
