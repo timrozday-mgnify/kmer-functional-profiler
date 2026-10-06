@@ -332,12 +332,16 @@ def em_starts(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
             continue
         starts = sorted(by_start)
         frames = []
-        for s in starts:
-            p = pl.read_csv(by_start[s], separator="\t", infer_schema_length=None)
-            keep = [c for c in (*START_RELATIVE, *START_ABSOLUTE) if c in p.columns]
-            frames.append(p.select("unit", *keep).rename({c: f"{c}.{s}" for c in keep}))
-        usual = pl.read_csv(by_start[0], separator="\t", infer_schema_length=None)
-        kept = usual.filter(pl.col("kmers_unique") >= 1).select("unit", "component", "kmers_unique")
+        for s in starts:  # only the compared columns: full-index profiles are wide and long
+            p = pl.scan_csv(by_start[s], separator="\t", infer_schema_length=None)
+            keep = [c for c in (*START_RELATIVE, *START_ABSOLUTE) if c in p.collect_schema()]
+            frames.append(p.select("unit", *keep).rename({c: f"{c}.{s}" for c in keep}).collect())
+        kept = (
+            pl.scan_csv(by_start[0], separator="\t", infer_schema_length=None)
+            .filter(pl.col("kmers_unique") >= 1)
+            .select("unit", "component", "kmers_unique")
+            .collect()
+        )
         joined = kept
         for f in frames:
             joined = joined.join(f, on="unit", how="left")
