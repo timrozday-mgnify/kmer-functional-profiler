@@ -32,6 +32,8 @@ for r in standard-novaseq frames-novaseq frames-miseq; do (cd kfp-ablations/$r &
 # then, each when its NovaSeq run has finished:
 cd kfp-ablations/standard-query-cost && sbatch run.sh
 cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one after another
+# EM convergence fix (plan, phase 7, step 29), once tiers-novaseq's indexes exist:
+cd kfp-ablations/em-query-cost && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
