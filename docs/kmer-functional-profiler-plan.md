@@ -1558,6 +1558,24 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - Interpretation. On the same units, the selection-conditioned count-space estimator alone (B) cuts the 70–80% bias by about a third (+0.13 → +0.09 NovaSeq, +0.16 → +0.10 at 1.65 M) and lifts interval coverage from 0.68–0.80 to 0.84–0.92 overall, and at 70–80% from 0.09–0.18 to 0.86–0.90. The rest of the bias is survival above a^k: with short regions (C, region 10) it is within ±0.015 at 80–100% in both runs and at 70–80% at 1.65 M (−0.035 NovaSeq), and NovaSeq and 1.65 M now agree within ~0.03, which step 22's per-depth calibration could not achieve. Longer regions over-correct below 80%: the region length matters, which is why the protein-pair fit measures co-survival. Spearman is unchanged (0.40–0.47), as expected for a monotone change. The mask at 5 halves the units with an `aai` (8,862 → 4,011 NovaSeq).
   - **Order:** (1) the `aai-model` HPC run from `dev-aai`; (2) `aai-score --model results/aai_model.json` over the `floor` and `tiers` profiles; (3) decision rule of step 23 against the union truth; (4) merge `dev-aai` into main after the ablations.
 
+* **Phase 7, step 26 — sylph's read-error estimate tested against the Phred-based one: not adopted (`dev-aai`).** Sylph uses no error estimate for ANI: its zero-inflated fit absorbs the uniform thinning errors cause, as `aai` does here. It estimates the error survival E only to turn effective coverage into depth for `--estimate-unknown`: E = 1 − n₁ / Σ_{a>1} a nₐ over the read sketch's k-mer multiplicities (singletons taken as errors; the paper advises giving ε for soil and ocean). Here, `sample_summary`'s `error_thinning` plays that role, from Phred and masked bases.
+  - **Test (local, scratch).** Eight bacterial genomes (38 Mb, 332 contigs), InSilicoSeq lognormal abundances, seed 1, 2 M reads: error-free at 151 and 301 bp (patched perfect model), NovaSeq (151 bp) and MiSeq (301 bp); all pairs, 1 in 4 and 1 in 20. Index: the genomes' six-frame ORFs ≥ 100 aa (88,895 units), `t_base` 0.02. True thinning: the summed `coverage_zi` of units at ≥ 3× (error-free), error set over the error-free set of the same read length. Read length alone changes depth (a 301-bp read more often runs past a reading frame's end, which drops the frame), hence the 301-bp error-free set. E is on all sampled read k-mers and on the 1-in-256 subsample the query keeps.
+
+    | reads | model | true | Phred `error_thinning` | sylph E (all) | sylph E (1/256) |
+    |---|---|---|---|---|---|
+    | all | error-free 151 | 1 | 0.981 | 0.980 | 0.982 |
+    | all | NovaSeq | 0.950 | 0.939 | 0.943 | 0.934 |
+    | all | error-free 301 | 1 | 0.971 | 0.992 | 0.993 |
+    | all | MiSeq | 0.786 | 0.745 | 0.854 | 0.849 |
+    | 1 in 4 | NovaSeq | 0.935 | 0.940 | 0.853 | 0.828 |
+    | 1 in 4 | MiSeq | 0.773 | 0.745 | 0.778 | 0.745 |
+    | 1 in 4 | error-free 151 | 1 | 0.981 | 0.901 | 0.911 |
+    | 1 in 20 | NovaSeq | 0.913 | 0.940 | 0.503 | 0.419 |
+    | 1 in 20 | MiSeq | 0.748 | 0.744 | 0.504 | 0.510 |
+    | 1 in 20 | error-free 151 | 1 | 0.981 | 0.582 | 0.639 |
+
+  - **Interpretation.** The Phred estimate is within 0.041 of the truth everywhere and does not depend on depth. Sylph's E matches it only at full depth (NovaSeq −0.007 against Phred −0.011; MiSeq +0.068 against −0.041). It falls with depth even for error-free reads (0.98 → 0.90 → 0.58), because k-mers of low-coverage contigs occur once: its assumption 1. A real metagenome has far more low-coverage sequence than this sample, so E would be worse there. It also misses errors that drop whole frames (a stop gains no singleton k-mers). Not added. The one thing it shows: the Phred estimate reads 0.97–0.98 for error-free reads (masked bases and nominal qualities), a floor of ~2–3% thinning that is not errors; small, left as is.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
