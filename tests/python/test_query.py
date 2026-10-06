@@ -1,10 +1,13 @@
 """Query counts against an index built from the fixture proteins."""
 
+import dataclasses
 import itertools
 import json
+import sys
 import time
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -38,6 +41,7 @@ from kmer_functional_profiler.query import (
     sample_summary,
     unit_hits,
 )
+from kmer_functional_profiler.survival import SurvivalModel
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 READS = (DATA / "reads_1.fastq.gz", DATA / "reads_2.fastq.gz")
@@ -235,28 +239,173 @@ def test_aai_interval_without_draws(members: Path) -> None:
     assert got["aai_hi"].max() <= 1.0  # type: ignore[operator]
 
 
+def strains(model: SurvivalModel, t: float, units: int, length: int, rng: Any) -> np.ndarray:
+    """Sites left unchanged at divergence ``t`` in ``units`` homologs of ``length`` sites, drawn
+    from ``model``'s generative process (a Markov chain of rate categories along the sequence)."""
+    r = model.rates
+    redraw = rng.random((units, length)) < model.switch
+    fresh = rng.integers(0, len(r), (units, length))
+    cat = fresh.copy()
+    for i in range(1, length):
+        cat[:, i] = np.where(redraw[:, i], fresh[:, i], cat[:, i - 1])
+    return rng.random((units, length)) >= -np.expm1(-r[cat] * t)
+
+
+def windows_of(same: np.ndarray, k: int) -> np.ndarray:
+    return np.lib.stride_tricks.sliding_window_view(same, k, axis=1).all(axis=2)
+
+
 def test_aai_interval_survival_variance() -> None:
     # Substitutions at identity a over L positions: the share of the L - k + 1 windows that
-    # survive has variance c (1 - c) d / L, d the overlap factor aai_interval uses.
+    # survive has variance c (1 - c) d / L, d the overlap factor aai_fit uses.
     rng = np.random.default_rng(0)
     k, length, a = 11, 400, 0.93
     hit = rng.random((4000, length)) < a
-    windows = np.lib.stride_tricks.sliding_window_view(hit, k, axis=1).all(axis=2)
-    c = windows.mean(axis=1)
+    c = windows_of(hit, k).mean(axis=1)
     n = length - k + 1
-    lo, hi = query.aai_interval(
+    model = SurvivalModel(k)
+    _, lo, hi, _ = query.aai_fit(
         coverage=np.array([1e6]), present=np.array([a**k]), m=np.array([n]),
-        pin_sum=np.array([n]), n_kmers=np.array([n]), k=k,
+        pin_sum=np.array([n]), n_kmers=np.array([n]), windows=np.array([n]), model=model,
     )  # fmt: skip
     # The interval of a from the survival term alone holds ~95% of simulated strains.
     inside = ((c ** (1 / k) >= lo[0]) & (c ** (1 / k) <= hi[0])).mean()
     assert 0.92 <= inside <= 0.98
     # More kept windows, narrower; sparse sampling (t << 1) removes the overlap term.
-    args = {"coverage": np.full(3, 1e6), "present": np.full(3, a**k), "k": k}
-    lo, hi = query.aai_interval(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
-                                n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
+    args = {"coverage": np.full(3, 1e6), "present": np.full(3, a**k), "model": model,
+            "windows": np.full(3, 2000)}  # fmt: skip
+    _, lo, hi, _ = query.aai_fit(m=np.array([20, 200, 200]), pin_sum=np.array([20, 200, 200]),
+                                 n_kmers=np.array([20, 200, 2000]), **args)  # fmt: skip
     width = hi - lo
     assert width[0] > width[1] > width[2]
+
+
+def test_survival_model_matches_its_generative_process() -> None:
+    # Independent substitutions: S = a^k and the overlap factor of identical windows.
+    a = np.linspace(0.5, 1.0, 11)
+    flat = SurvivalModel(11)
+    assert flat.survival(a) == pytest.approx(a**11, rel=2e-3)
+    assert flat.identity(a**11) == pytest.approx(a, abs=1e-4)
+    b = 0.9
+    expected = 1 + 2 * sum((b**j - b**11) / (1 - b**11) for j in range(1, 11))
+    assert flat.overlap(np.array([b**11]), 1.0, 1e9)[0] == pytest.approx(expected, rel=1e-3)
+    # iid site rates (region 1) keep a^k whatever their spread; clustered rates keep more.
+    assert SurvivalModel(11, 0.3, 1.0).survival(a) == pytest.approx(a**11, rel=5e-3)
+    assert (SurvivalModel(11, 1.0, 30.0).survival(a[:-1]) > a[:-1] ** 11 + 0.01).all()
+    # Survival, identity and co-survival against Monte Carlo of the same process, no fitting.
+    rng = np.random.default_rng(3)
+    model, k = SurvivalModel(11, 1.0, 30.0, categories=8), 11
+    for t in (0.1, 0.3):
+        same = strains(model, t, 3000, 400, rng)
+        win = windows_of(same, k)
+        got_a = same.mean()
+        assert model.survival(got_a) == pytest.approx(win.mean(), abs=0.01)
+        for lag in (1, 10, 40):
+            both = (win[:, :-lag] & win[:, lag:]).mean()
+            s = win.mean()
+            rho = model.tables["rho"][np.argmin(np.abs(model.tables["a"] - got_a)), lag - 1]
+            assert (both - s**2) / (s * (1 - s)) == pytest.approx(rho, abs=0.03)
+
+
+def test_aai_fit_recovers_identity_under_clustered_rates() -> None:
+    rng = np.random.default_rng(1)
+    model, n, units = SurvivalModel(11, 1.0, 30.0, categories=8), 400, 300
+    for t in (0.1, 0.2, 0.35):
+        same = strains(model, t, units, n + 10, rng)
+        a = same.mean()
+        present = windows_of(same, 11).mean(axis=1)
+        full = np.full(units, float(n))
+        args = {"coverage": np.full(units, 20.0), "present": present, "m": full, "pin_sum": full,
+                "n_kmers": full, "windows": full}  # fmt: skip
+        point, lo, hi, _ = query.aai_fit(model=model, **args)
+        assert np.median(point) == pytest.approx(a, abs=0.015)
+        # dense windows: clustering inflates the variance far beyond independent windows
+        assert ((lo <= a) & (a <= hi)).mean() >= 0.9
+        # a^k reads these strains as closer than they are, with too narrow intervals
+        flat, flat_lo, flat_hi, _ = query.aai_fit(model=SurvivalModel(11), **args)
+        assert np.median(flat) > a + 0.01
+        assert ((flat_lo <= a) & (a <= flat_hi)).mean() < 0.7
+
+
+def test_selection_at_the_detection_limit_is_corrected() -> None:
+    # Low depth: aai is reported only for units with >= 5 hit k-mers, the lucky draws
+    # among those at this depth. Inverting their hits reads high; conditioning on the
+    # selection does not.
+    rng = np.random.default_rng(2)
+    model, n, units, a, seen = SurvivalModel(11), 300, 20_000, 0.9, 0.05
+    survive = rng.random((units, n)) < a**11
+    hit = (survive & (rng.random((units, n)) < seen)).sum(axis=1)
+    hit = hit[hit >= 5]
+    full = np.full(hit.size, float(n))
+    args = {"coverage": np.full(hit.size, -np.log1p(-seen)), "present": hit / (n * seen),
+            "m": full, "pin_sum": full, "n_kmers": 10 * full, "windows": full,
+            "model": model}  # fmt: skip
+    point, lo, hi, _ = query.aai_fit(**args, selected=5)
+    naive = np.clip(hit / (n * seen), 0, 1) ** (1 / 11)
+    assert np.median(naive) > a + 0.015
+    assert np.median(point) == pytest.approx(a, abs=0.01)
+    assert ((lo <= a) & (a <= hi)).mean() >= 0.95
+    # one hit k-mer says nothing beyond the selection: the interval is all of [0, 1]
+    one = {key: v[:1] if isinstance(v, np.ndarray) else v for key, v in args.items()}
+    one["present"] = np.array([1 / (n * seen)])
+    _, lo1, hi1, _ = query.aai_fit(**one)
+    assert (lo1[0], hi1[0]) == pytest.approx((0.0, 1.0), abs=1e-6)
+
+
+def test_min_aai_kmers_nulls_aai_but_keeps_its_kmers(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    got = profile(index, *READS, with_aai=True, min_aai_kmers=1e9)
+    assert (
+        got.select("aai", "aai_lo", "aai_hi", "aai_naive").null_count().row(0) == (got.height,) * 4
+    )
+    assert (got.filter(pl.col("kmers_unique") > 0)["aai_kmers"] > 0).all()
+    assert profile(index, *READS, with_aai=True, min_aai_kmers=0)["aai"].null_count() < got.height
+
+
+MODEL = {"survival": "markov_gamma", "shape": 1.0, "region": 30.0}
+
+
+def test_aai_model_sidecar_changes_the_estimate(members: Path, tmp_path: Path) -> None:
+    build_index(members, tmp_path / "idx", IndexParams(k=K, t_base=1.0, fp_bits=64))
+    plain = profile(Index.load(tmp_path / "idx"), *READS, with_aai=True)
+    model = MODEL | {"k": K}
+    runner, attach = CliRunner(), ["aai-model", str(tmp_path / "idx")]
+    bad = tmp_path / "bad.json"
+    for wrong in ({"k": K + 1}, {"region": 0.5}, {"survival": "regional_gamma"}):
+        bad.write_text(json.dumps(model | wrong))
+        assert runner.invoke(app, [*attach, str(bad)]).exit_code != 0
+    good = tmp_path / "model.json"
+    good.write_text(json.dumps(model))
+    assert runner.invoke(app, [*attach, str(good)]).exit_code == 0
+    index = Index.load(tmp_path / "idx")
+    assert index.aai_model == model
+    got = plain.join(profile(index, *READS, with_aai=True), on="unit")
+    got = got.filter(pl.col("aai").is_not_null())
+    assert got.height > 0 and (got["aai_kmers"] == got["aai_kmers_right"]).all()
+    # the same survival read under clustered rates is a lower identity
+    assert (got["aai_right"] <= got["aai"] + 1e-9).all()
+    assert runner.invoke(app, attach).exit_code == 0  # no file: removed
+    assert Index.load(tmp_path / "idx").aai_model is None
+
+
+def test_benchmark_reestimates_aai_as_the_query(shared: Path) -> None:
+    # bench.py's offline rerun of archived profiles (step 23) gives what the query reports
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "workflows" / "fmh-benchmark"))
+    import bench
+
+    index = build(shared, t_base=1.0, fp_bits=64)
+    for model, mask in ((None, 5), (MODEL, 2)):
+        got = profile(
+            dataclasses.replace(index, aai_model=model), *READS, with_aai=True, min_aai_kmers=mask
+        )
+        assert got["aai"].drop_nulls().len() > 0
+        again = bench.reestimate_aai(
+            got.drop("aai", "aai_lo", "aai_hi", "aai_kmers"),
+            SurvivalModel.from_json(model, K),
+            mask,
+        )
+        for c in ("aai", "aai_lo", "aai_hi", "aai_kmers"):
+            assert again[c].fill_null(-1).to_list() == pytest.approx(got[c].fill_null(-1).to_list())
 
 
 def write_members(path: Path, seqs: list[str], first_rep: int = 0) -> Path:

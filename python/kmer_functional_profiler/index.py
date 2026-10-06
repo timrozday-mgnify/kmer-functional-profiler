@@ -74,6 +74,7 @@ MASK_WIDTH: Final = 6
 
 
 AAI_CALIBRATION: Final = "aai_calibration.json"
+AAI_MODEL: Final = "aai_model.json"  # the k-mer survival model aai inverts
 PROMISCUOUS: Final = "promiscuous.npy"
 
 
@@ -497,6 +498,7 @@ class Index:
     tier2: PackedTable
     dense: PackedTable | None = None
     aai_calibration: dict[str, Any] | None = None
+    aai_model: dict[str, Any] | None = None
     promiscuous: NDArray[np.uint64] | None = None  # see promiscuous_base; None if not built
 
     @classmethod
@@ -504,14 +506,18 @@ class Index:
         """Read an index; its tiers and unit columns are memory-mapped unless ``mmap`` is
         False. ``aai_calibration.json``, if present, is the map the query applies to ``aai``
         (attached after the build, see ``query.check_aai_calibration``; a sidecar, so
-        ``meta.json`` and the hashes recorded of it stay as built)."""
+        ``meta.json`` and the hashes recorded of it stay as built); ``aai_model.json``, if
+        present, the k-mer survival model ``aai`` inverts (``survival.SurvivalModel``; a
+        sidecar for the same reason)."""
         directory = Path(directory)
         meta = json.loads((directory / "meta.json").read_text())
         calibration = directory / AAI_CALIBRATION
+        model = directory / AAI_MODEL
         promiscuous = directory / PROMISCUOUS
         return cls(
             promiscuous=np.load(promiscuous) if promiscuous.exists() else None,
             aai_calibration=json.loads(calibration.read_text()) if calibration.exists() else None,
+            aai_model=json.loads(model.read_text()) if model.exists() else None,
             meta=meta,
             units=UnitTable(directory, mmap=mmap),
             tier2=PackedTable.load(directory, "tier2", meta["tier2"], mmap=mmap),
