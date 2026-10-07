@@ -20,6 +20,19 @@ substitutions): S = a^k and B_j = a^(k + min(j, k)).
 
 Everything depends on (``shape``, ``region``, k, t) only, so it is tabulated once on a grid
 of t, and per-unit values are interpolated: ~0.06 s per model, ~0.1 s per 10^6 units.
+
+Markov-beta (``concentration`` set; plan, phase 7, step 33): the categories are sites'
+chances to stay unchanged rather than rates: the ``categories`` equal-probability slices of
+Beta(a phi, (1 - a) phi), phi = ``concentration``, each at its slice's mean (so they average
+exactly a), at a = exp(-t) on the same grid. A region's identity scatters around the pair's
+own identity with a fixed concentration, as protein pairs show; under gamma rates the
+contrast changes with t. The transfer products are the same.
+
+``ends`` < 1 is end loss: a share 1 - ``ends`` of a unit's windows lies outside the region a
+homolog aligns to and is never shared, so survival is ``ends`` S. In the correlation it
+thins windows independently: rho' = ``ends`` rho (1 - S) / (1 - ``ends`` S).
+ponytail: real end loss is contiguous (two ends) and varies between units, variance this
+leaves out; model the aligned share per unit if intervals under-cover near identity 1.
 """
 
 from dataclasses import dataclass
@@ -27,6 +40,7 @@ from functools import cached_property
 from typing import Any, Final, Self
 
 import numpy as np
+from scipy.stats import beta as beta_dist
 from scipy.stats import gamma
 
 T_GRID: Final = np.concatenate([[0.0], np.geomspace(1e-4, 50.0, 1199)])  # divergence
@@ -42,13 +56,18 @@ class SurvivalModel:
     shape: float | None = None
     region: float = 1.0
     categories: int = CATEGORIES
+    concentration: float | None = None  # Markov-beta's phi, in place of ``shape``
+    ends: float = 1.0
 
     @classmethod
     def from_json(cls, model: dict[str, Any] | None, k: int) -> Self:
         """The model of an ``aai_model.json`` (None: independent substitutions)."""
         if model is None:
             return cls(k)
-        return cls(k, model["shape"], model["region"], model.get("categories", CATEGORIES))
+        categories, ends = model.get("categories", CATEGORIES), model.get("ends", 1.0)
+        if model["survival"] == "markov_beta":
+            return cls(k, None, model["region"], categories, model["concentration"], ends)
+        return cls(k, model["shape"], model["region"], categories, ends=ends)
 
     @property
     def rates(self) -> np.ndarray:
@@ -62,17 +81,37 @@ class SurvivalModel:
     @property
     def switch(self) -> float:
         """Chance per site that the rate category is redrawn."""
-        return 0.0 if self.shape is None else 1 / self.region
+        return 0.0 if self.shape is None and self.concentration is None else 1 / self.region
+
+    def keep_at(self, t: np.ndarray) -> np.ndarray:
+        """(len(``t``) x categories): each category's chance that a site is unchanged at
+        divergence ``t``."""
+        t = np.asarray(t, dtype=np.float64)[:, None]
+        if self.concentration is None:
+            return np.asarray(np.exp(-t * self.rates))
+        phi, c = self.concentration, self.categories
+        a, change = np.exp(-t), -np.expm1(-t)
+
+        def slice_means(mean: np.ndarray) -> np.ndarray:
+            """The ``c`` slices' means of Beta(mean phi, (1 - mean) phi), ascending."""
+            p, q = np.maximum(mean * phi, 1e-300), np.maximum((1 - mean) * phi, 1e-300)
+            with np.errstate(all="ignore"):
+                edges = beta_dist.ppf(np.arange(c + 1) / c, p, q)
+                mass = np.diff(beta_dist.cdf(edges, p + 1, q), axis=1)  # E[X; slice] / mean
+            return np.asarray(c * mean * np.nan_to_num(mass))
+
+        # the side away from 1 keeps float precision: X for a <= 1/2, 1 - X above
+        keep = np.where(a <= 0.5, slice_means(a), 1 - slice_means(change)[:, ::-1])
+        return np.asarray(np.clip(keep, 0.0, 1.0))
 
     @cached_property
     def tables(self) -> dict[str, np.ndarray]:
         """Over ``T_GRID``: ``a``, ``S``; ``rho`` (T x ``MAX_LAG``), the correlation
         (B_j - S^2) / (S (1 - S)) of the survival of windows j = 1.. apart; and its running
         sums ``R1`` = sum_{i<=j} rho_i and ``R2`` = sum_{i<=j} i rho_i, for :meth:`overlap`."""
-        k, t = self.k, T_GRID[:, None]
-        r, rho = self.rates, self.switch
-        pi = np.full(len(r), 1 / len(r))
-        e = np.exp(-t * r)  # (T, C): a site unchanged, by category
+        k, rho = self.k, self.switch
+        e = self.keep_at(T_GRID)  # (T, C): a site unchanged, by category
+        pi = np.full(e.shape[1], 1 / e.shape[1])
 
         def right(v: np.ndarray) -> np.ndarray:  # v @ P: stay, or redraw from pi
             return np.asarray((1 - rho) * v + rho * v.sum(axis=1, keepdims=True) * pi)
@@ -102,6 +141,9 @@ class SurvivalModel:
         with np.errstate(invalid="ignore", divide="ignore"):
             corr = np.where(var[:, None] > 1e-12, cov / var[:, None], 0.0)
         a = e @ pi
+        if self.ends < 1:  # end loss, windows thinned independently (module docstring)
+            corr = corr * self.ends * (1 - survive[:, None]) / (1 - self.ends * survive[:, None])
+            survive = self.ends * survive
         j = np.arange(1, MAX_LAG + 1)
         return {"a": a, "S": survive, "rho": corr,
                 "R1": corr.cumsum(axis=1), "R2": (j * corr).cumsum(axis=1)}  # fmt: skip
@@ -154,13 +196,19 @@ class SurvivalModel:
 
 def check_aai_model(model: dict[str, Any], params: dict[str, Any]) -> None:
     """Raise ValueError unless ``model`` is a usable survival model for an index built with
-    ``params``: ``survival`` "markov_gamma", ``shape`` > 0, ``region`` >= 1, and
+    ``params``: ``survival`` "markov_gamma" (``shape`` > 0) or "markov_beta"
+    (``concentration`` > 0), ``region`` >= 1, ``ends`` (if given) in (0, 1], and
     ``k``/``alphabet``, if it records them (the aai-model workflow's fit does), equal to the
     index's."""
-    if model.get("survival") != "markov_gamma":
-        raise ValueError('survival must be "markov_gamma"')
-    if not model.get("shape", 0) > 0 or not model.get("region", 0) >= 1:
-        raise ValueError("shape must be > 0 and region >= 1")
+    spread = {"markov_gamma": "shape", "markov_beta": "concentration"}.get(
+        str(model.get("survival"))
+    )
+    if spread is None:
+        raise ValueError('survival must be "markov_gamma" or "markov_beta"')
+    if not model.get(spread, 0) > 0 or not model.get("region", 0) >= 1:
+        raise ValueError(f"{spread} must be > 0 and region >= 1")
+    if not 0 < model.get("ends", 1.0) <= 1:
+        raise ValueError("ends must be in (0, 1]")
     differ = [p for p in ("k", "alphabet") if p in model and model[p] != params.get(p)]
     if differ:
         raise ValueError(f"model fitted for another {', '.join(differ)}")

@@ -241,14 +241,14 @@ def test_aai_interval_without_draws(members: Path) -> None:
 
 def strains(model: SurvivalModel, t: float, units: int, length: int, rng: Any) -> np.ndarray:
     """Sites left unchanged at divergence ``t`` in ``units`` homologs of ``length`` sites, drawn
-    from ``model``'s generative process (a Markov chain of rate categories along the sequence)."""
-    r = model.rates
+    from ``model``'s generative process (a Markov chain of categories along the sequence)."""
+    keep = model.keep_at(np.array([t]))[0]
     redraw = rng.random((units, length)) < model.switch
-    fresh = rng.integers(0, len(r), (units, length))
+    fresh = rng.integers(0, len(keep), (units, length))
     cat = fresh.copy()
     for i in range(1, length):
         cat[:, i] = np.where(redraw[:, i], fresh[:, i], cat[:, i - 1])
-    return rng.random((units, length)) >= -np.expm1(-r[cat] * t)
+    return np.asarray(rng.random((units, length)) >= 1 - keep[cat])
 
 
 def windows_of(same: np.ndarray, k: int) -> np.ndarray:
@@ -305,6 +305,30 @@ def test_survival_model_matches_its_generative_process() -> None:
             s = win.mean()
             rho = model.tables["rho"][np.argmin(np.abs(model.tables["a"] - got_a)), lag - 1]
             assert (both - s**2) / (s * (1 - s)) == pytest.approx(rho, abs=0.03)
+
+
+def test_markov_beta_matches_its_generative_process() -> None:
+    # Categories average exactly a; survival and co-survival match Monte Carlo of the chain.
+    model = SurvivalModel(11, None, 6.0, categories=8, concentration=4.0)
+    t = np.array([0.0, 0.05, 0.3, 0.7, 5.0])
+    assert model.keep_at(t).mean(axis=1) == pytest.approx(np.exp(-t), abs=1e-9)
+    rng = np.random.default_rng(5)
+    for t1 in (0.1, 0.3):
+        win = windows_of(strains(model, t1, 3000, 400, rng), 11)
+        s = win.mean()
+        assert model.survival(np.exp(-t1)) == pytest.approx(s, abs=0.01)
+        row = np.argmin(np.abs(model.tables["a"] - np.exp(-t1)))
+        for lag in (1, 6, 20):
+            both = (win[:, :-lag] & win[:, lag:]).mean()
+            assert (both - s**2) / (s * (1 - s)) == pytest.approx(
+                model.tables["rho"][row, lag - 1], abs=0.03
+            )
+    # End loss scales survival and thins the correlation; identity(1 - loss) stays 1.
+    ends = SurvivalModel(11, None, 6.0, categories=8, concentration=4.0, ends=0.9)
+    a = np.array([0.7, 0.85, 0.95])
+    assert ends.survival(a) == pytest.approx(0.9 * model.survival(a), rel=1e-9)
+    assert ends.identity(np.array([0.95]))[0] == pytest.approx(1.0)
+    assert (ends.tables["rho"][1:] <= model.tables["rho"][1:] + 1e-12).all()
 
 
 def test_aai_fit_recovers_identity_under_clustered_rates() -> None:

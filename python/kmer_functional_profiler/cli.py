@@ -117,7 +117,7 @@ def aai_model(
     ] = None,
 ) -> None:
     """Attach a k-mer survival model to an index (``aai_model.json``): its queries then
-    estimate ``aai`` under it (Markov-modulated gamma rates, ``survival.SurvivalModel``)
+    estimate ``aai`` under it (Markov-modulated regions, ``survival.SurvivalModel``)
     instead of a^k."""
     target = index_dir / AAI_MODEL
     if model is None:
