@@ -2197,6 +2197,8 @@ A primary output: per sample, abundance of each Pfam (and unit) attributed to ea
 
 Added 2026-10-07; the default genome → function path from phase 11, step 7 on. G1 explains a sample by individual reference genomes. The sample's strain is rarely one of them, so G1 reports a relative with π\_G < 1, and that genome's content says nothing about which accessory functions the sample's strain carries. A species' pangenome does: how often each unit occurs among its strains. Core units (prevalence ≈ 1) should be present if the species is, and accessory units need the reads to decide. Fitting species and their carriage together gives both answers from one likelihood: which species are present at what depth, and which units each carries in this sample. This is the joint model kfp-prior set aside (B3). The reads are used once, so the cavity problem of B1 does not arise.
 
+**Functions are MGnify90 clusters.** A unit is the index's unit: a MGnify Proteins 90% identity cluster for the release indexes, so the species index links genomes to MGnify90 clusters and the fit works on them alone. Pfam (or KO, on the fmh benchmark's KO indexes) is only a label: outputs roll up to it and benchmarks score on it, but it never enters prevalence, carriage, depth or presence.
+
 **Data.**
 
 - *h\_u*: the profile's raw tier-2 `hits` per unit, as G1.
