@@ -451,17 +451,19 @@ def mgnify_nearest(args: argparse.Namespace) -> None:
     coverage >= 0.5, as the truth's hits). Where the member pass found none (its
     ``--max-target-seqs`` filled by other clusters' members; ``member_hit`` false), the
     representative's identity, which is a member's."""
-    hits = pl.concat(  # the subject is a member, read into cluster_rep's column
-        pl.read_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
-        for p in args.hits
-    ).rename({"cluster_rep": "nearest"})
     clusters = pl.read_parquet(args.member_clusters).rename({"protein_id": "nearest"})
-    best = (
-        hits.filter(pl.col("length") / pl.col("qlen") >= 0.5)
-        .join(clusters, on="nearest")
+    # reduced one chunk at a time (a gene's hits are all in its chunk's file): with up to
+    # 1000 member targets per gene, all chunks' hits at once crashed polars (exit 139)
+    best = pl.concat(
+        pl.scan_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
+        .rename({"cluster_rep": "nearest"})  # the subject is a member
+        .filter(pl.col("length") / pl.col("qlen") >= 0.5)
+        .join(clusters.lazy(), on="nearest")
         .group_by("gene_name", "cluster_rep")
         .agg(pl.all().sort_by("pident", "bitscore").last())
         .select("gene_name", "cluster_rep", "nearest", identity_nearest=pl.col("pident") / 100)
+        .collect()
+        for p in args.hits
     )
     units = pl.read_parquet(args.gene_units).join(best, on=["gene_name", "cluster_rep"], how="left")
     units.with_columns(
