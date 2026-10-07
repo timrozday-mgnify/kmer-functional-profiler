@@ -54,6 +54,11 @@ can run whenever `00-dbs` has.
 the human-gut catalogue's pangenomes from the EBI FTP, and profiles against the 1-in-100
 subset unless `INDEX=<built index>` is set (`cd species-benchmark && INDEX=... sbatch run.sh`).
 
+`gtdb-species-index` builds phase 11's GTDB species index (`workflows/gtdb-species-index`)
+on the `dev-species` branch: `cd gtdb-species-index && INDEX=<built index> sbatch run.sh`.
+It downloads genomes from NCBI (1000 sampled species by default; `--max_species ''` for
+the whole release). Run it after `species-benchmark` reads well (plan: phase 11, step 11).
+
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for
 7 days; lower `--time` in `run.sh` if your partition caps it.
