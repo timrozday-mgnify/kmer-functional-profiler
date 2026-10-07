@@ -28,8 +28,11 @@ from kmer_functional_profiler.index import (
 from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
 from kmer_functional_profiler.species import (
+    PRIOR_PRESENT,
+    SpeciesIndex,
     species_index_from_catalogue,
     species_index_from_genomes,
+    species_profile,
 )
 from kmer_functional_profiler.survival import check_aai_model
 
@@ -289,6 +292,66 @@ def species_index(
         assert genomes is not None
         meta = species_index_from_genomes(index_dir, genomes, out_dir, names)
     typer.echo(json.dumps(meta, indent=2))
+
+
+@app.command(name="species")
+def species_command(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    species_index: Annotated[Path, typer.Argument(help="Output of `species-index`")],
+    out: Annotated[Path, typer.Argument(help="TSV of detected species")] = Path("species.tsv"),
+    units: Annotated[
+        Path, typer.Option(help="TSV of the detected species' units: prevalence, carriage")
+    ] = Path("species_units.tsv"),
+    presence: Annotated[
+        Path, typer.Option(help="TSV of unit presence updated by the species (kfp-prior format)")
+    ] = Path("presence.tsv"),
+    pfam_presence: Annotated[
+        Path, typer.Option(help="TSV of Pfam presence, observed and updated")
+    ] = Path("pfam_presence.tsv"),
+    function_taxon: Annotated[
+        Path,
+        typer.Option(
+            help="TSV of each function's split hits (hits_em) per species, genus and family, "
+            "with unclassified and the total"
+        ),
+    ] = Path("function_species.tsv"),
+    summary: Annotated[
+        Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
+    ] = None,
+    index: Annotated[
+        Path | None,
+        typer.Option(help="The profile's index, checked against the species index's"),
+    ] = None,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: Annotated[
+        float, typer.Option(help="Prior probability that a screened species is present")
+    ] = PRIOR_PRESENT,
+) -> None:
+    """Species present and their depths, fitted jointly with the units each carries in the
+    sample (prevalence as prior, the profile's hits as evidence); updated unit and Pfam
+    presence; the function x species table. The profile is not modified."""
+    si = SpeciesIndex(species_index)
+    if index is not None:
+        try:
+            si.check_index(index)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    result = species_profile(
+        prof, si, min_containment=min_containment, min_units=min_units, prior=prior
+    )
+    outputs = {"species": out, "units": units, "presence": presence,
+               "pfam_presence": pfam_presence, "function_species": function_taxon}  # fmt: skip
+    for key, path in outputs.items():
+        table = result[key]
+        if isinstance(table, pl.DataFrame):
+            table.write_csv(path, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(result["summary"], indent=2) + "\n")
+    detected = result["species"]
+    assert isinstance(detected, pl.DataFrame)
+    typer.echo(f"{detected.height} species detected -> {out}", err=True)
 
 
 @app.command()

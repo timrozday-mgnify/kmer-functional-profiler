@@ -1846,6 +1846,38 @@ Developed on the `dev-phase11` branch (from `dev`), one feature branch per step 
   - *Size:* every (genome, carried unit) row of a catalogue is held in memory, ~12 B each, ~10 GB for human-gut (`ponytail:` note).
   - Tests: `test_translate_matches_the_proteins`, `test_species_index_from_catalogue` (*q* = 1 on units every genome carries, *e* equal to the genome index's content, a one-genome species shrunk towards its genus and given its genus' units at a small prior, the unit-major view), `test_completeness_raises_prevalence_of_units_incomplete_genomes_miss`, `test_genome_set_path_equals_catalogue_path` (identical pairs, *q* and *e*), `test_exclude_and_cli`; the shrinkage tests moved from kfp-prior.
 
+* **Phase 11, step 8 — `species`: the joint fit (Species model, step 8).**
+  - *Command:* `species PROFILE SPECIES_INDEX [OUT]` (`--units`, `--presence`, `--pfam-presence`, `--function-taxon`, `--summary`, `--index` checksum, `--min-containment`, `--min-units`, `--prior`).
+  - *Screen:* genome mode's rule on prevalence-weighted content, Σ\_{u hit} *q e* / Σ\_u *q e* ≥ 0.1 on ≥ 10 hit units. Every unit of a screened species enters the fit, hit or not.
+  - *Fit (`fit_species`):* the plan's variational EM, vectorised over (species, unit) pairs.
+    - Starts from prevalence-weighted depths, every screened species present.
+    - Each round updates, in order: carriage *r* (the conditional posterior with the other sources at their means); the background; the allocation and the depth's Gamma posterior; presence.
+    - Stops when depths (relative) and presence change by < 10⁻⁶.
+    - In the synthetic checks it converges in 5–20 rounds and well under a second.
+  - *Amendment: the background is spike-and-slab per unit.* The planned per-unit Gamma background (shape 0.1) kept whatever share of a unit's hits it started with: exp E log β ≈ its own allocation, so nothing pulls it back. Depths came out 8–17% low on simulated samples. Now each unit's background is off, or with probability 0.05 on with Gamma(0.1, 0.01) hits. It is on with its posterior given the species' predicted mean *M\_u*, and then takes the excess max(*h* − *M\_u*, 0). The posterior compares a Poisson at *M\_u* against ℓ = max(Pois(*h*; *M*), NB(*h*) e^(−*M*)): the background may add hits, but never remove them. The same ℓ scores presence, so hits a species does not need cost it nothing, and hits it cannot explain earn it nothing.
+  - *Amendment: `depth` is reported at the posterior mode less the prior's shape (allocated hits / Σ r e, the MLE).* The posterior mean adds the prior's one hit, +18% at 0.01× on 50 units. The mean is still used inside the fit.
+  - *Presence:* logit *p* = logit ρ (0.01) + Σ\_u [log(*q* ℓ(μ₋ₛ + λ*e*) + (1 − *q*) ℓ(μ₋ₛ)) − log ℓ(μ₋ₛ)] + log Gamma(λ̂) + ½ log(2π var λ). This is the per-unit carriage marginal with the depth's Laplace term.
+  - *Synthetic checks (scratch):* six species × 10 genomes, 300 core and 200 accessory units each, prevalence 0.1–0.9, strains drawn from the prevalences, Poisson hits.
+    - Depths within 2–8% from 0.02× to 5×.
+    - On zero-hit accessory units the mean *r* matched the share truly carried (0.26/0.25, 0.47/0.52, 0.10/0.10, 0.36/0.38).
+    - An outside organism hitting 20–40% of an absent species' core units, at 3 or 30 hits each, gave that species *p* ≈ 10⁻⁹, with the present species' depth unchanged.
+  - Tests:
+    - `test_one_core_species_recovers_its_depth`;
+    - `test_accessory_units_follow_depth_and_hits`: at 5×, zero-hit accessory units have *r* < 10⁻³; at 0.01×, *r* stays within 10% of *q*; at zero hits with one source, *r* is kfp-prior's closed form;
+    - `test_background_and_a_species_whose_core_is_missing`;
+    - `test_two_species_sharing_core_units`: depths recovered, and a shared unit's hits split 1:3.
+  - *Not built:* species ambiguity groups (step 3's rule one level up), left to the benchmark to show whether near-identical species split badly.
+
+* **Phase 11, step 9 — function outputs (Species model, step 9).**
+  - `species.tsv`: detected species (*p* ≥ 0.5) with `id`, `name`, `taxonomy`, `present_prob`, `depth` and a 95% interval from the Gamma posterior. The interval's variance is inflated by the Pearson φ over the detected species' units, as in step 3. Also `relative_abundance`, `units_hit`, `containment`, `core_hit` (share of *q* ≥ 0.9 units hit) and `accessory_called`. `species_units.tsv` lists their pairs, with prevalence, carriage, expected and assigned hits.
+  - `presence.tsv` and `pfam_presence.tsv` are in kfp-prior's format, so `prior-score` reads them.
+    - Hit units: 1 − (1 − `present_prob`)(1 − Π-carriage). Zero-hit units with a prior ≥ 0.05: Π-carriage, where Π-carriage = 1 − Π\_s(1 − *p\_s r\_{s,u}*).
+    - A unit no screened species carries keeps `present_prob`, which is taken as 1 when the profile has none.
+    - *Amendment:* the planned `coverage_species` is `expected_hits` (raw hits, Σ *p r* λ *e*). The Pfam roll-up and `sibling_hit` repeat kfp-prior's, since neither package imports the other.
+  - `function_species.tsv`: `hits_em` split by the allocation over the detected species; the background, undetected species and uncarried units go to `unclassified`. Ranks are family, genus and species, through `taxon_labels`; functions through `unit_functions` (split out of `function_taxon`).
+  - Summary: `explained_fraction` (hits assigned to detected species), `genome_equivalents`, φ, iterations, imputed units.
+  - Tests: `test_profile_and_outputs` (interval brackets the depth at 0.15×; missed core units imputed; an uncarried unit's presence unchanged and its hits unclassified; every rank sums to the total), `test_no_species_leaves_presence_unchanged`, `test_species_cli` (fixture index: Pfam functions, checksum refusal).
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
