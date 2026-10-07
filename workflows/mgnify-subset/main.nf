@@ -103,13 +103,14 @@ process INDEX {
 
     input:
     tuple val(sample), val(dense), path(members), path(pfam)
+    val index_args  // an input, not params in the script: Nextflow does not hash params' values
 
     output:
     path 'index', emit: index
 
     script:
     """
-    ${params.kfp} index ${members} index --pfam ${pfam} ${params.index_args}${dense ? ' --t-dense ' + dense : ''}
+    ${params.kfp} index ${members} index --pfam ${pfam} ${index_args}${dense ? ' --t-dense ' + dense : ''}
     """
 
     stub:
@@ -168,6 +169,7 @@ process CANDIDATES {
 
     input:
     tuple val(bucket), path(members)
+    val index_args  // as INDEX: so -resume rebuilds when it changes (later steps take these files)
 
     output:
     tuple val(bucket), path(members), path("${members.baseName}.units.parquet"), path("${members.baseName}.stats.json"), emit: units
@@ -175,7 +177,7 @@ process CANDIDATES {
 
     script:
     """
-    ${params.python} ${projectDir}/mgnify_subset.py candidates --members ${members} --prefix ${members.baseName} ${params.index_args}
+    ${params.python} ${projectDir}/mgnify_subset.py candidates --members ${members} --prefix ${members.baseName} ${index_args}
     """
 
     stub:
@@ -545,14 +547,14 @@ workflow {
             members_table ? channel.value(file(members_table, checkIfExists: true)) : MERGE.out.members.first(),
             pfam_table ? channel.value(file(pfam_table, checkIfExists: true)) : MERGE.out.pfam.first(),
         )
-        INDEX(SUBSET.out.combine(channel.fromList(dense)).map { s, m, p, d -> [s, d, m, p] })
+        INDEX(SUBSET.out.combine(channel.fromList(dense)).map { s, m, p, d -> [s, d, m, p] }, params.index_args)
     }
     if (params.build) {
         ch_members = MERGE.out.members.flatten().map { f ->
             def m = f.name =~ /bucket(\d+)/
             [m ? m[0][1] as int : 0, f]
         }
-        CANDIDATES(ch_members)
+        CANDIDATES(ch_members, params.index_args)
         BLOOM(CANDIDATES.out.units.map { t -> t[2] }.collect(), CANDIDATES.out.candidates.collect())
         PRESENCE(CANDIDATES.out.units, BLOOM.out)
         ch_ranges = PRESENCE.out.flatten().map { f -> [(f.name =~ /range(\d+)/)[0][1] as int, f] }

@@ -36,6 +36,11 @@ cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one af
 cd kfp-ablations/em-query-cost && sbatch run.sh
 # EM convergence from 5 starts on two deep soil metagenomes (step 30), as em-query-cost:
 cd kfp-ablations/em-starts-soil && sbatch run.sh
+# aai survival model (plan, phase 7, step 25), independent of the rest; no 00-dbs needed:
+cd kfp-ablations/aai-model && sbatch run.sh
+# the three release tiers at full scale (slim, standard, large), independent of the rest;
+# reads the whole release (RELEASE=<local mirror> to use one), ~1 TB of buckets in results-*/:
+cd kfp-ablations/release-tiers && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a

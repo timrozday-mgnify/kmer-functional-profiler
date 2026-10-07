@@ -318,6 +318,7 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     # g3: absent from the sample. Two HSPs of one pair: the best counts.
     hits = ("g1\t10\t96.0\t200\t200\t210\t380\ng1\t11\t80.0\t190\t200\t200\t250\n"
             "g1\t11\t70.0\t50\t200\t200\t40\ng2\t20\t85.0\t300\t300\t300\t400\n"
+            "g2\t10\t90.0\t300\t300\t210\t300\n"
             "g3\t30\t99.0\t100\t100\t100\t200\n")  # fmt: skip
     (tmp_path / "h.tsv").write_text(hits)
     run(tmp_path, "mgnify-genes", "--hits", "h.tsv")
@@ -333,6 +334,7 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
             "aai_lo": [0.93, None, 0.70, 0.8],
             "aai_hi": [0.99, None, 0.84, 0.95],
             "aai_naive": [0.97, 0.79, 0.86, 0.9],
+            "aai_kmers": [6.0, 0.0, 12.0, 2.0],
         }
     )
     got = bench.aai_score(profile, units, genes)
@@ -342,6 +344,12 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     assert got["recall_0.95"] == 1.0 and got["recall_0.8"] == 1.0  # g2 beyond 90%: 20 found
     assert got["aai_bias_0.95"] == pytest.approx(-0.01) and got["aai_cover_0.95"] == 1.0
     assert got["aai_bias_0.8"] == pytest.approx(-0.05) and got["aai_cover_0.8"] == 0.0
+    # union truth: 10 holds g1's (96%) and g2's (90%) k-mers, as one strain at ~97.4%
+    union = (1 - (1 - 0.96**11) * (1 - 0.9**11)) ** (1 / 11)
+    assert got["aai_bias_union_0.95"] == pytest.approx(0.95 - union)
+    assert got["aai_cover_union"] == 0.5  # 10 covered, 20 (85%) not
+    assert got["aai_n_kmers5"] == 1 and got["aai_bias_kmers5"] == pytest.approx(0.95 - union)
+    assert got["aai_n_kmers10"] == 1 and got["aai_n_kmers0"] == 0
     # aai_naive on every hit unit, near hits included: 11 against g1's 80%
     assert got["naive_n"] == 3 and got["naive_bias_0.8"] == pytest.approx(
         (0.86 - 0.85 + 0.79 - 0.8) / 2
