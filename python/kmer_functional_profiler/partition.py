@@ -368,7 +368,7 @@ def units(
     for p in prefixes:
         for key, value in json.loads(Path(f"{p}.final.json").read_text()).items():
             stats[key] = stats.get(key, 0) + value
-    n_postings = int(table["m_g"].sum())
+    n_postings = int(table["m_g"].cast(pl.UInt64).sum())
     stats |= {
         "n_units": table.height,
         "t_max": float(table["t_g"].max() or 0.0),  # type: ignore[arg-type]
@@ -384,7 +384,7 @@ def units(
 
     meta = pack("max_hash_g", n_postings) | {"stats": stats}
     if dense:
-        meta["dense"] = pack("max_hash_dense", int(table["m_dense"].sum()))
+        meta["dense"] = pack("max_hash_dense", int(table["m_dense"].cast(pl.UInt64).sum()))
     (out / "pack.json").write_text(json.dumps(meta) + "\n")
 
 
