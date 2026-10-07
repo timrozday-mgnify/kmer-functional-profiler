@@ -18,11 +18,14 @@ from kmer_functional_profiler.species import (
     SpeciesIndex,
     _counts,
     fit_alpha,
+    fit_species,
     lineages,
     prevalence,
     species_index_from_catalogue,
     species_index_from_genomes,
+    species_profile,
     translate,
+    write_species_index,
 )
 
 # --- Shrinkage (moved from kfp-prior) ---
@@ -216,4 +219,196 @@ def test_exclude_and_cli(tmp_path: Path, index_dir: Path) -> None:
     assert held["unit"].to_list() == list(range(9))
     assert json.loads((tmp_path / "si" / "meta.json").read_text())["source"] == "catalogue"
     bad = CliRunner().invoke(app, ["species-index", str(index_dir), str(tmp_path / "x")])
+    assert bad.exit_code != 0
+
+
+# --- The fit and its outputs ---
+
+
+def synthetic_index(
+    tmp: Path, species: dict[str, dict[int, float]], genomes: int = 10, n_units: int = 200
+) -> SpeciesIndex:
+    """A species index of ``genomes`` genomes per species, each carrying unit u with
+    probability species[s][u] (content 2 + u % 7), units 0..max: no profiler index needed."""
+    rng = np.random.default_rng(0)
+    (tmp / "idx").mkdir(parents=True, exist_ok=True)
+    (tmp / "idx" / "meta.json").write_text("{}")
+    rows, gen = [], []
+    for name, carriage in species.items():
+        for _ in range(genomes):
+            g = len(gen)
+            gen.append((g, f"{name}{g}", f"d__B;f__F;g__G{name};s__{name}"))
+            rows += [(g, u, 2.0 + u % 7) for u, p in carriage.items() if rng.random() < p]
+    carried = pl.DataFrame(rows, schema=["genome", "unit", "c"], orient="row").cast(
+        {"genome": pl.UInt32, "unit": pl.UInt32}
+    )
+    table = pl.DataFrame(gen, schema=["genome", "name", "taxonomy"], orient="row").cast(
+        {"genome": pl.UInt32}
+    )
+    write_species_index(tmp / "si", tmp / "idx", n_units, carried, table, frozenset(), {})
+    return SpeciesIndex(tmp / "si")
+
+
+def exact(si: SpeciesIndex, depth: dict[str, float], units: dict[str, set[int]]) -> pl.DataFrame:
+    """A profile whose hits are exactly Σ_s depth_s e_{s,u} over the units each strain has."""
+    ids = dict(zip(si.species["name"], si.species["species"], strict=True))
+    hits: dict[int, float] = {}
+    for name, d in depth.items():
+        pairs = si.by_species(np.array([ids[name]]))
+        for u, e in pairs.select("unit", "e").iter_rows():
+            if u in units[name]:
+                hits[u] = hits.get(u, 0.0) + d * e
+    return pl.DataFrame({"unit": list(hits), "hits": list(hits.values())}).cast({"unit": pl.UInt32})
+
+
+def fitted(si: SpeciesIndex, prof: pl.DataFrame) -> tuple[dict[str, dict], pl.DataFrame]:
+    species, pairs, _ = fit_species(prof, si)
+    names = si.species.select(pl.col("species").cast(pl.UInt32), "name")
+    by_name = {row["name"]: row for row in species.join(names, on="species").iter_rows(named=True)}
+    return by_name, pairs.join(names, on="species")
+
+
+CORE_50 = dict.fromkeys(range(50), 1.0)
+
+
+def test_one_core_species_recovers_its_depth(tmp_path: Path) -> None:
+    si = synthetic_index(tmp_path, {"A": CORE_50})
+    by_name, pairs = fitted(si, exact(si, {"A": 2.0}, {"A": set(range(50))}))
+    assert by_name["A"]["present_prob"] > 0.999
+    assert by_name["A"]["depth"] == pytest.approx(2.0, rel=0.01)
+    assert (pairs["carriage_prob"] > 0.999).all()
+
+
+def test_accessory_units_follow_depth_and_hits(tmp_path: Path) -> None:
+    accessory = dict.fromkeys(range(50, 70), 0.5)
+    si = synthetic_index(tmp_path, {"A": CORE_50 | accessory})
+    strain = set(range(60))  # half the accessory units, as their prevalence has it
+    for depth in (5.0, 0.01):
+        prof = exact(si, {"A": depth}, {"A": strain})
+        by_name, pairs = fitted(si, prof)
+        assert by_name["A"]["depth"] == pytest.approx(depth, rel=0.05)
+        r = dict(pairs.select("unit", "carriage_prob").iter_rows())
+        q = dict(pairs.select("unit", "q").iter_rows())
+        if depth > 1:  # zero hits where ~20 were due: absent; hit: carried
+            assert all(r[u] < 1e-3 for u in range(60, 70)) and all(r[u] > 0.999 for u in strain)
+        else:  # ~0.05 hits due: zero hits say little, carriage stays near prevalence
+            assert all(0.9 * q[u] < r[u] <= q[u] for u in range(60, 70)), r
+    # At zero hits and no other source, carriage is kfp-prior's closed form (at the
+    # posterior mean depth).
+    row = pairs.filter(pl.col("unit") == 60)
+    q, e, a = row["q"][0], row["e"][0], by_name["A"]
+    kept = q * np.exp(-a["shape"] / a["rate"] * e)
+    assert row["carriage_prob"][0] == pytest.approx(kept / (1 - q + kept), rel=1e-3)
+
+
+def test_background_and_a_species_whose_core_is_missing(tmp_path: Path) -> None:
+    si = synthetic_index(tmp_path, {"A": CORE_50, "B": dict.fromkeys(range(50, 100), 1.0)})
+    prof = exact(si, {"A": 1.0}, {"A": set(range(50))})
+    # an organism outside the set hits 15 of B's 50 core units, and units nobody carries
+    other = pl.DataFrame({"unit": list(range(50, 65)), "hits": [8.0] * 15})
+    by_name, _ = fitted(si, pl.concat([prof, other.cast({"unit": pl.UInt32})]))
+    assert by_name["A"]["present_prob"] > 0.999
+    assert by_name["A"]["depth"] == pytest.approx(1.0, rel=0.02)
+    assert by_name["B"]["present_prob"] < 1e-3
+
+
+def test_two_species_sharing_core_units(tmp_path: Path) -> None:
+    shared = dict.fromkeys(range(30), 1.0)
+    si = synthetic_index(
+        tmp_path,
+        {"A": shared | dict.fromkeys(range(30, 80), 1.0),
+         "B": shared | dict.fromkeys(range(80, 130), 1.0)},
+    )  # fmt: skip
+    units = {"A": set(range(80)), "B": set(range(30)) | set(range(80, 130))}
+    by_name, pairs = fitted(si, exact(si, {"A": 1.0, "B": 3.0}, units))
+    assert by_name["A"]["depth"] == pytest.approx(1.0, rel=0.02)
+    assert by_name["B"]["depth"] == pytest.approx(3.0, rel=0.02)
+    # a shared unit's hits split 1:3
+    split = dict(pairs.filter(pl.col("unit") == 0).select("name", "hits_assigned").iter_rows())
+    assert split["B"] / split["A"] == pytest.approx(3.0, rel=0.02)
+
+
+def test_profile_and_outputs(tmp_path: Path) -> None:
+    accessory = dict.fromkeys(range(50, 70), 0.5)
+    si = synthetic_index(tmp_path, {"A": CORE_50 | accessory})
+    # A at low depth: misses part of its core; a unit nobody carries has hits.
+    rng = np.random.default_rng(1)
+    prof = exact(si, {"A": 0.15}, {"A": set(range(50))}).with_columns(
+        hits=pl.Series(rng.poisson(exact(si, {"A": 0.15}, {"A": set(range(50))})["hits"]))
+    )
+    prof = pl.concat([prof, pl.DataFrame({"unit": [70], "hits": [20]})], how="vertical_relaxed")
+    prof = (
+        prof.cast({"hits": pl.Float64})
+        .with_columns(
+            unit=pl.col("unit").cast(pl.UInt32), present_prob=pl.lit(0.9), hits_em=pl.col("hits")
+        )
+        .filter(pl.col("hits") > 0)
+    )
+    out = species_profile(prof, si, min_units=5)
+    species = out["species"]
+    assert isinstance(species, pl.DataFrame) and species["name"].to_list() == ["A"]
+    assert species["depth_lo"][0] < 0.15 < species["depth_hi"][0]
+    presence = out["presence"]
+    assert isinstance(presence, pl.DataFrame)
+    p = dict(presence.select("unit", "present_prob_updated").iter_rows())
+    missed = set(range(50)) - set(prof["unit"].to_list())
+    assert missed and all(p[u] > 0.5 for u in missed)  # core units imputed
+    assert p[70] == pytest.approx(0.9)  # no species carries it: unchanged
+    assert presence.filter(pl.col("unit").is_in(list(missed)))["imputed"].all()
+    table = out["function_species"]
+    assert isinstance(table, pl.DataFrame)
+    totals = table.filter(pl.col("rank") == "total").select("function", total="hits_em")
+    sums = (
+        table.filter(pl.col("rank") != "total")
+        .group_by("function", "rank")
+        .agg(pl.col("hits_em").sum())
+    )
+    check = sums.join(totals, on="function")
+    assert set(sums["rank"]) == {"family", "genus", "species"}
+    assert np.allclose(check["hits_em"], check["total"])
+    assert set(table.filter(pl.col("function") == "70")["taxon"]) == {"", "unclassified"}
+    sp = table.filter((pl.col("rank") == "species") & (pl.col("taxon") == "A"))
+    assert sp.height == prof.filter(pl.col("unit") < 70).height  # every hit unit of A
+
+
+def test_no_species_leaves_presence_unchanged(tmp_path: Path) -> None:
+    si = synthetic_index(tmp_path, {"A": CORE_50})
+    prof = pl.DataFrame({"unit": [3, 7], "hits": [5.0, 2.0], "present_prob": [0.4, 0.8]}).cast(
+        {"unit": pl.UInt32}
+    )
+    out = species_profile(prof, si)
+    presence = out["presence"]
+    assert isinstance(presence, pl.DataFrame)
+    assert out["species"].height == 0  # type: ignore[union-attr]
+    hit = presence.filter(pl.col("hits") > 0).sort("unit")
+    assert hit["present_prob_updated"].to_list() == pytest.approx([0.4, 0.8])
+    assert not presence["imputed"].any()
+
+
+def test_species_cli(tmp_path: Path, index_dir: Path) -> None:
+    genomes = {g: list(m) for g, m in A_GENOMES.items()} | {"MGYG000000004": list(range(10, 20))}
+    gi = annotate_genomes_for(tmp_path, index_dir, genomes)
+    species_index_from_genomes(index_dir, gi, tmp_path / "si")
+    si = SpeciesIndex(tmp_path / "si")
+    prof = exact(si, {"A": 3.0}, {"A": set(range(10))}).with_columns(
+        hits_em=pl.col("hits"), present_prob=pl.lit(1.0)
+    )
+    prof.write_csv(tmp_path / "p.tsv", separator="\t")
+    out = tmp_path / "o"
+    out.mkdir()
+    args = ["species", str(tmp_path / "p.tsv"), str(tmp_path / "si"), str(out / "s.tsv"),
+            "--units", str(out / "u.tsv"), "--presence", str(out / "pr.tsv"),
+            "--pfam-presence", str(out / "pf.tsv"), "--function-taxon", str(out / "ft.tsv"),
+            "--summary", str(out / "sum.json"), "--index", str(index_dir),
+            "--min-units", "5"]  # fmt: skip
+    got = CliRunner().invoke(app, args)
+    assert got.exit_code == 0, got.output
+    species = pl.read_csv(out / "s.tsv", separator="\t")
+    assert species["name"].to_list() == ["A"]
+    assert species["depth"][0] == pytest.approx(3.0, rel=0.02)
+    ft = pl.read_csv(out / "ft.tsv", separator="\t")
+    assert ft["function"].str.starts_with("PF").all()  # the index's Pfam labels
+    assert json.loads((out / "sum.json").read_text())["explained_fraction"] > 0.99
+    assert pl.read_csv(out / "pf.tsv", separator="\t").height > 0
+    bad = CliRunner().invoke(app, [*args[:4], "--index", str(tmp_path / "si")])
     assert bad.exit_code != 0

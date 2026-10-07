@@ -42,18 +42,24 @@ from typing import Final
 import numpy as np
 import polars as pl
 from scipy import sparse
+from scipy.special import digamma, expit, gammaln
+from scipy.stats import gamma
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.genomes import (
     GTDB_PREFIX,
+    MIN_CONTAINMENT,
+    MIN_UNITS,
     PROTEINS_PER_BATCH,
     best_units,
     fasta,
     protein_hits,
+    taxon_labels,
+    unit_functions,
 )
 from kmer_functional_profiler.index import Index
 from kmer_functional_profiler.mask import _sha256
-from kmer_functional_profiler.query import _ranges
+from kmer_functional_profiler.query import _div, _ranges
 
 RANKS: Final = ("family", "genus", "species")  # top down
 ALPHAS: Final = np.geomspace(0.01, 100, 21)
@@ -549,3 +555,390 @@ class SpeciesIndex:
                 "e": self.s_e[rows].astype(np.float64),
             }
         )
+
+
+# --- The fit (phase 11, step 8) ---
+
+# ponytail: priors are guesses, to tune on the strain hold-out benchmark (step 10).
+PRIOR_PRESENT: Final = 0.01  # ρ: prior probability that a screened species is present
+DEPTH_SHAPE: Final = 1.0  # Gamma prior on a present species' depth (weak)
+DEPTH_RATE: Final = 1e-3
+BG_SHAPE: Final = 0.1  # Gamma prior on a unit's background rate, in hits (sparse)
+BG_RATE: Final = 0.01
+BG_PRIOR: Final = 0.05  # prior probability that a unit has background hits at all
+DETECTED: Final = 0.5  # present_prob reported as detected
+TINY: Final = 1e-12
+
+
+def _log_pois(h: np.ndarray, m: np.ndarray) -> np.ndarray:
+    out: np.ndarray = h * np.log(np.maximum(m, TINY)) - m - gammaln(h + 1)
+    return out
+
+
+def _log_nb(h: np.ndarray) -> np.ndarray:
+    """Log marginal of h hits from a background rate under its Gamma prior alone."""
+    a, b = BG_SHAPE, BG_RATE
+    out: np.ndarray = (
+        gammaln(h + a) - gammaln(a) - gammaln(h + 1) + a * np.log(b / (b + 1)) - h * np.log1p(b)
+    )
+    return out
+
+
+def _explain(h: np.ndarray, m: np.ndarray, nb: np.ndarray) -> np.ndarray:
+    """Log probability of h hits from sources at mean m, the background free to add hits:
+    either m explains them, or the background does and the sources gave ~none."""
+    out: np.ndarray = np.maximum(_log_pois(h, m), nb - m)
+    return out
+
+
+def fit_species(
+    prof: pl.DataFrame,
+    si: SpeciesIndex,
+    *,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: float = PRIOR_PRESENT,
+    tol: float = 1e-6,
+    max_iter: int = 2000,
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, float]]:
+    """Species presence and depth, fitted jointly with each species' carriage of its units in
+    the sample (plan: Species model), by variational EM.
+
+    h_u ~ Poisson(β_u + Σ_s b_s z_{s,u} λ_s e_{s,u}) over the profile's raw unit ``hits``:
+    presence b_s ~ Bernoulli(``prior``), depth λ_s ~ Gamma(``DEPTH_SHAPE``, ``DEPTH_RATE``)
+    if present, carriage z_{s,u} ~ Bernoulli(q_{s,u}), background β_u = 0, or with
+    probability ``BG_PRIOR`` ~ Gamma(``BG_SHAPE``, ``BG_RATE``). Species are screened as
+    genome mode's are, on prevalence-weighted content: Σ_{u hit} q e / Σ_u q e
+    ≥ ``min_containment`` on ≥ ``min_units`` hit units.
+
+    Each round, with the other sources at their means (μ₋ₛ):
+
+    - carriage r = P(z = 1 | h)
+      = q Pois(h; μ₋ₛ + λe) / [q Pois(h; μ₋ₛ + λe) + (1 - q) Pois(h; μ₋ₛ)];
+    - the background is on with its posterior given the species' mean M_u (spike against
+      slab, :func:`_explain`) and then takes the excess, max(h - M_u, 0); the rest of the
+      hits are allocated ∝ p_s r exp(E log λ_s) e;
+    - depth given presence: Gamma(a₀ + Σ_u allocated hits as if present, b₀ + Σ_u r e)
+      over every unit of the species, hit or not;
+    - presence: logit p = logit ρ + Σ_u log[q ℓ(μ₋ₛ + λe) + (1 - q) ℓ(μ₋ₛ)] - log ℓ(μ₋ₛ),
+      plus the depth's Laplace term; ℓ lets the background explain a unit's hits instead
+      (:func:`_explain`), so hits a species does not need cost it nothing and hits it
+      cannot explain earn it nothing.
+
+    Returns per screened species (``species``, ``present_prob``, ``depth``: the mode of λ's
+    Gamma posterior given presence less the prior's shape, i.e. allocated hits / Σ r e,
+    ``shape``, ``rate``, ``units_hit``, ``containment``), per (species, unit) pair
+    (``q``, ``e``, ``hits``, ``carriage_prob``, ``expected_hits`` = r λ e,
+    ``hits_assigned``: the allocation, weighted by presence; the rest of a unit's hits is
+    the background's); and a report.
+    """
+    hit = prof.filter(pl.col("hits") > 0).select(
+        pl.col("unit").cast(pl.UInt32), pl.col("hits").cast(pl.Float64)
+    )
+    content = si.species.select(pl.col("species").cast(pl.UInt32), total="content")
+    screened = (
+        si.by_unit(np.sort(hit["unit"].to_numpy()))
+        .group_by("species")
+        .agg(units_hit=pl.len().cast(pl.UInt32), on_hit=(pl.col("q") * pl.col("e")).sum())
+        .join(content, on="species")
+        .with_columns(containment=pl.col("on_hit") / pl.col("total"))
+        .filter(pl.col("containment") >= min_containment, pl.col("units_hit") >= min_units)
+        .select("species", "units_hit", "containment")
+        .sort("species")
+    )
+    report: dict[str, float] = {"screened_species": screened.height}
+    pairs = (
+        si.by_species(screened["species"].to_numpy())
+        .join(hit, on="unit", how="left")
+        .with_columns(pl.col("hits").fill_null(0.0))
+    )
+    n_s = screened.height
+    s = np.searchsorted(screened["species"].to_numpy(), pairs["species"].to_numpy())
+    unit_ids, u = np.unique(pairs["unit"].to_numpy(), return_inverse=True)
+    n_u = len(unit_ids)
+    q = np.clip(pairs["q"].to_numpy(), CLIP, 1 - CLIP)
+    lq, l1q = np.log(q), np.log1p(-q)
+    e, h = pairs["e"].to_numpy(), pairs["hits"].to_numpy()
+    h_u = np.zeros(n_u)
+    h_u[u] = h
+    nb = _log_nb(h)
+    # Start: depth from prevalence-weighted hits, every screened species present.
+    rate = DEPTH_RATE + np.bincount(s, q * e, n_s)
+    lam = _div(np.bincount(s, q * h, n_s), rate - DEPTH_RATE)
+    shape = DEPTH_SHAPE + lam * (rate - DEPTH_RATE)
+    p, r = np.ones(n_s), q.copy()
+    y_bg = np.zeros(n_u)
+    logit_prior = np.log(prior) - np.log1p(-prior)
+    logit_bg = np.log(BG_PRIOR) - np.log1p(-BG_PRIOR)
+    nb_u = _log_nb(h_u)
+    for iteration in range(1, max_iter + 1):  # noqa: B007  (reported after the loop)
+        mean_lam, log_lam = shape / rate, digamma(shape) - np.log(rate)
+        mu = mean_lam[s] * e
+        m = p[s] * r * mu
+        others = np.maximum((np.bincount(u, m, n_u) + y_bg)[u] - m, TINY)
+        r = expit(lq - l1q - mu + h * np.log1p(mu / others))
+        # Background: on with its posterior given the species' mean, taking the excess.
+        m = p[s] * r * mu
+        mean_u = np.bincount(u, m, n_u)
+        on = expit(logit_bg + _explain(h_u, mean_u, nb_u) - _log_pois(h_u, mean_u))
+        y_bg = on * np.maximum(h_u - mean_u, 0.0)
+        w = r * np.exp(log_lam[s]) * e
+        total = np.bincount(u, p[s] * w, n_u)
+        left = (h_u - y_bg)[u]
+        if_present = _div(left * w, w + total[u] - p[s] * w)
+        new_shape = DEPTH_SHAPE + np.bincount(s, if_present, n_s)
+        rate = DEPTH_RATE + np.bincount(s, r * e, n_s)
+        lam_hat = new_shape / rate
+        others = np.maximum((mean_u + y_bg)[u] - m, TINY)
+        alone = _explain(h, others, nb)
+        with_s = np.logaddexp(lq + _explain(h, others + lam_hat[s] * e, nb), l1q + alone)
+        occam = gamma.logpdf(lam_hat, DEPTH_SHAPE, scale=1 / DEPTH_RATE) + 0.5 * np.log(
+            2 * np.pi * new_shape / rate**2
+        )
+        new_p = expit(logit_prior + np.bincount(s, with_s - alone, n_s) + occam)
+        change = max(
+            float(np.max(np.abs(lam_hat - mean_lam) / np.maximum(lam_hat, TINY), initial=0.0)),
+            float(np.max(np.abs(new_p - p), initial=0.0)),
+        )
+        shape, p = new_shape, new_p
+        if change < tol:
+            break
+    report |= {"iterations": iteration, "max_change": change}
+    mean_lam, log_lam = shape / rate, digamma(shape) - np.log(rate)
+    w = r * np.exp(log_lam[s]) * e
+    total = np.bincount(u, p[s] * w, n_u)
+    # depth reported at the posterior mode (the MLE at DEPTH_SHAPE 1): the mean adds a hit
+    # (DEPTH_SHAPE), which biases species with few hits upwards
+    depth = np.maximum(shape - DEPTH_SHAPE, 0.0) / rate
+    species = screened.with_columns(present_prob=p, depth=depth, shape=shape, rate=rate)
+    pairs = pairs.with_columns(
+        carriage_prob=r,
+        expected_hits=r * depth[s] * e,
+        hits_assigned=_div((h_u - y_bg)[u] * p[s] * w, total[u]),
+    )
+    return species, pairs, report
+
+
+# --- Outputs (phase 11, step 9) ---
+
+CORE: Final = 0.9  # prevalence from which a unit counts as core in the species table
+
+
+def _intervals(species: pl.DataFrame, pairs: pl.DataFrame) -> tuple[pl.DataFrame, float]:
+    """95% ``depth_lo``/``depth_hi`` from each species' Gamma posterior, its variance
+    inflated by φ = max(1, Pearson χ² / (units - species)) over the units of detected
+    species (mean-field posteriors are too narrow; unit hits are overdispersed)."""
+    detected = species.filter(pl.col("present_prob") >= DETECTED).select("species")
+    units = pairs.join(detected, on="species", how="semi")["unit"].unique().implode()
+    per_unit = (
+        pairs.filter(pl.col("unit").is_in(units))
+        .join(species.select("species", "present_prob"), on="species")
+        .group_by("unit")
+        .agg(pl.col("hits").first(), (pl.col("present_prob") * pl.col("expected_hits")).sum())
+        .filter(pl.col("present_prob") > 0)
+    )
+    dof = max(per_unit.height - detected.height, 1)
+    chi2 = ((per_unit["hits"] - per_unit["present_prob"]) ** 2 / per_unit["present_prob"]).sum()
+    phi = max(1.0, float(chi2) / dof)
+    a, b = species["shape"].to_numpy() / phi, species["rate"].to_numpy() / phi
+    return species.with_columns(
+        depth_lo=gamma.ppf(0.025, a, scale=1 / b), depth_hi=gamma.ppf(0.975, a, scale=1 / b)
+    ), phi
+
+
+def unit_presence(
+    prof: pl.DataFrame, pairs: pl.DataFrame, species: pl.DataFrame, unit_pfam: pl.DataFrame | None
+) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+    """Unit and Pfam presence updated by the species fit, in kfp-prior's format.
+
+    Per unit, carriage by some species: P = 1 - Π_s (1 - p_s r_{s,u}); ``prior`` the same
+    with q for r, ``expected_hits`` Σ_s p_s r λ e. Hit units: 1 - (1 - ``present_prob``)
+    (1 - P), so a unit no screened species carries keeps ``present_prob`` (taken as 1 if
+    the profile has none). Zero-hit units with a prior ≥ ``Q_FLOOR``: P, ``imputed`` if
+    ≥ 0.5. ``sibling_hit``: one of the unit's Pfams is observed through another unit. Per
+    Pfam, ``present_prob_observed`` and ``present_prob_updated`` (units independent) and
+    ``imputed``."""
+    weighted = pairs.join(species.select("species", "present_prob"), on="species")
+    per_unit = weighted.group_by("unit").agg(
+        carried=1 - (1 - pl.col("present_prob") * pl.col("carriage_prob")).product(),
+        prior=1 - (1 - pl.col("present_prob") * pl.col("q")).product(),
+        expected_hits=(pl.col("present_prob") * pl.col("expected_hits")).sum(),
+    )
+    observed = prof.filter(pl.col("hits") > 0).select(
+        pl.col("unit").cast(pl.UInt32),
+        pl.col("hits").cast(pl.Float64),
+        present_prob=pl.col("present_prob").cast(pl.Float64)
+        if "present_prob" in prof.columns
+        else pl.lit(1.0),
+    )
+    hit = observed.join(per_unit, on="unit", how="left").with_columns(
+        pl.col("prior", "expected_hits", "carried").fill_null(0.0)
+    )
+    hit = hit.with_columns(
+        present_prob_updated=1 - (1 - pl.col("present_prob")) * (1 - pl.col("carried"))
+    ).drop("carried")
+    zero = (
+        per_unit.join(observed, on="unit", how="anti")
+        .filter(pl.col("prior") >= Q_FLOOR)
+        .select(
+            "unit",
+            hits=pl.lit(0.0),
+            present_prob=pl.lit(None, pl.Float64),
+            prior="prior",
+            expected_hits="expected_hits",
+            present_prob_updated="carried",
+        )  # fmt: skip
+    )
+    presence = pl.concat([hit, zero], how="diagonal_relaxed").with_columns(
+        imputed=(pl.col("hits") == 0) & (pl.col("present_prob_updated") >= 0.5)
+    )
+    if unit_pfam is None:
+        return presence.with_columns(sibling_hit=pl.lit(None, pl.Boolean)).sort("unit"), None
+    labels = unit_pfam.select(pl.col("unit").cast(pl.UInt32), "pfam_accession")
+    seen = labels.join(
+        presence.filter((pl.col("hits") > 0) & (pl.col("present_prob") >= 0.5)), on="unit"
+    )["pfam_accession"].unique()
+    sibling = labels.filter(pl.col("pfam_accession").is_in(seen.implode()))["unit"].unique()
+    presence = presence.with_columns(
+        sibling_hit=(pl.col("hits") == 0) & pl.col("unit").is_in(sibling.implode())
+    ).sort("unit")
+    by_pfam = (
+        presence.join(labels, on="unit")
+        .group_by("pfam_accession")
+        .agg(
+            present_prob_observed=1 - (1 - pl.col("present_prob").fill_null(0.0)).product(),
+            present_prob_updated=1 - (1 - pl.col("present_prob_updated")).product(),
+        )
+        .with_columns(
+            imputed=(pl.col("present_prob_observed") < 0.5)
+            & (pl.col("present_prob_updated") >= 0.5)
+        )
+        .sort("pfam_accession")
+    )
+    return presence, by_pfam
+
+
+def function_species(
+    prof: pl.DataFrame, pairs: pl.DataFrame, species: pl.DataFrame, si: SpeciesIndex
+) -> pl.DataFrame:
+    """The function x species table: each unit's split hits (``hits_em``) attributed to
+    the detected species by the fit's allocation (``hits_assigned`` / ``hits``); the rest
+    (background, undetected species, units no screened species carries) is
+    ``unclassified``. Species roll up to genus and family by taxonomy (a missing rank takes
+    the lowest taxon above it); functions as genome mode's table (Pfam, else unit name).
+    Long format: ``function``, ``rank`` (``total``, ``family``, ``genus``, ``species``),
+    ``taxon``, ``hits_em``."""
+    split = prof.filter(pl.col("hits_em") > 0).select(
+        pl.col("unit").cast(pl.UInt32), "hits_em", *(["name"] if "name" in prof.columns else [])
+    )
+    detected = species.filter(pl.col("present_prob") >= DETECTED).select("species")
+    shares = (
+        pairs.join(detected, on="species", how="semi")
+        .filter(pl.col("hits") > 0)
+        .select("unit", "species", share=pl.col("hits_assigned") / pl.col("hits"))
+    )
+    resp = split.join(shares, on="unit").select(
+        "unit", genome="species", hits_em=pl.col("hits_em") * pl.col("share")
+    )
+    names = si.species.select(
+        pl.col("species").cast(pl.UInt32).alias("genome"), "name", "taxonomy",
+        group=pl.col("species").cast(pl.UInt32),
+    )  # fmt: skip
+    labels = (
+        taxon_labels(names.join(detected.select(genome="species"), on="genome", how="semi"))
+        .filter(pl.col("rank") != "species")
+        .with_columns(rank=pl.col("rank").replace("genome", "species"))
+    )
+    classified = resp.join(labels, on="genome").select("unit", "rank", "taxon", "hits_em")
+    ranks = pl.DataFrame({"rank": ["family", "genus", "species"]})
+    done = classified.group_by("unit", "rank").agg(done=pl.col("hits_em").sum())
+    unclassified = (
+        split.select("unit", "hits_em")
+        .join(ranks, how="cross")
+        .join(done, on=["unit", "rank"], how="left")
+        .with_columns(rest=pl.col("hits_em") - pl.col("done").fill_null(0.0))
+        .filter(pl.col("rest") > 1e-9 * pl.col("hits_em"))  # rounding, not hits
+        .select("unit", "rank", taxon=pl.lit("unclassified"), hits_em="rest")
+    )
+    total = split.select("unit", rank=pl.lit("total"), taxon=pl.lit(""), hits_em="hits_em")
+    return (
+        pl.concat([total, classified, unclassified])
+        .join(unit_functions(si.unit_pfam, split), on="unit")
+        .group_by("function", "rank", "taxon")
+        .agg(pl.col("hits_em").sum())
+        .sort("function", "rank", "taxon")
+    )
+
+
+def species_profile(
+    prof: pl.DataFrame,
+    si: SpeciesIndex,
+    *,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: float = PRIOR_PRESENT,
+) -> dict[str, object]:
+    """:func:`fit_species` as reports: ``species`` (detected, ``present_prob`` ≥
+    ``DETECTED``: ``id``, ``name``, ``taxonomy``, ``present_prob``, ``depth`` with its
+    interval, ``relative_abundance``, ``units_hit``, ``containment``, ``core_hit`` (share of
+    units with q ≥ ``CORE`` hit), ``accessory_called`` (units with q < ``CORE`` and
+    carriage ≥ 0.5)); ``units`` (their pairs); ``presence`` and ``pfam_presence``
+    (:func:`unit_presence`); ``function_species`` (None without ``hits_em``); and
+    ``summary``: raw ``hits``, ``explained_fraction`` (hits assigned to detected species
+    over all), ``genome_equivalents`` (Σ depth of the detected), counts."""
+    species, pairs, report = fit_species(
+        prof, si, min_containment=min_containment, min_units=min_units, prior=prior
+    )
+    species, phi = _intervals(species, pairs)
+    counts = pairs.group_by("species").agg(
+        core_hit=((pl.col("q") >= CORE) & (pl.col("hits") > 0)).sum()
+        / (pl.col("q") >= CORE).sum().clip(1),
+        accessory_called=((pl.col("q") < CORE) & (pl.col("carriage_prob") >= 0.5)).sum(),
+    )
+    names = si.species.select(pl.col("species").cast(pl.UInt32), "id", "name", "taxonomy")
+    detected = (
+        species.filter(pl.col("present_prob") >= DETECTED)
+        .join(counts, on="species")
+        .join(names, on="species")
+        .with_columns(relative_abundance=pl.col("depth") / pl.col("depth").sum())
+        .select(
+            "species",
+            "id",
+            "name",
+            "taxonomy",
+            "present_prob",
+            "depth",
+            "depth_lo",
+            "depth_hi",
+            "relative_abundance",
+            "units_hit",
+            "containment",
+            "core_hit",
+            "accessory_called",
+        )  # fmt: skip
+        .sort("depth", descending=True)
+    )
+    units = pairs.join(detected.select("species"), on="species", how="semi").select(
+        "species", "unit", prevalence="q", e="e", hits="hits", carriage_prob="carriage_prob",
+        expected_hits="expected_hits", hits_assigned="hits_assigned",
+    )  # fmt: skip
+    presence, by_pfam = unit_presence(prof, pairs, species, si.unit_pfam)
+    hits = float(prof.filter(pl.col("hits") > 0)["hits"].sum())
+    summary = report | {
+        "hits": hits,
+        "explained_fraction": float(units["hits_assigned"].sum()) / hits if hits else 0.0,
+        "genome_equivalents": float(detected["depth"].sum()),
+        "species_detected": detected.height,
+        "phi": phi,
+        "imputed_units": int(presence["imputed"].sum()),
+    }
+    return {
+        "species": detected,
+        "units": units,
+        "presence": presence,
+        "pfam_presence": by_pfam,
+        "function_species": function_species(prof, pairs, species, si)
+        if "hits_em" in prof.columns
+        else None,
+        "summary": summary,
+    }
