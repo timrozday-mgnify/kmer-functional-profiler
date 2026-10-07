@@ -1577,7 +1577,9 @@ def uhgg_pick(args: argparse.Namespace) -> None:
     ≥ ``--min-genomes`` genomes and a non-representative genome of ≥ ``--min-completeness``
     and ≤ ``--max-contamination`` are the pool; each of ``--replicates`` samples takes
     ``--per-sample`` of them, one such genome each (never reused), at a depth log-uniform
-    on [``--depth-min``, ``--depth-max``]. Writes ``samples.tsv`` (``sample``, ``genome``,
+    on [``--depth-min``, ``--depth-max``]. ``--two-strain-replicates`` more samples give each
+    species two such genomes, at depths drawn alike (the lineage model's two-strain arm,
+    phase 11, step 12). Writes ``samples.tsv`` (``sample``, ``genome``,
     ``species``, ``depth``), ``exclude.txt`` (every picked genome: left out of the species
     index) and ``species.txt`` (the samples' species plus ``--distractors`` others)."""
     rng = random.Random(args.seed)
@@ -1597,12 +1599,13 @@ def uhgg_pick(args: argparse.Namespace) -> None:
     }
     pool = sorted(candidates)
     rows: list[tuple[int, str, str, float]] = []
-    for sample in range(1, args.replicates + 1):
+    for sample in range(1, args.replicates + args.two_strain_replicates + 1):
+        strains = 1 if sample <= args.replicates else 2
         for sp in rng.sample(pool, min(args.per_sample, len(pool))):
             left = [g for g in candidates[sp] if g not in {r[1] for r in rows}]
-            if left:
+            for genome in rng.sample(left, strains) if len(left) >= strains else []:
                 depth = math.exp(rng.uniform(math.log(args.depth_min), math.log(args.depth_max)))
-                rows.append((sample, rng.choice(left), sp, depth))
+                rows.append((sample, genome, sp, depth))
     samples = pl.DataFrame(rows, schema=["sample", "genome", "species", "depth"], orient="row")
     samples.write_csv("samples.tsv", separator="\t")
     Path("exclude.txt").write_text("".join(f"{g}\n" for g in samples["genome"]))
@@ -1671,7 +1674,10 @@ def uhgg_score(args: argparse.Namespace) -> None:
     - Presence (``--presence``, ``--pfam-presence``, kfp-prior's format): completeness per
       bin of carrier depth, observed vs updated, and purity; calibration of zero-hit units
       to ``--out-calibration``.
-    - Carriage (``--units``, species arms): over the true species' accessory units
+    - Lineages (``--kind lineage``: ``lineages.tsv`` as ``--pred``, summed per species;
+      ``lineage_units.tsv`` as ``--units``, its deepest lineage): also the share of
+      two-strain species (both strains ≥ 1x) given ≥ 2 lineages.
+    - Carriage (``--units``): over the true one-strain species' accessory units
       (0.1 < q < 0.9) with zero hits, the AUROC of ``carriage_prob`` against the held-out
       genome's carriage, and log loss of ``carriage_prob`` and of the prevalence.
     - Function x species (``--function-taxon``, rank species): as ``genome-score``'s,
@@ -1685,7 +1691,19 @@ def uhgg_score(args: argparse.Namespace) -> None:
                         schema_overrides={"taxonomy": pl.String})  # fmt: skip
     row: dict[str, Any] = {"sample": args.sample, "arm": args.arm}
     if args.pred:
-        if args.kind == "sylph":
+        if args.kind == "lineage":  # lineages.tsv: a species' lineages summed
+            lineages = pl.read_csv(args.pred, separator="\t", infer_schema_length=0).cast(
+                {"relative_abundance": pl.Float64}
+            )
+            pred = lineages.group_by("id").agg(p=pl.col("relative_abundance").sum())
+            # two strains of a species, both at >= 1x: resolved if it has >= 2 lineages
+            pairs = truth.filter(pl.col("depth") >= 1).group_by("species").agg(n=pl.len())
+            two = pairs.filter(pl.col("n") == 2)["species"]
+            found = lineages.group_by("id").agg(n=pl.len()).filter(pl.col("n") >= 2)["id"]
+            row |= {"two_strain_species": two.len(),
+                    "two_strain_resolved": two.is_in(found.implode()).mean()
+                    if two.len() else None}  # fmt: skip
+        elif args.kind == "sylph":
             raw = pl.read_csv(args.pred, separator="\t")
             pred = raw.select(
                 id=pl.col("Genome_file").str.split("/").list.last().str.replace(r"\.f\w+$", ""),
@@ -1696,11 +1714,12 @@ def uhgg_score(args: argparse.Namespace) -> None:
             pred = pl.read_csv(args.pred, separator="\t", infer_schema_length=0).select(
                 id=pl.col(column), p=pl.col("relative_abundance").cast(pl.Float64)
             )
-        both = truth.select(id="species", t="t").join(pred, on="id", how="full",
+        per_species = truth.group_by("species").agg(pl.col("t").sum())  # two-strain samples
+        both = per_species.select(id="species", t="t").join(pred, on="id", how="full",
                                                       coalesce=True).fill_null(0.0)  # fmt: skip
         tp = both.filter((pl.col("t") > 0) & (pl.col("p") > 0))
-        row |= {"n_truth": truth.height, "n_pred": pred.height, "tp": tp.height,
-                **_f1(tp.height, pred.height, truth.height),
+        row |= {"n_truth": per_species.height, "n_pred": pred.height, "tp": tp.height,
+                **_f1(tp.height, pred.height, per_species.height),
                 "l1": float((both["t"] - both["p"]).abs().sum()),
                 "spearman": float(spearmanr(tp["t"], tp["p"]).statistic)
                 if tp.height > 2 else None}  # fmt: skip
@@ -1772,11 +1791,15 @@ def uhgg_score(args: argparse.Namespace) -> None:
         )  # fmt: skip
     if args.units:
         ids = names.select(pl.col("species").cast(pl.UInt32), "id")
+        # species with one strain in the sample (two strains have no one carriage truth)
+        single = truth.filter(pl.col("species").count().over("species") == 1)
+        pairs = pl.read_csv(args.units, separator="\t", schema_overrides=floats)
+        if "lineage" in pairs.columns:  # lineage_units.tsv: the deepest lineage's carriage
+            pairs = pairs.filter(pl.col("lineage").cast(pl.Int64) == 0)
         pairs = (
-            pl.read_csv(args.units, separator="\t", schema_overrides=floats)
-            .cast({"species": pl.UInt32, "unit": pl.UInt32})
+            pairs.cast({"species": pl.UInt32, "unit": pl.UInt32})
             .join(ids, on="species")
-            .join(truth.select(id="species", name="genome"), on="id")
+            .join(single.select(id="species", name="genome"), on="id")
             .filter(pl.col("prevalence").is_between(0.1, 0.9, closed="none"), pl.col("hits") == 0)
             .join(held.select("name", "unit", x=pl.lit(True)), on=["name", "unit"], how="left")
             .with_columns(pl.col("x").fill_null(False))
@@ -1985,6 +2008,7 @@ def main() -> None:
     p = sub.add_parser("uhgg-pick")
     p.add_argument("--metadata", required=True)
     p.add_argument("--replicates", type=int, default=5)
+    p.add_argument("--two-strain-replicates", type=int, default=0)
     p.add_argument("--per-sample", type=int, default=30)
     p.add_argument("--min-genomes", type=int, default=20)
     p.add_argument("--min-completeness", type=float, default=90)
@@ -2005,7 +2029,7 @@ def main() -> None:
     for name in ("truth", "species-index", "arm"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--sample", type=int, required=True)
-    p.add_argument("--kind", default="species", choices=["species", "genomes", "sylph"])
+    p.add_argument("--kind", default="species", choices=["species", "genomes", "sylph", "lineage"])
     for name in ("pred", "presence", "pfam-presence", "units", "function-taxon"):
         p.add_argument(f"--{name}")
     p.add_argument("--out", default="species_score.tsv")

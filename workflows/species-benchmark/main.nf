@@ -1,8 +1,9 @@
 // Species model strain hold-out benchmark (plan: phase 11, step 10; README.md): samples of
 // non-representative MGnify catalogue genomes, simulated with InSilicoSeq and profiled; the
 // species index is built with those genomes left out, so every sample strain is new to it.
-// Arms: the species model and its ablations, genome mode (G1) on the representatives with
-// kfp-prior (B1) on top, and sylph on the representatives' DNA.
+// Arms: the species model and its ablations, the lineage model prototype (phase 11, step
+// 12; also on two-strain samples), genome mode (G1) on the representatives with kfp-prior
+// (B1) on top, and sylph on the representatives' DNA.
 
 // --name FILE for an input given and not empty (an arm without that output passes [])
 def opt(name, files) {
@@ -40,6 +41,7 @@ process PICK {
     script:
     """
     ${params.bench} uhgg-pick --metadata ${metadata} --replicates ${params.replicates} \\
+        --two-strain-replicates ${params.two_strain_replicates} \\
         --per-sample ${params.per_sample} --min-genomes ${params.min_genomes} \\
         --min-completeness ${params.min_completeness} --max-contamination ${params.max_contamination} \\
         --distractors ${params.distractors} --depth-min ${params.depth_min} --depth-max ${params.depth_max} \\
@@ -204,6 +206,30 @@ process SPECIES_FIT {
     "touch species.tsv presence.tsv pfam_presence.tsv species_units.tsv function_species.tsv summary.json"
 }
 
+process LINEAGE_FIT {
+    tag "sample ${sample}"
+    label 'process_medium'
+    publishDir "${params.outdir}/lineage", mode: 'copy', saveAs: { f -> "sample${sample}_${f}" }
+
+    input:
+    tuple val(sample), path(profile)
+    path species_index
+    path code, stageAs: 'code*/*'
+
+    output:
+    tuple val(sample), path('lineages.tsv'), path('lineage_units.tsv'), emit: fit
+    path 'summary.json'
+
+    script:
+    """
+    ${params.kfp} lineage ${profile} ${species_index} lineages.tsv --units lineage_units.tsv \\
+        --summary summary.json ${params.fit_args} ${params.lineage_args}
+    """
+
+    stub:
+    "touch lineages.tsv lineage_units.tsv summary.json"
+}
+
 process REPS {
     label 'process_single'
 
@@ -361,7 +387,7 @@ workflow {
     PICK(METADATA.out.metadata, bench_py)
     FETCH_CATALOGUE(METADATA.out.metadata, PICK.out.species)
     FETCH_GENOMES(PICK.out.samples)
-    SIMULATE(channel.of(1..params.replicates), PICK.out.samples, FETCH_GENOMES.out.genomes, bench_py)
+    SIMULATE(channel.of(1..(params.replicates + params.two_strain_replicates)), PICK.out.samples, FETCH_GENOMES.out.genomes, bench_py)
     def ch_index = params.index
         ? channel.value(file(params.index, checkIfExists: true))
         : INDEX(file(params.members, checkIfExists: true), params.pfam ? file(params.pfam, checkIfExists: true) : [], ch_code).index
@@ -380,6 +406,7 @@ workflow {
         ch_code,
     )
     def ch_default = SPECIES_INDEX.out.index.filter { it[0] == 'default' }.map { it[1] }.first()
+    LINEAGE_FIT(PROFILE.out.profile, ch_default, ch_code)
 
     // Genome mode on the representatives (G1), kfp-prior (B1) on its fit; sylph
     REPS(FETCH_CATALOGUE.out.catalogue, PICK.out.species, bench_py)
@@ -391,6 +418,7 @@ workflow {
     SCORE(
         SPECIES_FIT.out.fit
             .map { sample, arm, sp, pr, pf, units, ft -> [sample, arm, 'species', sp, pr, pf, units, ft] }
+            .mix(LINEAGE_FIT.out.fit.map { sample, l, u -> [sample, 'lineage', 'lineage', l, [], [], u, []] })
             .mix(GENOME_FIT.out.fit.map { sample, g, ft -> [sample, 'genomes', 'genomes', g, [], [], [], ft] })
             .mix(GENOME_FIT.out.prior.map { sample, pr, pf -> [sample, 'kfp_prior', 'species', [], pr, pf, [], []] })
             .mix(SYLPH.out.profile.map { sample, p -> [sample, 'sylph', 'sylph', p, [], [], [], []] }),

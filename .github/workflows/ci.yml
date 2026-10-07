@@ -60,7 +60,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --locked
+      - run: uv sync --locked --group phylo  # phylo: the lineage prototype (mypy, tests)
       - name: HMMER (Pfam fixtures and their tests)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y hmmer

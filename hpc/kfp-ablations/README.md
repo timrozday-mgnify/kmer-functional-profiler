@@ -53,6 +53,8 @@ can run whenever `00-dbs` has.
 (`workflows/species-benchmark`); it needs a checkout of the `dev-species` branch, fetches
 the human-gut catalogue's pangenomes from the EBI FTP, and profiles against the 1-in-100
 subset unless `INDEX=<built index>` is set (`cd species-benchmark && INDEX=... sbatch run.sh`).
+Its lineage arm (step 12) needs JAX and NumPyro: re-run `bash workflows/setup.sh` in the
+checkout after pulling, which now installs the `phylo` group.
 
 `gtdb-species-index` builds phase 11's GTDB species index (`workflows/gtdb-species-index`)
 on the `dev-species` branch: `cd gtdb-species-index && INDEX=<built index> sbatch run.sh`.

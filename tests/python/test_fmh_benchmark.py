@@ -571,3 +571,35 @@ def test_uhgg_pick_sample_and_score(tmp_path: Path) -> None:
     assert got["carriage_auc"] == 1.0 and got["accessory_pairs"] == 2
     calibration = pl.read_csv(tmp_path / "species_calibration.tsv", separator="\t")
     assert calibration["n"].sum() == 2  # the zero-hit units 2 and 3
+
+
+def test_uhgg_two_strain_samples_and_lineage_score(tmp_path: Path) -> None:
+    """Two-strain samples (phase 11, step 12) and the lineage arm's scoring."""
+    catalogue = ROOT / "tests" / "data" / "mini_uhgg"
+    run(tmp_path, "uhgg-pick", "--metadata", str(catalogue / "genomes-all_metadata.tsv"),
+        "--replicates", "0", "--two-strain-replicates", "1", "--per-sample", "2",
+        "--min-genomes", "3", "--distractors", "0")  # fmt: skip
+    samples = pl.read_csv(tmp_path / "samples.tsv", separator="\t")
+    # only beta has two eligible genomes (alpha's 3 is 80% complete)
+    assert sorted(samples["genome"]) == ["MGYG000000005", "MGYG000000006"]
+
+    si = tmp_path / "si"
+    si.mkdir()
+    pl.DataFrame({"species": [0, 1], "id": ["SA", "SB"], "name": ["A", "B"]}).write_csv(
+        si / "species.tsv", separator="\t"
+    )
+    pl.DataFrame({"name": ["G1", "G2"], "species": ["SA"] * 2, "unit": [1, 2],
+                  "c": [1.0] * 2}).write_parquet(si / "held_out.parquet")  # fmt: skip
+    pl.DataFrame({"sample": [1, 1], "genome": ["G1", "G2"], "species": ["SA", "SA"],
+                  "depth": [2.0, 3.0]}).write_csv(
+        tmp_path / "truth.tsv", separator="\t")  # fmt: skip
+    pl.DataFrame({"id": ["SA", "SA", "SB"], "lineage": [0, 1, 0],
+                  "relative_abundance": [0.5, 0.3, 0.2]}).write_csv(
+        tmp_path / "lineages.tsv", separator="\t")  # fmt: skip
+    run(tmp_path, "uhgg-score", "--truth", "truth.tsv", "--species-index", "si", "--sample", "1",
+        "--arm", "lineage", "--kind", "lineage", "--pred", "lineages.tsv")  # fmt: skip
+    got = dict(pl.read_csv(tmp_path / "species_score.tsv", separator="\t")
+               .select("metric", "value").iter_rows())  # fmt: skip
+    assert got["n_truth"] == 1 and got["completeness"] == 1.0 and got["purity"] == 0.5
+    assert got["l1"] == pytest.approx(0.4)
+    assert got["two_strain_species"] == 1 and got["two_strain_resolved"] == 1.0
