@@ -29,7 +29,11 @@ TRUTH            reads mapped back with minimap2 (mappy); a KO is present if a r
 MGNIFY_INDEX, MGNIFY_REPS, MGNIFY_DB, MGNIFY_ANNOTATE, MGNIFY_GENES
                  per --mgnify_indexes entry: the index (built here from members, or given),
                  its cluster representatives, and every genome protein searched against them
-                 (DIAMOND blastp) -> mgnify/<name>_gene_units.parquet (MGnify90-level truth)
+                 (DIAMOND blastp) -> mgnify/<name>_gene_units_reps.parquet
+MGNIFY_MEMBERS, MGNIFY_MEMBER_DB, MGNIFY_NEAREST_ANNOTATE, MGNIFY_NEAREST
+                 the members of every hit cluster, the genome proteins searched against them:
+                 per (gene, cluster) the nearest member -> mgnify/<name>_gene_units.parquet
+                 (MGnify90-level truth)
 PROFILE          kmer-functional-profiler query, every metagenome x every index; profiles of
                  --mgnify_indexes (Pfam-labelled units) are summed per Pfam
 AAI_SCORE, AAI_SUMMARY
@@ -167,6 +171,8 @@ To download them ahead of (or apart from) the benchmark, e.g. on a node with int
 | `--mgnify_indexes` | `[]` | `[name:, path:, members:, pfam:, args:]` maps of MGnify90 indexes (config file only; see [MGnify90-level truth](#mgnify90-level-truth-unit-resolution-and-containment-aai)) |
 | `--mgnify_min_id`, `--mgnify_min_cov` | `0.9`, `0.8` | A gene is in its nearest cluster at this identity and coverage |
 | `--mgnify_diamond_args` | `--sensitive --max-target-seqs 25 --id 50 --query-cover 50` | Which near hits are kept |
+| `--mgnify_nearest_diamond_args` | `--sensitive --max-target-seqs 1000 --id 50 --query-cover 50` | The nearest-member pass, against the hit clusters' members (`member_hit` false where a gene's targets filled with other clusters' members) |
+| `--aai_models` | `[]` | `[name:, path:]` maps of `aai_model.json` files (config file only): each MGnify profile is also scored with `aai` re-estimated under it, as arm `<arm>+<name>` |
 | `--query_arms` | one plain arm | `[name:, args:, reads:, mask:, decoy:]` maps (config file only; see [Ablations](#ablations)) |
 | `--host_fractions` | `0` | Host share of read pairs, comma-separated, e.g. `0,0.5,0.9,0.99` |
 | `--host_genome_url`, `--host_extra_url` | T2T-CHM13v2.0; rCRS chrM + PhiX174 (NCBI) | Host genome for spike-in reads and masks |
@@ -247,7 +253,9 @@ its near hits, each with identity and coverage. A present gene (reads in the sam
 | `completeness_90` | Clusters holding a present gene at the 90% level that are detected (`kmers_unique` >= 1) |
 | `purity_nearest`, `purity_near` | Detected units that are some present gene's nearest cluster, or any of its hits |
 | `recall_<lo>` | Present genes whose nearest cluster is detected, by that hit's identity (0.95, 0.9, 0.8, 0.7, 0.5): resolution below 90% |
+| `aai_truth` | `nearest` (identity to each cluster's nearest member) or `rep` (to its representative: a `gene_units.parquet` from before the member pass) |
 | `aai_bias_<lo>`, `aai_cover_<lo>`, `aai_spearman`, `aai_n` | Detected units' `aai` against the depth-weighted identity of the present genes they are nearest to; `aai_cover` = share inside `aai_lo`–`aai_hi` |
+| `aai_bias_members<lo>`, `aai_cover_members<lo>`, `aai_n_members<lo>` | The same against the union truth, by the unit's `n_members` (1, 2, 4, 11, 101+): the union term's interval coverage |
 | `naive_bias_<lo>`, `naive_within05_<lo>`, `naive_spearman` | Every profiled unit a present gene hits (near hits included): `aai_naive` against the best identity of a present gene to it |
 
 `calibration/<name>[~arm].json` is an inverse calibration of `aai` (plan, phase 7, steps
@@ -259,9 +267,12 @@ reports calibrated `aai` and keeps `aai_raw`); it is fitted on this benchmark on
 it on others before attaching it to an index for real samples (plan, step 17). A test
 fixture has too few units for a map (`widen` null; `calibrate-aai` refuses it).
 
-The identity is to the cluster *representative*, which is what `aai` estimates (to the
-cluster's consensus; plan, phase 7, steps 7 and 9). Entries take either a built index and the
-members it came from, or members (with `pfam` and `args`) to build here:
+For `aai` and `aai_naive` the identity is to the cluster's *nearest member*, which is what
+`aai` estimates (plan, phase 7, steps 33–34: the survival model is fitted at nearest-member
+identity, and its union term covers the rest of the members). A second DIAMOND pass searches
+the genome proteins against the members of every cluster they hit (`--mgnify_nearest_diamond_args`).
+Detection and `recall_<lo>` stay at identity to the representative. Entries take either a
+built index and the members it came from, or members (with `pfam` and `args`) to build here:
 
 ```groovy
 params.mgnify_indexes = [

@@ -1,0 +1,20 @@
+{
+ "survival": "markov_beta",
+ "concentration": 4.123327333678635,
+ "region": 4.849260943485584,
+ "ends": 0.9461349572290713,
+ "union": 0.07576896495535657,
+ "union_slope": 0.3364159942262766,
+ "categories": 16,
+ "k": 11,
+ "alphabet": "protein",
+ "fit": {
+  "n_one": 70111,
+  "rmse_one": 0.004723313469051656,
+  "rmse_both_one": 0.0060320723337286735,
+  "n_union": 29465,
+  "rmse_union": 0.012822897292615645,
+  "rmse_independent_union": 0.10197814271218185,
+  "source": "aai-model run of 2026-10-07 (main after PR #100), fit_model.py fit of step 34"
+ }
+}

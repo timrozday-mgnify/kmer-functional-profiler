@@ -41,7 +41,7 @@ from kmer_functional_profiler.query import (
     sample_summary,
     unit_hits,
 )
-from kmer_functional_profiler.survival import SurvivalModel
+from kmer_functional_profiler.survival import SurvivalModel, check_aai_model
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 READS = (DATA / "reads_1.fastq.gz", DATA / "reads_2.fastq.gz")
@@ -349,6 +349,48 @@ def test_aai_fit_recovers_identity_under_clustered_rates() -> None:
         flat, flat_lo, flat_hi, _ = query.aai_fit(model=SurvivalModel(11), **args)
         assert np.median(flat) > a + 0.01
         assert ((flat_lo <= a) & (a <= flat_hi)).mean() < 0.7
+
+
+def test_union_of_members() -> None:
+    # One member (or no union term) is the one-member model; more members keep more, and
+    # survival still falls with identity; check_aai_model rejects a negative term.
+    base = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95)
+    union = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95,
+                          union=0.1, union_slope=0.3)  # fmt: skip
+    a, rows = np.array([0.7, 0.85, 0.95]), np.arange(len(base.tables["S"]))
+    assert union.union_survival(a, 1) == pytest.approx(base.survival(a))
+    assert union.union_at(rows, 1.0) == pytest.approx(base.tables["S"])
+    s = [union.union_survival(a, n) for n in (1, 10, 300)]
+    assert (s[0] < s[1]).all() and (s[1] < s[2]).all()
+    assert (np.diff(union.union_at(rows, 300.0)) <= 1e-12).all()
+    model = {"survival": "markov_beta", "concentration": 4.0, "region": 5.0, "ends": 0.95,
+             "union": 0.1, "union_slope": 0.3}  # fmt: skip
+    assert SurvivalModel.from_json(model, 11) == dataclasses.replace(union, categories=16)
+    check_aai_model(model, {"k": 11})
+    with pytest.raises(ValueError, match="union"):
+        check_aai_model(model | {"union_slope": -0.1}, {"k": 11})
+
+
+def test_aai_fit_recovers_identity_against_a_union() -> None:
+    # A unit of 3 members, each an independent homolog at identity a: a window is hit if
+    # any member keeps it. With union 1 and slope 0 (m = n), the estimate given n_members
+    # recovers a; reading it as one member does not.
+    rng = np.random.default_rng(6)
+    model = SurvivalModel(11, None, 6.0, categories=8, concentration=4.0)
+    union = dataclasses.replace(model, union=1.0)
+    n, units = 300, 300
+    for t in (0.15, 0.3):
+        same = np.stack([strains(model, t, units, n + 10, rng) for _ in range(3)])
+        a = same.mean()
+        present = windows_of(same.reshape(-1, n + 10), 11).reshape(3, units, -1).any(axis=0)
+        full = np.full(units, float(n))
+        args = {"coverage": np.full(units, 20.0), "present": present.mean(axis=1), "m": full,
+                "pin_sum": full, "n_kmers": full, "windows": full}  # fmt: skip
+        point, lo, hi, _ = query.aai_fit(model=union, n_members=np.full(units, 3.0), **args)
+        assert np.median(point) == pytest.approx(a, abs=0.015)
+        assert ((lo <= a) & (a <= hi)).mean() >= 0.9
+        one, _, _, _ = query.aai_fit(model=model, **args)
+        assert np.median(one) > a + 0.02
 
 
 def test_selection_at_the_detection_limit_is_corrected() -> None:

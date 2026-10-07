@@ -3,6 +3,7 @@
 // detection by other tools (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4).
 // See README.md.
 
+include { MGNIFY_DB; MGNIFY_DB as MGNIFY_MEMBER_DB; MGNIFY_ANNOTATE; MGNIFY_ANNOTATE as MGNIFY_NEAREST_ANNOTATE } from './mgnify_diamond.nf'
 
 process FETCH {
     label 'process_single'
@@ -135,49 +136,10 @@ process MGNIFY_REPS {
     "touch reps.faa"
 }
 
-process MGNIFY_DB {
-    tag "${name}"
-    label 'process_medium'
-    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
-
-    input:
-    tuple val(name), path(faa)
-
-    output:
-    tuple val(name), path("reps_${name}.dmnd"), emit: db
-
-    script:
-    "diamond makedb --in ${faa} --db reps_${name} --threads ${task.cpus}"
-
-    stub:
-    "touch reps_${name}.dmnd"
-}
-
-process MGNIFY_ANNOTATE {
-    tag "${name} ${faa.baseName}"
-    label 'process_medium'
-    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
-
-    input:
-    tuple val(name), path(db), path(faa)
-
-    output:
-    tuple val(name), path("${faa.baseName}.hits.tsv"), emit: hits
-
-    script:
-    """
-    diamond blastp --db ${db} --query ${faa} --out ${faa.baseName}.hits.tsv --threads ${task.cpus} \\
-        --outfmt 6 qseqid sseqid pident length qlen slen bitscore ${params.mgnify_diamond_args}
-    """
-
-    stub:
-    "touch ${faa.baseName}.hits.tsv"
-}
-
 process MGNIFY_GENES {
     tag "${name}"
     label 'process_medium'
-    publishDir "${params.outdir}/mgnify", mode: 'copy', saveAs: { "${name}_gene_units.parquet" }
+    publishDir "${params.outdir}/mgnify", mode: 'copy', saveAs: { "${name}_gene_units_reps.parquet" }
 
     input:
     tuple val(name), path(hits, stageAs: 'hits/*')
@@ -193,22 +155,66 @@ process MGNIFY_GENES {
     "touch gene_units.parquet"
 }
 
+process MGNIFY_MEMBERS {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(gene_units), path(members, stageAs: 'members/*')
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('members.faa'), emit: faa
+    tuple val(name), path('member_clusters.parquet'), emit: clusters
+
+    script:
+    "${params.bench} mgnify-members --members ${members} --gene-units ${gene_units}"
+
+    stub:
+    "touch members.faa member_clusters.parquet"
+}
+
+process MGNIFY_NEAREST {
+    tag "${name}"
+    label 'process_medium'
+    publishDir "${params.outdir}/mgnify", mode: 'copy', saveAs: { "${name}_gene_units.parquet" }
+
+    input:
+    tuple val(name), path(hits, stageAs: 'hits/*'), path(gene_units), path(clusters)
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('gene_units_nearest.parquet'), emit: genes
+
+    script:
+    """
+    ${params.bench} mgnify-nearest --hits hits/* --gene-units ${gene_units} \\
+        --member-clusters ${clusters} --out gene_units_nearest.parquet
+    """
+
+    stub:
+    "touch gene_units_nearest.parquet"
+}
+
 process AAI_SCORE {
-    tag "seed ${sid} ${name}${arm ? '~' + arm : ''}"
+    tag "seed ${sid} ${name}${arm ? '~' + arm : ''}${model_name ? '+' + model_name : ''}"
     label 'process_single'
 
     input:
-    tuple val(sid), val(name), val(arm), path(units), path(gene_units), path(genes)
+    // model: '' for the profile's own aai, else an aai_model.json (params.aai_models) to
+    // re-estimate it under, scored as arm '<arm>+<model_name>'
+    tuple val(sid), val(name), val(arm), path(units), path(gene_units), path(genes), val(model_name), val(model)
     path code, stageAs: 'code/*'
 
     output:
     path 'aai_score.tsv', emit: score
 
     script:
+    def scored = model_name ? "${arm}+${model_name}" : arm
     """
     ${params.bench} aai-score --profile ${units} --gene-units ${gene_units} --genes ${genes} \\
-        --sample seed${sid} --index ${name} --arm '${arm}' --min-id ${params.mgnify_min_id} \\
-        --min-cov ${params.mgnify_min_cov}
+        --sample seed${sid} --index ${name} --arm '${scored}' --min-id ${params.mgnify_min_id} \\
+        --min-cov ${params.mgnify_min_cov} ${model ? "--model ${model}" : ''}
     """
 
     stub:
@@ -251,7 +257,7 @@ process AAI_SUMMARY {
     path 'aai_scores.tsv'
 
     script:
-    "${params.bench} summary ${scores} --keys index arm --out aai_summary.tsv --scores-out aai_scores.tsv"
+    "${params.bench} summary ${scores} --keys index arm aai_truth --out aai_summary.tsv --scores-out aai_scores.tsv"
 
     stub:
     "touch aai_summary.tsv aai_scores.tsv"
@@ -1086,9 +1092,26 @@ workflow BENCHMARK {
             bench_py,
         )
         MGNIFY_DB(MGNIFY_REPS.out.faa)
-        MGNIFY_ANNOTATE(MGNIFY_DB.out.db.combine(GENOME_PROTEINS.out.faa.flatten()))
+        MGNIFY_ANNOTATE(MGNIFY_DB.out.db.combine(GENOME_PROTEINS.out.faa.flatten()), params.mgnify_diamond_args)
         MGNIFY_GENES(MGNIFY_ANNOTATE.out.hits.groupTuple(), bench_py)
-        ch_gene_units = MGNIFY_GENES.out.genes.flatMap { name, genes -> sharing[name].collect { n -> [n, genes] } }
+        // nearest-member identity, what aai estimates (plan, phase 7, step 34): the genes
+        // against the members of the clusters they hit
+        MGNIFY_MEMBERS(
+            MGNIFY_GENES.out.genes.join(
+                channel.fromList(mgnify.findAll { it.name in sharing.keySet() }).map { cfg -> [cfg.name, files(cfg.members)] }
+            ),
+            bench_py,
+        )
+        MGNIFY_MEMBER_DB(MGNIFY_MEMBERS.out.faa)
+        MGNIFY_NEAREST_ANNOTATE(
+            MGNIFY_MEMBER_DB.out.db.combine(GENOME_PROTEINS.out.faa.flatten()),
+            params.mgnify_nearest_diamond_args,
+        )
+        MGNIFY_NEAREST(
+            MGNIFY_NEAREST_ANNOTATE.out.hits.groupTuple().join(MGNIFY_GENES.out.genes).join(MGNIFY_MEMBERS.out.clusters),
+            bench_py,
+        )
+        ch_gene_units = MGNIFY_NEAREST.out.genes.flatMap { name, genes -> sharing[name].collect { n -> [n, genes] } }
     }
 
     // Query arms (phase 7): which reads (raw, fastp, hostile), extra query options, and
@@ -1239,7 +1262,10 @@ workflow BENCHMARK {
         .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
         .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }
         .combine(TRUTH.out.genes, by: 0)  // sid, name, arm, units, gene_units, genes
-    AAI_SCORE(ch_aai, bench_py)
+    def ch_models = channel.of(['', '']).mix(
+        channel.fromList(params.aai_models).map { m -> [m.name, file(m.path, checkIfExists: true).toString()] }
+    )
+    AAI_SCORE(ch_aai.combine(ch_models), bench_py)
     AAI_SUMMARY(AAI_SCORE.out.score.collect())
     // aai -> identity map per index and arm, fitted on half the clusters of every seed
     AAI_CALIBRATE(

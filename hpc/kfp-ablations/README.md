@@ -38,6 +38,10 @@ cd kfp-ablations/em-query-cost && sbatch run.sh
 cd kfp-ablations/em-starts-soil && sbatch run.sh
 # aai survival model (plan, phase 7, step 25), independent of the rest; no 00-dbs needed:
 cd kfp-ablations/aai-model && sbatch run.sh
+# aai under the step-34 model against nearest-member identity (plan, phase 7, step 34), once
+# floor-novaseq and floor-1.65M have finished: their published profiles rescored, arms
+# '+step34', '+step34_nounion', '+step34_ends1' (no index rebuilt, no query rerun):
+cd kfp-ablations/aai-rescore && sbatch run.sh
 # the three release tiers at full scale (slim, standard, large), independent of the rest;
 # reads the whole release (RELEASE=<local mirror> to use one), ~1 TB of buckets in results-*/:
 cd kfp-ablations/release-tiers && sbatch run.sh
