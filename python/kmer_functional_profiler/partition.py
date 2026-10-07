@@ -38,6 +38,8 @@ from typing import Any, Final
 
 import numpy as np
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.dataset as ds  # type: ignore[import-untyped]
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.index import (
@@ -404,23 +406,25 @@ def _pack(
 ) -> None:
     """Rows of ``files`` in pack range ``part`` of ``meta`` (layout and bounds), packed."""
     lo, hi = meta["bounds"][part], meta["bounds"][part + 1]
-    in_range = pl.col("hash") >= lo
+    # Read with pyarrow: on the EBI cluster, polars' filter wrote 0 for some kept hashes at
+    # the range's lower edge (polars 1.44.2), and CONCAT found the parts' keys out of order.
+    in_range = ds.field("hash") >= pa.scalar(lo, pa.uint64())
     if hi < 2**64:
-        in_range &= pl.col("hash") < hi
-    rows = (
-        pl.scan_parquet(files)
-        .filter(in_range)
-        .select("hash", "cluster_rep", "pin_q")
-        .join(
-            pl.scan_parquet(Path(units_dir) / "units.parquet").select("cluster_rep", "unit"),
-            on="cluster_rep",
-        )
-        .collect()
+        in_range &= ds.field("hash") < pa.scalar(hi, pa.uint64())
+    table = ds.dataset(files, format="parquet").to_table(
+        columns=["hash", "cluster_rep", "pin_q"], filter=in_range
     )
+    rows = pl.from_arrow(table).join(  # type: ignore[union-attr]
+        pl.read_parquet(Path(units_dir) / "units.parquet", columns=["cluster_rep", "unit"]),
+        on="cluster_rep",
+    )
+    hashes = rows["hash"].to_numpy()
+    if len(hashes) and (int(hashes.min()) < lo or int(hashes.max()) >= hi):
+        raise ValueError(f"pack range {part}: hashes outside [{lo}, {hi})")
     values = (rows["unit"].cast(pl.UInt64).to_numpy() << np.uint64(PIN_BITS)) | rows[
         "pin_q"
     ].to_numpy()
-    PackedPart.build(rows["hash"].to_numpy(), values, meta["layout"]).save(out_prefix)
+    PackedPart.build(hashes, values, meta["layout"]).save(out_prefix)
     counts = {"postings": rows.height, "distinct_hashes": rows["hash"].n_unique()}
     Path(f"{out_prefix}.json").write_text(json.dumps(counts) + "\n")
 
