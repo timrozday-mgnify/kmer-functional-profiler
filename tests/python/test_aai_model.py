@@ -1,5 +1,6 @@
 """The aai-model workflow's survival counting and fit."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -105,13 +106,17 @@ def test_pairs_take_the_nearest_member_of_each_candidate_cluster(tmp_path: Path)
     )
     out = tmp_path / "pairs.parquet"
     args = ["pairs", "--hits", str(hits), "--candidates", str(cands),
-            "--member-clusters", str(clusters), "--out", str(out)]  # fmt: skip
+            "--member-clusters", str(clusters), "--out", str(out),
+            "--stats-out", str(tmp_path / "stats.json")]  # fmt: skip
     sys.argv = ["fit_model.py", *args]
     fit_model.main()
     got = {r["cluster_rep"]: r for r in pl.read_parquet(out).iter_rows(named=True)}
     assert got[1]["nearest"] == 2 and got[1]["identity"] == pytest.approx(0.85)
     assert got[1]["identity_rep"] == pytest.approx(0.70)
     assert got[5]["nearest"] == 5 and got[5]["identity"] == pytest.approx(0.65)
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["candidates"] == 2 and stats["with_member_hit"] == 2 and stats["pairs"] == 2
+    assert stats["with_member_hit_by_size"] == {"1": 1.0, "2-3": 1.0}
 
 
 def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: Path) -> None:

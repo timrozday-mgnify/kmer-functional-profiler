@@ -65,7 +65,8 @@ process PAIRS {
     path member_clusters
 
     output:
-    path 'pairs.parquet'
+    path 'pairs.parquet', emit: pairs
+    path 'pairs_stats.json'
 
     script:
     """
@@ -74,7 +75,7 @@ process PAIRS {
     """
 
     stub:
-    "touch pairs.parquet"
+    "touch pairs.parquet pairs_stats.json"
 }
 
 process SURVIVAL {
@@ -122,5 +123,5 @@ workflow {
     MEMBER_DB(CANDIDATES.out.combine(Channel.value(members)))
     NEAREST_ALIGN(MEMBERS_DB(MEMBER_DB.out.faa).combine(MEMBER_DB.out.queries.flatten()), params.diamond_nearest_args)
     PAIRS(NEAREST_ALIGN.out.collect(), CANDIDATES.out, MEMBER_DB.out.clusters)
-    FIT(SURVIVAL(PAIRS.out.combine(Channel.value(members))))
+    FIT(SURVIVAL(PAIRS.out.pairs.combine(Channel.value(members))))
 }

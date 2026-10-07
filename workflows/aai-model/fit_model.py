@@ -160,8 +160,39 @@ def pairs(args: argparse.Namespace) -> None:
         )
         .select("protein_id", "cluster_rep", "identity", "identity_rep", nearest="subject")
     )
-    print(f"{cands.height} candidates, {nearest.height} with a member hit", flush=True)
-    _per_bin(nearest, "identity", args).write_parquet(args.out)
+    kept = _per_bin(nearest, "identity", args)
+    kept.write_parquet(args.out)
+    # how many candidates pass 2 lost (--max-target-seqs filled by other clusters' members),
+    # published beside the pairs: step 33's run only logged it
+    stats = {
+        "candidates": cands.height,
+        "with_member_hit": nearest.height,
+        "pairs": kept.height,
+        "with_member_hit_by_size": dict(
+            zip(*_lost_by_size(cands, nearest, args.member_clusters), strict=True)
+        ),
+    }
+    Path(args.stats_out).write_text(json.dumps(stats, indent=1) + "\n")
+
+
+def _lost_by_size(
+    cands: pl.DataFrame, nearest: pl.DataFrame, member_clusters: str
+) -> tuple[list[str], list[float]]:
+    """Per cluster size band (members of C), the share of candidates with a member hit."""
+    sizes = pl.read_parquet(member_clusters).group_by("cluster_rep").agg(n=pl.len())
+    found = nearest.select("protein_id", "cluster_rep", found=pl.lit(True))
+    got = (
+        cands.join(sizes, on="cluster_rep", how="left")
+        .join(found, on=["protein_id", "cluster_rep"], how="left")
+        .with_columns(
+            band=pl.col("n").cut([1, 3, 10, 100], labels=["1", "2-3", "4-10", "11-100", "101+"]),
+            found=pl.col("found").fill_null(False),
+        )
+        .group_by("band")
+        .agg(pl.col("found").mean())
+        .sort("band")
+    )
+    return got["band"].cast(pl.String).to_list(), got["found"].to_list()
 
 
 def _hashes(df: pl.DataFrame, k: int, alphabet: str) -> pl.DataFrame:
@@ -542,6 +573,7 @@ def main() -> None:
         if name == "pairs":
             p.add_argument("--candidates", required=True)
             p.add_argument("--member-clusters", required=True)
+            p.add_argument("--stats-out", default="pairs_stats.json")
         p.add_argument("--min-cov", type=float, default=0.8)
         p.add_argument("--min-id", type=float, default=0.6)
         p.add_argument("--bin", type=float, default=0.02)

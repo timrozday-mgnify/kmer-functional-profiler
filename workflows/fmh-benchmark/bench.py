@@ -18,6 +18,11 @@
 - ``mgnify-genes``: DIAMOND blastp of the genomes' proteins against those representatives ->
   ``gene_units.parquet``: per gene its best and near-hit clusters, with identity and
   coverage (the truth of unit-level detection and of containment AAI).
+- ``mgnify-members``: the members of every cluster in ``gene_units.parquet``, as FASTA
+  (``members.faa``) and member -> cluster (``member_clusters.parquet``).
+- ``mgnify-nearest``: DIAMOND blastp of the genomes' proteins against those members ->
+  ``gene_units.parquet`` with ``identity_nearest`` and ``nearest``: per (gene, cluster) the
+  member with the highest identity, what ``aai`` estimates (plan, phase 7, step 34).
 - ``aai-score``: a unit profile against that truth: detection at the MGnify90 level (genes
   whose best cluster passes ``--id``/``--cov``), recall of the nearest cluster beyond it, and
   ``aai`` / ``aai_naive`` against the alignment identities (see :func:`aai_score`). With
@@ -428,9 +433,59 @@ def mgnify_genes(args: argparse.Namespace) -> None:
     )
 
 
+def mgnify_members(args: argparse.Namespace) -> None:
+    """The members of every cluster some gene hits (``--gene-units``), as FASTA named by
+    ``protein_id``, and member -> cluster: the database of the nearest-member pass."""
+    paths = [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in args.members]
+    clusters = pl.read_parquet(args.gene_units)["cluster_rep"].unique().implode()
+    hit = pl.scan_parquet(paths).filter(pl.col("cluster_rep").is_in(clusters))
+    hit.select("protein_id", "cluster_rep").sink_parquet(args.clusters_out)
+    hit.select(pl.format(">{}\n{}", "protein_id", "sequence")).sink_csv(
+        args.out, include_header=False, quote_style="never"
+    )
+
+
+def mgnify_nearest(args: argparse.Namespace) -> None:
+    """``--gene-units`` with ``identity_nearest`` and ``nearest``: per (gene, cluster), the
+    member of the cluster with the highest identity among the gene's hits to members (query
+    coverage >= 0.5, as the truth's hits). Where the member pass found none (its
+    ``--max-target-seqs`` filled by other clusters' members; ``member_hit`` false), the
+    representative's identity, which is a member's."""
+    hits = pl.concat(  # the subject is a member, read into cluster_rep's column
+        pl.read_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
+        for p in args.hits
+    ).rename({"cluster_rep": "nearest"})
+    clusters = pl.read_parquet(args.member_clusters).rename({"protein_id": "nearest"})
+    best = (
+        hits.filter(pl.col("length") / pl.col("qlen") >= 0.5)
+        .join(clusters, on="nearest")
+        .group_by("gene_name", "cluster_rep")
+        .agg(pl.all().sort_by("pident", "bitscore").last())
+        .select("gene_name", "cluster_rep", "nearest", identity_nearest=pl.col("pident") / 100)
+    )
+    units = pl.read_parquet(args.gene_units).join(best, on=["gene_name", "cluster_rep"], how="left")
+    units.with_columns(
+        member_hit=pl.col("nearest").is_not_null(),
+        identity_nearest=pl.max_horizontal(
+            pl.col("identity_nearest").fill_null(pl.col("identity")), "identity"
+        ),
+        nearest=pl.col("nearest").fill_null(pl.col("cluster_rep")),
+    ).write_parquet(args.out)
+
+
+def aai_identity(gene_units: pl.DataFrame) -> pl.DataFrame:
+    """``gene_units`` with ``identity`` to the nearest member where the member pass ran
+    (``identity_nearest``): what ``aai`` estimates (plan, phase 7, step 34); identity to the
+    representative otherwise."""
+    if "identity_nearest" not in gene_units.columns:
+        return gene_units
+    return gene_units.with_columns(identity="identity_nearest")
+
+
 IDENTITY_BINS = ((0.95, 1.01), (0.9, 0.95), (0.8, 0.9), (0.7, 0.8), (0.5, 0.7))
 LENGTH_BINS = ((0, 150), (150, 300), (300, 600), (600, float("inf")))  # gene length, aa
 AAI_KMER_BINS = ((0, 3), (3, 5), (5, 10), (10, float("inf")))  # aai_kmers: 1-2, 3-4, 5-9, 10+
+MEMBER_BINS = ((1, 2), (2, 4), (4, 11), (11, 101), (101, float("inf")))  # n_members
 
 
 def aai_score(
@@ -469,6 +524,13 @@ def aai_score(
     - ``aai_bias_kmers<lo>``, ``aai_cover_kmers<lo>``, ``aai_n_kmers<lo>``: against the union
       truth, by the hit k-mers the estimate rests on (``aai_kmers``, ``AAI_KMER_BINS``):
       near the detection limit the reported units are the lucky draws.
+    - ``aai_bias_members<lo>``, ``aai_cover_members<lo>``, ``aai_n_members<lo>``: the same
+      by the unit's members (``n_members``, ``MEMBER_BINS``): the survival model's union term
+      takes one member's window correlation for a union's (step 34).
+
+    The ``aai`` and ``aai_naive`` truths are identity to each cluster's nearest member where
+    ``gene_units`` has it (:func:`aai_identity`; ``aai_truth`` "nearest", else "rep");
+    detection and ``recall_<lo>`` stay at identity to the representative.
     - ``naive_bias_<lo>``, ``naive_within05_<lo>``, ``naive_spearman``, ``naive_n``: every
       profiled unit some present gene hits, ``aai_naive`` against the best identity of a
       present gene to it (near hits included).
@@ -526,12 +588,13 @@ def aai_score(
                 out[f"abund_bias_len{lo}"] = e.median() if e.len() else None  # type: ignore[assignment]
                 out[f"abund_err_len{lo}"] = e.abs().median() if e.len() else None  # type: ignore[assignment]
     # aai of detected units, against the identity of the genes they are nearest to
-    truth = aai_truth(nearest)
+    aai_hits = aai_identity(hits)
+    truth = aai_truth(aai_hits.filter(pl.col("rank") == 1))
     if "aai" in profile.columns:
         a = (
             profile.filter(pl.col("kmers_unique") >= 1, pl.col("aai").is_not_null())
             .join(truth, on="cluster_rep")
-            .join(union_truth(hits, k), on="cluster_rep")
+            .join(union_truth(aai_hits, k), on="cluster_rep")
         )
         out["aai_n"] = a.height
         out["aai_mixed"] = int((a["genes"] > 1).sum())
@@ -559,8 +622,13 @@ def aai_score(
                 part = a.filter(pl.col("aai_kmers").is_between(lo, hi, closed="left"))
                 out[f"aai_n_kmers{lo}"] = part.height
                 bias_cover(part, "true_union", f"kmers{lo}")
+        if "n_members" in a.columns:
+            for lo, hi in MEMBER_BINS:
+                part = a.filter(pl.col("n_members").is_between(lo, hi, closed="left"))
+                out[f"aai_n_members{lo}"] = part.height
+                bias_cover(part, "true_union", f"members{lo}")
     if "aai_naive" in profile.columns:
-        best = hits.group_by("cluster_rep").agg(true=pl.col("identity").max())
+        best = aai_hits.group_by("cluster_rep").agg(true=pl.col("identity").max())
         n = profile.join(best, on="cluster_rep")
         out["naive_n"] = n.height
         out["naive_spearman"] = (
@@ -692,9 +760,11 @@ def aai_calibrate(args: argparse.Namespace) -> None:
     parts = []
     for path, genes in zip(args.profiles, args.genes, strict=True):
         truth = pl.read_csv(genes)
-        nearest = gene_units.join(
-            truth.filter(pl.col("depth") > 0).select("gene_name", "depth"), on="gene_name"
-        ).filter(pl.col("qcov") >= 0.5, pl.col("rank") == 1)
+        nearest = (
+            aai_identity(gene_units)
+            .join(truth.filter(pl.col("depth") > 0).select("gene_name", "depth"), on="gene_name")
+            .filter(pl.col("qcov") >= 0.5, pl.col("rank") == 1)
+        )
         profile = read_profile(path).filter(pl.col("kmers_unique") >= 1)
         if "aai_raw" in profile.columns:  # an index already calibrated: refit on the raw aai
             raw = ("aai_raw", "aai_raw_lo", "aai_raw_hi")
@@ -740,17 +810,11 @@ def aai_score_step(args: argparse.Namespace) -> None:
         mask = MIN_AAI_KMERS if args.min_aai_kmers is None else args.min_aai_kmers
         fitted = None if args.model is None else json.loads(Path(args.model).read_text())
         profile = reestimate_aai(profile, SurvivalModel.from_json(fitted, args.k), mask)
-    row = aai_score(
-        profile,
-        pl.read_parquet(args.gene_units),
-        pl.read_csv(args.genes),
-        args.min_id,
-        args.min_cov,
-        args.k,
-    )
-    pl.DataFrame([{"sample": args.sample, "index": args.index, "arm": args.arm, **row}]).write_csv(
-        args.out, separator="\t"
-    )
+    gene_units = pl.read_parquet(args.gene_units)
+    row = aai_score(profile, gene_units, pl.read_csv(args.genes), args.min_id, args.min_cov, args.k)
+    kind = "nearest" if "identity_nearest" in gene_units.columns else "rep"
+    head = {"sample": args.sample, "index": args.index, "arm": args.arm, "aai_truth": kind}
+    pl.DataFrame([head | row]).write_csv(args.out, separator="\t")
 
 
 def pfam_profile(args: argparse.Namespace) -> None:
@@ -1228,6 +1292,16 @@ def main() -> None:
     p = sub.add_parser("mgnify-genes")
     p.add_argument("--hits", required=True, nargs="+")
     p.add_argument("--out", default="gene_units.parquet")
+    p = sub.add_parser("mgnify-members")
+    p.add_argument("--members", required=True, nargs="+", help="parquet files or directories")
+    p.add_argument("--gene-units", required=True)
+    p.add_argument("--out", default="members.faa")
+    p.add_argument("--clusters-out", default="member_clusters.parquet")
+    p = sub.add_parser("mgnify-nearest")
+    p.add_argument("--hits", required=True, nargs="+")
+    p.add_argument("--gene-units", required=True)
+    p.add_argument("--member-clusters", required=True)
+    p.add_argument("--out", default="gene_units_nearest.parquet")
     p = sub.add_parser("aai-score")
     for name in ("profile", "gene-units", "genes", "sample", "index"):
         p.add_argument(f"--{name}", required=True)
@@ -1276,6 +1350,7 @@ def main() -> None:
              "cost": cost, "pfam-proteins": pfam_proteins, "pfam-domains": pfam_domains,
              "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
              "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
+             "mgnify-members": mgnify_members, "mgnify-nearest": mgnify_nearest,
              "aai-score": aai_score_step, "aai-calibrate": aai_calibrate}  # fmt: skip
     steps[args.step](args)
 

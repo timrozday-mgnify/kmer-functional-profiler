@@ -356,6 +356,51 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     )
 
 
+def test_nearest_member_truth(tmp_path: Path) -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    # Clusters 10 (members 10, 101, 102) and 20 (members 20, 201). g1 hits 10's rep at 85%
+    # and member 101 at 93% (102 at 99% but query coverage 0.3: skipped); g2 hits 20 at 85%
+    # in pass 1 and no member in pass 2 (the rep's identity stays).
+    (tmp_path / "h1.tsv").write_text("g1\t10\t85.0\t200\t200\t200\t300\n"
+                                     "g2\t20\t85.0\t200\t200\t200\t300\n")  # fmt: skip
+    run(tmp_path, "mgnify-genes", "--hits", "h1.tsv", "--out", "reps.parquet")
+    members = pl.DataFrame({"protein_id": [10, 101, 102, 20, 201, 30],
+                            "cluster_rep": [10, 10, 10, 20, 20, 30],
+                            "sequence": ["MK"] * 6})  # fmt: skip
+    members.write_parquet(tmp_path / "members.parquet")
+    run(tmp_path, "mgnify-members", "--members", "members.parquet", "--gene-units", "reps.parquet")
+    clusters = pl.read_parquet(tmp_path / "member_clusters.parquet")
+    assert sorted(clusters["protein_id"].to_list()) == [10, 20, 101, 102, 201]  # not 30
+    assert (tmp_path / "members.faa").read_text().count(">") == 5
+    (tmp_path / "h2.tsv").write_text("g1\t10\t85.5\t200\t200\t200\t300\n"
+                                     "g1\t101\t93.0\t200\t200\t200\t350\n"
+                                     "g1\t102\t99.0\t60\t200\t60\t100\n")  # fmt: skip
+    run(tmp_path, "mgnify-nearest", "--hits", "h2.tsv", "--gene-units", "reps.parquet",
+        "--member-clusters", "member_clusters.parquet", "--out", "near.parquet")  # fmt: skip
+    near = {
+        r["gene_name"]: r for r in pl.read_parquet(tmp_path / "near.parquet").iter_rows(named=True)
+    }
+    assert near["g1"]["nearest"] == 101 and near["g1"]["identity_nearest"] == pytest.approx(0.93)
+    assert near["g1"]["identity"] == pytest.approx(0.85)  # rep identity kept for detection
+    assert near["g2"]["nearest"] == 20 and near["g2"]["identity_nearest"] == pytest.approx(0.85)
+    assert near["g1"]["member_hit"] and not near["g2"]["member_hit"]
+    # aai is scored against the nearest member; coverage also by n_members
+    units = pl.read_parquet(tmp_path / "near.parquet")
+    genes = pl.DataFrame({"gene_name": ["g1", "g2"], "depth": [2.0, 1.0]})
+    profile = pl.DataFrame({"cluster_rep": [10, 20], "kmers_unique": [5, 5], "aai": [0.92, 0.84],
+                            "aai_lo": [0.9, 0.8], "aai_hi": [0.95, 0.88], "aai_kmers": [9.0, 9.0],
+                            "n_members": [3, 2]})  # fmt: skip
+    got = bench.aai_score(profile, units, genes)
+    assert got["aai_bias_0.9"] == pytest.approx(0.92 - 0.93) and got["aai_cover_0.9"] == 1.0
+    assert got["aai_n_members2"] == 2 and got["aai_cover_members2"] == 1.0
+    assert got["aai_n_members1"] == 0
+    # rep truth (no member pass): g1's cluster sits at 85%
+    rep = bench.aai_score(profile, units.drop("identity_nearest", "nearest"), genes)
+    assert rep["aai_bias_0.8"] == pytest.approx(((0.92 - 0.85) + (0.84 - 0.85)) / 2)
+
+
 def test_aai_score_by_gene_length() -> None:
     sys.path.insert(0, str(SCRIPT.parent))
     import bench

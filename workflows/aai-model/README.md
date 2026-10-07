@@ -47,7 +47,8 @@ nextflow run workflows/aai-model -profile slurm \
 
 `nextflow run workflows/aai-model -stub -profile test --members <any file>` checks the wiring.
 
-PAIRS logs how many candidates kept a member hit. In pass 2, a P in a large cluster can fill
+`results/pairs_stats.json` counts the candidates, those that kept a member hit (overall and
+by cluster size) and the pairs kept. In pass 2, a P in a large cluster can fill
 `--max-target-seqs` with that cluster's members and lose the hit to another candidate
 cluster. If many candidates are lost, raise it in `--diamond_nearest_args`.
 
