@@ -1411,10 +1411,13 @@ def survival_quantiles(
     level: float = 0.95,
     selected: float = 1.0,
     seen_range: tuple[np.ndarray, np.ndarray] | None = None,
+    n_members: np.ndarray | float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(point, lower, upper) identity from ``h`` hit k-mers of an average member's
     ``pin_sum`` kept windows (sampled at rate ``keep`` out of ``windows``), each window
     surviving with probability S(a) under ``model`` and hit with probability ``seen``.
+    S is the union's of the unit's ``n_members`` (:meth:`SurvivalModel.union_at`; one
+    member's without a union term), identity to the nearest member (step 34).
 
     At identity a (a row of the model's grid), h = sum_i x_i y_i over the n = ``pin_sum``
     windows, x_i survival (correlated: variance inflation d, :meth:`SurvivalModel.overlap_at`;
@@ -1435,12 +1438,15 @@ def survival_quantiles(
     """
     tables, last = model.tables, len(model.tables["S"]) - 1
     n = np.maximum(pin_sum, 1e-9)
+    n_members = np.asarray(n_members, dtype=np.float64)
     clump = np.maximum(np.asarray(clumping, dtype=np.float64), 1.0)
 
     def cdfs(row: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """P(h' <= h | h' >= ``selected``) and P(h' < h | ...) at ``row``, hit chance ``p``."""
-        surv = tables["S"][row]
+        surv = model.union_at(row, n_members)
         mean = n * p * surv
+        # ponytail: one member's window correlation for the union's; a union of members
+        # likely evens survival out (less correlated), so intervals err wide, not narrow
         d = model.overlap_at(row, keep, windows)
         var = n * p * surv * (1 - p) + n * p**2 * surv * (1 - surv) * d
         var += (clump - 1) * n * surv**2 * p * (1 - p)
@@ -1550,6 +1556,7 @@ def aai_fit(
     clumping: np.ndarray | float = 1.0,
     level: float = 0.95,
     selected: float = 1.0,
+    n_members: np.ndarray | float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Containment AAI from a zero-inflated fit, with a ``level`` interval, no draws:
     (``aai``, ``aai_lo``, ``aai_hi``, h). Arrays are per unit.
@@ -1557,11 +1564,11 @@ def aai_fit(
     The hit k-mers h = present x m x seen, seen = 1 - exp(-coverage), of an average
     member's ``pin_sum`` kept windows are turned into identity by :func:`survival_quantiles`
     under the index's survival model (``model``, :mod:`~kmer_functional_profiler.survival`),
-    given h >= ``selected``; t = m / ``n_kmers`` is the windows' sampling rate and
-    ``windows`` an average member's windows (length - k + 1). ``clumping`` is 1 + the
-    unit's expected kept k-mers per covering read: at low depth the sample size is the
-    reads, not the k-mers (without it a strain at 100% identity and depth ~1 got intervals
-    around 0.88-0.95, phase 7, step 8). The coverage is a zero-truncated Poisson MLE with
+    given h >= ``selected``, for units of ``n_members``; t = m / ``n_kmers`` is the windows'
+    sampling rate and ``windows`` an average member's windows (length - k + 1). ``clumping``
+    is 1 + the unit's expected kept k-mers per covering read: at low depth the sample size
+    is the reads, not the k-mers (without it a strain at 100% identity and depth ~1 got
+    intervals around 0.88-0.95, phase 7, step 8). The coverage is a zero-truncated Poisson MLE with
     variance lambda (1 - e^-l)^2 / (h (1 - e^-l - l e^-l)) (delta method, inflated by
     ``clumping``); the bounds take seen at the ends of its ``level`` interval.
     """
@@ -1576,8 +1583,9 @@ def aai_fit(
     spread = norm.ppf((1 + level) / 2) * np.sqrt(clump * _div(np.ones_like(info), info))
     seen_range = (-np.expm1(-np.maximum(lam - spread, 1e-9)), -np.expm1(-(lam + spread)))
     point, lo, hi = survival_quantiles(
-        h, pin, seen, keep, windows, model, clump, level, max(selected, 1.0), seen_range
-    )
+        h, pin, seen, keep, windows, model, clump, level, max(selected, 1.0), seen_range,
+        n_members,
+    )  # fmt: skip
     return point, lo, hi, h
 
 
@@ -1591,6 +1599,7 @@ def aai_columns(
     model: SurvivalModel,
     clumping: np.ndarray | float,
     min_kmers: float,
+    n_members: np.ndarray | float = 1.0,
 ) -> pl.DataFrame:
     """:func:`aai_fit` as ``aai``, ``aai_lo``, ``aai_hi`` and ``aai_kmers``; the first three
     null below ``min_kmers`` hit k-mers (an estimate on a few k-mers is mostly the luck that
@@ -1598,8 +1607,9 @@ def aai_columns(
     about one hit and the zero-inflated fit cannot tell coverage from presence), and
     estimated given h >= ``min_kmers``, the selection they are reported under."""
     *estimate, h = aai_fit(
-        coverage, present, m, pin_sum, n_kmers, windows, model, clumping, selected=min_kmers
-    )
+        coverage, present, m, pin_sum, n_kmers, windows, model, clumping, selected=min_kmers,
+        n_members=n_members,
+    )  # fmt: skip
     # h is EM-fitted: the tolerance keeps a unit at exactly min_kmers hit k-mers
     keep = (h >= min_kmers - 1e-3) & (np.asarray(coverage) >= MIN_AAI_LAMBDA)
     names = ("aai", "aai_lo", "aai_hi")
@@ -1614,6 +1624,14 @@ def unit_windows(units: pl.DataFrame, k: int) -> np.ndarray:
         if column in units.columns:
             return np.asarray(np.maximum(units[column].to_numpy().astype(np.float64) + shift, 1.0))
     raise ValueError("units have no length column")
+
+
+def unit_members(units: pl.DataFrame) -> np.ndarray:
+    """Each unit's members (``n_members``; 1 for indexes without it, e.g. sourmash
+    imports): the union the survival model's union term scales with."""
+    if "n_members" not in units.columns:
+        return np.ones(units.height)
+    return np.asarray(np.maximum(units["n_members"].to_numpy().astype(np.float64), 1.0))
 
 
 def ztp_lambda(mean: np.ndarray, iterations: int = 50) -> np.ndarray:
@@ -1641,6 +1659,7 @@ def aai_naive(
     model: SurvivalModel,
     min_kmers: float = MIN_AAI_KMERS,
     clumping: np.ndarray | float = 1.0,
+    n_members: np.ndarray | float = 1.0,
 ) -> pl.DataFrame:
     """Per unit, independently (shared k-mers count for every holder, as sylph's ``query``):
     the point of :func:`survival_quantiles` (given at least ``min_kmers`` hit) for the
@@ -1654,7 +1673,7 @@ def aai_naive(
     seen = np.where(low, 1.0, -np.expm1(-np.maximum(lam, MIN_AAI_LAMBDA)))
     point, _, _ = survival_quantiles(
         kmers_hit.astype(np.float64), pin_sum.astype(np.float64), seen, keep, windows, model,
-        clumping, selected=max(min_kmers, 1.0),
+        clumping, selected=max(min_kmers, 1.0), n_members=n_members,
     )  # fmt: skip
     point = np.where(kmers_hit >= min_kmers, point, np.nan)
     return pl.DataFrame({"aai_naive": point, "aai_naive_lower_bound": low}).with_columns(
@@ -2146,6 +2165,7 @@ def profile(
                     # sourmash imports have no n_kmers: windows taken as all kept (t = 1)
                     "n_kmers": hit_info["n_kmers"] if "n_kmers" in hit_info.columns else m_g,
                     "windows": unit_windows(hit_info, params.k),
+                    "n_members": unit_members(hit_info),
                 }
             ),
             on="unit",
@@ -2162,6 +2182,7 @@ def profile(
             model,
             1 + mu[zi["unit"].to_numpy()],
             min_aai_kmers,
+            zi["n_members"].to_numpy(),
         )
         fits.append(
             zi.select(
@@ -2204,6 +2225,7 @@ def profile(
             model,
             min_aai_kmers,
             1 + mu_tier2[at],
+            unit_members(hit_info)[at],
         ).with_columns(unit=per_unit["unit"])
     unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep

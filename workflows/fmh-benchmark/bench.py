@@ -70,6 +70,7 @@ from kmer_functional_profiler.query import (
     aai_columns,
     calibrate_aai,
     check_aai_calibration,
+    unit_members,
     unit_windows,
     ztp_lambda,
 )
@@ -605,6 +606,7 @@ def reestimate_aai(
     est = aai_columns(
         profile["coverage_zi"].to_numpy(), present, m, pin_sum,
         profile["n_kmers"].to_numpy(), unit_windows(profile, model.k), model, 1 + mu, min_kmers,
+        unit_members(profile),
     )  # fmt: skip
     est = est.with_columns(
         pl.when(pl.Series(fitted)).then(pl.col(c)).alias(c) for c in ("aai", "aai_lo", "aai_hi")

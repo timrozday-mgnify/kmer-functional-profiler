@@ -397,40 +397,133 @@ def fit_model(
     }
 
 
-def fit(args: argparse.Namespace) -> None:
-    pairs_df = pl.concat(pl.read_parquet(p) for p in args.survival)
-    strata = [("all", pl.lit(True))]
-    strata += [
-        (f"identity {lo}-{min(hi, 1.0)}", pl.col("identity").is_between(lo, hi, closed="left"))
-        for lo, hi in IDENTITY_BANDS
-    ]
-    strata += [
-        (
-            (f"members {lo}" if hi == lo + 1 else f"members {lo}-{hi - 1}")
-            if hi < 2**62
-            else f"members {lo}+",
-            pl.col("n_members").is_between(lo, hi, closed="left"),
+def _size_band(n_members: np.ndarray) -> np.ndarray:
+    """The ``SIZE_BANDS`` index of each pair's cluster size."""
+    return np.searchsorted([lo for lo, _ in SIZE_BANDS], n_members, side="right") - 1
+
+
+def union_fit(
+    df: pl.DataFrame,
+    base: SurvivalModel,
+    k: int,
+    union: tuple[float, float] | None = None,
+    min_pairs: int = 20,
+) -> dict[str, float]:
+    """The union term over a one-member ``base`` model (its c, phi and region): weighted
+    least squares of the window survival of multi-member pairs, averaged per (``BIN`` of
+    identity, size band), against the same pairs' 1 - (1 - S)^m, m = n^(g0 + g1 (a - 0.8))
+    (:meth:`SurvivalModel.members`), over (log g0, log g1): both >= 0, so survival falls
+    with identity. ``union`` (g0, g1) fixes them, for the error of the overall fit on a
+    stratum. Returns ``union``, ``union_slope``, ``n_bins``, ``rmse``,
+    ``rmse_independent`` (a^k) and ``rmse_pairs``."""
+    df = df.filter(pl.col("window_survival").is_not_nan())
+    a, y = df["identity"].to_numpy(), df["window_survival"].to_numpy()
+    n = df["n_members"].to_numpy().astype(np.float64)
+    group = np.unique(
+        np.stack([np.floor(a / BIN), _size_band(n)], axis=1), axis=0, return_inverse=True
+    )[1].ravel()
+    count = np.bincount(group)
+    ok = count >= min_pairs
+    w = count[ok] / count[ok].sum()
+    obs = np.bincount(group, y)[ok] / count[ok]
+    log_miss = np.log1p(-np.minimum(base.survival(a), 1 - 1e-15))  # log(1 - c S), per pair
+
+    def predict(x: np.ndarray) -> np.ndarray:
+        g0, g1 = np.exp(x) if union is None else union
+        power = np.maximum(g0 + g1 * (a - 0.8), 0.0)
+        return np.asarray(-np.expm1(n**power * log_miss))
+
+    def loss(x: np.ndarray) -> float:
+        return float((w * (obs - np.bincount(group, predict(x))[ok] / count[ok]) ** 2).sum())
+
+    x = np.zeros(2)
+    if union is None:
+        starts = (
+            [np.log(0.1), np.log(0.3)],
+            [np.log(0.3), np.log(0.01)],
+            [np.log(0.05), np.log(2)],
         )
-        for lo, hi in SIZE_BANDS
-    ]
-    rows: list[dict[str, Any]] = []
-    for name, where in strata:
-        part = pairs_df.filter(where)
-        if name == "all" or part.height >= args.min_stratum:
-            ends = rows[0]["ends"] if rows else None  # strata at the overall fit's end loss
-            rows.append({"stratum": name, "n": part.height, **fit_model(part, args.k, ends=ends)})
+        best: Any = min(
+            (minimize(loss, x0, method="Nelder-Mead", options={"xatol": 1e-4, "fatol": 1e-12})
+             for x0 in starts),
+            key=lambda r: r.fun,
+        )  # fmt: skip
+        x = best.x
+    g0, g1 = np.exp(x) if union is None else union
+    ak = np.bincount(group, a**k)[ok] / count[ok]
+    return {
+        "union": float(g0),
+        "union_slope": float(g1),
+        "n_bins": int(ok.sum()),
+        "rmse": float(np.sqrt(loss(x))),
+        "rmse_independent": float(np.sqrt((w * (obs - ak) ** 2).sum())),
+        "rmse_pairs": float(np.sqrt(((y - predict(x)) ** 2).mean())),
+    }
+
+
+def _band(lo: int, hi: int) -> str:
+    return (
+        f"members {lo}+"
+        if hi >= 2**62
+        else f"members {lo}-{hi - 1}"
+        if hi > lo + 1
+        else f"members {lo}"
+    )
+
+
+def fit(args: argparse.Namespace) -> None:
+    """Two stages (step 34). One member: c, phi and region from single-member pairs (end
+    loss shows only there: other members cover P's ends), then the union term (g0, g1) from
+    multi-member pairs over that model. ``model_strata.tsv``: the one-member model refitted
+    per identity band at its c; per cluster size, the union term refitted (``union``,
+    ``union_slope``) and the overall model's error there (``rmse_overall``)."""
+    pairs_df = pl.concat(pl.read_parquet(p) for p in args.survival)
+    one = pairs_df.filter(pl.col("n_members") == 1)
+    many = pairs_df.filter(pl.col("n_members") > 1)
+    base_fit = fit_model(one, args.k)
+    base = SurvivalModel(
+        args.k, None, base_fit["region"], CATEGORIES, base_fit["concentration"], base_fit["ends"]
+    )
+    rows: list[dict[str, Any]] = [{"stratum": "members 1", "n": one.height, **base_fit}]
+    print(rows[-1], flush=True)
+    for lo, hi in IDENTITY_BANDS:
+        part = one.filter(pl.col("identity").is_between(lo, hi, closed="left"))
+        if part.height >= args.min_stratum:
+            got = fit_model(part, args.k, ends=base_fit["ends"])
+            rows.append(
+                {"stratum": f"members 1, identity {lo}-{min(hi, 1.0)}", "n": part.height, **got}
+            )
             print(rows[-1], flush=True)
-    pl.DataFrame(rows).write_csv(args.strata_out, separator="\t")
-    fitted = ("n", "n_bins", "rmse", "rmse_both", "rmse_independent", "rmse_pairs")
+    union = union_fit(many, base, args.k) if many.height else {"union": 0.0, "union_slope": 0.0}
+    overall = (union["union"], union["union_slope"])
+    rows.append({"stratum": "members 2+", "n": many.height, **union})
+    for lo, hi in SIZE_BANDS[1:]:
+        part = many.filter(pl.col("n_members").is_between(lo, hi, closed="left"))
+        if part.height >= args.min_stratum:
+            rows.append({
+                "stratum": _band(lo, hi), "n": part.height, **union_fit(part, base, args.k),
+                "rmse_overall": union_fit(part, base, args.k, overall)["rmse"],
+            })  # fmt: skip
+            print(rows[-1], flush=True)
+    pl.DataFrame(rows, infer_schema_length=None).write_csv(args.strata_out, separator="\t")
     model = {
         "survival": "markov_beta",
-        "concentration": rows[0]["concentration"],
-        "region": rows[0]["region"],
-        "ends": rows[0]["ends"],
+        "concentration": base_fit["concentration"],
+        "region": base_fit["region"],
+        "ends": base_fit["ends"],
+        "union": union["union"],
+        "union_slope": union["union_slope"],
         "categories": CATEGORIES,
         "k": args.k,
         "alphabet": args.alphabet,
-        "fit": {key: rows[0][key] for key in fitted},
+        "fit": {
+            "n_one": one.height,
+            "rmse_one": base_fit["rmse"],
+            "rmse_both_one": base_fit["rmse_both"],
+            "n_union": many.height,
+            "rmse_union": union.get("rmse", float("nan")),
+            "rmse_independent_union": union.get("rmse_independent", float("nan")),
+        },
     }
     Path(args.out).write_text(json.dumps(model, indent=1) + "\n")
 

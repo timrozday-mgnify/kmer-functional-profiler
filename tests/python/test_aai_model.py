@@ -112,3 +112,46 @@ def test_pairs_take_the_nearest_member_of_each_candidate_cluster(tmp_path: Path)
     assert got[1]["nearest"] == 2 and got[1]["identity"] == pytest.approx(0.85)
     assert got[1]["identity_rep"] == pytest.approx(0.70)
     assert got[5]["nearest"] == 5 and got[5]["identity"] == pytest.approx(0.65)
+
+
+def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: Path) -> None:
+    # Multi-member pairs whose window survival is the union model's plus noise: union_fit
+    # finds (g0, g1). fit() then writes the one-member model and the union term.
+    rng = np.random.default_rng(7)
+    base = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95)
+    true = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95,
+                         union=0.08, union_slope=0.3)  # fmt: skip
+    a = rng.uniform(0.6, 1.0, 20_000)
+    n = np.exp(rng.uniform(np.log(2), np.log(500), a.size)).round()
+    noisy = true.union_survival(a, n) + rng.normal(0, 0.05, a.size)
+    many = pl.DataFrame({"identity": a, "n_members": n, "window_survival": noisy})
+    got = fit_model.union_fit(many, base, 11)
+    assert got["union"] == pytest.approx(0.08, abs=0.02)
+    assert got["union_slope"] == pytest.approx(0.3, abs=0.1)
+    assert got["rmse"] < 0.01 < got["rmse_independent"]
+    # end to end: one-member pairs from the base model's process, plus the union pairs
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_query import strains, windows_of
+
+    rows = []
+    for t in np.linspace(0.02, 0.5, 30):
+        same = strains(base, float(t), 40, 300, rng)
+        win = windows_of(same, 11)
+        win[:, int(0.95 * win.shape[1]) :] = False
+        for i in range(len(win)):
+            w = win[i]
+            both = {f"both_{j}": (w[:-j] & w[j:]).mean() for j in fit_model.LAGS}
+            rows.append({"identity": same[i].mean(), "window_survival": w.mean(),
+                         "n_windows": len(w), "n_members": 1.0} | both)  # fmt: skip
+    one = pl.DataFrame(rows)
+    path = tmp_path / "survival.parquet"
+    pl.concat([one, many], how="diagonal").write_parquet(path)
+    out, strata = tmp_path / "aai_model.json", tmp_path / "strata.tsv"
+    sys.argv = ["fit_model.py", "fit", "--survival", str(path), "--out", str(out),
+                "--strata-out", str(strata), "--min-stratum", "500"]  # fmt: skip
+    fit_model.main()
+    model = __import__("json").loads(out.read_text())
+    assert model["survival"] == "markov_beta" and model["ends"] == pytest.approx(0.95, abs=0.02)
+    assert model["union"] > 0 and model["union_slope"] > 0
+    names = pl.read_csv(strata, separator="\t")["stratum"].to_list()
+    assert names[0] == "members 1" and "members 2+" in names and "members 101+" in names

@@ -33,6 +33,13 @@ homolog aligns to and is never shared, so survival is ``ends`` S. In the correla
 thins windows independently: rho' = ``ends`` rho (1 - S) / (1 - ``ends`` S).
 ponytail: real end loss is contiguous (two ends) and varies between units, variance this
 leaves out; model the aligned share per unit if intervals under-cover near identity 1.
+
+Union (``union`` g0, ``union_slope`` g1; step 34): a unit of n members is matched against
+their union. Measured at identity to the nearest member, the union still keeps more than one
+member does, as m effective independent members: S_n = 1 - (1 - S)^m with
+m = n^(g0 + g1 (a - ``UNION_PIVOT``)), S with end loss (the union covers members' ends too).
+g0 = g1 = 0 (or n = 1) is one member. Survival depends on n, so it is per unit
+(:meth:`union_at`); the tables stay one member's.
 """
 
 from dataclasses import dataclass
@@ -46,6 +53,7 @@ from scipy.stats import gamma
 T_GRID: Final = np.concatenate([[0.0], np.geomspace(1e-4, 50.0, 1199)])  # divergence
 MAX_LAG: Final = 300  # co-survival is tabulated for windows up to this far apart
 CATEGORIES: Final = 16
+UNION_PIVOT: Final = 0.8  # identity at which the union's exponent is g0
 
 
 @dataclass(frozen=True)
@@ -58,16 +66,23 @@ class SurvivalModel:
     categories: int = CATEGORIES
     concentration: float | None = None  # Markov-beta's phi, in place of ``shape``
     ends: float = 1.0
+    union: float = 0.0
+    union_slope: float = 0.0
 
     @classmethod
     def from_json(cls, model: dict[str, Any] | None, k: int) -> Self:
         """The model of an ``aai_model.json`` (None: independent substitutions)."""
         if model is None:
             return cls(k)
-        categories, ends = model.get("categories", CATEGORIES), model.get("ends", 1.0)
+        extra = {
+            "categories": model.get("categories", CATEGORIES),
+            "ends": model.get("ends", 1.0),
+            "union": model.get("union", 0.0),
+            "union_slope": model.get("union_slope", 0.0),
+        }
         if model["survival"] == "markov_beta":
-            return cls(k, None, model["region"], categories, model["concentration"], ends)
-        return cls(k, model["shape"], model["region"], categories, ends=ends)
+            return cls(k, None, model["region"], concentration=model["concentration"], **extra)
+        return cls(k, model["shape"], model["region"], **extra)
 
     @property
     def rates(self) -> np.ndarray:
@@ -156,8 +171,28 @@ class SurvivalModel:
         )
 
     def survival(self, a: np.ndarray) -> np.ndarray:
-        """S at identity ``a``."""
+        """S at identity ``a`` (one member)."""
         return self._at(a, "a", "S")
+
+    def members(self, a: np.ndarray, n_members: np.ndarray | float) -> np.ndarray:
+        """The union's effective members m = n^(g0 + g1 (a - ``UNION_PIVOT``)), exponent
+        floored at 0, at identity ``a`` for units of ``n_members``."""
+        power = np.maximum(self.union + self.union_slope * (np.asarray(a) - UNION_PIVOT), 0.0)
+        return np.asarray(np.maximum(np.asarray(n_members, dtype=np.float64), 1.0) ** power)
+
+    def union_at(self, row: np.ndarray, n_members: np.ndarray | float) -> np.ndarray:
+        """Survival of a union of ``n_members`` at integer rows ``row`` of ``T_GRID``:
+        1 - (1 - S)^m. Falls with the row (as a does) when ``union_slope`` >= 0."""
+        tab = self.tables
+        if self.union == 0 and self.union_slope == 0:
+            return np.asarray(tab["S"][row])
+        m = self.members(tab["a"][row], n_members)
+        return np.asarray(-np.expm1(m * np.log1p(-np.minimum(tab["S"][row], 1 - 1e-15))))
+
+    def union_survival(self, a: np.ndarray, n_members: np.ndarray | float) -> np.ndarray:
+        """S_n at identity ``a`` for units of ``n_members``."""
+        s = np.minimum(self.survival(a), 1 - 1e-15)
+        return np.asarray(-np.expm1(self.members(a, n_members) * np.log1p(-s)))
 
     def identity(self, s: np.ndarray) -> np.ndarray:
         """The identity whose survival is ``s`` (beyond the grid: its end)."""
@@ -197,7 +232,8 @@ class SurvivalModel:
 def check_aai_model(model: dict[str, Any], params: dict[str, Any]) -> None:
     """Raise ValueError unless ``model`` is a usable survival model for an index built with
     ``params``: ``survival`` "markov_gamma" (``shape`` > 0) or "markov_beta"
-    (``concentration`` > 0), ``region`` >= 1, ``ends`` (if given) in (0, 1], and
+    (``concentration`` > 0), ``region`` >= 1, ``ends`` (if given) in (0, 1], ``union`` and
+    ``union_slope`` (if given) >= 0 (so survival falls with identity in every unit), and
     ``k``/``alphabet``, if it records them (the aai-model workflow's fit does), equal to the
     index's."""
     spread = {"markov_gamma": "shape", "markov_beta": "concentration"}.get(
@@ -209,6 +245,8 @@ def check_aai_model(model: dict[str, Any], params: dict[str, Any]) -> None:
         raise ValueError(f"{spread} must be > 0 and region >= 1")
     if not 0 < model.get("ends", 1.0) <= 1:
         raise ValueError("ends must be in (0, 1]")
+    if not (model.get("union", 0.0) >= 0 and model.get("union_slope", 0.0) >= 0):
+        raise ValueError("union and union_slope must be >= 0")
     differ = [p for p in ("k", "alphabet") if p in model and model[p] != params.get(p)]
     if differ:
         raise ValueError(f"model fitted for another {', '.join(differ)}")

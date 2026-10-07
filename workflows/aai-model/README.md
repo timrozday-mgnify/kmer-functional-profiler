@@ -1,11 +1,13 @@
 # aai-model
 
-Fits the k-mer survival model that `aai` inverts (plan, phase 7, steps 23, 25 and 33). Real
+Fits the k-mer survival model that `aai` inverts (plan, phase 7, steps 23, 25, 33 and 34). Real
 proteins keep more exact k-mers than a^k at identity a, because conserved sites cluster.
 The model (`kmer_functional_profiler.survival`, Markov-beta) splits a sequence into regions,
 a Markov chain that starts a new region with probability 1/`region` per site. Each region's
 identity scatters around the pair's identity as Beta(a φ, (1 − a) φ), φ = `concentration`.
-`ends` is the share of a unit's windows inside the region a homolog aligns to. Identity,
+`ends` is the share of a unit's windows inside the region a homolog aligns to. A unit of n
+members keeps more than one member does: its survival is 1 − (1 − S)^m, with m = n^(g₀ + g₁(a − 0.8))
+effective members (`union`, `union_slope`). Identity,
 window survival and the co-survival of windows j apart then follow exactly, from small
 matrix products tabulated once per model.
 
@@ -26,8 +28,10 @@ NEAREST_ALIGN  DIAMOND blastp of P against those members             (--chunks j
 PAIRS       per candidate, the member of C with the highest identity (coverage filter, not P),
             <= per_bin pairs per 0.02 of that identity; identity_rep kept for comparison
 SURVIVAL    per pair: P's windows in C's union, pin_sum, co-survival by lag (every k-mer)
-FIT         aai_model.json (least squares on the 0.01-identity bins' means over phi, region,
-            ends), model_strata.tsv (refitted by identity band and cluster size)
+FIT         aai_model.json, two stages on the bins' means: phi, region and ends from one-member
+            pairs (bins of 0.01 identity), then union and union_slope from multi-member pairs
+            (bins of identity x cluster size); model_strata.tsv (one-member model by identity
+            band, union term by cluster size, and the overall model's error per size)
 ```
 
 ## Run
@@ -55,9 +59,8 @@ Attach the fit to an index; its queries then estimate `aai` under it:
 kmer-functional-profiler aai-model <index> results/aai_model.json
 ```
 
-Check `model_strata.tsv` first. With nearest-member identity, `concentration`, `region` and
-`ends` should agree across identity bands and across cluster sizes (`members 1` to
-`members 101+`). If large clusters still sit above the rest, the union of members adds
-survival beyond the nearest one, and one parameter set is not enough (plan, step 33).
+Check `model_strata.tsv` first. The `members 1, identity …` rows should agree on
+`concentration` and `region`. For the `members 2-3` … `members 101+` rows, `rmse_overall`
+(the shipped model's binned error at that size) should be ≤ 0.02 (plan, step 34).
 `ends` comes from pairs at >= 0.8 coverage. If the benchmark's genes cover their units
 differently, compare `"ends": 1` on the same profiles (`aai-score --model`).
