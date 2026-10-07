@@ -799,6 +799,7 @@ process ANNOTATE_GENOMES {
 
     output:
     tuple val(name), path("genomes_${name}"), emit: index
+    tuple val(name), path(index), path("genomes_${name}"), emit: with_index
 
     script:
     "${params.kfp} annotate-genomes ${index} ${genome_set}/genomes.tsv genomes_${name}"
@@ -936,22 +937,23 @@ process SUBSAMPLE {
     "touch sub_R1.fastq.gz sub_R2.fastq.gz"
 }
 
-process PRIOR_BUILD {
+process SPECIES_INDEX {
     tag "${name}"
     label 'process_medium'
 
     input:
-    tuple val(name), path(genome_index)
+    tuple val(name), path(index), path(genome_index)
     path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
 
     output:
-    tuple val(name), path("carriage_${name}"), emit: carriage
+    tuple val(name), path("species_${name}"), emit: index
 
     script:
-    "${params.kfp_prior} build ${genome_index} carriage_${name}"
+    // also kfp-prior's carriage table (carriage.parquet, clades.parquet, lineage.parquet)
+    "${params.kfp} species-index ${index} species_${name} --genomes ${genome_index}"
 
     stub:
-    "mkdir carriage_${name}"
+    "mkdir species_${name}"
 }
 
 process PRIOR_UPDATE {
@@ -1692,10 +1694,10 @@ workflow BENCHMARK {
         )
         GENOME_SCORE.out.score.collectFile(name: 'genome_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
         // kfp-prior on every fitted sample (full samples at fraction 1, and the ladder's rungs)
-        PRIOR_BUILD(ANNOTATE_GENOMES.out.index, ch_code)
+        SPECIES_INDEX(ANNOTATE_GENOMES.out.with_index, ch_code)
         PRIOR_UPDATE(
             GENOME_FIT.out.prior.map { sid, name, profile, gi, genomes -> [name, sid, profile, gi, genomes] }
-                .combine(PRIOR_BUILD.out.carriage, by: 0)
+                .combine(SPECIES_INDEX.out.index, by: 0)
                 .map { name, sid, profile, gi, genomes, carriage -> [sid, name, profile, gi, genomes, carriage] },
             ch_code,
         )

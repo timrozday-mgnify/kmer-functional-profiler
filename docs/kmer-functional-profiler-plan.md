@@ -1832,6 +1832,20 @@ Developed on the `dev-phase11` branch (from `dev`), one feature branch per step 
     - `genomes.py`'s `report` is typed `dict[str, float]`, as main's `em` now is.
   - *Checked:* ruff and mypy clean; 144 tests pass.
 
+* **Phase 11, step 7 — the species index (`species-index`; Species model, step 7).**
+  - *Command:* `species-index INDEX OUT --catalogue DIR` (an MGnify genome catalogue laid out as on the FTP site: `genomes-all_metadata.tsv`, `species_catalogue/<prefix>/<rep>/`) or `--genomes GENOME_INDEX` (`annotate-genomes` output with taxonomy); `--exclude` (genome names left out of every count, their carried units written to `held_out.parquet` as benchmark truth); `--species` (catalogue representatives to keep).
+  - *Catalogue path:* each species' Panaroo families (`pan-genome.fna`, translated by table 11, frame 0, terminal stop dropped; k-mers spanning internal stops are never hashed) are hashed by `protein_hits` and given best units by `best_units` (both split out of `genome_content`, unchanged). The family × genome presence comes from `gene_presence_absence.Rtab`, so a genome carries *u* when a family it holds has *u* as its best unit. Its content on *u* sums its families' hits there, over all links. A species with no pangenome (one genome) uses its representative's `.faa`.
+  - *Genome-set path:* carriage from `genome_best`, content from the unit-major CSR. `annotate-genomes` now passes an optional `completeness` column (percent) through to `genomes.tsv`.
+  - *Aggregation (one function for both):*
+    - Counts per clade, with clade sizes N = Σ completeness, so a unit a 50%-complete MAG misses costs half a genome.
+    - α per rank by leave-one-genome-out (raw counts), moved from kfp-prior unchanged.
+    - *q* shrunk root → family → genus → species, capped at 1, for every unit the species' genus carries (its own when it has no genus); pairs with *q* < 0.05 are dropped.
+    - *e* is the mean content of the species' carriers, else the genus', family's or all genomes'.
+    - Written as species-major and unit-major CSRs (`s_*`, `u_*`), `species.tsv`, `genomes.parquet`, kfp-prior's carriage files, `unit_pfam.parquet` and `meta.json` with the index checksum.
+  - *Amendment (plan: kfp-prior reads q from the species index):* kfp-prior's `build` command is removed. `kfp-prior update` takes the species index of `species-index --genomes` as its carriage table (same files), and the fmh benchmark's `PRIOR_BUILD` became `SPECIES_INDEX`. It still recomputes its own *q* per detected genome, so its results are unchanged apart from N now being Σ completeness.
+  - *Size:* every (genome, carried unit) row of a catalogue is held in memory, ~12 B each, ~10 GB for human-gut (`ponytail:` note).
+  - Tests: `test_translate_matches_the_proteins`, `test_species_index_from_catalogue` (*q* = 1 on units every genome carries, *e* equal to the genome index's content, a one-genome species shrunk towards its genus and given its genus' units at a small prior, the unit-major view), `test_completeness_raises_prevalence_of_units_incomplete_genomes_miss`, `test_genome_set_path_equals_catalogue_path` (identical pairs, *q* and *e*), `test_exclude_and_cli`; the shrinkage tests moved from kfp-prior.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

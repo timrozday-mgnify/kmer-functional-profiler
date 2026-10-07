@@ -4,9 +4,9 @@ A companion of the profiler, as Bracken is to Kraken: it reads the profiler's an
 mode's output files (``profile.tsv``, ``genomes.tsv``, the genome index of
 ``annotate-genomes``) and never imports the profiler.
 
-- :func:`build_carriage`: from which units each reference genome carries (its proteins' best
-  units, ``genome_best.parquet``), carriage counts per family, genus and species, and a
-  shrinkage strength α per rank fitted by leave-one-genome-out log loss.
+- :class:`Carriage`: carriage counts per family, genus and species and a shrinkage strength
+  α per rank, as the profiler's ``species-index --genomes`` writes them (the counts and α
+  fit moved there with the species model, phase 11, step 7).
 - :func:`update`: per detected genome G, the carriage frequency q_{G,u} of its species
   shrunk towards genus, family and all genomes; a noisy-OR prior over genomes; and each
   unit's presence updated by its own hits (closed form at zero hits, odds rescaling of the
@@ -22,9 +22,6 @@ import numpy as np
 import polars as pl
 
 RANKS: Final = ("family", "genus", "species")  # top down
-GTDB_PREFIX: Final = {"f": "family", "g": "genus", "s": "species"}
-ALPHAS: Final = np.geomspace(0.01, 100, 21)
-MAX_HOLDOUT: Final = 200  # held-out genomes per rank when fitting α
 Q_FLOOR: Final = 0.05  # carriage frequencies below this give no prior
 CLIP: Final = 1e-6
 
@@ -33,135 +30,10 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def lineages(genomes: pl.DataFrame) -> pl.DataFrame:
-    """``genome`` and its ``family``, ``genus`` and ``species`` from a GTDB-style
-    ``taxonomy`` column (by prefix; null where missing). A genome without a species is a
-    species of its own (``genome:<name>``)."""
-    taxa = genomes["taxonomy"] if "taxonomy" in genomes.columns else [None] * genomes.height
-    rows = []
-    for g, name, taxonomy in zip(genomes["genome"], genomes["name"], taxa, strict=True):
-        parts = [x.strip() for x in (taxonomy or "").split(";")]
-        by_rank = {GTDB_PREFIX[x[0]]: x for x in parts if x[1:3] == "__" and len(x) > 3
-                   and x[0] in GTDB_PREFIX}  # fmt: skip
-        rows.append((g, by_rank.get("family"), by_rank.get("genus"),
-                     by_rank.get("species") or f"genome:{name}"))  # fmt: skip
-    schema = {"genome": pl.UInt32, **dict.fromkeys(RANKS, pl.String)}
-    return pl.DataFrame(rows, schema=schema, orient="row")
-
-
-def _counts(carried: pl.DataFrame, lineage: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Carriage counts ``rank``, ``clade``, ``unit``, ``n`` and clade sizes ``rank``,
-    ``clade``, ``N``, per rank and for all genomes (rank ``root``, clade "")."""
-    long = pl.concat(
-        [lineage.select("genome", rank=pl.lit("root"), clade=pl.lit(""))]
-        + [lineage.select("genome", rank=pl.lit(r), clade=pl.col(r)) for r in RANKS]
-    ).drop_nulls("clade")
-    n = carried.join(long, on="genome").group_by("rank", "clade", "unit").agg(n=pl.len())
-    sizes = long.group_by("rank", "clade").agg(N=pl.len())
-    return n.cast({"n": pl.Int64}), sizes.cast({"N": pl.Int64})
-
-
-def _parent(lineage: pl.DataFrame, rank: str) -> pl.DataFrame:
-    """Per genome, the nearest clade above ``rank`` (``p_rank``, ``p``), else root."""
-    above = RANKS[: RANKS.index(rank)]
-    p_rank, p = pl.lit("root"), pl.lit("")
-    for r in above:  # top down: the last non-null wins
-        p_rank = pl.when(pl.col(r).is_not_null()).then(pl.lit(r)).otherwise(p_rank)
-        p = pl.when(pl.col(r).is_not_null()).then(pl.col(r)).otherwise(p)
-    return lineage.select("genome", p_rank=p_rank, p=p)
-
-
-def fit_alpha(
-    carried: pl.DataFrame, lineage: pl.DataFrame, rank: str, seed: int = 0
-) -> tuple[float, dict[str, float]]:
-    """α at ``rank`` by leave-one-genome-out log loss: each held-out genome's carriage of
-    the units its parent clade carries (its own clade's, when the parent is root), predicted
-    from the rest of its clade shrunk towards the rest of the parent's frequency. Returns
-    α and the losses of the best α, of no shrinkage (α → 0) and of the parent alone
-    (α → ∞), per prediction."""
-    n, sizes = _counts(carried, lineage)
-    eligible = (
-        lineage.select("genome", clade=pl.col(rank))
-        .join(sizes.filter(pl.col("rank") == rank), on="clade")
-        .filter(pl.col("N") >= 2)
-    )
-    if eligible.height == 0:
-        return 1.0, {}
-    held = eligible.sample(min(MAX_HOLDOUT, eligible.height), seed=seed).join(
-        _parent(lineage, rank), on="genome"
-    )
-    by_parent = held.filter(pl.col("p_rank") != "root").join(
-        n, left_on=["p_rank", "p"], right_on=["rank", "clade"]
-    )
-    by_clade = held.filter(pl.col("p_rank") == "root").join(
-        n.filter(pl.col("rank") == rank), on="clade"
-    )
-    rows = (
-        pl.concat(
-            [
-                by_parent.select("genome", "clade", "p_rank", "p", "unit"),
-                by_clade.select("genome", "clade", "p_rank", "p", "unit"),
-            ]
-        )  # fmt: skip
-        .join(
-            n.filter(pl.col("rank") == rank).select("clade", "unit", n_c="n"),
-            on=["clade", "unit"],
-            how="left",
-        )  # fmt: skip
-        .join(sizes.filter(pl.col("rank") == rank).select("clade", N_c="N"), on="clade")
-        .join(
-            n.select(p_rank="rank", p="clade", unit="unit", n_p="n"),
-            on=["p_rank", "p", "unit"],
-            how="left",
-        )  # fmt: skip
-        .join(sizes.select(p_rank="rank", p="clade", N_p="N"), on=["p_rank", "p"])
-        .join(carried.with_columns(x=pl.lit(1)), on=["genome", "unit"], how="left")
-        .with_columns(pl.col("n_c", "n_p", "x").fill_null(0))
-    )
-    x = rows["x"].to_numpy().astype(np.float64)
-    rest = rows["n_c"].to_numpy() - x
-    parent = (rows["n_p"].to_numpy() - x) / np.maximum(rows["N_p"].to_numpy() - 1, 1)
-    size = rows["N_c"].to_numpy() - 1.0
-
-    def loss(alpha: float) -> float:
-        q = np.clip((rest + alpha * parent) / (size + alpha), CLIP, 1 - CLIP)
-        return float(-(x * np.log(q) + (1 - x) * np.log1p(-q)).mean())
-
-    losses = [loss(a) for a in ALPHAS]
-    best = float(ALPHAS[int(np.argmin(losses))])
-    return best, {"best": min(losses), "no_shrinkage": loss(1e-9), "parent_only": loss(1e9)}
-
-
-def build_carriage(genome_index: str | Path, out: str | Path) -> dict[str, object]:
-    """Write the carriage table of a genome index (``annotate-genomes`` output, with
-    ``genome_best.parquet`` and a ``taxonomy`` column in ``genomes.tsv`` for shrinkage):
-    ``carriage.parquet`` (``rank``, ``clade``, ``unit``, ``n``), ``clades.parquet``
-    (``rank``, ``clade``, ``N``), ``lineage.parquet`` and ``meta.json`` (α per rank, its
-    held-out losses, the genome index's checksum)."""
-    genome_index, out = Path(genome_index), Path(out)
-    genomes = pl.read_csv(genome_index / "genomes.tsv", separator="\t")
-    lineage = lineages(genomes.cast({"genome": pl.UInt32}))
-    carried = (
-        pl.read_parquet(genome_index / "genome_best.parquet").select("genome", "unit").unique()
-    )
-    n, sizes = _counts(carried, lineage)
-    fits = {r: fit_alpha(carried, lineage, r) for r in RANKS}
-    out.mkdir(parents=True, exist_ok=True)
-    n.sort("rank", "clade", "unit").write_parquet(out / "carriage.parquet")
-    sizes.sort("rank", "clade").write_parquet(out / "clades.parquet")
-    lineage.write_parquet(out / "lineage.parquet")
-    meta = {
-        "genome_index_meta_sha256": _sha256(genome_index / "meta.json"),
-        "alpha": {r: a for r, (a, _) in fits.items()},
-        "held_out_log_loss": {r: losses for r, (_, losses) in fits.items()},
-        "genomes": genomes.height,
-    }
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    return meta
-
-
 class Carriage:
-    """A carriage table written by :func:`build_carriage`."""
+    """The carriage table of a species index built from a genome index
+    (``species-index --genomes``): ``carriage.parquet``, ``clades.parquet``,
+    ``lineage.parquet`` and α in ``meta.json``."""
 
     def __init__(self, path: str | Path) -> None:
         path = Path(path)
@@ -259,7 +131,7 @@ def update(
     taken as independent) and ``imputed``.
     """
     genome_index = Path(genome_index)
-    if _sha256(genome_index / "meta.json") != carriage.meta["genome_index_meta_sha256"]:
+    if _sha256(genome_index / "meta.json") != carriage.meta.get("genome_index_meta_sha256"):
         raise ValueError(
             f"the carriage table was built from another genome index than {genome_index}"
         )

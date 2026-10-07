@@ -27,6 +27,10 @@ from kmer_functional_profiler.index import (
 )
 from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
+from kmer_functional_profiler.species import (
+    species_index_from_catalogue,
+    species_index_from_genomes,
+)
 from kmer_functional_profiler.survival import check_aai_model
 
 app = typer.Typer(no_args_is_help=True)
@@ -243,6 +247,48 @@ def genomes_command(
     if summary is not None:
         summary.write_text(json.dumps(sample, indent=2) + "\n")
     typer.echo(f"{table.height} genomes detected -> {out}", err=True)
+
+
+@app.command()
+def species_index(
+    index_dir: Path,
+    out_dir: Path,
+    catalogue: Annotated[
+        Path | None,
+        typer.Option(
+            help="MGnify genome catalogue directory (genomes-all_metadata.tsv and "
+            "species_catalogue/ as on the FTP site): pangenome families annotated, carriage "
+            "from gene_presence_absence.Rtab"
+        ),
+    ] = None,
+    genomes: Annotated[
+        Path | None,
+        typer.Option(help="Output of `annotate-genomes` with taxonomy (species from s__), instead"),
+    ] = None,
+    exclude: Annotated[
+        Path | None,
+        typer.Option(
+            help="Genome names (one per line) left out of every count; their carried units "
+            "go to held_out.parquet (benchmark truth)"
+        ),
+    ] = None,
+    species: Annotated[
+        Path | None,
+        typer.Option(help="With --catalogue: species representatives (one per line) to keep"),
+    ] = None,
+) -> None:
+    """Build a species index: per (species, unit) the prevalence prior and the expected
+    hits per genome copy, from a genome catalogue's pangenomes or an annotated genome set."""
+    if (catalogue is None) == (genomes is None):
+        raise typer.BadParameter("give one of --catalogue and --genomes")
+    names = frozenset(exclude.read_text().split()) if exclude is not None else frozenset()
+    if catalogue is not None:
+        keep = set(species.read_text().split()) if species is not None else None
+        meta = species_index_from_catalogue(index_dir, catalogue, out_dir, names, keep)
+    else:
+        assert genomes is not None
+        meta = species_index_from_genomes(index_dir, genomes, out_dir, names)
+    typer.echo(json.dumps(meta, indent=2))
 
 
 @app.command()
