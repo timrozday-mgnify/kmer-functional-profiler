@@ -12,6 +12,8 @@ fmh-funprofiler benchmark inputs (Zenodo 10055954) for ``workflows/fmh-benchmark
 genomes with gene mapping tables, their proteins, gene-to-KO table and KO sketches, plus
 ``Pfam-mini.hmm``: Pfam-style HMMs (with GA cut-offs) built by ``hmmbuild`` from segments of
 some of those proteins, one of them carrying two, so Pfam truth has sub-gene domains.
+``mini_uhgg/`` lays the mini_fmh genomes out as an MGnify genome catalogue (FTP layout) for
+``workflows/species-benchmark``.
 """
 
 import gzip
@@ -329,6 +331,58 @@ def mini_mgnify(rng: random.Random) -> None:
     )
 
 
+def mini_uhgg() -> None:
+    """The mini_fmh genomes as an MGnify genome catalogue, laid out as on the FTP site.
+    Species A (representative MGYG000000001) and B (MGYG000000004) share genus G1 and have
+    three genomes each over gaa's and gbb's genes as Panaroo families: two carry every
+    family, the third a subset (A's is 80% complete). Species C (MGYG000000007, genus G2,
+    no species name) is gcc alone, with no pangenome. Every genome's GFF carries its
+    species' DNA after ``##FASTA``."""
+    src = OUT / "mini_fmh" / "genomes_extracted_from_kegg"
+    out = OUT / "mini_uhgg"
+    lineage = "d__Bacteria;p__P;c__C;o__O;"
+    species = {  # rep: (source genome, lineage, {genome: (families, completeness)})
+        "MGYG000000001": ("gaa", lineage + "f__F1;g__G1;s__G1 alpha",
+                          {"MGYG000000001": (range(25), 100), "MGYG000000002": (range(25), 100),
+                           "MGYG000000003": (range(20), 80)}),
+        "MGYG000000004": ("gbb", lineage + "f__F1;g__G1;s__G1 beta",
+                          {"MGYG000000004": (range(25), 100), "MGYG000000005": (range(25), 100),
+                           "MGYG000000006": (range(5, 25), 100)}),
+        "MGYG000000007": ("gcc", lineage + "f__F2;g__G2;s__",
+                          {"MGYG000000007": (range(25), 100)}),
+    }  # fmt: skip
+    meta = ["Genome\tGenome_type\tCompleteness\tContamination\tSpecies_rep\tLineage"]
+    for rep, (g, taxonomy, genomes) in species.items():
+        genes = pl.read_csv(src / g / f"{g}_mapping.csv")
+        dna = (src / g / f"{g}.fasta").read_text()
+        root = out / "species_catalogue" / rep[:-2] / rep
+        (root / "genome").mkdir(parents=True, exist_ok=True)
+        (root / "genome" / f"{rep}.faa").write_text(
+            "".join(f">{rep}_{i}\n{s}\n" for i, s in enumerate(genes["aa_sequence"]))
+        )
+        (root / "genome" / f"{rep}.fna").write_text(dna)
+        if len(genomes) > 1:
+            (root / "pan-genome").mkdir(exist_ok=True)
+            (root / "pan-genome" / "pan-genome.fna").write_text(
+                "".join(f">fam{i}\n{s}\n" for i, s in enumerate(genes["nt_sequence"]))
+            )
+            rows = ["Gene\t" + "\t".join(genomes)] + [
+                f"fam{i}\t" + "\t".join(str(int(i in fams)) for fams, _ in genomes.values())
+                for i in range(genes.height)
+            ]
+            (root / "pan-genome" / "gene_presence_absence.Rtab").write_text("\n".join(rows) + "\n")
+        for genome, (_, completeness) in genomes.items():
+            meta.append(f"{genome}\tMAG\t{completeness}\t0.5\t{rep}\t{taxonomy}")
+            gff = out / "all_genomes" / rep[:-2] / rep / "genomes1" / f"{genome}.gff.gz"
+            gff.parent.mkdir(parents=True, exist_ok=True)
+            with (
+                gff.open("wb") as f,
+                gzip.GzipFile(filename="", mode="wb", fileobj=f, mtime=0) as gz,
+            ):
+                gz.write(f"##gff-version 3\n##FASTA\n{dna}".encode())
+    (out / "genomes-all_metadata.tsv").write_text("\n".join(meta) + "\n")
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
@@ -336,3 +390,4 @@ if __name__ == "__main__":
     mini_pfam(random.Random(20261001))
     mini_host(random.Random(20261002))
     mini_mgnify(random.Random(20261003))
+    mini_uhgg()

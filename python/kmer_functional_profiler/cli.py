@@ -28,6 +28,7 @@ from kmer_functional_profiler.index import (
 from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
 from kmer_functional_profiler.species import (
+    BG_PRIOR,
     PRIOR_PRESENT,
     SpeciesIndex,
     species_index_from_catalogue,
@@ -279,6 +280,13 @@ def species_index(
         Path | None,
         typer.Option(help="With --catalogue: species representatives (one per line) to keep"),
     ] = None,
+    alpha: Annotated[
+        float | None,
+        typer.Option(help="Fix the shrinkage α at every rank (ablation; ~0: no shrinkage)"),
+    ] = None,
+    completeness: Annotated[
+        bool, typer.Option(help="Weight genomes by completeness (off: an ablation)")
+    ] = True,
 ) -> None:
     """Build a species index: per (species, unit) the prevalence prior and the expected
     hits per genome copy, from a genome catalogue's pangenomes or an annotated genome set."""
@@ -287,10 +295,12 @@ def species_index(
     names = frozenset(exclude.read_text().split()) if exclude is not None else frozenset()
     if catalogue is not None:
         keep = set(species.read_text().split()) if species is not None else None
-        meta = species_index_from_catalogue(index_dir, catalogue, out_dir, names, keep)
+        meta = species_index_from_catalogue(
+            index_dir, catalogue, out_dir, names, keep, alpha, completeness
+        )
     else:
         assert genomes is not None
-        meta = species_index_from_genomes(index_dir, genomes, out_dir, names)
+        meta = species_index_from_genomes(index_dir, genomes, out_dir, names, alpha, completeness)
     typer.echo(json.dumps(meta, indent=2))
 
 
@@ -327,6 +337,10 @@ def species_command(
     prior: Annotated[
         float, typer.Option(help="Prior probability that a screened species is present")
     ] = PRIOR_PRESENT,
+    background_prior: Annotated[
+        float,
+        typer.Option(help="Prior probability that a unit has background hits (0: none)"),
+    ] = BG_PRIOR,
 ) -> None:
     """Species present and their depths, fitted jointly with the units each carries in the
     sample (prevalence as prior, the profile's hits as evidence); updated unit and Pfam
@@ -339,8 +353,9 @@ def species_command(
             raise typer.BadParameter(str(e)) from e
     prof = pl.read_csv(profile_tsv, separator="\t")
     result = species_profile(
-        prof, si, min_containment=min_containment, min_units=min_units, prior=prior
-    )
+        prof, si, min_containment=min_containment, min_units=min_units, prior=prior,
+        background_prior=background_prior,
+    )  # fmt: skip
     outputs = {"species": out, "units": units, "presence": presence,
                "pfam_presence": pfam_presence, "function_species": function_taxon}  # fmt: skip
     for key, path in outputs.items():

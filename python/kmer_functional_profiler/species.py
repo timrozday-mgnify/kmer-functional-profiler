@@ -59,7 +59,7 @@ from kmer_functional_profiler.genomes import (
 )
 from kmer_functional_profiler.index import Index
 from kmer_functional_profiler.mask import _sha256
-from kmer_functional_profiler.query import _div, _ranges
+from kmer_functional_profiler.query import _div, _ranges, gather
 
 RANKS: Final = ("family", "genus", "species")  # top down
 ALPHAS: Final = np.geomspace(0.01, 100, 21)
@@ -256,12 +256,15 @@ def write_species_index(
     genomes: pl.DataFrame,
     exclude: frozenset[str],
     meta: dict[str, object],
+    alpha: float | None = None,
+    completeness: bool = True,
 ) -> dict[str, object]:
     """Aggregate (``genome``, ``unit``, ``c``) carriage rows of ``genomes`` (``genome``,
     ``name``, ``species`` or ``taxonomy``, optional ``taxonomy`` and ``completeness`` in
     [0, 1]) into a species index at ``out`` (module docstring); genomes named in
     ``exclude`` are left out of every count, and their carried units written to
-    ``held_out.parquet``."""
+    ``held_out.parquet``. Ablations: ``alpha`` fixes α at every rank instead of fitting it
+    (≈ 0: no shrinkage); ``completeness`` False counts every genome as complete."""
     out.mkdir(parents=True, exist_ok=True)
     lineage_all = lineages(genomes)
     held = genomes.filter(pl.col("name").is_in(list(exclude)))
@@ -273,11 +276,15 @@ def write_species_index(
     kept = genomes.filter(~pl.col("name").is_in(list(exclude)))
     lineage = lineage_all.join(kept.select("genome"), on="genome", how="semi")
     carried = carried.join(kept.select("genome"), on="genome", how="semi")
-    completeness = kept.select("genome", "completeness") if "completeness" in kept.columns else None
-    n, sizes = _counts(carried.select("genome", "unit"), lineage, completeness)
+    weights = (
+        kept.select("genome", "completeness")
+        if completeness and "completeness" in kept.columns
+        else None
+    )
+    n, sizes = _counts(carried.select("genome", "unit"), lineage, weights)
     fits = {r: fit_alpha(carried.select("genome", "unit"), lineage, r) for r in RANKS}
-    alpha = {r: a for r, (a, _) in fits.items()}
-    pairs = prevalence(carried, lineage, n, sizes, alpha)
+    alphas = {r: a if alpha is None else alpha for r, (a, _) in fits.items()}
+    pairs = prevalence(carried, lineage, n, sizes, alphas)
     first = lineage.unique("species", keep="first", maintain_order=True)
     taxonomy = (
         kept.select("genome", "taxonomy") if "taxonomy" in kept.columns
@@ -316,7 +323,7 @@ def write_species_index(
     _csr(pairs, "species", "unit", n_species, out, "s_", "species_offsets.npy")
     _csr(pairs, "unit", "species", n_units, out, "u_", "unit_offsets.npy")
     kept.join(lineage.select("genome", "species"), on="genome").select(
-        "genome", "name", "species", *(["completeness"] if completeness is not None else [])
+        "genome", "name", "species", *(["completeness"] if "completeness" in kept.columns else [])
     ).write_parquet(out / "genomes.parquet")
     n.sort("rank", "clade", "unit").write_parquet(out / "carriage.parquet")
     sizes.sort("rank", "clade").write_parquet(out / "clades.parquet")
@@ -330,7 +337,9 @@ def write_species_index(
         "genomes": kept.height,
         "excluded": held.height,
         "pairs": pairs.height,
-        "alpha": alpha,
+        "alpha": alphas,
+        "alpha_fixed": alpha,
+        "completeness_weighted": weights is not None,
         "held_out_log_loss": {r: losses for r, (_, losses) in fits.items()},
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -349,6 +358,8 @@ def species_index_from_genomes(
     genome_index: str | Path,
     out: str | Path,
     exclude: frozenset[str] = frozenset(),
+    alpha: float | None = None,
+    completeness: bool = True,
 ) -> dict[str, object]:
     """A species index from an ``annotate-genomes`` genome index (its ``genome_best`` for
     carriage, its content for *e*); ``genomes.tsv`` may have ``completeness`` (percent)."""
@@ -378,7 +389,7 @@ def species_index_from_genomes(
         "genome_index_meta_sha256": _sha256(genome_index / "meta.json"),
     }
     return write_species_index(
-        Path(out), index_dir, gmeta["units"], carried, genomes, exclude, meta
+        Path(out), index_dir, gmeta["units"], carried, genomes, exclude, meta, alpha, completeness
     )
 
 
@@ -434,6 +445,8 @@ def species_index_from_catalogue(
     out: str | Path,
     exclude: frozenset[str] = frozenset(),
     species: set[str] | None = None,
+    alpha: float | None = None,
+    completeness: bool = True,
 ) -> dict[str, object]:
     """A species index from an MGnify genome catalogue directory (``CATALOGUE_METADATA``
     and ``species_catalogue/`` as on the FTP site), optionally only the species whose
@@ -491,8 +504,9 @@ def species_index_from_catalogue(
     carried = pl.concat([pl.DataFrame(schema=schema), *parts])
     meta: dict[str, object] = {"source": "catalogue", "catalogue": str(catalogue)}
     return write_species_index(
-        Path(out), index_dir, index.units.height, carried, genomes, exclude, meta
-    )
+        Path(out), index_dir, index.units.height, carried, genomes, exclude, meta, alpha,
+        completeness,
+    )  # fmt: skip
 
 
 class SpeciesIndex:
@@ -568,6 +582,8 @@ BG_RATE: Final = 0.01
 BG_PRIOR: Final = 0.05  # prior probability that a unit has background hits at all
 DETECTED: Final = 0.5  # present_prob reported as detected
 TINY: Final = 1e-12
+CARRIED: Final = 0.5  # prevalence from which gather counts a unit as the species'
+START_ITER: Final = 50  # Poisson EM rounds for the starting depths
 
 
 def _log_pois(h: np.ndarray, m: np.ndarray) -> np.ndarray:
@@ -584,11 +600,23 @@ def _log_nb(h: np.ndarray) -> np.ndarray:
     return out
 
 
-def _explain(h: np.ndarray, m: np.ndarray, nb: np.ndarray) -> np.ndarray:
-    """Log probability of h hits from sources at mean m, the background free to add hits:
-    either m explains them, or the background does and the sources gave ~none."""
-    out: np.ndarray = np.maximum(_log_pois(h, m), nb - m)
+def _explain(h: np.ndarray, m: np.ndarray, nb: np.ndarray, log_bg: float, phi: float) -> np.ndarray:
+    """ℓ: log probability of h hits from sources at mean m with a unit's background off,
+    or (log prior ``log_bg``) on and explaining them while the sources gave ~none; the
+    likelihoods tempered by the dispersion ``phi`` (quasi-likelihood)."""
+    out: np.ndarray = np.logaddexp(
+        np.log1p(-np.exp(log_bg)) + _log_pois(h, m) / phi, log_bg + (nb - m) / phi
+    )
     return out
+
+
+def _dispersion(h: np.ndarray, m: np.ndarray) -> float:
+    """φ ≥ 1 from the median squared Pearson residual over hit units (χ²₁'s median is
+    0.455): robust to the few units a fit gets wrong, which a mean would let dominate."""
+    hit = (h > 0) & (m > TINY)
+    if hit.sum() < 3:
+        return 1.0
+    return max(1.0, float(np.median((h[hit] - m[hit]) ** 2 / m[hit])) / 0.455)
 
 
 def fit_species(
@@ -598,6 +626,7 @@ def fit_species(
     min_containment: float = MIN_CONTAINMENT,
     min_units: int = MIN_UNITS,
     prior: float = PRIOR_PRESENT,
+    background_prior: float = BG_PRIOR,
     tol: float = 1e-6,
     max_iter: int = 2000,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, float]]:
@@ -607,23 +636,28 @@ def fit_species(
     h_u ~ Poisson(β_u + Σ_s b_s z_{s,u} λ_s e_{s,u}) over the profile's raw unit ``hits``:
     presence b_s ~ Bernoulli(``prior``), depth λ_s ~ Gamma(``DEPTH_SHAPE``, ``DEPTH_RATE``)
     if present, carriage z_{s,u} ~ Bernoulli(q_{s,u}), background β_u = 0, or with
-    probability ``BG_PRIOR`` ~ Gamma(``BG_SHAPE``, ``BG_RATE``). Species are screened as
+    probability ``background_prior`` ~ Gamma(``BG_SHAPE``, ``BG_RATE``). Species are screened as
     genome mode's are, on prevalence-weighted content: Σ_{u hit} q e / Σ_u q e
-    ≥ ``min_containment`` on ≥ ``min_units`` hit units.
+    ≥ ``min_containment`` on ≥ ``min_units`` hit units; then gathered (G0): each hit unit
+    with q ≥ ``CARRIED`` goes to the species with the most such units left, and species
+    left fewer than ``min_units`` drop out.
 
     Each round, with the other sources at their means (μ₋ₛ):
 
-    - carriage r = P(z = 1 | h)
-      = q Pois(h; μ₋ₛ + λe) / [q Pois(h; μ₋ₛ + λe) + (1 - q) Pois(h; μ₋ₛ)];
-    - the background is on with its posterior given the species' mean M_u (spike against
-      slab, :func:`_explain`) and then takes the excess, max(h - M_u, 0); the rest of the
-      hits are allocated ∝ p_s r exp(E log λ_s) e;
+    - carriage r = P(z = 1 | h) = q ℓ(μ₋ₛ + λe) / [q ℓ(μ₋ₛ + λe) + (1 - q) ℓ(μ₋ₛ)], ℓ the
+      Poisson likelihood with the background free to add hits (:func:`_explain`);
+    - the background is on with its posterior given the mean M_u (spike against slab) and
+      then takes the excess, max(h - M_u, 0); the rest of the hits are allocated
+      ∝ p_s r exp(E log λ_s) e. Each species' depth and presence use M_u with itself
+      present, so doubt about its presence does not hand its hits to the background;
     - depth given presence: Gamma(a₀ + Σ_u allocated hits as if present, b₀ + Σ_u r e)
       over every unit of the species, hit or not;
     - presence: logit p = logit ρ + Σ_u log[q ℓ(μ₋ₛ + λe) + (1 - q) ℓ(μ₋ₛ)] - log ℓ(μ₋ₛ),
-      plus the depth's Laplace term; ℓ lets the background explain a unit's hits instead
-      (:func:`_explain`), so hits a species does not need cost it nothing and hits it
-      cannot explain earn it nothing.
+      plus the depth's Laplace term: hits a species does not need cost it nothing and
+      hits it cannot explain earn it nothing;
+    - every likelihood term is tempered by the dispersion φ (:func:`_dispersion`, from the
+      current fit), so overdispersed unit hits (k-mer clumping, a strain unlike the
+      catalogue's) weaken the evidence instead of switching carriage off.
 
     Returns per screened species (``species``, ``present_prob``, ``depth``: the mode of λ's
     Gamma posterior given presence less the prior's shape, i.e. allocated hits / Σ r e,
@@ -646,7 +680,22 @@ def fit_species(
         .select("species", "units_hit", "containment")
         .sort("species")
     )
-    report: dict[str, float] = {"screened_species": screened.height}
+    # G0 one level up: gather over hit units the screened species likely carry, so a
+    # species whose hits another explains (identical content, a shared core) drops out
+    # before the fit, which cannot tell such species apart.
+    likely = (
+        si.by_unit(np.sort(hit["unit"].to_numpy()))
+        .join(screened.select("species"), on="species", how="semi")
+        .filter(pl.col("q") >= CARRIED)
+    )
+    kept = gather(likely.select(unit="species", hash="unit"), np.ones(si.species.height)).filter(
+        pl.col("kmers_unique") >= min_units
+    )
+    report: dict[str, float] = {
+        "screened_species": screened.height,
+        "gathered_species": kept.height,
+    }
+    screened = screened.join(kept.select(species="unit"), on="species", how="semi")
     pairs = (
         si.by_species(screened["species"].to_numpy())
         .join(hit, on="unit", how="left")
@@ -662,40 +711,54 @@ def fit_species(
     h_u = np.zeros(n_u)
     h_u[u] = h
     nb = _log_nb(h)
-    # Start: depth from prevalence-weighted hits, every screened species present.
-    rate = DEPTH_RATE + np.bincount(s, q * e, n_s)
-    lam = _div(np.bincount(s, q * h, n_s), rate - DEPTH_RATE)
-    shape = DEPTH_SHAPE + lam * (rate - DEPTH_RATE)
-    p, r = np.ones(n_s), q.copy()
-    y_bg = np.zeros(n_u)
+    # Start: every gathered species present, depths by Poisson EM with carriage at its
+    # prior (shared hits split, not counted in full by each holder).
+    exposure = np.bincount(s, q * e, n_s)
+    lam = np.full(n_s, _div(h.sum(), exposure.sum()) if n_s else 0.0)
+    for _ in range(START_ITER):
+        mean_u = np.bincount(u, q * lam[s] * e, n_u)
+        lam = lam * _div(np.bincount(s, q * e * _div(h_u, mean_u)[u], n_s), exposure)
+    rate = DEPTH_RATE + exposure
+    shape = DEPTH_SHAPE + lam * exposure
+    p, r, phi = np.ones(n_s), q.copy(), 1.0
     logit_prior = np.log(prior) - np.log1p(-prior)
-    logit_bg = np.log(BG_PRIOR) - np.log1p(-BG_PRIOR)
+    with np.errstate(divide="ignore"):  # 0: no background (an ablation)
+        log_bg = float(np.log(background_prior))
     nb_u = _log_nb(h_u)
     for iteration in range(1, max_iter + 1):  # noqa: B007  (reported after the loop)
         mean_lam, log_lam = shape / rate, digamma(shape) - np.log(rate)
         mu = mean_lam[s] * e
-        m = p[s] * r * mu
-        others = np.maximum((np.bincount(u, m, n_u) + y_bg)[u] - m, TINY)
-        r = expit(lq - l1q - mu + h * np.log1p(mu / others))
-        # Background: on with its posterior given the species' mean, taking the excess.
+        # Carriage, depth and presence are each species' as if present, against the other
+        # species at their means; ℓ (_explain) gives the background its say. (Measuring a
+        # species against a background that took its hits because its presence was in
+        # doubt would feed back: presence down, background up, presence further down.)
         m = p[s] * r * mu
         mean_u = np.bincount(u, m, n_u)
-        on = expit(logit_bg + _explain(h_u, mean_u, nb_u) - _log_pois(h_u, mean_u))
-        y_bg = on * np.maximum(h_u - mean_u, 0.0)
+        # dispersion of hit units the species likely carry, every species present (with
+        # the presence-weighted mean, doubt about presence would inflate φ, and φ in turn
+        # the doubt)
+        likely = q >= CARRIED
+        phi = _dispersion(h[likely], np.bincount(u, r * mu, n_u)[u][likely])
+        others = np.maximum(mean_u[u] - m, TINY)
+        lc, lo = (_explain(h, others + mu, nb, log_bg, phi),
+                  _explain(h, others, nb, log_bg, phi))  # fmt: skip
+        r = expit(lq - l1q + lc - lo)
+        # Hits left for the species if present: the background (on with its posterior
+        # given the species' mean) takes the excess over it.
+        mean_if = others + r * mu
+        on = np.exp(log_bg + (nb - mean_if) / phi - _explain(h, mean_if, nb, log_bg, phi))
+        left = h - on * np.maximum(h - mean_if, 0.0)
         w = r * np.exp(log_lam[s]) * e
         total = np.bincount(u, p[s] * w, n_u)
-        left = (h_u - y_bg)[u]
         if_present = _div(left * w, w + total[u] - p[s] * w)
         new_shape = DEPTH_SHAPE + np.bincount(s, if_present, n_s)
         rate = DEPTH_RATE + np.bincount(s, r * e, n_s)
         lam_hat = new_shape / rate
-        others = np.maximum((mean_u + y_bg)[u] - m, TINY)
-        alone = _explain(h, others, nb)
-        with_s = np.logaddexp(lq + _explain(h, others + lam_hat[s] * e, nb), l1q + alone)
+        with_s = np.logaddexp(lq + _explain(h, others + lam_hat[s] * e, nb, log_bg, phi), l1q + lo)
         occam = gamma.logpdf(lam_hat, DEPTH_SHAPE, scale=1 / DEPTH_RATE) + 0.5 * np.log(
-            2 * np.pi * new_shape / rate**2
+            2 * np.pi * phi * new_shape / rate**2
         )
-        new_p = expit(logit_prior + np.bincount(s, with_s - alone, n_s) + occam)
+        new_p = expit(logit_prior + np.bincount(s, with_s - lo, n_s) + occam)
         change = max(
             float(np.max(np.abs(lam_hat - mean_lam) / np.maximum(lam_hat, TINY), initial=0.0)),
             float(np.max(np.abs(new_p - p), initial=0.0)),
@@ -703,8 +766,11 @@ def fit_species(
         shape, p = new_shape, new_p
         if change < tol:
             break
-    report |= {"iterations": iteration, "max_change": change}
+    report |= {"iterations": iteration, "max_change": change, "fit_phi": phi}
     mean_lam, log_lam = shape / rate, digamma(shape) - np.log(rate)
+    mean_u = np.bincount(u, p[s] * r * mean_lam[s] * e, n_u)
+    on_u = np.exp(log_bg + (nb_u - mean_u) / phi - _explain(h_u, mean_u, nb_u, log_bg, phi))
+    y_bg = on_u * np.maximum(h_u - mean_u, 0.0)
     w = r * np.exp(log_lam[s]) * e
     total = np.bincount(u, p[s] * w, n_u)
     # depth reported at the posterior mode (the MLE at DEPTH_SHAPE 1): the mean adds a hit
@@ -877,6 +943,7 @@ def species_profile(
     min_containment: float = MIN_CONTAINMENT,
     min_units: int = MIN_UNITS,
     prior: float = PRIOR_PRESENT,
+    background_prior: float = BG_PRIOR,
 ) -> dict[str, object]:
     """:func:`fit_species` as reports: ``species`` (detected, ``present_prob`` ≥
     ``DETECTED``: ``id``, ``name``, ``taxonomy``, ``present_prob``, ``depth`` with its
@@ -887,8 +954,9 @@ def species_profile(
     ``summary``: raw ``hits``, ``explained_fraction`` (hits assigned to detected species
     over all), ``genome_equivalents`` (Σ depth of the detected), counts."""
     species, pairs, report = fit_species(
-        prof, si, min_containment=min_containment, min_units=min_units, prior=prior
-    )
+        prof, si, min_containment=min_containment, min_units=min_units, prior=prior,
+        background_prior=background_prior,
+    )  # fmt: skip
     species, phi = _intervals(species, pairs)
     counts = pairs.group_by("species").agg(
         core_hit=((pl.col("q") >= CORE) & (pl.col("hits") > 0)).sum()

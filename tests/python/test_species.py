@@ -290,7 +290,7 @@ def test_accessory_units_follow_depth_and_hits(tmp_path: Path) -> None:
         r = dict(pairs.select("unit", "carriage_prob").iter_rows())
         q = dict(pairs.select("unit", "q").iter_rows())
         if depth > 1:  # zero hits where ~20 were due: absent; hit: carried
-            assert all(r[u] < 1e-3 for u in range(60, 70)) and all(r[u] > 0.999 for u in strain)
+            assert all(r[u] < 1e-3 for u in range(60, 70)) and all(r[u] > 0.99 for u in strain)
         else:  # ~0.05 hits due: zero hits say little, carriage stays near prevalence
             assert all(0.9 * q[u] < r[u] <= q[u] for u in range(60, 70)), r
     # At zero hits and no other source, carriage is kfp-prior's closed form (at the
@@ -412,3 +412,26 @@ def test_species_cli(tmp_path: Path, index_dir: Path) -> None:
     assert pl.read_csv(out / "pf.tsv", separator="\t").height > 0
     bad = CliRunner().invoke(app, [*args[:4], "--index", str(tmp_path / "si")])
     assert bad.exit_code != 0
+
+
+def test_identical_species_are_explained_away(tmp_path: Path) -> None:
+    si = synthetic_index(tmp_path, {"A": CORE_50, "B": CORE_50})
+    species, _, report = fit_species(exact(si, {"A": 3.0}, {"A": set(range(50))}), si)
+    assert report["screened_species"] == 2 and species.height == 1  # gather keeps one
+    assert species["depth"][0] == pytest.approx(3.0, rel=0.01)
+
+
+def test_overdispersed_hits_keep_the_species_and_its_core(tmp_path: Path) -> None:
+    """Gamma-Poisson hits (variance ~6x the mean): Poisson evidence alone would switch
+    carriage off on the units far from λe; tempering by φ keeps them."""
+    si = synthetic_index(tmp_path, {"A": CORE_50})
+    mean = exact(si, {"A": 4.0}, {"A": set(range(50))})
+    rng = np.random.default_rng(3)
+    hits = rng.poisson(rng.gamma(0.8, mean["hits"].to_numpy() / 0.8))
+    prof = mean.with_columns(hits=pl.Series(hits, dtype=pl.Float64)).filter(pl.col("hits") > 0)
+    species, pairs, report = fit_species(prof, si)
+    assert report["fit_phi"] > 3
+    assert species["present_prob"][0] > 0.99
+    assert species["depth"][0] == pytest.approx(4.0, rel=0.3)
+    hit = pairs.filter(pl.col("hits") > 0)
+    assert (hit["carriage_prob"] > 0.9).all()

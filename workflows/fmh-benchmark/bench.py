@@ -61,6 +61,11 @@
 - ``subsample``, ``prior-score``: kfp-prior's depth ladder (phase 11): read pairs kept at
   a fraction; unit and Pfam presence, observed vs updated, by carrier depth, and the
   calibration of zero-hit units.
+- ``uhgg-pick``, ``uhgg-sample``, ``uhgg-reps``, ``uhgg-score``: the species model's strain
+  hold-out benchmark (phase 11, step 10; ``workflows/species-benchmark``): samples of
+  non-representative catalogue genomes left out of the species index; each sample's FASTA
+  and per-contig coverage for InSilicoSeq; the representatives as a genome set; and species
+  detection, unit and Pfam presence, carriage and the function x species table scored.
 - ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
@@ -68,6 +73,7 @@ import argparse
 import gzip
 import itertools
 import json
+import math
 import random
 import sys
 from collections.abc import Iterable, Iterator
@@ -1420,7 +1426,7 @@ def genome_score(args: argparse.Namespace) -> None:
         ft = pl.read_csv(args.function_taxon, separator="\t",
                          schema_overrides={"taxon": pl.String, "hits_em": pl.Float64})  # fmt: skip
         total = float(ft.filter(pl.col("rank") == "total")["hits_em"].sum())
-        genome = ft.filter(pl.col("rank") == "genome")
+        genome = ft.filter(pl.col("rank") == args.rank)
         ours = genome.filter(pl.col("taxon") != "unclassified").select(
             genome="taxon", label="function", p=pl.col("hits_em") / max(total, 1e-300)
         )
@@ -1468,7 +1474,7 @@ def _accession(col: str) -> pl.Expr:
     )
 
 
-def _by_depth(truth: pl.DataFrame, predicted: set, level: str) -> list[dict[str, Any]]:
+def _by_depth(truth: pl.DataFrame, predicted: dict[str, set], level: str) -> list[dict[str, Any]]:
     """Completeness per bin of the depth of the deepest sample genome carrying each true
     item (``item``, ``depth``), observed and updated (``predicted``: {kind: items})."""
     binned = truth.with_columns(
@@ -1555,6 +1561,270 @@ def prior_score(args: argparse.Namespace) -> None:
         .sort("bin")
         .write_csv(args.out_calibration, separator="\t")
     )
+
+
+# --- Species model: strain hold-out benchmark (phase 11, step 10) ---
+
+
+def _metadata(path: str) -> pl.DataFrame:
+    return pl.read_csv(path, separator="\t", infer_schema=False).with_columns(
+        pl.col("Completeness", "Contamination").cast(pl.Float64)
+    )
+
+
+def uhgg_pick(args: argparse.Namespace) -> None:
+    """Samples for the strain hold-out benchmark from a catalogue's metadata. Species with
+    ≥ ``--min-genomes`` genomes and a non-representative genome of ≥ ``--min-completeness``
+    and ≤ ``--max-contamination`` are the pool; each of ``--replicates`` samples takes
+    ``--per-sample`` of them, one such genome each (never reused), at a depth log-uniform
+    on [``--depth-min``, ``--depth-max``]. Writes ``samples.tsv`` (``sample``, ``genome``,
+    ``species``, ``depth``), ``exclude.txt`` (every picked genome: left out of the species
+    index) and ``species.txt`` (the samples' species plus ``--distractors`` others)."""
+    rng = random.Random(args.seed)
+    meta = _metadata(args.metadata)
+    sizes = meta.group_by("Species_rep").agg(n=pl.len())
+    eligible = (
+        meta.filter(
+            pl.col("Genome") != pl.col("Species_rep"),
+            pl.col("Completeness") >= args.min_completeness,
+            pl.col("Contamination") <= args.max_contamination,
+        )
+        .join(sizes.filter(pl.col("n") >= args.min_genomes), on="Species_rep")
+        .sort("Genome")
+    )
+    candidates = {
+        key[0]: part["Genome"].to_list() for key, part in eligible.group_by("Species_rep")
+    }
+    pool = sorted(candidates)
+    rows: list[tuple[int, str, str, float]] = []
+    for sample in range(1, args.replicates + 1):
+        for sp in rng.sample(pool, min(args.per_sample, len(pool))):
+            left = [g for g in candidates[sp] if g not in {r[1] for r in rows}]
+            if left:
+                depth = math.exp(rng.uniform(math.log(args.depth_min), math.log(args.depth_max)))
+                rows.append((sample, rng.choice(left), sp, depth))
+    samples = pl.DataFrame(rows, schema=["sample", "genome", "species", "depth"], orient="row")
+    samples.write_csv("samples.tsv", separator="\t")
+    Path("exclude.txt").write_text("".join(f"{g}\n" for g in samples["genome"]))
+    used = set(samples["species"])
+    others = sorted(set(meta["Species_rep"]) - used)
+    chosen = sorted(used) + sorted(rng.sample(others, min(args.distractors, len(others))))
+    Path("species.txt").write_text("".join(f"{sp}\n" for sp in chosen))
+
+
+def uhgg_sample(args: argparse.Namespace) -> None:
+    """One sample's genomes (``--genomes-dir``/<genome>.fna) as ``sample.fna`` (records
+    ``<genome>|<contig>``) and ``coverage.txt`` (each record at its genome's depth) for
+    ``iss generate --coverage_file``."""
+    samples = pl.read_csv(args.samples, separator="\t").filter(pl.col("sample") == args.sample)
+    with open("sample.fna", "w") as fna, open("coverage.txt", "w") as cov:
+        for genome, depth in samples.select("genome", "depth").iter_rows():
+            for line in (Path(args.genomes_dir) / f"{genome}.fna").read_text().splitlines(True):
+                if line.startswith(">"):
+                    record = f"{genome}|{line[1:].split()[0]}"
+                    fna.write(f">{record}\n")
+                    cov.write(f"{record}\t{depth}\n")
+                else:
+                    fna.write(line)
+
+
+def uhgg_reps(args: argparse.Namespace) -> None:
+    """The catalogue's representatives of ``--species`` as a genome set for
+    ``annotate-genomes``: ``--out-dir``/genomes.tsv (``genome``, ``path`` to the
+    representative's ``.faa``, absolute; ``taxonomy``; ``completeness``)."""
+    root = Path(args.catalogue).resolve()
+    species = Path(args.species).read_text().split()
+    meta = _metadata(str(root / "genomes-all_metadata.tsv")).filter(
+        (pl.col("Genome") == pl.col("Species_rep")) & pl.col("Genome").is_in(species)
+    )
+    paths = [str(root / "species_catalogue" / g[:-2] / g / "genome" / f"{g}.faa")
+             for g in meta["Genome"]]  # fmt: skip
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    meta.select(genome="Genome", taxonomy="Lineage", completeness="Completeness").with_columns(
+        path=pl.Series(paths)
+    ).select("genome", "path", "taxonomy", "completeness").write_csv(
+        out / "genomes.tsv", separator="\t"
+    )
+
+
+def _auc(score: np.ndarray, label: np.ndarray) -> float | None:
+    """Area under the ROC curve (Mann-Whitney, ties averaged)."""
+    from scipy.stats import rankdata
+
+    pos, neg = int(label.sum()), int((~label).sum())
+    if not pos or not neg:
+        return None
+    ranks = rankdata(score)
+    return float((ranks[label].sum() - pos * (pos + 1) / 2) / (pos * neg))
+
+
+def uhgg_score(args: argparse.Namespace) -> None:
+    """One arm on one sample of the strain hold-out benchmark, in long format (``sample``,
+    ``arm``, ``metric``, ``value``). Truth: the sample's species
+    and depths (``samples.tsv``) and the units its genomes carry (``held_out.parquet`` of
+    the species index that left them out), with Pfam from the index's labels.
+
+    - Detection (``--pred``; ``--kind`` species: ``species.tsv`` by ``id``; genomes:
+      ``genomes.tsv`` of representatives by ``name``; sylph): purity, completeness, F1,
+      L1 of relative abundances, Spearman over true positives.
+    - Presence (``--presence``, ``--pfam-presence``, kfp-prior's format): completeness per
+      bin of carrier depth, observed vs updated, and purity; calibration of zero-hit units
+      to ``--out-calibration``.
+    - Carriage (``--units``, species arms): over the true species' accessory units
+      (0.1 < q < 0.9) with zero hits, the AUROC of ``carriage_prob`` against the held-out
+      genome's carriage, and log loss of ``carriage_prob`` and of the prevalence.
+    - Function x species (``--function-taxon``, rank species): as ``genome-score``'s,
+      truth (species, Pfam) ∝ depth x the genome's content on the Pfam's units.
+    """
+    from scipy.stats import spearmanr
+
+    truth = pl.read_csv(args.truth, separator="\t").filter(pl.col("sample") == args.sample)
+    truth = truth.with_columns(t=pl.col("depth") / pl.col("depth").sum())
+    names = pl.read_csv(Path(args.species_index) / "species.tsv", separator="\t",
+                        schema_overrides={"taxonomy": pl.String})  # fmt: skip
+    row: dict[str, Any] = {"sample": args.sample, "arm": args.arm}
+    if args.pred:
+        if args.kind == "sylph":
+            raw = pl.read_csv(args.pred, separator="\t")
+            pred = raw.select(
+                id=pl.col("Genome_file").str.split("/").list.last().str.replace(r"\.f\w+$", ""),
+                p=pl.col("Taxonomic_abundance") / 100,
+            )
+        else:
+            column = "id" if args.kind == "species" else "name"
+            pred = pl.read_csv(args.pred, separator="\t", infer_schema_length=0).select(
+                id=pl.col(column), p=pl.col("relative_abundance").cast(pl.Float64)
+            )
+        both = truth.select(id="species", t="t").join(pred, on="id", how="full",
+                                                      coalesce=True).fill_null(0.0)  # fmt: skip
+        tp = both.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+        row |= {"n_truth": truth.height, "n_pred": pred.height, "tp": tp.height,
+                **_f1(tp.height, pred.height, truth.height),
+                "l1": float((both["t"] - both["p"]).abs().sum()),
+                "spearman": float(spearmanr(tp["t"], tp["p"]).statistic)
+                if tp.height > 2 else None}  # fmt: skip
+    held = pl.read_parquet(Path(args.species_index) / "held_out.parquet").join(
+        truth.select(name="genome", depth="depth"), on="name"
+    )
+    units = (
+        held.group_by("unit")
+        .agg(pl.col("depth").max())
+        .select(item=pl.col("unit").cast(pl.Int64), depth="depth")
+    )
+    pfam_path = Path(args.species_index) / "unit_pfam.parquet"
+    labels = (
+        pl.read_parquet(pfam_path).select(pl.col("unit").cast(pl.UInt32), pfam=_accession(
+            "pfam_accession"))
+        if pfam_path.exists() else None
+    )  # fmt: skip
+    floats = {
+        c: pl.Float64
+        for c in (
+            "hits",
+            "present_prob",
+            "present_prob_updated",
+            "present_prob_observed",
+            "prevalence",
+            "carriage_prob",
+        )
+    }  # typed when empty
+    calibration = pl.DataFrame(
+        schema={"sample": pl.Int64, "arm": pl.String, "bin": pl.String, "n": pl.UInt32,
+                "predicted": pl.Float64, "carried": pl.Float64}
+    )  # fmt: skip
+    if args.presence:
+        presence = pl.read_csv(args.presence, separator="\t", schema_overrides=floats)
+        called = {
+            "observed": set(
+                presence.filter((pl.col("hits") > 0) & (pl.col("present_prob") >= 0.5))["unit"]
+            ),
+            "updated": set(presence.filter(pl.col("present_prob_updated") >= 0.5)["unit"]),
+        }
+        scored = _by_depth(units, called, "unit")
+        if args.pfam_presence and labels is not None:
+            pfams = (
+                held.join(labels, on="unit").group_by("pfam").agg(pl.col("depth").max())
+                .select(item="pfam", depth="depth")
+            )  # fmt: skip
+            pp = pl.read_csv(args.pfam_presence, separator="\t", schema_overrides=floats)
+            pp = pp.with_columns(item=_accession("pfam_accession"))
+            called = {
+                "observed": set(pp.filter(pl.col("present_prob_observed") >= 0.5)["item"]),
+                "updated": set(pp.filter(pl.col("present_prob_updated") >= 0.5)["item"]),
+            }
+            scored += _by_depth(pfams, called, "pfam")
+        for r in scored:  # wide: one row per arm and sample
+            for k, v in r.items():
+                if k not in ("level", "bin"):
+                    row[f"{r['level']}_{r['bin']}_{k}"] = v
+        zero = presence.filter(pl.col("hits") == 0).with_columns(
+            carried=pl.col("unit").is_in(units["item"].implode()),
+            bin=pl.col("present_prob_updated").cut(PROB_BINS[1:-1], left_closed=True)
+            .cast(pl.String),
+        )  # fmt: skip
+        calibration = (
+            zero.group_by("bin")
+            .agg(n=pl.len(), predicted=pl.col("present_prob_updated").mean(),
+                 carried=pl.col("carried").mean())
+            .with_columns(sample=pl.lit(args.sample), arm=pl.lit(args.arm))
+            .select("sample", "arm", "bin", "n", "predicted", "carried").sort("bin")
+        )  # fmt: skip
+    if args.units:
+        ids = names.select(pl.col("species").cast(pl.UInt32), "id")
+        pairs = (
+            pl.read_csv(args.units, separator="\t", schema_overrides=floats)
+            .cast({"species": pl.UInt32, "unit": pl.UInt32})
+            .join(ids, on="species")
+            .join(truth.select(id="species", name="genome"), on="id")
+            .filter(pl.col("prevalence").is_between(0.1, 0.9, closed="none"), pl.col("hits") == 0)
+            .join(held.select("name", "unit", x=pl.lit(True)), on=["name", "unit"], how="left")
+            .with_columns(pl.col("x").fill_null(False))
+        )  # fmt: skip
+        x = pairs["x"].to_numpy()
+
+        def loss(p: np.ndarray) -> float | None:
+            p = np.clip(p, 1e-6, 1 - 1e-6)
+            return float(-(x * np.log(p) + (1 - x) * np.log1p(-p)).mean()) if len(x) else None
+
+        carriage = pairs["carriage_prob"].to_numpy()
+        row |= {"accessory_pairs": len(x), "carriage_auc": _auc(carriage, x),
+                "carriage_logloss": loss(carriage),
+                "prevalence_logloss": loss(pairs["prevalence"].to_numpy())}  # fmt: skip
+    if args.function_taxon and labels is not None:
+        ft = pl.read_csv(args.function_taxon, separator="\t",
+                         schema_overrides={"taxon": pl.String, "hits_em": pl.Float64})  # fmt: skip
+        total = float(ft.filter(pl.col("rank") == "total")["hits_em"].sum())
+        ours = ft.filter(
+            (pl.col("rank") == "species") & (pl.col("taxon") != "unclassified")
+        ).select(  # genome mode's table labels species s__<name>; ours <name>
+            taxon=pl.col("taxon").str.replace("^s__", ""),
+            label="function",
+            p=pl.col("hits_em") / max(total, 1e-300),
+        )
+        want = (
+            held.join(labels, on="unit")
+            .join(truth.select(name="genome", sp="species"), on="name")
+            .join(names.select(sp="id", taxon="name"), on="sp")
+            .group_by("taxon", "pfam").agg(w=(pl.col("depth") * pl.col("c")).sum())
+            .select("taxon", label="pfam", t=pl.col("w") / pl.col("w").sum())
+        )  # fmt: skip
+        pairs = want.join(ours, on=["taxon", "label"], how="full", coalesce=True).fill_null(0.0)
+        hit = pairs.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+        classified = float(ours["p"].sum())
+        row |= {f"ft_{k}": v for k, v in _f1(hit.height, ours.height, want.height).items()} | {
+            "ft_l1": float((pairs["t"] - pairs["p"]).abs().sum()),
+            "ft_right": float(hit["p"].sum()) / classified if classified else None,
+            "ft_unclassified": 1 - classified if total else None,
+        }
+    # long format: arms report different metrics, and collected files share one header
+    metrics = {k: v for k, v in row.items() if k not in ("sample", "arm")}
+    pl.DataFrame(
+        {"sample": args.sample, "arm": args.arm, "metric": list(metrics),
+         "value": [None if v is None else float(v) for v in metrics.values()]},
+        schema={"sample": pl.Int64, "arm": pl.String, "metric": pl.String, "value": pl.Float64},
+    ).write_csv(args.out, separator="\t")  # fmt: skip
+    calibration.write_csv(args.out_calibration, separator="\t")
 
 
 def main() -> None:
@@ -1696,6 +1966,7 @@ def main() -> None:
     p.add_argument("--tool", default="kfp", choices=["kfp", "sylph"])
     p.add_argument("--function-taxon")
     p.add_argument("--truth-functions")
+    p.add_argument("--rank", default="genome", help="the table's rank naming the genomes")
     p.add_argument("--out", default="genome_score.tsv")
     p = sub.add_parser("subsample")
     for name in ("r1", "r2"):
@@ -1711,6 +1982,34 @@ def main() -> None:
     p.add_argument("--domains", help="domains.parquet (with --pfam-presence)")
     p.add_argument("--out", default="prior_score.tsv")
     p.add_argument("--out-calibration", default="prior_calibration.tsv")
+    p = sub.add_parser("uhgg-pick")
+    p.add_argument("--metadata", required=True)
+    p.add_argument("--replicates", type=int, default=5)
+    p.add_argument("--per-sample", type=int, default=30)
+    p.add_argument("--min-genomes", type=int, default=20)
+    p.add_argument("--min-completeness", type=float, default=90)
+    p.add_argument("--max-contamination", type=float, default=5)
+    p.add_argument("--distractors", type=int, default=300)
+    p.add_argument("--depth-min", type=float, default=0.05)
+    p.add_argument("--depth-max", type=float, default=10)
+    p.add_argument("--seed", type=int, default=1)
+    p = sub.add_parser("uhgg-sample")
+    for name in ("samples", "genomes-dir"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--sample", type=int, required=True)
+    p = sub.add_parser("uhgg-reps")
+    for name in ("catalogue", "species"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--out-dir", default="reps")
+    p = sub.add_parser("uhgg-score")
+    for name in ("truth", "species-index", "arm"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--sample", type=int, required=True)
+    p.add_argument("--kind", default="species", choices=["species", "genomes", "sylph"])
+    for name in ("pred", "presence", "pfam-presence", "units", "function-taxon"):
+        p.add_argument(f"--{name}")
+    p.add_argument("--out", default="species_score.tsv")
+    p.add_argument("--out-calibration", default="species_calibration.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
@@ -1722,7 +2021,8 @@ def main() -> None:
              "study-ladder": study_ladder, "study-unrelated": study_unrelated,
              "genome-set": genome_set, "genome-truth": genome_truth,
              "genome-score": genome_score, "subsample": subsample,
-             "prior-score": prior_score}  # fmt: skip
+             "prior-score": prior_score, "uhgg-pick": uhgg_pick, "uhgg-sample": uhgg_sample,
+             "uhgg-reps": uhgg_reps, "uhgg-score": uhgg_score}  # fmt: skip
     steps[args.step](args)
 
 
