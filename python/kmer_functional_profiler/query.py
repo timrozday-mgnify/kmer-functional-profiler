@@ -784,6 +784,7 @@ def em(
     max_iter: int = 1000,
     report: dict[str, float] | None = None,
     start: np.random.Generator | None = None,
+    items_hit: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -815,12 +816,26 @@ def em(
     ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over
     calls, and ``em_max_change`` (how far the furthest of those was from converging: see
     :func:`_fit_components`).
+
+    A ``weight`` column (genome mode: holder = genome, item = unit, weight = the genome's
+    content on it) makes a holder's expected hits on an item coverage x weight, and
+    ``m_g`` its total weight over all items, hit or not; all weights 1 is the plain EM.
+    The zero-inflated present fraction then needs ``items_hit(holders, coverage)``: the
+    items each holder would have hit if all present, sum over its items of
+    1 - exp(-coverage x weight) (default ``m_g`` (1 - exp(-coverage))); with it, a hit
+    item counts as present in a holder with its posterior probability given the item's hits
+    (the other holders at their means), not by the holder's share of its hits, so items
+    many holders carry (core genes) do not lower each one's present fraction. ``prior``
+    is for unweighted k-mers only.
     """
+    if prior is not None and (items_hit is not None or "weight" in kmers.columns):
+        raise ValueError("a present prior needs unweighted items")
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())
     hashes, row = _ids(kmers["hash"].to_numpy())
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
+    weight = kmers["weight"].to_numpy().astype(np.float64) if "weight" in kmers.columns else None
     del kmers, hashes  # the sorted copy is not needed through the fit
     m = m_g[units].astype(np.float64)
     lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
@@ -832,18 +847,35 @@ def em(
 
     def make_step(b: _Block) -> Step:
         h, mb, per_unit = hits[b.kmer], m[b.unit], len(b.unit)
+        wb = None if weight is None else weight[b.pairs]
 
         def over_units(x: np.ndarray) -> np.ndarray:  # per unit, sum of x over its k-mers
-            return np.bincount(b.c, weights=x[b.r], minlength=per_unit)
+            y = x[b.r] if wb is None else x[b.r] * wb
+            return np.bincount(b.c, weights=y, minlength=per_unit)
 
         def step(la: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             w = la * p
-            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer)) + b.offset
+            per_pair = w[b.c] if wb is None else w[b.c] * wb
+            mu = np.bincount(b.r, weights=per_pair, minlength=len(b.kmer)) + b.offset
             attributed = w * over_units(_div(h, mu))  # expected hits from each unit
             if zero_inflated:
                 kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
                 seen = -np.expm1(-la)  # chance a present k-mer is hit
-                if prior is None:
+                if items_hit is not None:
+                    # A hit item is present in a holder with its posterior given the item's
+                    # hits, the other holders at their means; not by its share of the hits,
+                    # which would count an item two holders both carry as half present.
+                    own = la[b.c] if wb is None else la[b.c] * wb
+                    others = np.maximum(mu[b.r] - p[b.c] * own, 0.0)
+                    log_lr = np.full(len(own), np.inf)  # sole holder of a hit item: present
+                    np.divide(own, others, out=log_lr, where=others > 0)
+                    log_lr = h[b.r] * np.log1p(log_lr) - own
+                    q = p[b.c]
+                    odds_out = (1 - q) * np.exp(np.minimum(-log_lr, 700.0))
+                    post = _div(q, q + odds_out)
+                    present = np.bincount(b.c, weights=post, minlength=per_unit)
+                    new_p = np.minimum(1.0, _div(present, items_hit(units[b.unit], la)))
+                elif prior is None:
                     new_p = np.minimum(1.0, _div(kmers_hit, mb * seen))
                 else:
                     # Unhit k-mers are present with odds p (1 - seen) : (1 - p).
@@ -865,7 +897,7 @@ def em(
         tol,
         max_iter,
         report,
-        pair_weight=lambda p: lam[col[p]] * pi[col[p]],
+        pair_weight=lambda p: lam[col[p]] * pi[col[p]] * (1.0 if weight is None else weight[p]),
     )
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0
@@ -1857,7 +1889,9 @@ def profile(
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
-    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
+    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit, and
+    ``component_dense`` labels the components the EM is fitted on (units linked by shared
+    dense hits, which tier 2 may not have sampled; null for units gather drops).
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
     present rather than hit by background, from the tier-2 k-mers gather gave it; units
@@ -1886,6 +1920,8 @@ def profile(
     ``extra`` indexes (same k, alphabet and hash scheme) are queried jointly with ``index``:
     their units compete with its units in gather, EM and the posterior, with ids offset by
     the units of the indexes before, and a ``source`` column (0 = ``index``) in the output.
+    An index built with ``role: decoy`` in its ``meta.json`` competes the same way, but its
+    units are reported as one row (:func:`collapse_decoys`).
 
     ``mask`` (:class:`~kmer_functional_profiler.mask.Mask`, built against ``index``) drops
     masked sampled hashes before any lookup and subtracts the masked postings from the unit
@@ -2247,6 +2283,10 @@ def profile(
             on="unit",
             how="left",
         ).with_columns(pl.col("kmers_dense").fill_null(0))
+        dense_components = component_labels(detected.select("unit", "hash"))
+        result = result.join(
+            dense_components.rename({"component": "component_dense"}), on="unit", how="left"
+        )
     if all_estimators:
         rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
         with timer("baselines"):
@@ -2280,6 +2320,12 @@ def profile(
         .drop("index")
         .sort("unit")
     )
+    if joint.dense:
+        result = result.with_columns(
+            component_dense=pl.when(pl.col("component_dense").is_not_null()).then(
+                pl.col("unit").min().over("component_dense")
+            )
+        )
     result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.
@@ -2292,4 +2338,33 @@ def profile(
             None if census_max is None else (census[0], census[1]),
             joint.max_hash("tier2") / 2**64,
         )
-    return result.filter(pl.col("aai_naive") >= min_aai) if min_aai > 0 else result
+    if min_aai > 0:
+        result = result.filter(pl.col("aai_naive") >= min_aai)
+    decoys = [i for i, ix in enumerate(joint.indexes) if ix.meta.get("role") == "decoy"]
+    return collapse_decoys(result, decoys) if decoys and "source" in result.columns else result
+
+
+def collapse_decoys(result: pl.DataFrame, decoys: list[int]) -> pl.DataFrame:
+    """Replace the units of each decoy index (``source`` in ``decoys``) by one row named
+    ``decoy``: ``hits``, ``hits_em``, ``kmers_hit``, ``reads`` and ``m_g`` summed over its
+    hit units (``reads`` counts a read once per unit it hits), ``coverage`` and
+    ``coverage_em`` over that ``m_g``, and ``decoy_units`` (units hit) and
+    ``decoy_detected`` (units given hits by the EM). Decoy units have already competed in
+    gather and the EM; this only keeps them out of the unit and label tables."""
+    is_decoy = pl.col("source").is_in(decoys)
+    rows = (
+        result.filter(is_decoy)
+        .group_by("source")
+        .agg(
+            pl.col("hits", "hits_em", "kmers_hit", "reads", "m_g").sum(),
+            decoy_units=pl.len().cast(pl.UInt32),
+            decoy_detected=(pl.col("hits_em") > 0).sum().cast(pl.UInt32),
+        )
+        .with_columns(
+            name=pl.lit("decoy"),
+            coverage=pl.col("hits") / pl.col("m_g"),
+            coverage_em=pl.col("hits_em") / pl.col("m_g"),
+        )
+        .sort("source")
+    )
+    return pl.concat([result.filter(~is_decoy), rows], how="diagonal_relaxed")

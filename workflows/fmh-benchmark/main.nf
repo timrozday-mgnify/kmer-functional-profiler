@@ -3,6 +3,7 @@
 // detection by other tools (--tools: DIAMOND, fmh-funprofiler, kMermaid, HUMAnN 3 and 4).
 // See README.md.
 
+include { STUDY_CLUSTER; STUDY_MEMBERS; STUDY_INDEX_BUILD; STUDY_INDEX_BUILD as REBUILD_INDEX } from '../study-index/main.nf'
 
 process FETCH {
     label 'process_single'
@@ -424,7 +425,9 @@ process PROFILE {
     script:
     // by_pfam: units carry Pfam labels (MGnify90 clusters), and the profile is summed per Pfam
     def out = by_pfam ? 'units.tsv' : 'profile.tsv'
-    def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet"
+    // a labelled extra index (the study ladder's study index) adds its labels, offset
+    def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet" +
+        (decoy ? ' \$(ls decoy/unit_pfam.parquet 2>/dev/null)' : '')
     def extra = (mask ? ' --mask mask' : '') + (decoy ? ' --extra-index decoy' : '')
     """
     ${params.kfp} query ${index} ${r1} ${r2} --out ${out} --draws ${params.draws} --kmers kmers.parquet \\
@@ -673,10 +676,331 @@ process DECOY_INDEX {
     "mkdir decoy_${cfg}"
 }
 
+// ---- Study ladder (phase 10; README, Study ladder): part of each sample's genomes as a
+// study index queried with an MGnify index, against a rebuild that includes them.
+
+process STUDY_FAA {
+    tag "seed ${seed}"
+    label 'process_single'
+
+    input:
+    tuple val(seed), path(genes)
+    path genomes
+    path domains
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(seed), path('study.faa'), path('study_pfam.parquet'), emit: study
+    path 'study_genomes.txt'
+
+    script:
+    """
+    ${params.bench} study-proteins --genomes-dir ${genomes} --genes ${genes} --domains ${domains} \
+        --fraction ${params.study_fraction} --seed ${seed}
+    """
+
+    stub:
+    "touch study.faa study_pfam.parquet study_genomes.txt"
+}
+
+process STUDY_REBUILD_TABLES {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(members, stageAs: 'members/*'), path(pfam, stageAs: 'pfam/*'), path(study_members), path(study_pfam), path(gene_units)
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), path('members.parquet'), path('pfam.parquet'), emit: tables
+
+    script:
+    """
+    ${params.bench} study-rebuild --members ${members} --pfam ${pfam} --study-members ${study_members} \
+        --study-pfam ${study_pfam} --gene-units ${gene_units} --min-id ${params.mgnify_min_id} \
+        --min-cov ${params.mgnify_min_cov}
+    """
+
+    stub:
+    "touch members.parquet pfam.parquet"
+}
+
+process STUDY_UNRELATED {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), path(base, stageAs: 'base.tsv'), path(joint, stageAs: 'joint.tsv')
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'study_unrelated.tsv', emit: unrelated
+
+    script:
+    "${params.bench} study-unrelated --base base.tsv --joint joint.tsv --run seed${sid}_${name}"
+
+    stub:
+    "touch study_unrelated.tsv"
+}
+
+process STUDY_LADDER {
+    label 'process_single'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path scores, stageAs: 'score*.tsv'
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'study_ladder.tsv'
+
+    script:
+    "${params.bench} study-ladder --scores ${scores}"
+
+    stub:
+    "touch study_ladder.tsv"
+}
+
 // ---- Other tools (--tools). Each writes its raw output to raw/; TOOL_PROFILE turns it into
 // a profile SCORE reads. Tools run in pinned containers
 // (-profile docker or singularity); the kMermaid and HUMAnN images are built by
 // containers/build.sh.
+
+// ---- Genome mode (phase 11; README, Genome mode): every genome of the record (the samples'
+// and the rest as distractors) annotated with each kfp-hashed index, a genome fit per
+// plain-arm profile of a plain sample, scored against the read-origin truth; sylph on the same
+// genomes as the DNA baseline.
+
+process GENOME_SET {
+    label 'process_single'
+
+    input:
+    path genomes
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'genome_set', emit: set
+
+    script:
+    "${params.bench} genome-set --genomes-dir ${genomes}"
+
+    stub:
+    "mkdir genome_set && touch genome_set/genomes.tsv"
+}
+
+process ANNOTATE_GENOMES {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(index)
+    path genome_set
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(name), path("genomes_${name}"), emit: index
+
+    script:
+    "${params.kfp} annotate-genomes ${index} ${genome_set}/genomes.tsv genomes_${name}"
+
+    stub:
+    "mkdir genomes_${name}"
+}
+
+process GENOME_FIT {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/genomes", mode: 'copy', saveAs: { f -> "seed${sid}_${name}_${f}" }
+
+    input:
+    tuple val(sid), val(label), val(name), path(profile), path(genome_index)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), val(label), val(name), path('genomes.tsv'), path('function_taxon.tsv'), emit: fit
+    tuple val(sid), val(name), path(profile), path(genome_index), path('genomes.tsv'), emit: prior
+    path 'summary.json'
+
+    script:
+    """
+    ${params.kfp} genomes ${profile} ${genome_index} genomes.tsv --summary summary.json \\
+        --function-taxon function_taxon.tsv
+    """
+
+    stub:
+    "touch genomes.tsv function_taxon.tsv summary.json"
+}
+
+process GENOME_TRUTH {
+    tag "seed ${sid}"
+    label 'process_single'
+    publishDir "${params.outdir}/truth", mode: 'copy', saveAs: { f -> "seed${sid}_${f}" }
+
+    input:
+    tuple val(sid), path(genes), path(truth_genes)
+    path kos
+    path domains  // [] without Pfam
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), path('truth_genomes.csv'), path('truth_function_genome.csv'), emit: truth
+
+    script:
+    """
+    ${params.bench} genome-truth --genes ${genes} --truth-genes ${truth_genes} --kos ${kos} \\
+        ${domains ? "--domains ${domains}" : ''}
+    """
+
+    stub:
+    "touch truth_genomes.csv truth_function_genome.csv"
+}
+
+process SYLPH_DB {
+    label 'process_medium'
+    container params.sylph_container
+
+    input:
+    path genomes
+
+    output:
+    path 'genomes.syldb', emit: db
+
+    script:
+    "sylph sketch -t ${task.cpus} -c ${params.sylph_c} -o genomes -g ${genomes}/*/*.fasta"
+
+    stub:
+    "touch genomes.syldb"
+}
+
+process SYLPH {
+    tag "seed ${sid}"
+    label 'process_medium'
+    container params.sylph_container
+    publishDir "${params.outdir}/genomes", mode: 'copy', saveAs: { "seed${sid}_sylph.tsv" }
+
+    input:
+    tuple val(sid), path(r1), path(r2)
+    path db
+
+    output:
+    tuple val(sid), path('sylph.tsv'), emit: profile
+
+    script:
+    """
+    sylph sketch -t ${task.cpus} -c ${params.sylph_c} -1 ${r1} -2 ${r2} -d reads
+    sylph profile -t ${task.cpus} ${db} reads/*.sylsp > sylph.tsv
+    """
+
+    stub:
+    "touch sylph.tsv"
+}
+
+process GENOME_SCORE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(label), val(name), path(genomes, stageAs: 'pred/*'), path(function_taxon, stageAs: 'ft/*'), path(truth), path(truth_functions)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'genome_score.tsv', emit: score
+
+    script:
+    def tool = name == 'sylph' ? '--tool sylph' : ''
+    def ft = function_taxon ? "--function-taxon ${function_taxon} --truth-functions ${truth_functions}" : ''
+    """
+    ${params.bench} genome-score --genomes ${genomes} --truth ${truth} --sample seed${sid} \\
+        --label ${label} --index ${name} ${tool} ${ft}
+    """
+
+    stub:
+    "touch genome_score.tsv"
+}
+
+process SUBSAMPLE {
+    tag "seed ${seed} x${fraction}"
+    label 'process_single'
+
+    input:
+    tuple val(seed), path(r1), path(r2), val(fraction)
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    tuple val("${seed}d${fraction}"), val(seed), path('sub_R1.fastq.gz'), path('sub_R2.fastq.gz'), val(fraction), emit: reads
+
+    script:
+    "${params.bench} subsample --r1 ${r1} --r2 ${r2} --fraction ${fraction} --seed ${seed}"
+
+    stub:
+    "touch sub_R1.fastq.gz sub_R2.fastq.gz"
+}
+
+process PRIOR_BUILD {
+    tag "${name}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), path(genome_index)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(name), path("carriage_${name}"), emit: carriage
+
+    script:
+    "${params.kfp_prior} build ${genome_index} carriage_${name}"
+
+    stub:
+    "mkdir carriage_${name}"
+}
+
+process PRIOR_UPDATE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/prior", mode: 'copy', saveAs: { f -> "seed${sid}_${name}_${f}" }
+
+    input:
+    tuple val(sid), val(name), path(profile), path(genome_index), path(genomes), path(carriage)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), val(name), path(genome_index), path('presence.tsv'), path('pfam_presence.tsv'), emit: presence
+
+    script:
+    // pfam_presence.tsv only with Pfam labels: an empty file otherwise
+    """
+    ${params.kfp_prior} update ${profile} ${genomes} ${genome_index} ${carriage} \\
+        --out presence.tsv --pfam-out pfam_presence.tsv
+    touch pfam_presence.tsv
+    """
+
+    stub:
+    "touch presence.tsv pfam_presence.tsv"
+}
+
+process PRIOR_SCORE {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), path(genome_index), path(presence), path(pfam_presence), val(fraction), path(truth_genomes), path(genes)
+    path domains  // [] without Pfam
+    path code, stageAs: 'code/*'  // bench.py: only here so -resume reruns on changes
+
+    output:
+    path 'prior_score.tsv', emit: score
+    path 'prior_calibration.tsv', emit: calibration
+
+    script:
+    def pfam = pfam_presence.size() > 0 && domains ? "--pfam-presence ${pfam_presence} --genes ${genes} --domains ${domains}" : ''
+    """
+    ${params.bench} prior-score --presence ${presence} --genome-index ${genome_index} \\
+        --truth-genomes ${truth_genomes} --fraction ${fraction} --sample seed${sid} --index ${name} ${pfam}
+    """
+
+    stub:
+    "touch prior_score.tsv prior_calibration.tsv"
+}
 
 process DIAMOND_DB {
     label 'process_medium'
@@ -945,6 +1269,13 @@ process SUMMARY {
     "touch summary.tsv scores.tsv"
 }
 
+// [seed, MGnify index name] of a study ladder run, seed<N>_<name>[_rebuild]
+def studyRun(String run) {
+    def m = run =~ /^seed(\d+)_(.+?)(_rebuild)?$/
+    m.find()
+    return [m.group(1), m.group(2)]
+}
+
 // Output of a git command in the pipeline's checkout (for run.json).
 def git(List cmd) {
     return (['git', '-C', projectDir.toString()] + cmd).execute().text.trim()
@@ -1136,6 +1467,18 @@ workflow BENCHMARK {
 
     def ch_sid_reads = ch_reads.map { sid, _seed, r1, r2 -> [sid, r1, r2] }
     def ch_variants = ch_sid_reads.map { sid, r1, r2 -> ['raw', sid, r1, r2] }
+    // Depth ladder (kfp-prior; README, Genome mode): subsampled plain samples, queried raw and
+    // used by genome mode only (no truth is mapped for them, so nothing else scores them)
+    def ladder_fractions = params.depth_ladder.toString().tokenize(',')*.trim()*.toDouble()
+    def ch_ladder = channel.empty()  // sid, seed, fraction
+    if (ladder_fractions) {
+        if (!params.genome_mode) {
+            error "--depth_ladder needs --genome_mode"
+        }
+        SUBSAMPLE(SIMULATE.out.reads.filter { 0d in fractions }.combine(channel.fromList(ladder_fractions)), bench_py)
+        ch_variants = ch_variants.mix(SUBSAMPLE.out.reads.map { sid, _seed, r1, r2, _f -> ['raw', sid, r1, r2] })
+        ch_ladder = SUBSAMPLE.out.reads.map { sid, seed, _r1, _r2, f -> [sid, seed.toString(), f] }
+    }
     if ('fastp' in kinds) {
         FASTP(ch_sid_reads)
         ch_variants = ch_variants.mix(FASTP.out.reads)
@@ -1175,6 +1518,56 @@ workflow BENCHMARK {
         .map { _kind, sid, r1, r2, arm, label, name, index, by_pfam, mask, decoy ->
             [sid, r1, r2, label, name, index, by_pfam, arm.name, arm.args, arm.mask ? mask : [], arm.decoy ? decoy : []]
         }
+
+    // Study ladder: per seed and MGnify index built from members, a study index of part of the
+    // sample's genomes queried jointly (arm study) and a rebuild including them (arm rebuild)
+    def ladder = params.study_ladder ? mgnify.findAll { it.members } : []
+    if (params.study_ladder) {
+        if (!('pfam' in labels)) error '--study_ladder needs the pfam label (the study is scored on Pfam)'
+        if (!ladder || ladder.any { !it.pfam }) error '--study_ladder needs mgnify_indexes built from members, with pfam'
+        STUDY_FAA(SAMPLE.out.sample.map { seed, _fna, genes -> [seed, genes] }, FETCH.out.genomes, ch_domains, bench_py)
+        def ch_faa = STUDY_FAA.out.study.map { seed, faa, _pfam -> ["seed${seed}".toString(), faa] }
+        STUDY_CLUSTER(ch_faa, params.study_cluster_args)
+        STUDY_MEMBERS(ch_faa.join(STUDY_CLUSTER.out.clusters))
+        // seed, study members, study pfam
+        def ch_study = STUDY_MEMBERS.out.members
+            .join(STUDY_FAA.out.study.map { seed, _faa, pfam -> ["seed${seed}".toString(), pfam] })
+            .map { name, members, pfam -> [name - 'seed', members, pfam] }
+        def ch_base = ch_mgnify.filter { name, _index -> name in ladder*.name }
+        STUDY_INDEX_BUILD(
+            ch_study.combine(ch_base).map { seed, members, pfam, name, index -> ["seed${seed}_${name}", members, pfam, index] },
+            '',
+        )
+        STUDY_REBUILD_TABLES(
+            ch_study.combine(channel.fromList(ladder).map { cfg -> [cfg.name, files(cfg.members), file(cfg.pfam)] })
+                .map { seed, members, pfam, name, base_members, base_pfam -> [name, seed, base_members, base_pfam, members, pfam] }
+                .combine(ch_gene_units, by: 0)
+                .map { name, seed, base_members, base_pfam, members, pfam, gene_units ->
+                    ["seed${seed}_${name}", base_members, base_pfam, members, pfam, gene_units] },
+            bench_py,
+        )
+        REBUILD_INDEX(
+            STUDY_REBUILD_TABLES.out.tables
+                .map { run, members, pfam -> studyRun(run).reverse() + [members, pfam] }
+                .combine(ch_base, by: 0)
+                .map { name, seed, members, pfam, index -> ["seed${seed}_${name}_rebuild", members, pfam, index] },
+            '',
+        )
+        // the plain samples (no host spike-in): sid is the seed
+        def ch_plain = ch_reads.filter { sid, seed, _r1, _r2 -> sid == seed.toString() }
+            .map { sid, _seed, r1, r2 -> [sid, r1, r2] }
+        def ch_joint = STUDY_INDEX_BUILD.out.index
+            .map { run, study -> studyRun(run).reverse() + [study] }
+            .combine(ch_base, by: 0)
+            .map { name, seed, study, base -> [seed, name, study, base] }
+        def ch_rebuilt = REBUILD_INDEX.out.index.map { run, index -> studyRun(run) + [index] }
+        ch_runs = ch_runs.mix(
+            ch_plain.combine(ch_joint, by: 0)
+                .map { sid, r1, r2, name, study, base -> [sid, r1, r2, 'pfam', name, base, true, 'study', '', [], study] },
+            ch_plain.combine(ch_rebuilt, by: 0)
+                .map { sid, r1, r2, name, index -> [sid, r1, r2, 'pfam', name, index, true, 'rebuild', '', [], []] },
+        )
+    }
 
     PROFILE(ch_runs, ch_code)
     // sid, label, name, arm, profile, kmers, truth
@@ -1233,8 +1626,18 @@ workflow BENCHMARK {
         bench_py,
     )
     SUMMARY(SCORE.out.score.collect())
+    if (params.study_ladder) {
+        STUDY_LADDER(SCORE.out.score.collect(), bench_py)
+        STUDY_UNRELATED(
+            PROFILE.out.units.filter { it[2] == '' }.map { sid, name, _arm, units -> [sid, name, units] }
+                .join(PROFILE.out.units.filter { it[2] == 'study' }.map { sid, name, _arm, units -> [sid, name, units] }, by: [0, 1]),
+            bench_py,
+        )
+        STUDY_UNRELATED.out.unrelated.collectFile(name: 'study_unrelated.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+    }
     // unit-level detection and AAI of the MGnify indexes against the DIAMOND truth
     def ch_aai = PROFILE.out.units
+        .filter { it[2] !in ['study', 'rebuild'] }  // the ladder's indexes have other units
         .map { sid, name, arm, units -> [name, sid, arm, units] }
         .combine(ch_gene_units, by: 0)  // name, sid, arm, units, gene_units
         .map { name, sid, arm, units, gene_units -> [sid, name, arm, units, gene_units] }
@@ -1253,6 +1656,65 @@ workflow BENCHMARK {
             .combine(ch_mgnify, by: 0),  // name, arm, units, genes, gene_units, index
         bench_py,
     )
+
+    // Genome mode (phase 11): kfp-hashed indexes (not fmh_compat), plain arm, plain samples;
+    // MGnify indexes' unit profiles (units.tsv), not the per-Pfam sums
+    if (params.genome_mode) {
+        GENOME_SET(FETCH.out.genomes, bench_py)
+        ANNOTATE_GENOMES(
+            ch_indexes.filter { it[1] != 'fmh_compat' }.map { label, name, index, _by_pfam -> [name, index] },
+            GENOME_SET.out.set,
+            ch_code,
+        )
+        def by_pfam = mgnify*.name
+        def ch_unit_profiles = PROFILE.out.profile
+            .filter { it[3] == '' && !(it[2] in by_pfam) }
+            .map { sid, label, name, _arm, profile, _kmers -> [name, sid, label, profile] }
+            .mix(PROFILE.out.units.filter { it[2] == '' }.map { sid, name, _arm, units -> [name, sid, 'pfam', units] })
+            .filter { _name, sid, _label, _profile -> sid ==~ /\d+(d[\d.]+)?/ }  // not host spike-ins
+        GENOME_FIT(
+            ch_unit_profiles.combine(ANNOTATE_GENOMES.out.index, by: 0)
+                .map { name, sid, label, profile, gi -> [sid, label, name, profile, gi] },
+            ch_code,
+        )
+        GENOME_TRUTH(
+            SAMPLE.out.sample.map { seed, _fna, genes -> [seed.toString(), genes] }.join(TRUTH.out.genes),
+            FETCH.out.kos,
+            ch_domains,
+            bench_py,
+        )
+        SYLPH(ch_tool_reads, SYLPH_DB(FETCH.out.genomes).db)
+        GENOME_SCORE(
+            GENOME_FIT.out.fit
+                .mix(SYLPH.out.profile.map { sid, profile -> [sid, 'dna', 'sylph', profile, []] })
+                .combine(GENOME_TRUTH.out.truth, by: 0),
+            bench_py,
+        )
+        GENOME_SCORE.out.score.collectFile(name: 'genome_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+        // kfp-prior on every fitted sample (full samples at fraction 1, and the ladder's rungs)
+        PRIOR_BUILD(ANNOTATE_GENOMES.out.index, ch_code)
+        PRIOR_UPDATE(
+            GENOME_FIT.out.prior.map { sid, name, profile, gi, genomes -> [name, sid, profile, gi, genomes] }
+                .combine(PRIOR_BUILD.out.carriage, by: 0)
+                .map { name, sid, profile, gi, genomes, carriage -> [sid, name, profile, gi, genomes, carriage] },
+            ch_code,
+        )
+        def ch_rungs = ch_ladder.mix(ch_reads.filter { sid, seed, _r1, _r2 -> sid == seed.toString() }
+            .map { sid, seed, _r1, _r2 -> [sid, seed.toString(), 1.0d] })
+        def ch_seed_truth = GENOME_TRUTH.out.truth.map { sid, genomes, _functions -> [sid, genomes] }
+            .join(SAMPLE.out.sample.map { seed, _fna, genes -> [seed.toString(), genes] })  // seed, truth, genes
+        PRIOR_SCORE(
+            PRIOR_UPDATE.out.presence
+                .combine(ch_rungs, by: 0)  // sid, name, gi, presence, pfam, seed, fraction
+                .map { sid, name, gi, presence, pfam, seed, f -> [seed, sid, name, gi, presence, pfam, f] }
+                .combine(ch_seed_truth, by: 0)
+                .map { _seed, sid, name, gi, presence, pfam, f, truth, genes -> [sid, name, gi, presence, pfam, f, truth, genes] },
+            ch_domains,
+            bench_py,
+        )
+        PRIOR_SCORE.out.score.collectFile(name: 'prior_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+        PRIOR_SCORE.out.calibration.collectFile(name: 'prior_calibration.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
+    }
 
     // run.json: what produced the results in outdir (reads, indexes, code, status). params and
     // workflow are read here: inside the handler, names resolve against the workflow metadata.

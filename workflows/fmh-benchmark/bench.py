@@ -28,7 +28,16 @@
   the clusters of several samples' unit profiles and scored on the other half (see
   :func:`fit_aai_calibration`).
 - ``pfam-profile``: a profile against an index with Pfam labels (``unit_pfam.parquet``, e.g.
-  MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams.
+  MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams; several
+  label tables for a joint query (``--extra-index``), in the query's index order.
+- ``study-proteins``: the study ladder's study (phase 10): the proteins of a random
+  ``--fraction`` of a sample's genomes, as FASTA, with their Pfam domains.
+- ``study-rebuild``: the members and Pfam tables of a rebuild that includes the study: base
+  members plus the study's proteins, each in its nearest MGnify90 cluster where it passes
+  ``--min-id``/``--min-cov``, else in its own linclust cluster.
+- ``study-ladder``: base, base + study index and rebuild scores side by side, the share of
+  the rebuild's completeness gain the joint query recovers, and whether base units the
+  study does not touch changed.
 - ``score``: purity and completeness of one profile against a truth table, one row per
   count present (``kmers_hit``; ``kmers_unique`` after gather; ``kmers_wta`` and
   ``kmers_ufirst`` after winner-take-all and uniqueness-first) and ``--min-hits``
@@ -45,6 +54,13 @@
 - ``summary``: mean and sd of the scores per index, count and threshold.
 - ``cost``: wall time, CPU time and peak memory per step and index or tool, from the raw
   Nextflow trace.
+- ``genome-set``, ``genome-truth``, ``genome-score``: genome mode (phase 11): every genome
+  of the record as protein FASTA for ``annotate-genomes``; per-sample genome and
+  (genome, function) truth from the per-gene truth; and a genome fit (or sylph) scored
+  against it.
+- ``subsample``, ``prior-score``: kfp-prior's depth ladder (phase 11): read pairs kept at
+  a fraction; unit and Pfam presence, observed vs updated, by carrier depth, and the
+  calibration of zero-hit units.
 - ``iss``: ``iss`` with its arguments, the perfect error model patched (see :func:`iss`).
 """
 
@@ -57,7 +73,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Final
 
 import mappy
 import numpy as np
@@ -751,19 +767,33 @@ def aai_score_step(args: argparse.Namespace) -> None:
     )
 
 
-def pfam_profile(args: argparse.Namespace) -> None:
-    """Sum a unit profile per Pfam: counts and point estimates add over the units carrying
-    a Pfam; ``present_prob`` is the largest; intervals and per-unit columns are dropped."""
-    profile = read_profile(args.profile)
-    labels = pl.read_parquet(args.unit_pfam)
+def pfam_names(labels: pl.DataFrame) -> pl.DataFrame:
+    """``unit`` and ``name`` (``PF01007``) of a ``unit_pfam`` table."""
     accession = pl.col("pfam_accession")
-    labels = labels.select(
+    return labels.select(
         "unit",
         # MGnify stores the accession's number (1007 for PF01007); hmmsearch gives PF01007.23
         name=("PF" + accession.cast(pl.String).str.zfill(5))
         if labels.schema["pfam_accession"].is_integer()
         else accession.str.replace(r"\.\d+$", ""),
     )
+
+
+def pfam_profile(args: argparse.Namespace) -> None:
+    """Sum a unit profile per Pfam: counts and point estimates add over the units carrying
+    a Pfam; ``present_prob`` is the largest; intervals and per-unit columns are dropped."""
+    profile = read_profile(args.profile)
+    # several tables: a joint query, whose unit ids are offset by the units of the indexes
+    # before (each table's units.parquet beside it)
+    offsets = itertools.accumulate(
+        (pl.scan_parquet(Path(p).with_name("units.parquet")).select(pl.len()).collect().item()
+         for p in args.unit_pfam[:-1]),
+        initial=0,
+    )  # fmt: skip
+    labels = pl.concat(
+        pfam_names(pl.read_parquet(p)).with_columns(pl.col("unit").cast(pl.Int64) + offset)
+        for p, offset in zip(args.unit_pfam, offsets, strict=True)
+    ).cast({"unit": profile.schema["unit"]})
     summed = [c for pair in RULES for c in pair if c in profile.columns] + ["hits"]
     (
         profile.drop("name", strict=False)
@@ -776,6 +806,132 @@ def pfam_profile(args: argparse.Namespace) -> None:
         .sort("name")
         .write_csv(args.out, separator="\t")
     )
+
+
+def study_proteins(args: argparse.Namespace) -> None:
+    """A study for the study ladder: ``--fraction`` of the sample's genomes (at least one),
+    drawn with ``--seed``, as if recovered as MAGs. Writes their proteins (``study.faa``,
+    named by gene), Pfam domains (``study_pfam.parquet``: ``protein_id``,
+    ``pfam_accession``) and names (``study_genomes.txt``)."""
+    genomes = sorted(
+        pl.read_parquet(args.genes)["contig"].str.split("|").list.first().unique().to_list()
+    )
+    n = max(1, round(args.fraction * len(genomes)))
+    chosen = sorted(random.Random(args.seed).sample(genomes, n))
+    proteins = pl.concat(
+        pl.read_csv(Path(args.genomes_dir) / g / f"{g}_mapping.csv",
+                    columns=["gene_name", "aa_sequence"], schema_overrides=GENOME_COLUMNS)
+        for g in chosen
+    ).drop_nulls().unique("gene_name", keep="first", maintain_order=True)  # fmt: skip
+    with open(args.out, "w") as out:
+        for name, seq in proteins.iter_rows():
+            out.write(f">{name}\n{seq}\n")
+    (
+        pl.read_parquet(args.domains)
+        .filter(pl.col("gene_name").is_in(proteins["gene_name"].implode()))
+        .select(protein_id="gene_name", pfam_accession="pfam")
+        .unique()
+        .sort("protein_id", "pfam_accession")
+        .write_parquet(args.out_pfam)
+    )
+    Path(args.out_genomes).write_text("\n".join(chosen) + "\n")
+
+
+def _member_paths(paths: list[str]) -> list[str]:
+    return [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in paths]
+
+
+def study_rebuild(args: argparse.Namespace) -> None:
+    """Members and Pfam tables of the base plus the study (``study-ladder``'s rebuild arm).
+    A study protein joins its best MGnify90 cluster (``gene_units`` rank 1) where identity
+    and both coverages pass ``--min-id``/``--min-cov``, as a member of that cluster would;
+    otherwise it stays in its linclust cluster. Ids become strings, as the study's are."""
+    columns = ["protein_id", "cluster_rep", "full_length", "sequence"]
+    base = pl.scan_parquet(_member_paths(args.members)).select(columns)
+    nearest = (
+        pl.read_parquet(args.gene_units)
+        .filter(
+            pl.col("rank") == 1,
+            pl.col("identity") >= args.min_id,
+            pl.col("qcov") >= args.min_cov,
+            pl.col("scov") >= args.min_cov,
+        )
+        .select(protein_id="gene_name", nearest=pl.col("cluster_rep").cast(pl.String))
+    )
+    study = (
+        pl.read_parquet(args.study_members)
+        .join(nearest, on="protein_id", how="left")
+        .with_columns(cluster_rep=pl.coalesce("nearest", "cluster_rep"))
+        .select(columns)
+    )
+    pl.concat(
+        [base.with_columns(pl.col("protein_id", "cluster_rep").cast(pl.String)), study.lazy()]
+    ).sink_parquet(args.out)
+    pfam = pl.read_parquet(args.pfam, columns=["protein_id", "pfam_accession"])
+    pl.concat(
+        [
+            pfam_names(pfam.rename({"protein_id": "unit"})).select(
+                protein_id=pl.col("unit").cast(pl.String), pfam_accession="name"
+            ),
+            pl.read_parquet(args.study_pfam),
+        ]
+    ).write_parquet(args.out_pfam)
+
+
+def study_ladder(args: argparse.Namespace) -> None:
+    """The study ladder's gate (plan, Additional references: Evaluation). From the scores of
+    the plain arm (base), ``study`` (base + study index, joint) and ``rebuild`` per sample,
+    index, count, estimate and threshold: each arm's completeness and purity, and
+    ``recovered`` = (joint - base) / (rebuild - base) completeness (null without a gain)."""
+    keys = ["sample", "index", "count", "abundance", "min_hits"]
+    scores = pl.concat(
+        [pl.read_csv(p, separator="\t", schema_overrides={"arm": pl.String}) for p in args.scores],
+        how="diagonal_relaxed",
+    ).with_columns(pl.col("arm").fill_null(""))
+    arms = {"": "base", "study": "joint", "rebuild": "rebuild"}
+    wide = None
+    for arm, tag in arms.items():
+        part = scores.filter(pl.col("arm") == arm).select(
+            *keys, pl.col("completeness").alias(f"completeness_{tag}"),
+            pl.col("purity").alias(f"purity_{tag}"),
+        )  # fmt: skip
+        wide = part if wide is None else wide.join(part, on=keys, how="inner", nulls_equal=True)
+    assert wide is not None
+    gain = pl.col("completeness_rebuild") - pl.col("completeness_base")
+    wide = wide.with_columns(
+        recovered=pl.when(gain > 0).then(
+            (pl.col("completeness_joint") - pl.col("completeness_base")) / gain
+        )
+    )
+    wide.sort(keys).write_csv(args.out, separator="\t")
+
+
+def study_unrelated(args: argparse.Namespace) -> None:
+    """From a base and a joint (base + study) unit profile: base units whose components in
+    the joint query (tier 2 and dense) hold no study unit (``unrelated``), and how many changed
+    ``hits``, ``kmers_unique`` or ``coverage_em`` (``unrelated_changed``; should be 0)."""
+    alone, joint = read_profile(args.base), read_profile(args.joint)
+    # linked in tier 2 (gather) or, with a dense tier, in the dense hits the EM is fitted on
+    links = [c for c in ("component", "component_dense") if c in joint.columns]
+    study = joint.filter(pl.col("source") > 0)
+    own = joint.filter(
+        pl.col("source") == 0,
+        *(
+            ~pl.col(c).is_in(study[c].drop_nulls().unique().implode()).fill_null(True)
+            for c in links
+        ),
+    )
+    compared = ["hits", "kmers_unique", "coverage_em"]
+    both = own.select("unit", *compared).join(
+        alone.select("unit", *compared), on="unit", how="left", suffix="_alone"
+    )
+    diff = [
+        (pl.col(c) - pl.col(f"{c}_alone")).abs() > 1e-9 * (1 + pl.col(c).abs()) for c in compared
+    ]
+    changed = int(both.select(pl.any_horizontal(d.fill_null(True) for d in diff).sum()).item())
+    pl.DataFrame(
+        {"run": [args.run], "unrelated": [own.height], "unrelated_changed": [changed]}
+    ).write_csv(args.out, separator="\t")
 
 
 def abundance_scores(truth: pl.DataFrame, estimate: pl.DataFrame) -> dict[str, float | None]:
@@ -1167,6 +1323,240 @@ def iss(argv: list[str]) -> None:
     iss.app.main()
 
 
+def genome_set(args: argparse.Namespace) -> None:
+    """Genome mode's reference set (phase 11): every genome of the record, the samples'
+    and all others as distractors, as protein FASTA (``--out-dir``/``{genome}.faa``, from
+    its mapping table) and ``genomes.tsv`` (``genome``, ``path``) for ``annotate-genomes``."""
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    root = Path(args.genomes_dir)
+    names = sorted(p.name for p in root.iterdir() if (p / f"{p.name}.fasta").exists())
+    for g in names:
+        proteins = (
+            pl.read_csv(root / g / f"{g}_mapping.csv", columns=["gene_name", "aa_sequence"],
+                        schema_overrides=GENOME_COLUMNS)
+            .drop_nulls()
+            .unique("gene_name", keep="first", maintain_order=True)
+        )  # fmt: skip
+        with open(out / f"{g}.faa", "w") as f:
+            for name, seq in proteins.iter_rows():
+                f.write(f">{name}\n{seq}\n")
+    (out / "genomes.tsv").write_text("genome\tpath\n" + "".join(f"{g}\t{g}.faa\n" for g in names))
+
+
+def genome_truth(args: argparse.Namespace) -> None:
+    """Genome mode's truth for one sample, from the per-gene truth (``truth --out-genes``):
+    per genome its read ``depth`` (aligned bases over gene bases, all its genes) and
+    ``relative_abundance`` (share of Σ depth: cells, not reads), written to ``--out``; and
+    per (genome, KO) and (genome, Pfam) the summed depth of its genes carrying it
+    (``kind``, ``genome``, ``label``, ``depth``) to ``--out-functions``."""
+    genes = pl.read_parquet(args.genes).select(
+        "gene_name", genome=pl.col("contig").str.split("|").list.first(),
+        length=pl.col("end") - pl.col("start"),
+    )  # fmt: skip
+    covered = genes.join(pl.read_csv(args.truth_genes), on="gene_name", how="left").with_columns(
+        pl.col("bases", "depth").fill_null(0)
+    )
+    per_genome = covered.group_by("genome").agg(
+        depth=pl.col("bases").sum() / pl.col("length").sum()
+    )
+    per_genome.with_columns(relative_abundance=pl.col("depth") / pl.col("depth").sum()).sort(
+        "genome"
+    ).write_csv(args.out)
+    labels = [read_kos(args.kos).select(gene_name="gene_id", label="ko_id", kind=pl.lit("ko"))]
+    if args.domains:
+        domains = pl.read_parquet(args.domains).select("gene_name", label="pfam")
+        labels.append(domains.unique().with_columns(kind=pl.lit("pfam")))
+    (
+        covered.join(pl.concat(labels), on="gene_name")
+        .group_by("kind", "genome", "label")
+        .agg(pl.col("depth").sum())
+        .filter(pl.col("depth") > 0)
+        .sort("kind", "genome", "label")
+        .write_csv(args.out_functions)
+    )
+
+
+def _f1(tp: int, n_pred: int, n_truth: int) -> dict[str, float]:
+    purity, completeness = tp / max(n_pred, 1), tp / max(n_truth, 1)
+    f1 = 2 * purity * completeness / (purity + completeness) if tp else 0.0
+    return {"purity": purity, "completeness": completeness, "f1": f1}
+
+
+def genome_score(args: argparse.Namespace) -> None:
+    """Genome detection and abundance of one fit (``genomes`` output, or a sylph profile
+    with ``--tool sylph``) against ``genome-truth``: purity, completeness and F1 over the
+    genomes with reads; L1 between relative abundances over their union; Spearman over the
+    true positives. With ``--function-taxon``, the function x genome table against the
+    (genome, ``--label``) truth: L1 between shares (ours over the total, so unclassified
+    costs), F1 over (genome, function) pairs, ``ft_right`` (the share of classified hits
+    on true pairs) and ``ft_unclassified``. Genomes of an ambiguity group reported
+    together (names joined by commas) match no truth genome."""
+    from scipy.stats import spearmanr
+
+    if args.tool == "sylph":
+        raw = pl.read_csv(args.genomes, separator="\t")
+        pred = raw.select(
+            name=pl.col("Genome_file").str.split("/").list.last().str.replace(r"\.fasta$", ""),
+            relative_abundance=pl.col("Taxonomic_abundance") / 100,
+        )
+    else:
+        types = {"name": pl.String, "relative_abundance": pl.Float64}  # typed when empty
+        pred = pl.read_csv(args.genomes, separator="\t", schema_overrides=types).select(*types)
+    truth = pl.read_csv(args.truth).filter(pl.col("depth") > 0)
+    both = truth.select("genome", t="relative_abundance").join(
+        pred.select(genome="name", p="relative_abundance"), on="genome", how="full",
+        coalesce=True,
+    ).fill_null(0.0)  # fmt: skip
+    tp = both.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+    row: dict[str, object] = {
+        "sample": args.sample, "label": args.label, "index": args.index,
+        "n_truth": truth.height, "n_pred": pred.height, "tp": tp.height,
+        **_f1(tp.height, pred.height, truth.height),
+        "l1": float((both["t"] - both["p"]).abs().sum()),
+        "spearman": float(spearmanr(tp["t"], tp["p"]).statistic) if tp.height > 2 else None,
+    }  # fmt: skip
+    if args.function_taxon:
+        ft = pl.read_csv(args.function_taxon, separator="\t",
+                         schema_overrides={"taxon": pl.String, "hits_em": pl.Float64})  # fmt: skip
+        total = float(ft.filter(pl.col("rank") == "total")["hits_em"].sum())
+        genome = ft.filter(pl.col("rank") == "genome")
+        ours = genome.filter(pl.col("taxon") != "unclassified").select(
+            genome="taxon", label="function", p=pl.col("hits_em") / max(total, 1e-300)
+        )
+        want = pl.read_csv(args.truth_functions).filter(pl.col("kind") == args.label)
+        want = want.select("genome", "label", t=pl.col("depth") / pl.col("depth").sum())
+        pairs = want.join(ours, on=["genome", "label"], how="full", coalesce=True).fill_null(0.0)
+        hit = pairs.filter((pl.col("t") > 0) & (pl.col("p") > 0))
+        classified = float(ours["p"].sum())
+        row |= {f"ft_{k}": v for k, v in _f1(hit.height, ours.height, want.height).items()} | {
+            "ft_l1": float((pairs["t"] - pairs["p"]).abs().sum()),
+            "ft_right": float(hit["p"].sum()) / classified if classified else None,
+            "ft_unclassified": 1 - classified if total else None,
+        }
+    pl.DataFrame([row]).write_csv(args.out, separator="\t")
+
+
+def subsample(args: argparse.Namespace) -> None:
+    """A rung of the depth ladder (phase 11, kfp-prior): each read pair kept with
+    probability ``--fraction``, drawn with ``--seed``, so every genome's depth scales by it."""
+    rng = random.Random(args.seed)
+    with (
+        gzip.open(args.r1, "rt") as i1, gzip.open(args.r2, "rt") as i2,
+        gzip.open("sub_R1.fastq.gz", "wt", compresslevel=1) as o1,
+        gzip.open("sub_R2.fastq.gz", "wt", compresslevel=1) as o2,
+    ):  # fmt: skip
+        for rec1, rec2 in zip(_records(i1), _records(i2), strict=True):
+            if rng.random() < args.fraction:
+                o1.write(rec1)
+                o2.write(rec2)
+
+
+DEPTH_BINS: Final = [0.0, 0.05, 0.1, 0.3, 1.0, 3.0, float("inf")]
+PROB_BINS: Final = [i / 10 for i in range(11)]
+
+
+def _accession(col: str) -> pl.Expr:
+    """Pfam accessions as ``PF01007``, from MGnify's numbers or versioned names."""
+    return (
+        pl.col(col)
+        .cast(pl.String)
+        .str.replace(r"\.\d+$", "")
+        .map_elements(
+            lambda a: a if a.startswith("PF") else f"PF{int(a):05d}", return_dtype=pl.String
+        )
+    )
+
+
+def _by_depth(truth: pl.DataFrame, predicted: set, level: str) -> list[dict[str, Any]]:
+    """Completeness per bin of the depth of the deepest sample genome carrying each true
+    item (``item``, ``depth``), observed and updated (``predicted``: {kind: items})."""
+    binned = truth.with_columns(
+        bin=pl.col("depth").cut(DEPTH_BINS[1:-1], left_closed=True).cast(pl.String)
+    )
+    rows = []
+    for (label,), part in binned.group_by("bin"):
+        items = set(part["item"].to_list())
+        rows.append({"level": level, "bin": label, "n_truth": len(items)}
+                    | {f"completeness_{k}": len(items & v) / len(items)
+                       for k, v in predicted.items()})  # fmt: skip
+    every = set(truth["item"].to_list())
+    rows.append({"level": level, "bin": "all", "n_truth": len(every)}
+                | {f"completeness_{k}": len(every & v) / max(len(every), 1)
+                   for k, v in predicted.items()}
+                | {f"purity_{k}": len(every & v) / max(len(v), 1) for k, v in predicted.items()}
+                | {f"n_pred_{k}": len(v) for k, v in predicted.items()})  # fmt: skip
+    return rows
+
+
+def prior_score(args: argparse.Namespace) -> None:
+    """kfp-prior on a depth-ladder rung against what the sample's genomes carry: units
+    (their proteins' best units in the genome index) and, with ``--pfam-presence``, Pfams
+    (their genes' domains). Completeness per bin of carrier depth (the full sample's
+    genome depth x ``--fraction``) for the observed (``present_prob`` >= 0.5 with hits) and
+    updated (``present_prob_updated`` >= 0.5) calls, and purity over all; and, in
+    ``--out-calibration``, the units with zero hits per bin of ``present_prob_updated``:
+    their mean prediction and the share truly carried."""
+    gi = Path(args.genome_index)
+    names = pl.read_csv(gi / "genomes.tsv", separator="\t").select("genome", "name")
+    depth = pl.read_csv(args.truth_genomes).select(
+        name="genome", depth=pl.col("depth") * args.fraction
+    )
+    sample = names.join(depth, on="name")
+    units = (
+        pl.read_parquet(gi / "genome_best.parquet")
+        .join(sample.cast({"genome": pl.UInt32}), on="genome")
+        .group_by("unit")
+        .agg(pl.col("depth").max())
+        .select(item=pl.col("unit").cast(pl.Int64), depth="depth")
+    )
+    presence = pl.read_csv(args.presence, separator="\t")
+    called = {
+        "observed": set(presence.filter((pl.col("hits") > 0) & (pl.col("present_prob") >= 0.5))
+                        ["unit"].to_list()),
+        "updated": set(presence.filter(pl.col("present_prob_updated") >= 0.5)["unit"].to_list()),
+    }  # fmt: skip
+    rows = _by_depth(units, called, "unit")
+    if args.pfam_presence:
+        genome_of = pl.read_parquet(args.genes).select(
+            "gene_name", name=pl.col("contig").str.split("|").list.first()
+        )
+        pfams = (
+            pl.read_parquet(args.domains)
+            .join(genome_of, on="gene_name")
+            .join(depth, on="name")
+            .group_by("pfam")
+            .agg(pl.col("depth").max())
+            .select(item=_accession("pfam"), depth="depth")
+        )
+        pp = pl.read_csv(args.pfam_presence, separator="\t").with_columns(
+            item=_accession("pfam_accession")
+        )
+        called = {
+            "observed": set(pp.filter(pl.col("present_prob_observed") >= 0.5)["item"].to_list()),
+            "updated": set(pp.filter(pl.col("present_prob_updated") >= 0.5)["item"].to_list()),
+        }
+        rows += _by_depth(pfams, called, "pfam")
+    keys = {"sample": args.sample, "fraction": args.fraction, "index": args.index}
+    pl.DataFrame([keys | r for r in rows]).write_csv(args.out, separator="\t")
+    zero = presence.filter(pl.col("hits") == 0).with_columns(
+        carried=pl.col("unit").is_in(units["item"].implode()),
+        bin=pl.col("present_prob_updated").cut(PROB_BINS[1:-1], left_closed=True).cast(pl.String),
+    )
+    (
+        zero.group_by("bin")
+        .agg(
+            n=pl.len(),
+            predicted=pl.col("present_prob_updated").mean(),
+            carried=pl.col("carried").mean(),
+        )  # fmt: skip
+        .with_columns(**{k: pl.lit(v) for k, v in keys.items()})
+        .select(*keys, "bin", "n", "predicted", "carried")
+        .sort("bin")
+        .write_csv(args.out_calibration, separator="\t")
+    )
+
+
 def main() -> None:
     if sys.argv[1:2] == ["iss"]:  # iss parses its own arguments
         iss(sys.argv[2:])
@@ -1218,8 +1608,31 @@ def main() -> None:
     p.add_argument("--out-members", default="pfam_members.parquet")
     p = sub.add_parser("pfam-profile")
     p.add_argument("--profile", required=True)
-    p.add_argument("--unit-pfam", required=True)
+    p.add_argument("--unit-pfam", required=True, nargs="+", help="one per index, query order")
     p.add_argument("--out", default="pfam_profile.tsv")
+    p = sub.add_parser("study-proteins")
+    for name in ("genomes-dir", "genes", "domains"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, default=1.0, help="share of the sample's genomes")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--out", default="study.faa")
+    p.add_argument("--out-pfam", default="study_pfam.parquet")
+    p.add_argument("--out-genomes", default="study_genomes.txt")
+    p = sub.add_parser("study-rebuild")
+    p.add_argument("--members", required=True, nargs="+", help="base members: files or dirs")
+    for name in ("pfam", "study-members", "study-pfam", "gene-units"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--min-id", type=float, default=0.9)
+    p.add_argument("--min-cov", type=float, default=0.8)
+    p.add_argument("--out", default="members.parquet")
+    p.add_argument("--out-pfam", default="pfam.parquet")
+    p = sub.add_parser("study-ladder")
+    p.add_argument("--scores", required=True, nargs="+")
+    p.add_argument("--out", default="study_ladder.tsv")
+    p = sub.add_parser("study-unrelated")
+    for name in ("base", "joint", "run"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--out", default="study_unrelated.tsv")
     p = sub.add_parser("reps")
     p.add_argument("--members", required=True, nargs="+", help="parquet files or directories")
     p.add_argument("--out", default="reps.faa")
@@ -1268,13 +1681,48 @@ def main() -> None:
                                                  "min_hits"])  # fmt: skip
     p.add_argument("--out", default="summary.tsv")
     p.add_argument("--scores-out", default="scores.tsv")
+    p = sub.add_parser("genome-set")
+    p.add_argument("--genomes-dir", required=True)
+    p.add_argument("--out-dir", default="genome_set")
+    p = sub.add_parser("genome-truth")
+    for name in ("genes", "truth-genes", "kos"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--domains", help="domains.parquet: also (genome, Pfam) truth")
+    p.add_argument("--out", default="truth_genomes.csv")
+    p.add_argument("--out-functions", default="truth_function_genome.csv")
+    p = sub.add_parser("genome-score")
+    for name in ("genomes", "truth", "sample", "label", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--tool", default="kfp", choices=["kfp", "sylph"])
+    p.add_argument("--function-taxon")
+    p.add_argument("--truth-functions")
+    p.add_argument("--out", default="genome_score.tsv")
+    p = sub.add_parser("subsample")
+    for name in ("r1", "r2"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p = sub.add_parser("prior-score")
+    for name in ("presence", "genome-index", "truth-genomes", "sample", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--fraction", type=float, default=1.0)
+    p.add_argument("--pfam-presence")
+    p.add_argument("--genes", help="the sample's genes.parquet (with --pfam-presence)")
+    p.add_argument("--domains", help="domains.parquet (with --pfam-presence)")
+    p.add_argument("--out", default="prior_score.tsv")
+    p.add_argument("--out-calibration", default="prior_calibration.tsv")
     args = parser.parse_args()
     steps = {"members": members, "sample": sample, "truth": truth, "score": score,
              "detected": detected, "summary": summary, "tool-profile": tool_profile,
              "cost": cost, "pfam-proteins": pfam_proteins, "pfam-domains": pfam_domains,
              "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
              "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
-             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate}  # fmt: skip
+             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate,
+             "study-proteins": study_proteins, "study-rebuild": study_rebuild,
+             "study-ladder": study_ladder, "study-unrelated": study_unrelated,
+             "genome-set": genome_set, "genome-truth": genome_truth,
+             "genome-score": genome_score, "subsample": subsample,
+             "prior-score": prior_score}  # fmt: skip
     steps[args.step](args)
 
 

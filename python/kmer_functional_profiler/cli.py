@@ -1,13 +1,22 @@
 """Prototype CLI; mirrors the planned Rust one."""
 
 import json
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
+from kmer_functional_profiler.genomes import (
+    MIN_CONTAINMENT,
+    MIN_UNITS,
+    GenomeIndex,
+    genome_profile,
+)
+from kmer_functional_profiler.genomes import annotate_genomes as annotate
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
     AAI_MODEL,
@@ -50,23 +59,57 @@ def index(
     t_dense: float = DEFAULTS.t_dense,
     batch_residues: int = DEFAULTS.batch_residues,
     postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
+    like: Annotated[
+        Path | None,
+        typer.Option(
+            help="An index whose build parameters to copy (all but --batch-residues), so "
+            "the new one can be queried jointly with it"
+        ),
+    ] = None,
+    role: Annotated[
+        str | None,
+        typer.Option(
+            help="decoy: when queried as an --extra-index, its units compete but are "
+            "reported as one row (host or contaminant proteomes)"
+        ),
+    ] = None,
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
-    params = IndexParams(
-        k=k,
-        alphabet=alphabet,
-        t_base=t_base,
-        t_base_singleton=t_base_singleton,
-        n_min=n_min,
-        t_cap=t_cap,
-        oversample=oversample,
-        mask_adapters=mask_adapters,
-        max_groups=max_groups,
-        fp_bits=fp_bits,
-        t_dense=t_dense,
-        batch_residues=batch_residues,
+    if role not in (None, "decoy"):
+        raise typer.BadParameter("role must be decoy")
+    if like is not None:
+        base = json.loads((like / "meta.json").read_text())
+        if base.get("hash") != "kfp":
+            raise typer.BadParameter("--like needs an index built by `index` (kfp hash)")
+    params = (
+        IndexParams(
+            **{
+                f.name: base["params"][f.name]
+                for f in fields(IndexParams)
+                if f.name in base["params"]
+            }
+        )
+        if like is not None
+        else IndexParams(
+            k=k,
+            alphabet=alphabet,
+            t_base=t_base,
+            t_base_singleton=t_base_singleton,
+            n_min=n_min,
+            t_cap=t_cap,
+            oversample=oversample,
+            mask_adapters=mask_adapters,
+            max_groups=max_groups,
+            fp_bits=fp_bits,
+            t_dense=t_dense,
+        )
     )
-    typer.echo(json.dumps(build_index(members, out_dir, params, pfam, postings), indent=2))
+    params = replace(params, batch_residues=batch_residues)
+    stats = build_index(members, out_dir, params, pfam, postings)
+    if role is not None:
+        meta = json.loads((out_dir / "meta.json").read_text())
+        (out_dir / "meta.json").write_text(json.dumps(meta | {"role": role}, indent=2) + "\n")
+    typer.echo(json.dumps(stats, indent=2))
 
 
 @app.command()
@@ -140,6 +183,66 @@ def mask_command(
 ) -> None:
     """Build a mask sidecar: the index's k-mers in the six-frame translated genome."""
     typer.echo(json.dumps(build_mask(genome, index_dir, out_dir), indent=2))
+
+
+@app.command()
+def annotate_genomes(
+    index_dir: Path,
+    genomes: Annotated[
+        Path,
+        typer.Argument(
+            help="TSV: genome (name), path (protein FASTA, relative to the TSV), optional "
+            "taxonomy (GTDB-style d__;p__;...;s__)"
+        ),
+    ],
+    out_dir: Path,
+) -> None:
+    """Annotate reference genomes with the index: each genome's raw tier-2 hits per unit,
+    the content `genomes` fits a profile with."""
+    typer.echo(json.dumps(annotate(index_dir, genomes, out_dir), indent=2))
+
+
+@app.command(name="genomes")
+def genomes_command(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    genome_index: Annotated[Path, typer.Argument(help="Output of `annotate-genomes`")],
+    out: Annotated[Path, typer.Argument(help="TSV of detected genomes")] = Path("genomes.tsv"),
+    summary: Annotated[
+        Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
+    ] = None,
+    function_taxon: Annotated[
+        Path,
+        typer.Option(
+            help="TSV of each function's split hits (hits_em) per taxon and rank, with "
+            "unclassified and the total (Pfam if the genome index has labels, else unit name)"
+        ),
+    ] = Path("function_taxon.tsv"),
+    index: Annotated[
+        Path | None,
+        typer.Option(help="The profile's index, checked against the one annotated with"),
+    ] = None,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+) -> None:
+    """Genomes present and their depths, from a profile's per-unit hits."""
+    gi = GenomeIndex(genome_index)
+    if index is not None:
+        try:
+            gi.check_index(index)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    table, sample, stratified = genome_profile(
+        prof, gi, min_containment=min_containment, min_units=min_units
+    )
+    if stratified is None:
+        typer.echo("profile has no hits_em: no function x taxon table", err=True)
+    else:
+        stratified.write_csv(function_taxon, separator="\t")
+    table.write_csv(out, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(sample, indent=2) + "\n")
+    typer.echo(f"{table.height} genomes detected -> {out}", err=True)
 
 
 @app.command()

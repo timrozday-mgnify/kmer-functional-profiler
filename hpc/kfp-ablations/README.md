@@ -43,6 +43,12 @@ cd kfp-ablations/aai-model && sbatch run.sh
 cd kfp-ablations/release-tiers && sbatch run.sh
 ```
 
+`study-ladder` is phase 10's study ladder; it needs a checkout of the `dev` branch (until
+phase 10 is merged) and can run whenever `00-dbs` has.
+
+`genome-mode` is phase 11's genome arm; it needs a checkout of the `dev-phase11` branch and
+can run whenever `00-dbs` has.
+
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for
 7 days; lower `--time` in `run.sh` if your partition caps it.
