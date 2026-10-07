@@ -57,7 +57,7 @@ class SurvivalModel:
             return np.ones(1)
         q = (np.arange(self.categories) + 0.5) / self.categories
         r = gamma.ppf(q, self.shape, scale=1 / self.shape)
-        return r / r.mean()
+        return np.asarray(r / r.mean())
 
     @property
     def switch(self) -> float:
