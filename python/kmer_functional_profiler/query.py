@@ -1994,7 +1994,7 @@ def profile(
             at = np.minimum(np.searchsorted(wanted, b["hash"]), max(len(wanted) - 1, 0))
             keep = wanted[at] == b["hash"] if len(wanted) else np.zeros(len(at), dtype=bool)
             found = pl.DataFrame({"hash": b["hash"][keep], "read": b["read"][keep]})
-            parts.append(found.group_by("hash", "read").agg(n=pl.len()))
+            parts.append(found.group_by("hash", "read").agg(n=pl.len().cast(pl.UInt32)))
         return pl.concat(parts)
 
     def per_kmer(per_read: pl.DataFrame) -> pl.DataFrame:

@@ -23,11 +23,14 @@ for tier in "slim:--t-base 0.01 --t-base-singleton 0.001 --n-min 8:128" \
     # a config file, not --index_args: Nextflow reads a value starting with '--' as an option.
     # CONCAT holds tier 2 (sparse at 77 GB: ~31 GB) and BLOOM the candidate filter (~14 GB
     # sparse), both larger at higher floors: give them memory up front, not through retries.
+    # PRESENCE, GROUPS, PACK_RANGE (32 GB) and UNITS (128 GB) retried on the large tier.
     cat > "$name.config" <<CFG
 params.index_args = "--k 11 $args"
 process {
     withName: 'CONCAT' { memory = { ${concat_gb}.GB * task.attempt } }
     withName: 'BLOOM' { memory = { 64.GB * task.attempt } }
+    withName: 'PRESENCE|GROUPS|PACK_RANGE' { memory = { 64.GB * task.attempt } }
+    withName: 'UNITS' { memory = { 384.GB * task.attempt } }
 }
 CFG
     nextflow run "$WF/mgnify-subset" -c ../site.config -c "$name.config" ${RELEASE:+--release "$RELEASE"} \
