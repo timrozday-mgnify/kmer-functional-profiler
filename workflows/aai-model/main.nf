@@ -1,5 +1,7 @@
-// aai-model: the parameters of the k-mer survival model aai inverts (plan, phase 7, step 25),
-// fitted on MGnify protein pairs. Steps are in fit_model.py.
+// aai-model: the parameters of the k-mer survival model aai inverts (plan, phase 7, steps 25
+// and 33), fitted on MGnify protein pairs at nearest-member identity. Steps are in fit_model.py.
+
+include { DB as REP_DB; DB as MEMBERS_DB; ALIGN as REP_ALIGN; ALIGN as NEAREST_ALIGN } from './diamond.nf'
 
 process QUERIES {
     label 'process_medium'
@@ -18,42 +20,39 @@ process QUERIES {
     "touch reps.faa queries_000.faa queries_001.faa"
 }
 
-process DB {
+process CANDIDATES {
     label 'process_medium'
-    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
+    publishDir params.outdir, mode: 'copy'
 
     input:
-    path faa
+    path hits
 
     output:
-    path 'reps.dmnd'
+    path 'candidates.parquet'
 
     script:
-    "diamond makedb --in ${faa} --db reps --threads ${task.cpus}"
+    "${params.fit_model} candidates --hits ${hits} --per-bin ${params.per_bin_candidates} --min-cov ${params.min_cov} --seed ${params.seed}"
 
     stub:
-    "touch reps.dmnd"
+    "touch candidates.parquet"
 }
 
-process ALIGN {
-    tag "${faa.baseName}"
+process MEMBER_DB {
     label 'process_medium'
-    container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
 
     input:
-    tuple path(db), path(faa)
+    tuple path(candidates), path(members)
 
     output:
-    path "${faa.baseName}.hits.tsv"
+    path 'members.faa', emit: faa
+    path 'member_clusters.parquet', emit: clusters
+    path 'nearest_*.faa', emit: queries
 
     script:
-    """
-    diamond blastp --db ${db} --query ${faa} --out ${faa.baseName}.hits.tsv --threads ${task.cpus} \\
-        --outfmt 6 qseqid sseqid pident length qlen slen bitscore ${params.diamond_args}
-    """
+    "${params.fit_model} member-db --candidates ${candidates} --members ${members} --chunks ${params.chunks}"
 
     stub:
-    "touch ${faa.baseName}.hits.tsv"
+    "touch members.faa member_clusters.parquet nearest_000.faa nearest_001.faa"
 }
 
 process PAIRS {
@@ -62,12 +61,17 @@ process PAIRS {
 
     input:
     path hits
+    path candidates
+    path member_clusters
 
     output:
     path 'pairs.parquet'
 
     script:
-    "${params.fit_model} pairs --hits ${hits} --per-bin ${params.per_bin} --min-cov ${params.min_cov} --seed ${params.seed}"
+    """
+    ${params.fit_model} pairs --hits ${hits} --candidates ${candidates} --member-clusters ${member_clusters} \\
+        --per-bin ${params.per_bin} --min-cov ${params.min_cov} --seed ${params.seed}
+    """
 
     stub:
     "touch pairs.parquet"
@@ -111,7 +115,12 @@ process FIT {
 workflow {
     def members = file(params.members, checkIfExists: true)
     QUERIES(members)
-    ALIGN(DB(QUERIES.out.reps).combine(QUERIES.out.queries.flatten()))
-    PAIRS(ALIGN.out.collect())
+    // pass 1: P against the representatives finds candidate clusters at every identity
+    REP_ALIGN(REP_DB(QUERIES.out.reps).combine(QUERIES.out.queries.flatten()), params.diamond_args)
+    CANDIDATES(REP_ALIGN.out.collect())
+    // pass 2: P against the candidates' members gives its nearest member of each
+    MEMBER_DB(CANDIDATES.out.combine(Channel.value(members)))
+    NEAREST_ALIGN(MEMBERS_DB(MEMBER_DB.out.faa).combine(MEMBER_DB.out.queries.flatten()), params.diamond_nearest_args)
+    PAIRS(NEAREST_ALIGN.out.collect(), CANDIDATES.out, MEMBER_DB.out.clusters)
     FIT(SURVIVAL(PAIRS.out.combine(Channel.value(members))))
 }
