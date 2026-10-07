@@ -909,7 +909,9 @@ process GENOME_SCORE {
 
     script:
     def tool = name == 'sylph' ? '--tool sylph' : ''
-    def ft = function_taxon ? "--function-taxon ${function_taxon} --truth-functions ${truth_functions}" : ''
+    // the species arm's table names each genome (its own species) at rank species
+    def rank = name.startsWith('species_') ? '--rank species' : ''
+    def ft = function_taxon ? "--function-taxon ${function_taxon} --truth-functions ${truth_functions} ${rank}" : ''
     """
     ${params.bench} genome-score --genomes ${genomes} --truth ${truth} --sample seed${sid} \\
         --label ${label} --index ${name} ${tool} ${ft}
@@ -954,6 +956,33 @@ process SPECIES_INDEX {
 
     stub:
     "mkdir species_${name}"
+}
+
+process SPECIES_FIT {
+    tag "seed ${sid} ${name}"
+    label 'process_single'
+    publishDir "${params.outdir}/species", mode: 'copy', pattern: '*.{tsv,json}', saveAs: { f -> "seed${sid}_${name}_${f}" }
+
+    input:
+    tuple val(sid), val(label), val(name), path(profile), path(genome_index), path(species_index)
+    path code, stageAs: 'code/*'  // package sources: only here so -resume reruns on changes
+
+    output:
+    tuple val(sid), val(label), val("species_${name}"), path('species.tsv'), path('function_species.tsv'), emit: fit
+    tuple val(sid), val("species_${name}"), path(genome_index), path('presence.tsv'), path('pfam_presence.tsv'), emit: presence
+    path 'summary.json'
+
+    script:
+    // the record's genomes have no taxonomy: each is its own species, named as the genome
+    """
+    ${params.kfp} species ${profile} ${species_index} species.tsv --units species_units.tsv \\
+        --presence presence.tsv --pfam-presence pfam_presence.tsv \\
+        --function-taxon function_species.tsv --summary summary.json
+    touch pfam_presence.tsv function_species.tsv
+    """
+
+    stub:
+    "touch species.tsv function_species.tsv presence.tsv pfam_presence.tsv summary.json"
 }
 
 process PRIOR_UPDATE {
@@ -1686,15 +1715,23 @@ workflow BENCHMARK {
             bench_py,
         )
         SYLPH(ch_tool_reads, SYLPH_DB(FETCH.out.genomes).db)
+        // Species model (phase 11, steps 7-9) on the same genomes, each its own species
+        SPECIES_INDEX(ANNOTATE_GENOMES.out.with_index, ch_code)
+        SPECIES_FIT(
+            ch_unit_profiles.combine(ANNOTATE_GENOMES.out.index, by: 0)
+                .combine(SPECIES_INDEX.out.index, by: 0)
+                .map { name, sid, label, profile, gi, si -> [sid, label, name, profile, gi, si] },
+            ch_code,
+        )
         GENOME_SCORE(
             GENOME_FIT.out.fit
+                .mix(SPECIES_FIT.out.fit)
                 .mix(SYLPH.out.profile.map { sid, profile -> [sid, 'dna', 'sylph', profile, []] })
                 .combine(GENOME_TRUTH.out.truth, by: 0),
             bench_py,
         )
         GENOME_SCORE.out.score.collectFile(name: 'genome_scores.tsv', keepHeader: true, sort: true, storeDir: params.outdir)
         // kfp-prior on every fitted sample (full samples at fraction 1, and the ladder's rungs)
-        SPECIES_INDEX(ANNOTATE_GENOMES.out.with_index, ch_code)
         PRIOR_UPDATE(
             GENOME_FIT.out.prior.map { sid, name, profile, gi, genomes -> [name, sid, profile, gi, genomes] }
                 .combine(SPECIES_INDEX.out.index, by: 0)
@@ -1706,7 +1743,7 @@ workflow BENCHMARK {
         def ch_seed_truth = GENOME_TRUTH.out.truth.map { sid, genomes, _functions -> [sid, genomes] }
             .join(SAMPLE.out.sample.map { seed, _fna, genes -> [seed.toString(), genes] })  // seed, truth, genes
         PRIOR_SCORE(
-            PRIOR_UPDATE.out.presence
+            PRIOR_UPDATE.out.presence.mix(SPECIES_FIT.out.presence)
                 .combine(ch_rungs, by: 0)  // sid, name, gi, presence, pfam, seed, fraction
                 .map { sid, name, gi, presence, pfam, seed, f -> [seed, sid, name, gi, presence, pfam, f] }
                 .combine(ch_seed_truth, by: 0)

@@ -49,6 +49,11 @@ phase 10 is merged) and can run whenever `00-dbs` has.
 `genome-mode` is phase 11's genome arm; it needs a checkout of the `dev-phase11` branch and
 can run whenever `00-dbs` has.
 
+`species-benchmark` is phase 11's strain hold-out benchmark for the species model
+(`workflows/species-benchmark`); it needs a checkout of the `dev-species` branch, fetches
+the human-gut catalogue's pangenomes from the EBI FTP, and profiles against the 1-in-100
+subset unless `INDEX=<built index>` is set (`cd species-benchmark && INDEX=... sbatch run.sh`).
+
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for
 7 days; lower `--time` in `run.sh` if your partition caps it.

@@ -446,6 +446,16 @@ genomes carry no taxonomy, so the table is scored at genome rank. Ablation confi
 nextflow run workflows/fmh-benchmark -profile test,docker --genome_mode true --depth_ladder 0.3 --tools '' --outdir results-test-genomes
 ```
 
+### Species model arm
+
+With genome mode on, the species model (plan: Genome mode, Species model) runs beside G1
+on the same genomes. `SPECIES_INDEX` runs `species-index --genomes` per genome index;
+`SPECIES_FIT` runs `species` per profile, writing `species/seed<sid>_<name>_*`. It is scored
+by `GENOME_SCORE` as index `species_<name>`, its table at rank species, and its
+`presence.tsv` by `PRIOR_SCORE`. The record's genomes have no taxonomy, so each is its own
+one-genome species: this arm checks the code path. The species model's own benchmark is
+`workflows/species-benchmark`.
+
 ### kfp-prior and the depth ladder
 
 With genome mode on, `kfp-prior` runs on every fitted sample, and `--depth_ladder`

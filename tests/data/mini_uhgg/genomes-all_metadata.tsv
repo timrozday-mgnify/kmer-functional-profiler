@@ -1,0 +1,8 @@
+Genome	Genome_type	Completeness	Contamination	Species_rep	Lineage
+MGYG000000001	MAG	100	0.5	MGYG000000001	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha
+MGYG000000002	MAG	100	0.5	MGYG000000001	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha
+MGYG000000003	MAG	80	0.5	MGYG000000001	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha
+MGYG000000004	MAG	100	0.5	MGYG000000004	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta
+MGYG000000005	MAG	100	0.5	MGYG000000004	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta
+MGYG000000006	MAG	100	0.5	MGYG000000004	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta
+MGYG000000007	MAG	100	0.5	MGYG000000007	d__Bacteria;p__P;c__C;o__O;f__F2;g__G2;s__
