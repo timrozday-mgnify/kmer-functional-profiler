@@ -1,4 +1,4 @@
-"""kfp-prior: carriage shrinkage and the genome-informed presence update."""
+"""kfp-prior: the genome-informed presence update (shrinkage: test_species.py)."""
 
 import json
 from pathlib import Path
@@ -10,8 +10,9 @@ from test_genomes import DATA, index_dir, records, write_fasta  # noqa: F401  (i
 from typer.testing import CliRunner
 
 from kfp_prior.cli import app
-from kfp_prior.model import Carriage, build_carriage, update, zero_hit_presence
+from kfp_prior.model import Carriage, update, zero_hit_presence
 from kmer_functional_profiler.genomes import annotate_genomes
+from kmer_functional_profiler.species import species_index_from_genomes
 
 
 def test_zero_hit_closed_form() -> None:
@@ -21,61 +22,11 @@ def test_zero_hit_closed_form() -> None:
     assert got[2] < 1e-12  # (almost) always carried, 50 hits expected, none seen: absent
 
 
-def fake_index(tmp: Path, carried: dict[str, set[int]], taxonomy: dict[str, str]) -> Path:
-    """A genome index with only what ``build`` reads: genomes.tsv, genome_best, meta.json."""
+def fake_index(tmp: Path) -> Path:
+    """A genome index with only a meta.json: another index for the checksum test."""
     tmp.mkdir(parents=True, exist_ok=True)
-    names = list(carried)
-    pl.DataFrame(
-        {"genome": range(len(names)), "name": names, "taxonomy": [taxonomy[n] for n in names]}
-    ).write_csv(  # fmt: skip
-        tmp / "genomes.tsv", separator="\t"
-    )
-    rows = [(g, i, u) for g, n in enumerate(names) for i, u in enumerate(sorted(carried[n]))]
-    pl.DataFrame(rows, schema=["genome", "protein", "unit"], orient="row").write_parquet(
-        tmp / "genome_best.parquet"
-    )
     (tmp / "meta.json").write_text(json.dumps({"units": 1000}))
     return tmp
-
-
-def q_of(
-    tmp: Path, name: str, carried: dict[str, set[int]], taxonomy: dict[str, str], alpha: float
-) -> dict[int, float]:
-    build_carriage(fake_index(tmp / "gi", carried, taxonomy), tmp / "c")
-    meta = json.loads((tmp / "c" / "meta.json").read_text())
-    meta["alpha"] = dict.fromkeys(meta["alpha"], alpha)  # mechanics; the fit is tested below
-    (tmp / "c" / "meta.json").write_text(json.dumps(meta))
-    q = Carriage(tmp / "c").q([list(carried).index(name)])
-    return dict(zip(q["unit"].to_list(), q["q"].to_list(), strict=True))
-
-
-def test_shrinkage_towards_one_with_more_genomes_and_towards_genus(tmp_path: Path) -> None:
-    small = {f"s{i}": {1, 2} for i in range(2)} | {"o": {3}}
-    big = {f"s{i}": {1, 2} for i in range(20)} | {"o": {3}}
-    taxonomy = {n: "d__B;f__F;g__G;s__S" if n.startswith("s") else "d__B;f__F;g__G;s__O"
-                for n in big}  # fmt: skip
-    q2 = q_of(tmp_path / "2", "s0", small, taxonomy, 1.0)
-    q20 = q_of(tmp_path / "20", "s0", big, taxonomy, 1.0)
-    assert q2[1] < q20[1] and q20[1] > 0.95
-    # A one-genome species is pulled half-way (alpha 1) towards its genus, where 1 in 21
-    # genomes carries unit 3.
-    assert q_of(tmp_path / "o", "o", big, taxonomy, 1.0)[3] < 0.6
-
-
-def test_held_out_loss_beats_no_shrinkage_and_parent_alone(tmp_path: Path) -> None:
-    rng = np.random.default_rng(0)
-    carried, taxonomy = {}, {}
-    for g in range(6):  # genera with a core, species with their own accessory sets
-        core = set(rng.choice(1000, 40, replace=False).tolist())
-        for s in range(4):
-            accessory = set(rng.choice(1000, 30, replace=False).tolist())
-            for i in range(int(rng.integers(2, 6))):
-                kept = {u for u in core | accessory if rng.random() < 0.85}
-                carried[f"g{g}s{s}_{i}"] = kept
-                taxonomy[f"g{g}s{s}_{i}"] = f"d__B;f__F{g % 2};g__G{g};s__S{g}_{s}"
-    meta = build_carriage(fake_index(tmp_path / "gi", carried, taxonomy), tmp_path / "c")
-    losses = meta["held_out_log_loss"]["species"]  # type: ignore[index]
-    assert losses["best"] < losses["no_shrinkage"] and losses["best"] < losses["parent_only"]
 
 
 @pytest.fixture
@@ -89,7 +40,7 @@ def prior_index(tmp_path: Path, index_dir: Path) -> tuple[Path, Path, Path]:  # 
         lines.append(f"{g}\t{g}.faa\td__B;f__F;g__G;s__{g[0]}")
     (tmp_path / "g.tsv").write_text("\n".join(lines) + "\n")
     annotate_genomes(index_dir, tmp_path / "g.tsv", tmp_path / "gi")
-    build_carriage(tmp_path / "gi", tmp_path / "c")
+    species_index_from_genomes(index_dir, tmp_path / "gi", tmp_path / "c")
     return tmp_path, tmp_path / "gi", tmp_path / "c"
 
 
@@ -142,6 +93,6 @@ def test_cli_and_checksum(prior_index: tuple[Path, Path, Path], tmp_path: Path) 
     got = CliRunner().invoke(app, args)
     assert got.exit_code == 0, got.output
     assert pl.read_csv(tmp / "presence.tsv", separator="\t")["imputed"].sum() > 0
-    other = fake_index(tmp_path / "other", {"x": {1}}, {"x": "s__X"})
+    other = fake_index(tmp_path / "other")
     with pytest.raises(ValueError, match="another genome index"):
         update(observed([0]), pl.read_csv(tmp / "genomes.tsv", separator="\t"), other, Carriage(c))

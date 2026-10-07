@@ -454,7 +454,7 @@ With genome mode on, `kfp-prior` runs on every fitted sample, and `--depth_ladde
 
 ```text
 SUBSAMPLE      read pairs kept at each fraction -> sample <seed>d<fraction>
-PRIOR_BUILD    `kfp-prior build` per genome index -> carriage_<name>/
+SPECIES_INDEX  `species-index --genomes` per genome index -> species_<name>/ (kfp-prior carriage)
 PRIOR_UPDATE   `kfp-prior update` per fitted sample -> prior/seed<sid>_<name>_{presence,pfam_presence}.tsv
 PRIOR_SCORE    prior_scores.tsv: unit and Pfam completeness, observed (present_prob >= 0.5 with
                hits) vs updated (present_prob_updated >= 0.5), per bin of carrier depth (the
