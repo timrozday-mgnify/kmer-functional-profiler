@@ -357,7 +357,7 @@ Ten phases, each with a go/no-go gate, plus two optional ones; phases 1–5 are 
 | 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
 | 10. Additional references (desirable, not essential; in progress on the `dev` branch: decoy role (step 1), study-index recipe and `index --like` (step 2), study ladder set up for HPC (step 3); see Progress log) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
-| 11. Genome mode (desirable, not essential; in progress on the `dev-phase11` branch: `annotate-genomes` (step 1), `genomes` fit by gather and weighted ZI EM (step 2), function × taxon table, ambiguity groups and intervals (step 3), fmh benchmark genome arm with sylph set up for HPC (step 4), `kfp-prior` build and update (step 5), its depth ladder set up for HPC (step 6); the species model on `dev-species`: species index from catalogue pangenomes or a genome set (step 7), the joint fit by variational EM (step 8), unit, Pfam and function × species outputs (step 9), strain hold-out benchmark set up for HPC (step 10), GTDB species index recipe set up for HPC (step 11); next a continuous lineage model (step 12); see Progress log) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; the per-sample function × taxon table (Pfam × genome, rolled up to species and genus, with an unclassified remainder), a primary output. `species-index`: per-species unit prevalence from MGnify catalogue pangenomes (GTDB later). `species`: species presence and depth fitted jointly with each species' unit carriage in the sample (variational EM, prevalence as prior, k-mer hits as evidence), with updated unit and Pfam presence and the function × species table. Later, a continuous lineage model on a pseudo-phylogeny. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; function × taxon abundance L1 and (taxon, function) F1 no worse than HUMAnN 3.9's stratified output on KO; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. Species model, on the UHGG strain hold-out benchmark: species detection F1 and abundance L1 within 0.05 of sylph; at 0.1–1× depth, Pfam completeness +10 points at ≤ 2 points purity loss over observed, carriage calibration error ≤ 0.05 on zero-hit units, and calibration better than kfp-prior B1. |
+| 11. Genome mode (desirable, not essential; in progress on the `dev-phase11` branch: `annotate-genomes` (step 1), `genomes` fit by gather and weighted ZI EM (step 2), function × taxon table, ambiguity groups and intervals (step 3), fmh benchmark genome arm with sylph set up for HPC (step 4), `kfp-prior` build and update (step 5), its depth ladder set up for HPC (step 6); the species model on `dev-species`: species index from catalogue pangenomes or a genome set (step 7), the joint fit by variational EM (step 8), unit, Pfam and function × species outputs (step 9), strain hold-out benchmark set up for HPC (step 10), GTDB species index recipe set up for HPC (step 11), continuous lineage model prototype with a two-strain arm set up for HPC (step 12); see Progress log) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; the per-sample function × taxon table (Pfam × genome, rolled up to species and genus, with an unclassified remainder), a primary output. `species-index`: per-species unit prevalence from MGnify catalogue pangenomes (GTDB later). `species`: species presence and depth fitted jointly with each species' unit carriage in the sample (variational EM, prevalence as prior, k-mer hits as evidence), with updated unit and Pfam presence and the function × species table. Later, a continuous lineage model on a pseudo-phylogeny. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; function × taxon abundance L1 and (taxon, function) F1 no worse than HUMAnN 3.9's stratified output on KO; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. Species model, on the UHGG strain hold-out benchmark: species detection F1 and abundance L1 within 0.05 of sylph; at 0.1–1× depth, Pfam completeness +10 points at ≤ 2 points purity loss over observed, carriage calibration error ≤ 0.05 on zero-hit units, and calibration better than kfp-prior B1. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -1929,6 +1929,52 @@ Developed on the `dev-phase11` branch (from `dev`), one feature branch per step 
   - Tests: `test_ncbi_url` (an r226 assembly name with spaces), `test_pick_keeps_representative_then_best_per_species`; `-profile test,docker` on `tests/data/mini_gtdb` (the mini_uhgg genomes as a GTDB release and an NCBI mirror: 8 tasks, 3 species, 5 of 8 genomes kept).
   - *Run:* `hpc/kfp-ablations/gtdb-species-index/run.sh` (`INDEX=<built index>`), after step 10 reads well on MGnify, as planned.
   - Results: pending on HPC.
+
+* **Phase 11, step 12 — the continuous lineage model prototype (`lineage`; Continuous lineage model, step 12), set up, not run.**
+  - *Command:* `lineage PROFILE SPECIES_INDEX [OUT]` (`--units`, `--summary`, `--lineages` K = 2, `--dim` d = 2, `--starts` 4, `--seed`, and the species fit's screen and priors). Module `lineage.py`, NumPyro SVI with `AutoDelta` (MAP). JAX and NumPyro are the optional `phylo` dependency group; the CLI imports the module only when the command runs, so nothing else needs them.
+  - *Per species* (each detected species with ≥ 2 genomes):
+    - The species fit runs first.
+    - A logistic factor model is fitted on its genomes' carriage of its units, logit P(*g* carries *u*) = *b\_u* + *w\_u* · *x\_g*, with Normal priors. *b* starts at the logit frequency; *w* and *x* start at random, since zero is a saddle.
+    - K lineages are fitted to the sample: depth λ\_k \~ Gamma(0.5, 10⁻³) and *x\_k* from a mixture of N(*x\_g*, σ²) over the reference genomes, with σ the median nearest-neighbour distance between genomes.
+    - Carriage is summed out over its 2^K patterns per unit. The species model's ℓ gives the background its say, and φ comes from the species fit.
+    - The other species are fixed at the hits the species fit did not assign to this one (block coordinate ascent).
+    - It keeps the best of 4 starts, each at K random reference genomes.
+    - Lineages within σ of a deeper one merge into it, and lineages under 10% of the species' depth are dropped.
+  - *Outputs:*
+    - `lineages.tsv`: species, `lineage` (0 the deepest), `depth`, `share`, `relative_abundance`, `nearest` (3 closest reference genomes), `distance` (to the closest, in σ), `accessory_called`.
+    - `lineage_units.tsv`: species, lineage, unit, `prevalence`, `hits`, `carriage_prob` (posterior over the patterns), `hits_assigned`.
+    - One-genome species keep the species fit's depth and carriage as one lineage.
+  - *Species index:* writes `genome_units.parquet` (each kept genome's carried units), the per-genome carriage the factor fit needs. Step 7 planned to keep the family map and Rtab per species instead; the unit-level rows are what the fit reads.
+  - *Amendments (plan: a GP or Brownian prior along `mashtree.nwk`, fitted once per species):*
+    1. No tree. *x\_g* \~ N(0, I) is the plan's "embedding of content where no tree exists", used for every species: the benchmark's `fetch.sh` does not fetch `mashtree.nwk`, and the embedding already places strains by shared accessory content. A Brownian covariance from the tree is the upgrade if the gate is missed narrowly.
+    2. The factor fit runs per sample and detected species, not once per species and stored (~2 s per species here). It moves to the species index if the model is ported.
+    3. MAP rather than a variational posterior on λ and *x*; carriage is still a posterior, given them.
+    4. *Function × lineage table not built:* `hits_assigned` per (lineage, unit) is its input; it is built with the port.
+  - *Benchmark (step 10's workflow):*
+    - `uhgg-pick --two-strain-replicates` adds samples in which each species has two held-out genomes at independent depths (3 samples by default; the plan's "two-strain arm").
+    - `LINEAGE_FIT` runs `lineage` on every sample with the default species index, and `uhgg-score --kind lineage` scores it:
+      - detection, with lineages summed per species;
+      - carriage from the deepest lineage, on the same zero-hit accessory pairs as the species arms;
+      - `two_strain_resolved`: the share of species whose two strains are both ≥ 1× and which get ≥ 2 lineages.
+    - Detection truth is now summed per species. Carriage is scored on one-strain species only, for every arm, since two strains have no single carriage truth.
+    - `workflows/setup.sh` and CI install the `phylo` group.
+  - *Synthetic check (`test_lineage.py`):*
+    - Setup: 24 genomes in two clades (30 core units; 25 accessory units per clade, carried at 0.9 within the clade and 0.1 outside it).
+    - A new clade-0 strain at 0.05× (e = 10, so most units have no hits): on zero-hit accessory units, log loss 0.26 against the species model's 0.69. That is the closed-form *r* at the same depth with the species' prevalence.
+    - Strains of both clades at 3× and 2× gave two lineages at depths within 15%, each nearest its own clade.
+    - A fit takes ~3 s per species on a laptop CPU (4 starts, 1500 steps), plus ~2 s for the factor model.
+  - *Gate (unchanged):* port the model if:
+    - its `carriage_logloss` on held-out strains' accessory units is ≥ 10% below the species model's;
+    - species depth L1 is no worse;
+    - `two_strain_resolved` ≥ 0.8 at ≥ 1× each.
+  - Tests:
+    - `test_lineage_predicts_accessory_units_from_the_ones_seen_and_splits_two_strains`;
+    - `test_lineage_cli` (through a species index and the CLI);
+    - `test_uhgg_two_strain_samples_and_lineage_score`.
+  - *Checked:*
+    - `-profile test,docker` of the species benchmark (45 tasks). The mini catalogue has no genomes left for two-strain samples, so these are tested in `bench.py` only.
+    - ruff and mypy clean; 164 tests pass.
+  - Results: pending on HPC (`hpc/kfp-ablations/species-benchmark/run.sh`).
 
 ## Libraries
 

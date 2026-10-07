@@ -3,5 +3,5 @@
 # Needs uv (https://docs.astral.sh/uv/) and a Rust toolchain (rustup) on PATH.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-uv sync --locked --no-dev
+uv sync --locked --no-dev --group phylo  # phylo: the lineage arm (JAX, NumPyro)
 .venv/bin/kmer-functional-profiler version

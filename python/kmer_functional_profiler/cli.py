@@ -370,6 +370,49 @@ def species_command(
 
 
 @app.command()
+def lineage(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    species_index: Annotated[Path, typer.Argument(help="Output of `species-index`")],
+    out: Annotated[Path, typer.Argument(help="TSV of lineages")] = Path("lineages.tsv"),
+    units: Annotated[
+        Path, typer.Option(help="TSV of each lineage's units: prevalence, carriage, hits")
+    ] = Path("lineage_units.tsv"),
+    summary: Annotated[Path | None, typer.Option(help="JSON: the species fit's report")] = None,
+    lineages: Annotated[int, typer.Option(help="Lineages fitted per species (K)")] = 2,
+    dim: Annotated[int, typer.Option(help="Dimensions of the lineage coordinates")] = 2,
+    starts: Annotated[int, typer.Option(help="MAP starts per species")] = 4,
+    seed: int = 0,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: Annotated[
+        float, typer.Option(help="Prior probability that a screened species is present")
+    ] = PRIOR_PRESENT,
+    background_prior: Annotated[
+        float,
+        typer.Option(help="Prior probability that a unit has background hits (0: none)"),
+    ] = BG_PRIOR,
+) -> None:
+    """Prototype (phase 11, step 12): lineages within each detected species, placed among
+    its reference genomes, with their depths and carriage. Needs the `phylo` dependency
+    group (JAX, NumPyro)."""
+    try:
+        from kmer_functional_profiler.lineage import lineage_profile
+    except ImportError as e:
+        raise typer.BadParameter(f"needs the phylo dependency group ({e})") from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    result = lineage_profile(
+        prof, SpeciesIndex(species_index), dim=dim, k=lineages, starts=starts, seed=seed,
+        prior=prior, background_prior=background_prior, min_containment=min_containment,
+        min_units=min_units,
+    )  # fmt: skip
+    result["lineages"].write_csv(out, separator="\t")
+    result["units"].write_csv(units, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(result["summary"], indent=2) + "\n")
+    typer.echo(f"{result['lineages'].height} lineages -> {out}", err=True)
+
+
+@app.command()
 def query(
     index_dir: Path,
     r1: Path,

@@ -27,6 +27,7 @@ Files written to the index directory:
 - ``species_offsets.npy``, ``s_unit.npy``, ``s_q.npy``, ``s_e.npy``: pairs species-major;
   ``unit_offsets.npy``, ``u_species.npy``, ``u_q.npy``, ``u_e.npy``: the same unit-major;
 - ``genomes.parquet``: ``genome``, ``name``, ``species`` (id), ``completeness``;
+- ``genome_units.parquet``: ``genome``, ``unit``, the units each kept genome carries;
 - ``carriage.parquet``, ``clades.parquet``, ``lineage.parquet``: carriage counts per clade
   in kfp-prior's format (it reads them as its carriage table);
 - ``held_out.parquet``: units carried by each genome left out with ``exclude`` (benchmark
@@ -325,6 +326,9 @@ def write_species_index(
     kept.join(lineage.select("genome", "species"), on="genome").select(
         "genome", "name", "species", *(["completeness"] if "completeness" in kept.columns else [])
     ).write_parquet(out / "genomes.parquet")
+    carried.select("genome", "unit").sort("genome", "unit").write_parquet(
+        out / "genome_units.parquet"
+    )  # per-genome carriage: the lineage model's (step 12)
     n.sort("rank", "clade", "unit").write_parquet(out / "carriage.parquet")
     sizes.sort("rank", "clade").write_parquet(out / "clades.parquet")
     lineage.write_parquet(out / "lineage.parquet")
