@@ -143,13 +143,33 @@ process SPECIES_INDEX {
     "mkdir species_index && touch species_index.json"
 }
 
+process PANEL {
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path index
+    path genome_index
+    path code, stageAs: 'code*/*'
+
+    output:
+    path 'panel'
+    path 'panel.json'
+
+    script:
+    "${params.kfp_genomes} panel ${index} panel --genomes ${genome_index} ${params.panel_args} > panel.json"
+
+    stub:
+    "mkdir panel && touch panel.json"
+}
+
 workflow {
     if (!params.index) {
         error "--index: the index to annotate with (a profile's index)"
     }
     def ch_index = channel.value(file(params.index, checkIfExists: true))
     // ponytail: tracks the Python package only; Rust kernel changes still need a fresh run
-    def ch_code = channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect()
+    def ch_code = channel.fromPath("${projectDir}/../../python/{kmer_functional_profiler,kfp_genomes}/*.py").collect()
     PICK(METADATA().metadata, file("${projectDir}/gtdb.py"))
     def ch_shards = PICK.out.genomes
         .splitCsv(header: true, sep: '\t')
@@ -158,4 +178,7 @@ workflow {
     GENES(FETCH(ch_shards).dna)
     ANNOTATE(ch_index, PICK.out.annotate, GENES.out.faa.collect(), ch_code)
     SPECIES_INDEX(ch_index, ANNOTATE.out.index, ch_code)
+    if (params.panel) {
+        PANEL(ch_index, ANNOTATE.out.index, ch_code)  // the genome panel (phase 12, step 2)
+    }
 }

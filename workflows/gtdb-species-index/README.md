@@ -14,7 +14,13 @@ FETCH          each shard's genomic FASTA from NCBI (--ncbi_url; --max_downloads
 GENES          pyrodigal -p single (meta for genomes too short to train on), table 11
 ANNOTATE       kmer-functional-profiler annotate-genomes INDEX annotate.tsv
 SPECIES_INDEX  kmer-functional-profiler species-index INDEX --genomes -> <outdir>/species_index/
+PANEL          kfp-genomes panel INDEX --genomes (--panel, default on; --panel_args)
+               -> <outdir>/panel/ (phase 12: the genome panel `place` and `update` read)
 ```
+
+This is also the genome-panel workflow of phase 12 for a GTDB genome set: `--max_per_species`
+caps the genomes annotated per species, and the panel then keeps at most
+`--max-per-species` of them (`--panel_args`, default 50) by farthest-point sampling.
 
 Every genome, representatives included, is gene-called by pyrodigal from NCBI's DNA, so all
 proteins come from one caller. (GTDB ships representatives' Prodigal proteins only.)
