@@ -360,23 +360,25 @@ def test_nearest_member_truth(tmp_path: Path) -> None:
     sys.path.insert(0, str(SCRIPT.parent))
     import bench
 
-    # Clusters 10 (members 10, 101, 102) and 20 (members 20, 201). g1 hits 10's rep at 85%
-    # and member 101 at 93% (102 at 99% but query coverage 0.3: skipped); g2 hits 20 at 85%
-    # in pass 1 and no member in pass 2 (the rep's identity stays).
+    # Clusters 10 (members 10, 101, 102, 103) and 20 (members 20, 201). g1 hits 10's rep at
+    # 85% and member 101 at 93% (102 at 99% but query coverage 0.3, 103 at 97% but subject
+    # coverage 0.5: both skipped, as aai-model's pairs); g2 hits 20 at 85% in pass 1 and no
+    # member in pass 2 (the rep's identity stays).
     (tmp_path / "h1.tsv").write_text("g1\t10\t85.0\t200\t200\t200\t300\n"
                                      "g2\t20\t85.0\t200\t200\t200\t300\n")  # fmt: skip
     run(tmp_path, "mgnify-genes", "--hits", "h1.tsv", "--out", "reps.parquet")
-    members = pl.DataFrame({"protein_id": [10, 101, 102, 20, 201, 30],
-                            "cluster_rep": [10, 10, 10, 20, 20, 30],
-                            "sequence": ["MK"] * 6})  # fmt: skip
+    members = pl.DataFrame({"protein_id": [10, 101, 102, 103, 20, 201, 30],
+                            "cluster_rep": [10, 10, 10, 10, 20, 20, 30],
+                            "sequence": ["MK"] * 7})  # fmt: skip
     members.write_parquet(tmp_path / "members.parquet")
     run(tmp_path, "mgnify-members", "--members", "members.parquet", "--gene-units", "reps.parquet")
     clusters = pl.read_parquet(tmp_path / "member_clusters.parquet")
-    assert sorted(clusters["protein_id"].to_list()) == [10, 20, 101, 102, 201]  # not 30
-    assert (tmp_path / "members.faa").read_text().count(">") == 5
+    assert sorted(clusters["protein_id"].to_list()) == [10, 20, 101, 102, 103, 201]  # not 30
+    assert (tmp_path / "members.faa").read_text().count(">") == 6
     (tmp_path / "h2.tsv").write_text("g1\t10\t85.5\t200\t200\t200\t300\n"
-                                     "g1\t101\t93.0\t200\t200\t200\t350\n"
-                                     "g1\t102\t99.0\t60\t200\t60\t100\n")  # fmt: skip
+                                     "g1\t101\t93.0\t200\t200\t230\t350\n"
+                                     "g1\t102\t99.0\t60\t200\t60\t100\n"
+                                     "g1\t103\t97.0\t200\t200\t400\t350\n")  # fmt: skip
     run(tmp_path, "mgnify-nearest", "--hits", "h2.tsv", "--gene-units", "reps.parquet",
         "--member-clusters", "member_clusters.parquet", "--out", "near.parquet")  # fmt: skip
     near = {

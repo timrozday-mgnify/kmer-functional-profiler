@@ -172,6 +172,7 @@ To download them ahead of (or apart from) the benchmark, e.g. on a node with int
 | `--mgnify_min_id`, `--mgnify_min_cov` | `0.9`, `0.8` | A gene is in its nearest cluster at this identity and coverage |
 | `--mgnify_diamond_args` | `--sensitive --max-target-seqs 25 --id 50 --query-cover 50` | Which near hits are kept |
 | `--mgnify_nearest_diamond_args` | `--sensitive --max-target-seqs 1000 --id 50 --query-cover 50` | The nearest-member pass, against the hit clusters' members (`member_hit` false where a gene's targets filled with other clusters' members) |
+| `--mgnify_nearest_min_cov` | `0.8` | The nearest member counts only hits at this query and subject coverage, as aai-model's pairs |
 | `--aai_models` | `[]` | `[name:, path:]` maps of `aai_model.json` files (config file only): each MGnify profile is also scored with `aai` re-estimated under it, as arm `<arm>+<name>` |
 | `--query_arms` | one plain arm | `[name:, args:, reads:, mask:, decoy:]` maps (config file only; see [Ablations](#ablations)) |
 | `--host_fractions` | `0` | Host share of read pairs, comma-separated, e.g. `0,0.5,0.9,0.99` |
