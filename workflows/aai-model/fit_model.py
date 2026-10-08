@@ -4,11 +4,15 @@ region's identity around the pair's, mean ``region`` length of a Markov chain of
 along the sequence, and ``ends``, the share of windows inside the aligned region; plan,
 phase 7, steps 25 and 33), fitted on MGnify protein pairs.
 
-A pair is a protein P and an MGnify90 cluster C it aligns to. Its survival is the share of
-P's windows (k-mers in sequence order) found in the union of C's members' k-mers: what the
-query sees when P's gene is in a sample. Its identity is DIAMOND's, P against its nearest
-member of C (step 33; against C's representative, ``identity_rep``, in step 25, which left
-survival in large clusters far above what the identity predicts: P has closer members).
+A pair is a protein P and an MGnify90 cluster C it aligns to. Its survival is P's distinct
+k-mers found in the union of C's members' k-mers over ``pin_sum``, an average member's
+k-mers: the hit k-mers over ``pin_sum`` that the query inverts (``survival``, clipped at 1;
+step 34). The share of P's windows in the union (``window_survival``) runs 6-20% lower in
+multi-member clusters at 70-90% identity, since members run shorter than P; a union term
+fitted to it left the benchmark's multi-member units reading high there. Its identity is
+DIAMOND's, P against its nearest member of C (step 33; against C's representative,
+``identity_rep``, in step 25, which left survival in large clusters far above what the
+identity predicts: P has closer members).
 Survival against identity fixes how much survival exceeds a^k; it cannot by itself tell a
 strong contrast over short regions from a weaker one over long regions. Co-survival does:
 for lags j in ``LAGS``, the share of P's window pairs j apart both in C's union, against
@@ -66,6 +70,9 @@ SIZE_BANDS = ((1, 2), (2, 4), (4, 11), (11, 101), (101, 2**62))  # members, P le
 LAGS = (1, 3, 6, 11, 20, 40, 80, 150)  # co-survival lags, windows
 STANDARD = "^[ACDEFGHIKLMNPQRSTVWY]+$"
 BIN = 0.01  # identity bins the fit averages pairs over
+# the survival the fit matches: hit k-mers over pin_sum, as the query inverts; above 1 when
+# P outruns its cluster's average member, which no model reaches
+MEASURED = pl.col("survival").clip(upper_bound=1.0)
 
 
 def _members(paths: list[str]) -> pl.LazyFrame:
@@ -341,20 +348,20 @@ def predicted(model: SurvivalModel, identity: np.ndarray) -> tuple[np.ndarray, n
 
 def binned(df: pl.DataFrame, min_pairs: int = 20) -> pl.DataFrame:
     """Pairs averaged per ``BIN`` of identity (bins of >= ``min_pairs``): ``n``, ``a``,
-    ``S`` (window survival), ``both_<j>``, ``n_<j>`` (pairs with windows j apart) and
+    ``S`` (``MEASURED``), ``both_<j>``, ``n_<j>`` (pairs with windows j apart) and
     ``inv_<j>``, their mean 1 / (``n_windows`` - j), for end loss at lag j.
 
     Pair-to-pair scatter (~0.08 in S) swamps the model's error, so fitting single pairs
     cannot tell models apart; the bins' means can (step 33)."""
     both = [pl.col(f"both_{j}") for j in LAGS]
     return (
-        df.filter(pl.col("window_survival").is_not_nan())
+        df.filter(pl.col("survival").is_not_nan())
         .group_by(bin=(pl.col("identity") / BIN).floor())
         .agg(
             *(b.mean() for b in both),
             n=pl.len(),
             a=pl.col("identity").mean(),
-            S=pl.col("window_survival").mean(),
+            S=MEASURED.mean(),
             **{f"n_{j}": b.is_not_null().sum() for j, b in zip(LAGS, both, strict=True)},
             **{
                 f"inv_{j}": (1 / (pl.col("n_windows") - j)).filter(b.is_not_null()).mean()
@@ -414,8 +421,8 @@ def fit_model(
     )  # fmt: skip
     c, model = unpack(best.x)
     r_s, r_b = residuals(best.x)
-    pairs_a = df.filter(pl.col("window_survival").is_not_nan())
-    pa, ps = pairs_a["identity"].to_numpy(), pairs_a["window_survival"].to_numpy()
+    pairs_a = df.filter(pl.col("survival").is_not_nan())
+    pa, ps = pairs_a["identity"].to_numpy(), pairs_a.select(MEASURED).to_series().to_numpy()
     return {
         "concentration": model.concentration or 0.0,
         "region": model.region,
@@ -441,14 +448,14 @@ def union_fit(
     min_pairs: int = 20,
 ) -> dict[str, float]:
     """The union term over a one-member ``base`` model (its c, phi and region): weighted
-    least squares of the window survival of multi-member pairs, averaged per (``BIN`` of
+    least squares of the survival (``MEASURED``) of multi-member pairs, averaged per (``BIN`` of
     identity, size band), against the same pairs' 1 - (1 - S)^m, m = n^(g0 + g1 (a - 0.8))
     (:meth:`SurvivalModel.members`), over (log g0, log g1): both >= 0, so survival falls
     with identity. ``union`` (g0, g1) fixes them, for the error of the overall fit on a
     stratum. Returns ``union``, ``union_slope``, ``n_bins``, ``rmse``,
     ``rmse_independent`` (a^k) and ``rmse_pairs``."""
-    df = df.filter(pl.col("window_survival").is_not_nan())
-    a, y = df["identity"].to_numpy(), df["window_survival"].to_numpy()
+    df = df.filter(pl.col("survival").is_not_nan())
+    a, y = df["identity"].to_numpy(), df.select(MEASURED).to_series().to_numpy()
     n = df["n_members"].to_numpy().astype(np.float64)
     group = np.unique(
         np.stack([np.floor(a / BIN), _size_band(n)], axis=1), axis=0, return_inverse=True
@@ -492,6 +499,43 @@ def union_fit(
     }
 
 
+def scatter_fit(df: pl.DataFrame, model: SurvivalModel, min_pairs: int = 50) -> dict[str, float]:
+    """The union scatter (``spread`` c, ``spread_power`` b) of multi-member pairs about
+    ``model``'s S_n: per (0.05 of identity, size band), the pairs' mean squared residual of
+    ``MEASURED`` against window sampling, S_n (1 - S_n) d / n, plus (c S_n (1 - S_n)^b
+    (1 - 1/n))^2 (:meth:`SurvivalModel.union_scatter_at`), fitted on the log scale (bins
+    differ by orders of magnitude). Returns ``spread``, ``spread_power`` and ``rmse_log``
+    (``rmse_log_without``: with no scatter term)."""
+    df = df.filter(pl.col("survival").is_not_nan())
+    a, n = df["identity"].to_numpy(), df["n_members"].to_numpy().astype(np.float64)
+    windows = df["n_windows"].to_numpy().astype(np.float64)
+    s_n = np.minimum(model.union_survival(a, n), 1 - 1e-9)
+    within = s_n * (1 - s_n) * model.overlap(s_n, np.ones_like(s_n), windows) / windows
+    r2 = (df.select(MEASURED).to_series().to_numpy() - s_n) ** 2
+    group = np.unique(
+        np.stack([np.floor(a / 0.05), _size_band(n)], axis=1), axis=0, return_inverse=True
+    )[1].ravel()
+    count = np.bincount(group)
+    ok = count >= min_pairs
+    w = count[ok] / count[ok].sum()
+    obs, base = (np.bincount(group, x)[ok] / count[ok] for x in (r2, within))
+
+    def loss(x: np.ndarray) -> float:
+        c, b = np.exp(x)
+        extra = np.bincount(group, (c * s_n * (1 - s_n) ** b * (1 - 1 / n)) ** 2)[ok] / count[ok]
+        return float((w * (np.log(obs) - np.log(base + extra)) ** 2).sum())
+
+    best = min(
+        (minimize(loss, x0, method="Nelder-Mead") for x0 in ([np.log(0.3), np.log(0.3)],
+                                                             [np.log(0.1), np.log(1.0)])),
+        key=lambda r: r.fun,
+    )  # fmt: skip
+    c, b = np.exp(best.x)
+    without = float(np.sqrt((w * (np.log(obs) - np.log(base)) ** 2).sum()))
+    return {"spread": float(c), "spread_power": float(b), "rmse_log": float(np.sqrt(best.fun)),
+            "rmse_log_without": without}  # fmt: skip
+
+
 def _band(lo: int, hi: int) -> str:
     return (
         f"members {lo}+"
@@ -503,11 +547,12 @@ def _band(lo: int, hi: int) -> str:
 
 
 def fit(args: argparse.Namespace) -> None:
-    """Two stages (step 34). One member: c, phi and region from single-member pairs (end
+    """Three stages (step 34). One member: c, phi and region from single-member pairs (end
     loss shows only there: other members cover P's ends), then the union term (g0, g1) from
-    multi-member pairs over that model. ``model_strata.tsv``: the one-member model refitted
-    per identity band at its c; per cluster size, the union term refitted (``union``,
-    ``union_slope``) and the overall model's error there (``rmse_overall``)."""
+    multi-member pairs over that model, then the union scatter about it (:func:`scatter_fit`).
+    ``model_strata.tsv``: the one-member model refitted per identity band at its c; per
+    cluster size, the union term refitted (``union``, ``union_slope``) and the overall
+    model's error there (``rmse_overall``)."""
     pairs_df = pl.concat(pl.read_parquet(p) for p in args.survival)
     one = pairs_df.filter(pl.col("n_members") == 1)
     many = pairs_df.filter(pl.col("n_members") > 1)
@@ -537,6 +582,14 @@ def fit(args: argparse.Namespace) -> None:
             })  # fmt: skip
             print(rows[-1], flush=True)
     pl.DataFrame(rows, infer_schema_length=None).write_csv(args.strata_out, separator="\t")
+    union_model = SurvivalModel(
+        args.k, None, base_fit["region"], CATEGORIES, base_fit["concentration"],
+        base_fit["ends"], union["union"], union["union_slope"],
+    )  # fmt: skip
+    scatter = (
+        scatter_fit(many, union_model) if many.height else {"spread": 0.0, "spread_power": 0.0}
+    )
+    print(scatter, flush=True)
     model = {
         "survival": "markov_beta",
         "concentration": base_fit["concentration"],
@@ -544,6 +597,8 @@ def fit(args: argparse.Namespace) -> None:
         "ends": base_fit["ends"],
         "union": union["union"],
         "union_slope": union["union_slope"],
+        "spread": scatter["spread"],
+        "spread_power": scatter["spread_power"],
         "categories": CATEGORIES,
         "k": args.k,
         "alphabet": args.alphabet,
@@ -554,6 +609,8 @@ def fit(args: argparse.Namespace) -> None:
             "n_union": many.height,
             "rmse_union": union.get("rmse", float("nan")),
             "rmse_independent_union": union.get("rmse_independent", float("nan")),
+            "rmse_log_scatter": scatter.get("rmse_log", float("nan")),
+            "rmse_log_scatter_without": scatter.get("rmse_log_without", float("nan")),
         },
     }
     Path(args.out).write_text(json.dumps(model, indent=1) + "\n")

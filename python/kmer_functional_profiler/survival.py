@@ -40,6 +40,13 @@ member does, as m effective independent members: S_n = 1 - (1 - S)^m with
 m = n^(g0 + g1 (a - ``UNION_PIVOT``)), S with end loss (the union covers members' ends too).
 g0 = g1 = 0 (or n = 1) is one member. Survival depends on n, so it is per unit
 (:meth:`union_at`); the tables stay one member's.
+
+Union scatter (``spread`` c, ``spread_power`` b; step 34): a union's survival, as the query
+measures it (hit k-mers over an average member's), scatters around S_n beyond window
+sampling, by which members sit near the gene and how its length compares with theirs. Its
+relative SD is c (1 - S_n)^b (1 - 1/n) (:meth:`union_scatter_at`): 0 for one member,
+largest at low identity. Fitted on aai-model's multi-member pairs; without it, intervals of
+multi-member units with many hit k-mers were far too narrow.
 """
 
 from dataclasses import dataclass
@@ -68,6 +75,8 @@ class SurvivalModel:
     ends: float = 1.0
     union: float = 0.0
     union_slope: float = 0.0
+    spread: float = 0.0
+    spread_power: float = 0.0
 
     @classmethod
     def from_json(cls, model: dict[str, Any] | None, k: int) -> Self:
@@ -79,6 +88,8 @@ class SurvivalModel:
             "ends": model.get("ends", 1.0),
             "union": model.get("union", 0.0),
             "union_slope": model.get("union_slope", 0.0),
+            "spread": model.get("spread", 0.0),
+            "spread_power": model.get("spread_power", 0.0),
         }
         if model["survival"] == "markov_beta":
             return cls(k, None, model["region"], concentration=model["concentration"], **extra)
@@ -189,6 +200,15 @@ class SurvivalModel:
         m = self.members(tab["a"][row], n_members)
         return np.asarray(-np.expm1(m * np.log1p(-np.minimum(tab["S"][row], 1 - 1e-15))))
 
+    def union_scatter_at(self, row: np.ndarray, n_members: np.ndarray | float) -> np.ndarray:
+        """The relative SD of a union's survival at integer rows ``row`` of ``T_GRID``:
+        ``spread`` (1 - S_n)^``spread_power`` (1 - 1/n); 0 without ``spread``."""
+        n = np.maximum(np.asarray(n_members, dtype=np.float64), 1.0)
+        if self.spread == 0:
+            return np.zeros(np.broadcast(np.asarray(row), n).shape)
+        miss = np.maximum(1 - self.union_at(row, n), 0.0)
+        return np.asarray(self.spread * miss**self.spread_power * (1 - 1 / n))
+
     def union_survival(self, a: np.ndarray, n_members: np.ndarray | float) -> np.ndarray:
         """S_n at identity ``a`` for units of ``n_members``."""
         s = np.minimum(self.survival(a), 1 - 1e-15)
@@ -247,6 +267,8 @@ def check_aai_model(model: dict[str, Any], params: dict[str, Any]) -> None:
         raise ValueError("ends must be in (0, 1]")
     if not (model.get("union", 0.0) >= 0 and model.get("union_slope", 0.0) >= 0):
         raise ValueError("union and union_slope must be >= 0")
+    if not (model.get("spread", 0.0) >= 0 and model.get("spread_power", 0.0) >= 0):
+        raise ValueError("spread and spread_power must be >= 0")
     differ = [p for p in ("k", "alphabet") if p in model and model[p] != params.get(p)]
     if differ:
         raise ValueError(f"model fitted for another {', '.join(differ)}")

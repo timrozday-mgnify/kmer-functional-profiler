@@ -1424,7 +1424,8 @@ def survival_quantiles(
     neighbouring windows share sites, and under clustered rates windows a region apart
     survive together) and y_i a hit (Bernoulli(seen), in clumps of ``clumping``: a read hits
     a run of windows). So h is a count (:func:`count_cdf`) with mean n seen S and variance
-    n seen S (1 - seen) + n seen^2 S (1 - S) d + (clumping - 1) n S^2 seen (1 - seen). The
+    n seen S (1 - seen) + n seen^2 S (1 - S) d + (clumping - 1) n S^2 seen (1 - seen), plus
+    (n seen S v)^2 for a union's scatter v (:meth:`SurvivalModel.union_scatter_at`). The
     model's survival mean and variance match simulation of it, skew included (step 25).
 
     An estimate is reported only if h >= ``selected`` (a unit is in the profile only if
@@ -1441,8 +1442,8 @@ def survival_quantiles(
     n_members = np.asarray(n_members, dtype=np.float64)
     clump = np.maximum(np.asarray(clumping, dtype=np.float64), 1.0)
 
-    def cdfs(row: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """P(h' <= h | h' >= ``selected``) and P(h' < h | ...) at ``row``, hit chance ``p``."""
+    def cdfs(row: np.ndarray, p: np.ndarray, k: np.ndarray = h) -> tuple[np.ndarray, np.ndarray]:
+        """P(h' <= k | h' >= ``selected``) and P(h' < k | ...) at ``row``, hit chance ``p``."""
         surv = model.union_at(row, n_members)
         mean = n * p * surv
         # ponytail: one member's window correlation for the union's; a union of members
@@ -1450,14 +1451,15 @@ def survival_quantiles(
         d = model.overlap_at(row, keep, windows)
         var = n * p * surv * (1 - p) + n * p**2 * surv * (1 - surv) * d
         var += (clump - 1) * n * surv**2 * p * (1 - p)
+        var += (n * p * surv * model.union_scatter_at(row, n_members)) ** 2  # union scatter
         zero = count_cdf(np.full_like(h, selected - 1), mean, var)
         scale = 1 - zero
         # selection all but impossible: given it, h' sits at the threshold, below any h
         rare = scale < 1e-12
         scale = np.where(rare, 1.0, scale)
-        at = np.clip((count_cdf(h, mean, var) - zero) / scale, 0.0, 1.0)
-        before = np.clip((count_cdf(h - 1, mean, var) - zero) / scale, 0.0, 1.0)
-        return np.where(rare, 1.0, at), np.where(rare, (h >= selected + 1).astype(float), before)
+        at = np.clip((count_cdf(k, mean, var) - zero) / scale, 0.0, 1.0)
+        before = np.clip((count_cdf(k - 1, mean, var) - zero) / scale, 0.0, 1.0)
+        return np.where(rare, 1.0, at), np.where(rare, (k >= selected + 1).astype(float), before)
 
     def first(test: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
         """The first row where ``test`` (false, then true as S falls) holds; ``last`` if none."""
@@ -1472,8 +1474,13 @@ def survival_quantiles(
     tail = (1 - level) / 2
     upper = first(lambda row: cdfs(row, low_seen)[0] >= tail)
     point = first(lambda row: np.add(*cdfs(row, seen)) / 2 >= 0.5)
+    # beyond the model's reach (more hits than identity 1 gives on average, as in large
+    # unions, where hits over one member's pin_sum can exceed 1), the data say only "at the
+    # top": the lower bound is taken as for h at that mean, not collapsed onto 1 (step 34)
+    top = n * high_seen * model.union_at(np.zeros(len(h), dtype=int), n_members)
+    h_low = np.minimum(h, np.maximum(top, selected))
     # the lowest S whose upper tail P(h' >= h) still holds tail: one row before it fails
-    lower = np.maximum(first(lambda row: 1 - cdfs(row, high_seen)[1] < tail) - 1, 0)
+    lower = np.maximum(first(lambda row: 1 - cdfs(row, high_seen, h_low)[1] < tail) - 1, 0)
     # ponytail: rows of the grid (steps ~0.003 in a), not interpolated between them
     a = tables["a"]
     return a[point], np.minimum(a[lower], a[point]), np.maximum(a[upper], a[point])

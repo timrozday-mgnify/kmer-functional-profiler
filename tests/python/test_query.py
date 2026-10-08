@@ -371,6 +371,41 @@ def test_union_of_members() -> None:
         check_aai_model(model | {"union_slope": -0.1}, {"k": 11})
 
 
+def test_union_scatter_widens_multi_member_intervals_only() -> None:
+    # The union scatter is 0 for one member and without spread, shrinks as S_n nears 1,
+    # and widens a multi-member unit's interval at many hit k-mers; one member's is unchanged.
+    union = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95,
+                          union=0.1, union_slope=0.3)  # fmt: skip
+    spread = dataclasses.replace(union, spread=0.3, spread_power=0.27)
+    rows = np.array([0, 400, 800])  # a falls along the rows
+    assert (union.union_scatter_at(rows, 50.0) == 0).all()
+    assert (spread.union_scatter_at(rows, 1.0) == 0).all()
+    v = spread.union_scatter_at(rows, 50.0)
+    assert (v > 0).all() and v[0] < v[2]
+    with pytest.raises(ValueError, match="spread"):
+        check_aai_model({"survival": "markov_beta", "concentration": 4.0, "region": 5.0,
+                         "spread": -0.1}, {"k": 11})  # fmt: skip
+    full = np.full(1, 300.0)
+    args = {"coverage": np.full(1, 20.0), "present": np.full(1, 0.3), "m": full,
+            "pin_sum": full, "n_kmers": full, "windows": full}  # fmt: skip
+    for n_members, wider in ((50.0, True), (1.0, False)):
+        _, lo0, hi0, _ = query.aai_fit(model=union, n_members=np.full(1, n_members), **args)
+        _, lo1, hi1, _ = query.aai_fit(model=spread, n_members=np.full(1, n_members), **args)
+        assert ((hi1 - lo1) > (hi0 - lo0) + 0.01).item() is wider
+
+
+def test_interval_beyond_the_models_reach_keeps_a_lower_bound() -> None:
+    # More hit k-mers than identity 1 gives on average (a large union's hits over one
+    # member's pin_sum): the point is 1, and the lower bound is not collapsed onto it.
+    model = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95)
+    full = np.full(1, 40.0)
+    args = {"coverage": np.full(1, 20.0), "present": np.full(1, 1.2), "m": full,
+            "pin_sum": full, "n_kmers": full, "windows": full, "model": model}  # fmt: skip
+    point, lo, hi, _ = query.aai_fit(**args)
+    assert point.item() == pytest.approx(1.0) and hi.item() == pytest.approx(1.0)
+    assert lo.item() < 0.97
+
+
 def test_aai_fit_recovers_identity_against_a_union() -> None:
     # A unit of 3 members, each an independent homolog at identity a: a window is hit if
     # any member keeps it. With union 1 and slope 0 (m = n), the estimate given n_members
