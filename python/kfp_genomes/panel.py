@@ -558,3 +558,15 @@ class Panel:
             genomes=rows, names=g["name"].to_list(), completeness=comp, carried=carried,
             xt=xt, n=n, f=f, edges=edges, edge_prior=prior,
         )  # fmt: skip
+
+
+def check_profile(profile: pl.DataFrame, panel: Panel) -> None:
+    """Raise if ``profile`` is not of the panel's index: its units' tier-2 kept k-mers
+    (``m_g``) must be the panel's (a profile records no index checksum)."""
+    if "m_g" not in profile.columns:
+        raise ValueError("the profile has no m_g column")
+    both = profile.select(pl.col("unit").cast(pl.UInt32), "m_g").join(
+        panel.units.select("unit", m_panel="m_g"), on="unit"
+    )
+    if (both["m_g"].cast(pl.Int64) != both["m_panel"].cast(pl.Int64)).any():
+        raise ValueError(f"the profile is of another index than the panel {panel.path}")

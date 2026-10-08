@@ -5,14 +5,19 @@ import json
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
+from kfp_genomes.evidence import Histogram
 from kfp_genomes.panel import (
     MAX_PER_SPECIES,
     NEIGHBOURS,
+    Panel,
+    check_profile,
     panel_from_catalogue,
     panel_from_genomes,
 )
+from kfp_genomes.report import genome_profile
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -82,3 +87,54 @@ def panel(
         assert genomes is not None
         meta = panel_from_genomes(index_dir, genomes, out_dir, **options)
     typer.echo(json.dumps(meta, indent=2))
+
+
+@app.command()
+def place(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv of `query` (phase 12)")],
+    panel_dir: Annotated[Path, typer.Argument(help="Output of `kfp-genomes panel`")],
+    out_dir: Annotated[Path, typer.Argument(help="Directory for the outputs")] = Path("place"),
+    own_hist: Annotated[
+        Path | None,
+        typer.Option(
+            help="The profile's own-k-mer histogram (`query --own-hist`): strain mixtures' evidence"
+        ),  # fmt: skip
+    ] = None,
+    max_strains: Annotated[
+        int, typer.Option(help="Strains per species considered (K ≥ 2 by MCMC; slower)")
+    ] = 1,
+    index: Annotated[
+        Path | None, typer.Option(help="The profile's index, checked against the panel's")
+    ] = None,
+    seed: int = 0,
+    beta: Annotated[
+        float | None,
+        typer.Option(help="Fix the background prior (ablation) instead of fitting it"),
+    ] = None,
+) -> None:
+    """The genome profile: species present, their strains' depths, and where each strain
+    sits among the panel's reference genomes, from the functional profile (unchanged).
+    Writes genome_profile.tsv, candidates.tsv, placements.parquet, strain_units.parquet and
+    place_summary.json."""
+    panel_ = Panel(panel_dir)
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    try:
+        if index is not None:
+            panel_.check_index(index)
+        check_profile(prof, panel_)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    hist = Histogram.read(own_hist) if own_hist is not None else None
+    result = genome_profile(prof, panel_, max_strains=max_strains, hist=hist, seed=seed,
+                            beta=beta)  # fmt: skip
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key in ("genome_profile", "candidates"):
+        table = result[key]
+        assert isinstance(table, pl.DataFrame)
+        table.write_csv(out_dir / f"{key}.tsv", separator="\t")
+    for key in ("placements", "strain_units"):
+        table = result[key]
+        if isinstance(table, pl.DataFrame):
+            table.write_parquet(out_dir / f"{key}.parquet")
+    (out_dir / "place_summary.json").write_text(json.dumps(result["summary"], indent=2) + "\n")
+    typer.echo(f"{result['summary']['strains']} strains -> {out_dir}", err=True)  # type: ignore[index]
