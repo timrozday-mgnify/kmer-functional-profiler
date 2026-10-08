@@ -9,8 +9,9 @@
 # The floor runs' MGnify profiles rescored against nearest-member identity, aai re-estimated
 # under the step-34 survival model and two comparisons (plan, phase 7, step 34). Needs the
 # finished floor-novaseq and floor-1.65M runs; rebuilds no index and reruns no query.
+# tiers-novaseq: the release model's confirming check on the large tier (tbase05_all).
 source ../common.sh
-for r in floor-novaseq floor-1.65M; do
+for r in floor-novaseq floor-1.65M tiers-novaseq; do
     nextflow run "$WF/aai-rescore" -c ../site.config --run "../$r/results" \
         --members "$SUBSET/members.parquet" --genomes ../fmh-benchmark-data/genomes_extracted_from_kegg \
         --outdir "results/$r" -w "work/$r" -resume
