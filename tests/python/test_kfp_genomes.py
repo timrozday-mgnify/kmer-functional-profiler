@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 import pytest
-from genome_sim import Strain, simulate
+from genome_sim import Strain, simulate, simulate_with_histogram
 from scipy.stats import chi2
 from test_genomes import index_dir  # noqa: F401  (fixture)
 from typer.testing import CliRunner
@@ -22,6 +22,7 @@ from kfp_genomes.evidence import (
     mixture_loglik,
     zero_hit_present,
 )
+from kfp_genomes.mixtures import fit_mixture, strain_number_posterior
 from kfp_genomes.panel import (
     Panel,
     SpeciesPanel,
@@ -30,6 +31,7 @@ from kfp_genomes.panel import (
     write_panel,
 )
 from kfp_genomes.place import NOVEL, OneStrain, place_species, screen
+from kfp_genomes.report import CHECK_ALPHA, genome_profile
 from kmer_functional_profiler.query import coverage_interval, ztnb_one_rate
 
 # --- Evidence layer (step 1) ---
@@ -343,3 +345,158 @@ def test_species_sharing_units_are_fitted_together(tmp_path: Path) -> None:
         assert fit.depth_summary()[0] == pytest.approx(depth, rel=0.1)
         sp = placed.panels[s]
         assert fit.unit_carriage[np.isin(sp.units, list(shared))].min() > 0.9
+
+
+# --- Strain mixtures (step 4) ---
+
+FAST = {"temperatures": 8, "sweeps": 20, "chains": 2}  # where the marginal's accuracy is not tested
+
+
+def test_stepping_stone_matches_the_exact_marginal_for_one_strain(tmp_path: Path) -> None:
+    rng = np.random.default_rng(9)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    placed = place_species(simulate([Strain(refs["a1"], 2.0)]), panel, species=[0])
+    one = placed.fits[0]
+    mix = fit_mixture(placed.panels[0], placed.terms[0], one, 1, seed=1)
+    assert mix.log_bf == pytest.approx(one.log_bf, abs=1.0)
+    assert mix.diagnostics["rhat_ll"] < 1.1
+    assert np.median(mix.lam[:, 0]) == pytest.approx(one.depth_summary()[0], rel=0.02)
+    # a second strain is not needed: K = 1
+    two = fit_mixture(placed.panels[0], placed.terms[0], one, 2, seed=1)
+    assert strain_number_posterior({1: one.log_bf, 2: two.log_bf}, 0.5)[1] > 0.99
+
+
+def test_two_strains_in_distinct_clades_are_resolved(tmp_path: Path) -> None:
+    rng = np.random.default_rng(9)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    a, b = refs["a1"], refs["b2"]
+    placed = place_species(simulate([Strain(a, 5.0), Strain(b, 2.0)]), panel, species=[0])
+    one, sp = placed.fits[0], placed.panels[0]
+    two = fit_mixture(sp, placed.terms[0], one, 2, seed=1, **FAST)
+    assert strain_number_posterior({1: one.log_bf, 2: two.log_bf}, 0.5)[2] > 0.99
+    low, high = np.median(two.lam, 0)  # sorted by depth
+    assert low == pytest.approx(2.0, rel=0.1) and high == pytest.approx(5.0, rel=0.1)
+    # units of one strain only are assigned to it
+    only_a = np.isin(sp.units, list(a - b))
+    only_b = np.isin(sp.units, list(b - a))
+    assert two.carriage[1, only_a].min() > 0.9 and two.carriage[0, only_a].max() < 0.1
+    assert two.carriage[0, only_b].min() > 0.9 and two.carriage[1, only_b].max() < 0.1
+
+
+def test_near_identical_strains_are_one_honestly(tmp_path: Path) -> None:
+    rng = np.random.default_rng(9)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    a = refs["a1"]
+    near = a - set(sorted(a - set(range(300)))[:3])  # three accessory units fewer
+    strains = [Strain(a, 2.0, allele=1), Strain(near, 1.5, allele=1)]
+    placed = place_species(simulate(strains), panel, species=[0])
+    one = placed.fits[0]
+    two = fit_mixture(placed.panels[0], placed.terms[0], one, 2, seed=1, **FAST)
+    assert strain_number_posterior({1: one.log_bf, 2: two.log_bf}, 0.5)[1] > 0.5
+    assert one.depth_summary()[0] == pytest.approx(3.5, rel=0.1)
+
+
+def test_own_kmer_histogram_splits_strains_of_one_content(tmp_path: Path) -> None:
+    """Two strains with the same units but their own alleles, at 5x and 1x: the summed
+    depth and union survival fit one strain nearly as well; the histogram tells them apart."""
+    rng = np.random.default_rng(9)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    a = refs["a1"]
+    prof, hist = simulate_with_histogram([Strain(a, 5.0, allele=1), Strain(a, 1.0, allele=2)])
+    placed = place_species(prof, panel, species=[0])
+    sp, terms, one = placed.panels[0], placed.terms[0], placed.fits[0]
+    two = fit_mixture(sp, terms, one, 2, hist=Histogram.from_frame(hist), seed=1, **FAST)
+    assert strain_number_posterior({1: one.log_bf, 2: two.log_bf}, 0.5)[2] > 0.99
+    low, high = np.median(two.lam, 0)
+    assert low == pytest.approx(1.0, rel=0.2) and high == pytest.approx(5.0, rel=0.1)
+
+
+def test_several_alleles_reduce_to_one_and_match_simulation() -> None:
+    from kfp_genomes.evidence import log_likelihood_alleles
+
+    k, h, m, depth, f = 30.0, 70.0, 100.0, 2.0, 0.6
+    one = log_likelihood(k, h, m, depth, f, 1.3)
+    assert log_likelihood_alleles(k, h, m, [depth], [f], 1.3) == pytest.approx(one)
+    # a second allele at no depth changes nothing (its k-mers are present but never hit)
+    two = log_likelihood_alleles(k, h, m, [depth, 1e-12], [f, 0.9], 1.3)
+    assert two == pytest.approx(one, abs=1e-6)
+    # no hits, two alleles: P(no hits) as simulated
+    rng = np.random.default_rng(10)
+    n, d1, d2, f1, f2 = 100_000, 0.02, 0.05, 0.5, 0.7
+    rates = d1 * (rng.random((n, 40)) < f1) + d2 * (rng.random((n, 40)) < f2)
+    p_zero = (rng.poisson(rates).sum(1) == 0).mean()
+    expect = np.exp(log_likelihood_alleles(0, 0, 40, [d1, d2], [f1, f2]))
+    assert p_zero == pytest.approx(expect, abs=4 * np.sqrt(expect * (1 - expect) / n))
+
+
+# --- Outputs and model checks (step 5) ---
+
+
+def test_place_cli_outputs_and_model_free_evidence(tmp_path: Path) -> None:
+    rng = np.random.default_rng(11)
+    refs = two_clade_species(rng, 4)
+    b = {f"x{i}": set(range(1000, 1300)) for i in range(4)}
+    synthetic_panel(tmp_path, refs | b, dict.fromkeys(refs, "A") | dict.fromkeys(b, "B"))
+    held = two_clade_species(rng, 1)["a0"]
+    prof = simulate([Strain(held, 2.0), Strain(set(range(1000, 1300)), 1.0)])
+    prof.write_csv(tmp_path / "profile.tsv", separator="\t")
+    result = CliRunner().invoke(app, ["place", str(tmp_path / "profile.tsv"),
+                                      str(tmp_path / "panel"), str(tmp_path / "out")])  # fmt: skip
+    assert result.exit_code == 0, result.output
+    gp = pl.read_csv(tmp_path / "out" / "genome_profile.tsv", separator="\t")
+    assert gp["name"].to_list() == ["A", "B"] and (gp["strains"] == 1).all()
+    a = gp.row(0, named=True)
+    assert a["depth"] == pytest.approx(2.0, rel=0.1) and a["depth_lo"] < 2.0 < a["depth_hi"]
+    assert a["relative_abundance"] == pytest.approx(2 / 3, abs=0.05)
+    assert a["ref_g"].startswith("a") and a["nearest"].startswith("a")
+    assert a["present_prob"] > 0.99 and a["mixture_prob"] == 0
+    # model-free evidence beside the model's numbers
+    assert a["units_hit"] == len(held) and a["core_hit"] == a["core_units"] == 300
+    assert a["units_own"] == len(held) and a["kmers_own"] > 0
+    assert a["depth_greedy"] == pytest.approx(2.0, rel=0.1)
+    assert a["check_failed"] is None or a["check_failed"] == ""
+    units = pl.read_parquet(tmp_path / "out" / "strain_units.parquet")
+    carried = units.filter((pl.col("species") == 0) & (pl.col("carriage_prob") > 0.5))
+    assert set(carried["unit"]) == held
+    assert pl.read_csv(tmp_path / "out" / "candidates.tsv", separator="\t").height == 2
+    # a profile of another index is refused
+    prof.with_columns(m_g=pl.col("m_g") + 1).write_csv(tmp_path / "other.tsv", separator="\t")
+    result = CliRunner().invoke(app, ["place", str(tmp_path / "other.tsv"),
+                                      str(tmp_path / "panel"), str(tmp_path / "o2")])  # fmt: skip
+    assert result.exit_code != 0 and "another index" in result.output
+
+
+def test_posterior_draws_reproduce_the_reported_interval(tmp_path: Path) -> None:
+    rng = np.random.default_rng(12)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    for depth in (0.3, 2.0):
+        out = genome_profile(simulate([Strain(refs["a0"], depth)]), panel, species=[0])
+        row = out["genome_profile"].row(0, named=True)  # type: ignore[union-attr]
+        lam = out["placements"]["lambda"].to_numpy()  # type: ignore[index]
+        lo, hi = np.percentile(lam, [2.5, 97.5])
+        width = row["depth_hi"] - row["depth_lo"]
+        assert lo == pytest.approx(row["depth_lo"], abs=0.1 * width)
+        assert hi == pytest.approx(row["depth_hi"], abs=0.1 * width)
+        assert lam.mean() == pytest.approx(row["depth"], rel=0.02)
+
+
+def test_spread_check_flags_misspecified_depths(tmp_path: Path) -> None:
+    rng = np.random.default_rng(13)
+    refs = two_clade_species(rng, 3)
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    a = refs["a0"]
+    good = genome_profile(simulate([Strain(a, 2.0)]), panel, species=[0])
+    # a third of the strain's units at 3 copies, which the panel says are single-copy
+    triple = set(sorted(a)[::3])
+    bad = genome_profile(
+        simulate([Strain(a - triple, 2.0), Strain(triple, 2.0, copies=3)]), panel, species=[0]
+    )
+    g = good["genome_profile"].row(0, named=True)  # type: ignore[union-attr]
+    b = bad["genome_profile"].row(0, named=True)  # type: ignore[union-attr]
+    assert g["check_spread"] > CHECK_ALPHA and "spread" not in (g["check_failed"] or "")
+    assert b["check_spread"] < CHECK_ALPHA and "spread" in b["check_failed"]

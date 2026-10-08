@@ -24,6 +24,11 @@ fitted per species by marginal likelihood (type II ML), separately under K = 0 a
 a grid: an organism outside the panel that shares many of a species' units, at its own
 depth, is the background's, rather than being taken for the species.
 
+*Survival:* a sample strain's alleles keep a share of the unit's k-mers that is its
+references' times a survival scale (strains diverge from their references genome-wide),
+fitted per species by marginal likelihood like the background. A fixed reference survival
+cost a strain 10% more diverged than its references ~2 nats per unit.
+
 *Presence:* P(K_s ≥ 1) from the Bayes factor and a prior π fitted by empirical Bayes over the
 candidates (with a Beta(1, 9) hyperprior: most screened species are absent).
 """
@@ -37,7 +42,7 @@ import polars as pl
 from scipy.special import expit, logsumexp
 from scipy.stats import norm
 
-from kfp_genomes.evidence import BG_DEPTHS, Evidence, UnitTerms
+from kfp_genomes.evidence import BG_DEPTHS, F_FLOOR, Evidence, UnitTerms
 from kfp_genomes.panel import Panel, SpeciesPanel
 from kmer_functional_profiler.query import gather
 
@@ -51,6 +56,12 @@ LAMBDA_COARSE: Final = 25  # log grid over LAMBDA_RANGE
 LAMBDA_FINE: Final = 21  # points around the mode (replacing the coarse ones there)
 ZOOMS: Final = 8  # refinements of λ's grid at most
 LAMBDA_SD: Final = 1.5  # log-normal prior on λ: median 1x, sd 1.5 in ln
+# A sample strain may carry a unit at other copies than its reference (copy-number
+# variation): with probability COPY_CHANGE, uniform over COPIES.
+COPY_CHANGE: Final = 0.05
+COPIES: Final = (1, 2, 3, 4)
+SCALE_GRID: Final = np.round(np.arange(0.5, 1.301, 0.05), 2)  # strain survival / reference's
+SCALE_ROUNDS: Final = 4  # refits of the scale on the posterior's points
 BETA_GRID: Final = expit(np.linspace(-9, 4.5, 28))  # 1e-4 .. 0.99, even in log-odds
 PRESENT_A, PRESENT_B = 1.0, 9.0  # Beta hyperprior on π, the share of candidates present
 CORE: Final = 0.9  # q from which a unit is core (the candidate screen)
@@ -183,38 +194,81 @@ class OneStrain:
     def lambda_posterior(self) -> np.ndarray:
         return np.asarray(np.exp(logsumexp(self.log_post, axis=0)))
 
+    def _cells(self) -> tuple[np.ndarray, np.ndarray]:
+        """λ's posterior as mass spread evenly over cells of log λ around each grid point
+        (edges half-way between points): the edges and the cumulative mass at them."""
+        x = np.log(self.lam)
+        mid = (x[1:] + x[:-1]) / 2
+        step = x[1] - x[0] if len(x) > 1 else 0.0
+        edges = np.r_[x[0] - step / 2, mid, x[-1] + step / 2]
+        return edges, np.r_[0.0, np.cumsum(self.lambda_posterior())]
+
     def depth_summary(self) -> tuple[float, float, float]:
-        """Posterior mean of λ and its 95% interval (on the grid, log-linear)."""
+        """Posterior mean of λ and its 95% interval (λ's cells, :meth:`_cells`)."""
         p = self.lambda_posterior()
-        cdf = np.cumsum(p)
-        log_lam = np.log(self.lam)
-        lo, hi = np.interp([0.025, 0.975], cdf, log_lam)
+        edges, cdf = self._cells()
+        lo, hi = np.interp([0.025, 0.975], cdf / cdf[-1], edges)
         return float((p * self.lam).sum()), float(np.exp(lo)), float(np.exp(hi))
+
+    def sample(self, n: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        """``n`` posterior draws: placement points and λ (uniform within λ's cell)."""
+        flat = np.exp(self.log_post - self.log_post.max()).ravel()
+        cells = rng.choice(flat.size, n, p=flat / flat.sum())
+        point, j = np.divmod(cells, self.log_post.shape[1])
+        edges, _ = self._cells()
+        return point, np.exp(rng.uniform(edges[j], edges[j + 1]))
 
     def point_posterior(self) -> np.ndarray:
         return np.asarray(np.exp(logsumexp(self.log_post, axis=1)))
 
 
-def _carried(sp: SpeciesPanel, terms: UnitTerms, others: Others, lam: np.ndarray) -> np.ndarray:
-    """log L(carried) per source σ (G references, then the species average), unit and λ,
-    relative to M for hit units, with the other species at their means."""
-    n_src = np.vstack([sp.n, sp.n_mean[None]])  # S x U
-    f_src = np.vstack([sp.f, sp.f_mean[None]])
+def survival(sp: SpeciesPanel, scale: float) -> np.ndarray:
+    """Per source (references, then the species average) and unit, the sample allele's
+    survival: the source's, times the strain's survival ``scale``, at most 1."""
+    return np.asarray(np.clip(np.vstack([sp.f, sp.f_mean[None]]) * scale, F_FLOOR, 1.0))
+
+
+def _carried(
+    sp: SpeciesPanel,
+    terms: UnitTerms,
+    others: Others,
+    lam: np.ndarray,
+    scale: float = 1.0,
+    sources: slice = slice(None),
+) -> np.ndarray:
+    """log L(carried) per source σ (G references, then the species average; ``sources`` of
+    them), unit and λ, relative to M for hit units, with the other species at their means
+    and survival times ``scale``."""
+    n_src = np.vstack([sp.n, sp.n_mean[None]])[sources]  # S x U
+    f_src = survival(sp, scale)[sources]
     rows = np.arange(len(sp.units))
     out = np.empty((len(n_src), len(rows), len(lam)))
     lp = np.log(np.maximum(others.p, 1e-300))[:, None]
     l1p = np.log1p(-np.minimum(others.p, 1 - 1e-12))[:, None]
+    change = copy_change(terms, lam, survival(sp, scale)[-1], rows)
     for s in range(len(n_src)):
         d = lam[None, :] * n_src[s][:, None]
         f = np.broadcast_to(f_src[s][:, None], d.shape)
-        out[s] = terms.log_carried(d, f, rows)
-        if others.p.any():
-            # k-mers in either allele, at the depth that keeps the expected hits
-            f_both = 1 - (1 - f) * (1 - others.f[:, None])
-            d_both = (d * f + (others.depth * others.f)[:, None]) / np.maximum(f_both, 1e-12)
-            both = terms.log_carried(d_both, f_both, rows)
+        out[s] = np.logaddexp(np.log1p(-COPY_CHANGE) + terms.log_carried(d, f, rows), change)
+        if others.p.any():  # the others' allele as well (independent k-mer survival)
+            od = np.broadcast_to(others.depth[:, None], d.shape)
+            of = np.broadcast_to(others.f[:, None], d.shape)
+            both = terms.log_carried_alleles([d, od], [f, of], rows)
             out[s] = np.logaddexp(lp + both, l1p + out[s])
     return out
+
+
+def copy_change(
+    terms: UnitTerms, lam: np.ndarray, f: np.ndarray, rows: np.ndarray | slice = slice(None)
+) -> np.ndarray:
+    """log of ``COPY_CHANGE`` x L(carried) with the copies changed from the reference's:
+    uniform over ``COPIES`` (survival ``f``, the species' mean), per unit and λ."""
+    lam = np.atleast_1d(lam)
+    f = np.asarray(f)[rows] if np.ndim(f) else f
+    parts = [terms.log_carried(lam[None, :] * c, np.broadcast_to(np.reshape(f, (-1, 1)),
+                                                                 (np.size(f), len(lam))), rows)
+             for c in COPIES]  # fmt: skip
+    return np.asarray(np.log(COPY_CHANGE) + logsumexp(parts, axis=0) - np.log(len(COPIES)))
 
 
 def _not_carried(terms: UnitTerms, others: Others, beta: float, slab: int) -> np.ndarray:
@@ -287,31 +341,35 @@ def _fit_background(
     return best0[1], best1[1]
 
 
-def fit_one(
-    sp: SpeciesPanel, terms: UnitTerms, others: Others | None = None, beta: float | None = None
-) -> OneStrain:
-    """K ≤ 1 for one species, exactly on the grid (module docstring). ``beta`` fixes the
-    background prior (both models) instead of fitting it."""
-    others = Others.none(len(sp.units)) if others is None else others
-    grid = Placements.build(sp)
+def _fit_scale(
+    sp: SpeciesPanel, terms: UnitTerms, others: Others, grid: Placements, lam: np.ndarray,
+    log_w: np.ndarray, nc: np.ndarray,
+) -> float:  # fmt: skip
+    """The strain's survival scale by maximum marginal likelihood over the reference nodes
+    (t = 0, every ℓ; λ integrated): ``SCALE_GRID`` in steps of 0.1, then ± 0.05."""
+    nodes = np.flatnonzero(grid.t == 0)
 
-    def not_carried(b: float, slab: int) -> np.ndarray:
-        return _not_carried(terms, others, b, slab)
+    def score(scale: float) -> float:
+        log_a = _log_a(sp, _carried(sp, terms, others, lam, scale), nc)
+        ll = _evaluate(grid, log_a, nodes) + grid.log_prior[nodes, None] + log_w[None]
+        return float(logsumexp(ll))
 
+    coarse = SCALE_GRID[::2]
+    best = float(coarse[int(np.argmax([score(float(x)) for x in coarse]))])
+    fine = [x for x in (best - 0.05, best, best + 0.05) if SCALE_GRID[0] <= x <= SCALE_GRID[-1]]
+    return float(fine[int(np.argmax([score(x) for x in fine]))])
+
+
+def _fit_grid(
+    sp: SpeciesPanel, terms: UnitTerms, others: Others, grid: Placements, nc: np.ndarray,
+    scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:  # fmt: skip
+    """λ's grid zoomed onto the posterior until it resolves it, and log (likelihood x
+    prior) per (point, λ). The first (coarse) pass evaluates every node, and the pairs at
+    the λ where some node is within NEGLIGIBLE of the best; later passes only the points
+    within NEGLIGIBLE of the best (the rest stay -inf: negligible mass)."""
     lam, log_w = lambda_grid()
-    carried = _carried(sp, terms, others, lam)
-    if beta is None:
-        bg0, bg1 = _fit_background(sp, carried, not_carried, log_w)
-    else:  # fixed β, the slab still fitted
-        bg0, bg1 = _fit_background(sp, carried, lambda _, j: not_carried(beta, j), log_w)
-        bg0, bg1 = (beta, bg0[1]), (beta, bg1[1])
-    beta0, beta1 = bg0[0], bg1[0]
-    k0 = float(not_carried(*bg0).sum())
-    nc = not_carried(*bg1)
-    # λ's grid zoomed onto the posterior until it resolves it. The first (coarse) pass
-    # evaluates every node, and the pairs at the λ where some node is within NEGLIGIBLE of
-    # the best; later passes only the points within NEGLIGIBLE of the best (the rest stay
-    # -inf: negligible mass).
+    carried = _carried(sp, terms, others, lam, scale)
     is_node = grid.t == 0
     points = np.arange(len(grid.g))
     final = False
@@ -334,16 +392,72 @@ def fit_one(
         per_point = logsumexp(joint, axis=1)
         points = np.flatnonzero(per_point >= per_point.max() - NEGLIGIBLE)
         lam, log_w = lambda_grid(center, half)
-        carried = _carried(sp, terms, others, lam)
+        carried = _carried(sp, terms, others, lam, scale)
+    return lam, log_w, carried, log_a, joint
+
+
+def fit_one(
+    sp: SpeciesPanel,
+    terms: UnitTerms,
+    others: Others | None = None,
+    beta: float | None = None,
+    scale: float | None = None,
+) -> OneStrain:
+    """K ≤ 1 for one species, exactly on the grid (module docstring). ``beta`` fixes the
+    background prior (both models), ``scale`` the survival scale, instead of fitting them."""
+    others = Others.none(len(sp.units)) if others is None else others
+    grid = Placements.build(sp)
+
+    def not_carried(b: float, slab: int) -> np.ndarray:
+        return _not_carried(terms, others, b, slab)
+
+    def background(carried: np.ndarray) -> tuple[tuple[float, int], tuple[float, int]]:
+        if beta is None:
+            return _fit_background(sp, carried, not_carried, log_w)
+        bg0, bg1 = _fit_background(sp, carried, lambda _, j: not_carried(beta, j), log_w)
+        return (beta, bg0[1]), (beta, bg1[1])  # fixed β, the slab still fitted
+
+    lam, log_w = lambda_grid()
+    carried = _carried(sp, terms, others, lam)
+    bg0, bg1 = background(carried)
+    fixed_scale = scale is not None
+    if scale is None:  # survival scale given the background, then the background again
+        scale = _fit_scale(sp, terms, others, grid, lam, log_w, not_carried(*bg1))
+        bg0, bg1 = background(_carried(sp, terms, others, lam, scale))
+    beta0, beta1 = bg0[0], bg1[0]
+    k0 = float(not_carried(*bg0).sum())
+    nc = not_carried(*bg1)
+    lam, log_w, carried, log_a, joint = _fit_grid(sp, terms, others, grid, nc, scale)
+    for _ in range(0 if fixed_scale else SCALE_ROUNDS):
+        # the nodes confound survival with carriage (a lower scale excuses units a node
+        # carries and the strain lacks): refit it on the posterior's own points
+        log_post = joint - logsumexp(joint)
+        top = np.flatnonzero(logsumexp(log_post, axis=1) > np.log(KEEP_POINTS))
+
+        def score(
+            x: float, lam: np.ndarray = lam, top: np.ndarray = top, log_w: np.ndarray = log_w
+        ) -> float:
+            a = _log_a(sp, _carried(sp, terms, others, lam, x), nc)
+            return float(logsumexp(_evaluate(grid, a, top) + grid.log_prior[top, None]
+                                   + log_w[None]))  # fmt: skip
+
+        near = [x for x in scale + np.array([-0.1, -0.05, 0.0, 0.05, 0.1])
+                if SCALE_GRID[0] - 1e-9 <= x <= SCALE_GRID[-1] + 1e-9]  # fmt: skip
+        best = float(near[int(np.argmax([score(float(x)) for x in near]))])
+        if abs(best - scale) < 1e-9:
+            break
+        scale = best
+        lam, log_w, carried, log_a, joint = _fit_grid(sp, terms, others, grid, nc, scale)
     log_z1 = float(logsumexp(joint))
     log_post = joint - log_z1
     keep = np.argwhere(log_post > np.log(KEEP_POINTS) + log_post.max())
-    carriage, depth, surv = _unit_summaries(sp, grid, log_a, carried, lam, keep, log_post)
+    carriage, depth, surv = _unit_summaries(sp, grid, log_a, carried, lam, keep, log_post, scale)
     return OneStrain(
         species=sp.species, log_bf=log_z1 - k0, beta0=beta0, beta1=beta1, lam=lam,
         log_post=log_post, grid=grid, unit_carriage=carriage, unit_depth=depth, unit_f=surv,
         extra={"background_depth0": float(BG_DEPTHS[bg0[1]]),
-               "background_depth1": float(BG_DEPTHS[bg1[1]])},
+               "background_depth1": float(BG_DEPTHS[bg1[1]]), "slab1": float(bg1[1]),
+               "log_k0": k0, "survival_scale": scale},
     )  # fmt: skip
 
 
@@ -355,12 +469,13 @@ def _unit_summaries(
     lam: np.ndarray,
     keep: np.ndarray,
     log_post: np.ndarray,
+    scale: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """P(carried | data), E[depth | carried] and E[f | carried] per unit, averaged over the
     kept (point, λ) cells by their posterior."""
     xt = np.vstack([sp.xt, sp.q[None]])
     n_src = np.vstack([sp.n, sp.n_mean[None]])
-    f_src = np.vstack([sp.f, sp.f_mean[None]])
+    f_src = survival(sp, scale)
     avg = len(n_src) - 1
     weight = np.exp(log_post[keep[:, 0], keep[:, 1]])
     weight /= weight.sum()

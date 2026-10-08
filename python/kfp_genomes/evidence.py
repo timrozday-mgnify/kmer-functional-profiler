@@ -75,6 +75,39 @@ def log_likelihood(
     return np.asarray(term / np.asarray(w, dtype=np.float64))
 
 
+def log_likelihood_alleles(
+    k: np.ndarray,
+    h: np.ndarray,
+    m: np.ndarray,
+    depths: list[np.ndarray],
+    surv: list[np.ndarray],
+    w: np.ndarray | float = 1.0,
+) -> np.ndarray:
+    """log L of a unit several alleles carry (depths and survivals of each; independent):
+    a kept k-mer is hit with P = 1 - Π (1 - f + f e^-D); its hits, given hit, are taken as
+    zero-truncated Poisson at the rate D* whose mean Σ f D / P they have. With one allele
+    D* = D and this is :func:`log_likelihood` exactly."""
+    k, h, m = (np.asarray(x, dtype=np.float64) for x in (k, h, m))
+    log_none = 0.0
+    mean = 0.0
+    for d, f in zip(depths, surv, strict=True):
+        d = np.maximum(np.asarray(d, dtype=np.float64), 1e-300)
+        f = np.clip(np.asarray(f, dtype=np.float64), F_FLOOR, 1.0)
+        with np.errstate(divide="ignore"):
+            log_none = log_none + np.logaddexp(np.log1p(-f), np.log(f) - d)
+        mean = mean + f * d
+    p_hit = -np.expm1(log_none)
+    d_star = ztp_lambda(np.maximum(mean / np.maximum(p_hit, 1e-300), 1.0), iterations=12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        hits = np.where(
+            k > 0,
+            k * np.log(np.maximum(p_hit, 1e-300)) + h * np.log(np.maximum(d_star, 1e-300))
+            - k * d_star - k * np.log(np.maximum(-np.expm1(-d_star), 1e-300)),
+            0.0,
+        )  # fmt: skip
+    return np.asarray((hits + (m - k) * log_none) / np.asarray(w, dtype=np.float64))
+
+
 def _background_log_prior() -> np.ndarray:
     """Per slab centre (``BG_DEPTHS``), the log prior weight of each ``D_GRID`` point:
     log-normal of sd ``BG_SD`` (in ln) x trapezoid on log D, normalised over the grid."""
@@ -268,6 +301,20 @@ class UnitTerms:
             x[rows].reshape(shape) for x in (self.k, self.h, self.m, self.w, self.log_m, self.blank)
         )
         return np.where(blank, 0.0, log_likelihood(k, h, m, d, f, w) - log_m)
+
+    def log_carried_alleles(
+        self,
+        depths: list[np.ndarray],
+        surv: list[np.ndarray],
+        rows: np.ndarray | slice = slice(None),
+    ) -> np.ndarray:
+        """As :meth:`log_carried`, for a unit carried by several alleles
+        (:func:`log_likelihood_alleles`); depths and survivals broadcast as there."""
+        shape = (-1,) + (1,) * (np.ndim(depths[0]) - 1)
+        k, h, m, w, log_m, blank = (
+            x[rows].reshape(shape) for x in (self.k, self.h, self.m, self.w, self.log_m, self.blank)
+        )
+        return np.where(blank, 0.0, log_likelihood_alleles(k, h, m, depths, surv, w) - log_m)
 
     def log_ratio(
         self,

@@ -2276,6 +2276,83 @@ Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-spe
     - `test_outside_organism_sharing_part_of_a_core_is_not_the_species`: 20% and 40% sharing, P < 0.5 (the regression);
     - `test_strain_unlike_every_reference_is_novel`: P(ℓ > 0.5) > 0.5 for a random accessory set, and not for a panel genome;
     - `test_species_sharing_units_are_fitted_together`: two species sharing 100 units, depths within 10% (2.01 and 1.01), shared units carried by both.
+  - *Amendments made during steps 4–5 (in `place.py`, so they apply to K = 1 too):*
+    - *Survival scale.* A strain's alleles keep its references' survival times a scale, fitted per species by type II ML: first on the reference nodes, then refitted on the posterior's own points until stable. The nodes confound survival with carriage, because a lower scale excuses units a node carries and the strain lacks. With the references' survival fixed, a strain 10% more diverged lost ~2 nats per unit, and a strain could be called absent.
+    - *Copy-number change.* With probability 0.05 a carried unit has other copies than its reference (uniform over 1–4, at the species' mean survival). Without it, a strain with a third of its units at 3 copies, where the panel says 1, was called absent: the references carry those units, so the strain could neither carry them at its own depth nor leave them out.
+    - *Species sharing units* use the exact two-allele likelihood (below) in place of moment matching.
+    - The λ interval and posterior draws come from λ's cells (mass spread evenly over each grid point's cell in log λ), so draws reproduce the interval.
+
+* **Phase 12, step 4 — strain mixtures (`kfp_genomes/mixtures.py`).**
+  - *Likelihood:*
+    - Each strain is in one state per unit: not carrying it, or carrying it copied from g, h or the species average. The unit's likelihood sums over every combination exactly (4^K at most).
+    - *Several alleles (amendment):* a kept k-mer is hit with P = 1 − Π(1 − f + f e^−D). Its hits given hit are zero-truncated Poisson at the rate D* that matches their mean, Σ f D / P. With one allele this is the one-allele likelihood exactly; an allele at no depth changes nothing.
+      - The first version moment-matched a single depth over the union of the alleles' k-mers. A second strain at negligible depth then raised the union's survival, and K = 2 came out ~1200 nats below K = 1 on one-strain samples.
+    - *Copy changes* apply to units several strains carry too, at their summed depth. Without that, a strain at no depth "carrying" every unit escaped their log(0.95) cost, about 20 nats on 400 units, and K = 2 won on one-strain samples.
+  - *Histogram (opt-in):*
+    - A unit several strains carry adds its own-k-mer histogram's likelihood as a mixture at the rates of every non-empty subset of them, less the one-rate likelihood at D*.
+    - The weights are the share of k-mers in exactly those alleles that are hit, f's times 1 − P(0 | rate).
+    - *Amendment:* the weights are not free per unit, as the plan had. Free weights would add an EM inside every MCMC step and absorb the carriage pattern the strains should explain.
+    - *Bug found and fixed:* the first weights were not conditioned on a hit, which over-weighted the low-rate component and biased its strain's depth low (0.65× for 1×).
+    - The histogram's shape (squared CV) is a plug-in fitted under the K-strain model. The sample's one-rate shape (`rate_mixture`'s) is inflated by mixed units (0.1, against 0 in the simulation).
+  - *Starts (needed because one strain absorbs others by raising its survival scale):*
+    1. *Pair split:* each of the K = 1 posterior's top 3 reference pairs (g ≠ h) becomes two strains, one at each reference (ℓ = 0.25). The survival scale is lowered (0, −0.1, −0.2) and each depth re-maximised.
+    2. Coordinate ascent: each strain over the reference nodes at ℓ ∈ {0, 0.25, 0.5} with its depth maximised, depth splits onto any node, and the scale; up to 4 rounds.
+    3. A pilot at β = 1 that also slice-samples the survival scale; its median is the plug-in for K strains.
+  - *Sampler:* slice sampling on each log λ_k (width 0.3(1 − β) + 0.03), 3 placement moves per strain and sweep (one within its neighbour pair, two independence proposals), a swap of two strains' depths, 4 chains.
+  - *Marginal likelihood (amendment: generalised stepping-stone).* The path runs (L × prior)^β r^(1 − β) from a reference r: the K = 1 and pair/residual placements, log λ ~ N(start, 0.3), symmetrised over labels, sampled exactly. It uses 8 rungs, β = (j/8)³, 30 sweeps each after 5 burn-in.
+    - Starting from the prior, the first rung's draws were hopeless: K ≥ 2 came out ~1000 nats low.
+    - For K = 1 it matches the exact grid within 1 nat (0.2–1.1 on test samples).
+  - *K:* P(K) ∝ prior × Z_K. P(K ≥ 1) = π (empirical Bayes); then a truncated geometric with ratio 0.2. R-hat and ESS of the log-likelihood and each sorted log λ are reported.
+  - Tests:
+    - `test_stepping_stone_matches_the_exact_marginal_for_one_strain`, and a second strain is not wanted (P(K = 1) > 0.99);
+    - `test_two_strains_in_distinct_clades_are_resolved`: 5× and 2×; P(K = 2) > 0.99; depths within 10%; units of one strain only assigned to it (> 0.9, the other < 0.1);
+    - `test_near_identical_strains_are_one_honestly`: the same alleles, three units apart, gives K = 1 at the summed depth;
+    - `test_own_kmer_histogram_splits_strains_of_one_content`: two strains of one content with their own alleles at 5× and 1× are recovered (0.98×, 5.00×) with the histogram;
+    - `test_several_alleles_reduce_to_one_and_match_simulation`.
+  - *Simulator:* strains can share alleles (`allele`), and `simulate_with_histogram` writes the sidecar.
+  - *P(K ≥ 2) calibration (plan test 3), a run outside the test suite:*
+    - *Setup:* 12 simulated samples, each with a fresh panel of 8 references (two clades). The strains are new genomes, not panel ones. Six samples have one strain and six have one strain per clade, at depths log-uniform on 1–5×. Default sampler settings.
+    - *One-strain samples:* all six give P(K ≥ 2) = 0.000 and the right depth.
+    - *Two-strain samples:* five give P(K ≥ 2) = 1.000 with both depths within 3% (e.g. 4.82/3.24 → 4.79/3.28; 1.05/1.13 → 1.06/1.13). One (2.69× + 4.70×) was missed: one strain at 6.2×, P = 0. The start search did not find the split.
+    - It is not well calibrated in the plan's sense: every probability is 0 or 1, so 1 miss in 6 is a confident error.
+    - R-hat of the log-likelihood was 1.6–3.6 on the two-strain samples (chains on different placements).
+    - The test is still to be run properly, on the benchmark's simulated samples (step 8).
+  - *Known limits:*
+    - Chains can sit on neighbouring placements a few nats apart. R-hat of the log-likelihood flags it (1.26 on one sample; depths and K agree across chains).
+    - The upgrade is a conditional placement move over a strain's neighbourhood.
+  - *Cost:* a two-strain fit of a 6-reference, 600-unit species takes 15–30 s; at 50 references and 6000 units it is expected to be ~10× that. It is opt-in (`--max-strains`).
+
+* **Phase 12, step 5 — outputs and model checks (`kfp-genomes place`; `kfp_genomes/report.py`).**
+  - *Command:* `kfp-genomes place PROFILE PANEL OUT --own-hist --max-strains --index --seed --beta`.
+    - It refuses a profile of another index: `--index` is checked against the panel's checksum, and without it the profile's `m_g` must equal the panel's on shared units, since a profile records no checksum.
+  - *Outputs:*
+    - `genome_profile.tsv`, one row per strain of each detected species (P(K ≥ 1) ≥ 0.5), with K at its posterior mode:
+      - depth (mean, 95% interval) and relative abundance;
+      - species `present_prob` = P(K ≥ 1) and `mixture_prob` = P(K ≥ 2);
+      - placement: the commonest (g, h, t, ℓ) of the draws, `ell_mean`, `novel` (P(ℓ > 0.5) > 0.5), and `nearest`: the top 3 references with posterior weights (g gets 1 − t, h gets t);
+      - survival scale, log BF, R-hat and ESS for K ≥ 2;
+      - model checks and `check_failed`;
+      - the model-free evidence (below).
+    - `candidates.tsv`: every screened species with log BF, presence, β, slab depths and survival scale.
+    - `placements.parquet`: 500 draws per one-strain species (`species`, `strain`, `draw`, `ref_g`, `ref_h`, `t`, `ell`, `lambda`), or the MCMC's.
+    - `strain_units.parquet`: per (strain, unit) `carriage_prob`, `depth` (E[λ n | carried]), `survival`, `q`.
+    - `place_summary.json`.
+  - *Model-free evidence (asked for by the user, 2026-10-08), beside the model's numbers:*
+    - `units_hit` and `core_hit` of `core_units` (units with `present_prob` ≥ 0.5);
+    - `units_own`: the hit units gather gives the species when each goes to the first species, in gather order, that has it (G0 one level up);
+    - `kmers_own`: their `kmers_unique` (the simulated profiles' fitted hit k-mers);
+    - `depth_greedy`: the median `coverage_zi` / copies over its own core units, or all its own units when fewer than 5, as sylph does.
+    - They add no evidence the model lacks. They show whether a call rests on 3 units or 300, and a gap between `depth_greedy` and the model's depth flags misspecification. The unit-level `coverage_greedy` was left out: `kmers_unique` and `present_prob` already cover it.
+  - *Model checks* (posterior predictive, p-values, flagged below 0.01, reported never patched):
+    - `check_core`: core units detected against predicted (P(carried | placement) × P(≥ 1 hit), Poisson-binomial).
+    - `check_spread`: hit units the strains carry whose log coverage is more than 3 sd from the depth predicted at the references' copies, against the binomial rate that copy changes and chance allow. The sd comes from the likelihood-ratio interval `coverage_interval` gives.
+      - *Amendment:* the first version, a χ² over all units with a Poisson sd, failed correctly specified species (p ~ 10⁻¹³), and would fail any species with a few copy changes.
+    - `check_single` (K ≥ 2): units only one strain carries against that strain's depth.
+  - Tests:
+    - `test_place_cli_outputs_and_model_free_evidence`: depth 2.0 within 10% inside its interval; relative abundance 2/3; nearest references in its clade; `units_hit` = `units_own` = its 383 units; `depth_greedy` within 10%; no failed check; carried strain units equal its units; another index refused.
+    - `test_posterior_draws_reproduce_the_reported_interval` (0.3× and 2×);
+    - `test_spread_check_flags_misspecified_depths`: a third of units at 3 copies fails `check_spread` and the correct simulation passes.
+  - *Found while testing:* a new genome of a clade with only 4 references, each an independent 85% draw of the clade's accessory units, comes out `novel` (ℓ ≈ 0.8). Under the model that is the honest answer: no single reference resembles it. Whether real (clonal) accessory variation gives lower ℓ is for the benchmark.
 
 ## Libraries
 
