@@ -1077,7 +1077,7 @@ def presence(
     )
     prob = np.ones(len(units))
     it, done = 0, False
-    w = np.zeros(H_CAP + 1)
+    w: np.ndarray = np.zeros(H_CAP + 1)
     while not done and it < max_iter:
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
         new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
@@ -1722,7 +1722,8 @@ def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
     best, top, rates = -2 * ll1 + np.log(cnt), mu1.copy(), np.ones(n, dtype=np.uint8)
     for k in (2, 3):
         mu = np.maximum(mean[:, None] * np.exp(np.linspace(-1, 1, k))[None], 0.5)
-        w, ll = np.full((n, k), 1 / k), np.zeros(n)
+        w = np.full((n, k), 1 / k)
+        ll: np.ndarray = np.zeros(n)
         for _ in range(MIX_ITERATIONS):
             lp = np.log(w[u]) + _ztnb_logpmf(h[:, None], mu[u], v)
             mx = lp.max(1, keepdims=True)
