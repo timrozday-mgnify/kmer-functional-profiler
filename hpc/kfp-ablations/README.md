@@ -51,6 +51,24 @@ cd kfp-ablations/release-tiers && sbatch run.sh
 for r in abundance-novaseq abundance-1.65M abundance-tiers; do (cd kfp-ablations/$r && sbatch run.sh); done
 ```
 
+`study-ladder` is phase 10's study ladder; it needs a checkout of the `dev` branch (until
+phase 10 is merged) and can run whenever `00-dbs` has.
+
+`genome-mode` is phase 11's genome arm; it needs a checkout of the `dev-phase11` branch and
+can run whenever `00-dbs` has.
+
+`species-benchmark` is phase 11's strain hold-out benchmark for the species model
+(`workflows/species-benchmark`); it needs a checkout of the `dev-species` branch, fetches
+the human-gut catalogue's pangenomes from the EBI FTP, and profiles against the 1-in-100
+subset unless `INDEX=<built index>` is set (`cd species-benchmark && INDEX=... sbatch run.sh`).
+Its lineage arm (step 12) needs JAX and NumPyro: re-run `bash workflows/setup.sh` in the
+checkout after pulling, which now installs the `phylo` group.
+
+`gtdb-species-index` builds phase 11's GTDB species index (`workflows/gtdb-species-index`)
+on the `dev-species` branch: `cd gtdb-species-index && INDEX=<built index> sbatch run.sh`.
+It downloads genomes from NCBI (1000 sampled species by default; `--max_species ''` for
+the whole release). Run it after `species-benchmark` reads well (plan: phase 11, step 11).
+
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for
 7 days; lower `--time` in `run.sh` if your partition caps it.

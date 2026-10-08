@@ -356,8 +356,8 @@ Ten phases, each with a go/no-go gate, plus three optional ones; phases 1–5 ar
 | 7. Ablations and freeze (in progress: frame modes and quality mask (step 1) containment AAI (step 2) joint query (step 3), host mask (step 4) and Pfam scoring (step 5) in code; ablation runs set up for HPC (step 6); simulation ablation of frame modes and AAI run (step 7); closed-form AAI intervals (step 8); simulation ladder to 70% (step 9); MGnify90-level truth (step 10); `aai` ablation as a sparse/dense ladder (step 12); first MGnify90-level `aai` run, gate failed with the dense tier (step 13); unknown-fraction estimate in code, evaluation pending (step 14); `aai` ladder run: any dense tier beats sparse, the rate barely matters, gate still fails (step 15); inverse `aai` calibration removes the bias, ranking unchanged (step 16); calibration attachable to an index and applied by the query, to be validated across benchmarks (step 17); posterior cells read, and draws dropped: confidence from closed-form estimates on the k-mers (step 18); ablation batch revised and a raised floor (*t\_base* 0.02) set against the dense tier, set up for HPC (step 19); ablation results in, all runs but `floor` error-free: a raised floor beats the dense tier on accuracy and query cost but not on index size, the strict decision rule keeps the dense tier, amendment proposed; read QC stays off; the human mask matches hostile (step 20); three release tiers sized and their run set up (step 21); `aai` calibration does not transfer across depth (step 22); `aai` bias traced to three mechanisms, replacement estimator designed (step 23) and built, α fit set up for HPC, per-target α explored (step 24); Markov-modulated survival model with selection-conditioned count-space estimate, offline check promising, protein-pair fit pending (step 25); sylph's read-error estimate tested, not adopted (step 26); second ablation export: tiers run, rescored `floor`/`host`, `floor` error-free; at matched thresholds every floor beats sparse, `tbase02_all`/`tbase05`/`tbase10_all` calibrate and `tbase02_n16` does not, the decoy is no host filter, `tbase10_all` queries hit a blocked-EM ceiling at 100 M pairs (step 27); slim and large tiers decided, ~120 GB standard candidates and frame mode on the tiers set up for HPC, with abundance error by gene length (step 28); EM fits at the step cap traced to flat likelihood ridges (no accuracy cost); block-wise fits stopped short of the fixed point, fixed by blocks in graph order and accelerated rounds; `em_max_change` stat (step 29); random EM starts and a multi-start convergence check on two deep soil metagenomes: every fit's component coverages agree across five starts; the only misses are unit-level splits on one sample's `tbase10_all` (L1 ≤ 0.0013), and counted as a pass; no fit was large enough to go block-wise (step 30); third ablation export: of the standard candidates only `tbase015_all` calibrates `aai`, `tbase02_n16` leads detection and the 16-k-mer cap (not the selection by score) breaks `aai`; edges remove MiSeq's short-gene abundance bias at no matched-threshold purity cost, frame mode `edges:30` and standard tier `tbase02_all16` decided (step 31); the three tiers' full-scale build set up for HPC, and `-resume` made to rebuild when `--index_args` changes (step 32); step 25's protein-pair fit run and failed to fit; Markov-beta survival model with end loss, fitted at nearest-member identity, set up for HPC (step 33); step 33's run: nearest-member identity halves the cluster-size effect but leaves a union effect; a union term (m effective members) over the one-member model fits every cluster size (step 34); step 34 rescored on the floor runs: better than the as-profiled `aai` but step 25's rule fails, reading low as clusters grow; traced to the benchmark's truth (strain mixes scored against an independent-union truth, and a looser nearest-member coverage than the fit's): on single-gene units `step34` passes the bias rule at 80–95%, intervals too narrow at 10+ k-mers (step 34); see Progress log) | Ablations with the phase-6 method as the baseline, so each measures a change against what will ship: EM vs gather/winner-take-all/uniqueness-first, zero inflation, *p\_in* weighting, dense tier, floors, alphabet and k (scored also on within-component split error and ambiguity-group size, which the function × taxon table depends on; see Risks), frame mode (stop-free, stop-free + edges, all six), read QC (raw, quality mask, fastp); divergence ladder (with containment-AAI calibration, see Sequence similarity); host spike-in ladder with the joint query (`--extra-index`) and human mask sidecar (`mask`) built for it (Additional references, steps 1–2), deciding whether the release ships the human mask. Where an ablation changes the index, it is run on a nested subset whose accuracy phase 6 has tied to the full build. Algorithm spec written; golden outputs recorded. | Python + Nextflow | Defaults chosen on Pfam metrics at full-scale cost, including host handling; spec reviewed and covering joint queries and masks. If the divergence ladder forces a different alphabet or k, phase 6's cost study is repeated for it. |
 | 8. Rust port | Query, model and CLI in Rust, implementing the spec (the index build and lookup already ported in phase 6 are brought in line with it). Differential tests against the Python golden outputs (exact for counts, tolerance for EM). | Rust | All golden tests pass; ≥ 10x Python end to end; full-scale results of phase 7 reproduced. |
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
-| 10. Additional references (desirable, not essential) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
-| 11. Genome mode (desirable, not essential) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; the per-sample function × taxon table (Pfam × genome, rolled up to species and genus, with an unclassified remainder), a primary output. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; function × taxon abundance L1 and (taxon, function) F1 no worse than HUMAnN 3.9's stratified output on KO; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. |
+| 10. Additional references (desirable, not essential; in progress on the `dev` branch: decoy role (step 1), study-index recipe and `index --like` (step 2), study ladder set up for HPC (step 3); see Progress log) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
+| 11. Genome mode (desirable, not essential; in progress on the `dev-phase11` branch: `annotate-genomes` (step 1), `genomes` fit by gather and weighted ZI EM (step 2), function × taxon table, ambiguity groups and intervals (step 3), fmh benchmark genome arm with sylph set up for HPC (step 4), `kfp-prior` build and update (step 5), its depth ladder set up for HPC (step 6); the species model on `dev-species`: species index from catalogue pangenomes or a genome set (step 7), the joint fit by variational EM (step 8), unit, Pfam and function × species outputs (step 9), strain hold-out benchmark set up for HPC (step 10), GTDB species index recipe set up for HPC (step 11), continuous lineage model prototype with a two-strain arm set up for HPC (step 12); see Progress log) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; the per-sample function × taxon table (Pfam × genome, rolled up to species and genus, with an unclassified remainder), a primary output. `species-index`: per-species unit prevalence from MGnify catalogue pangenomes (GTDB later). `species`: species presence and depth fitted jointly with each species' unit carriage in the sample (variational EM, prevalence as prior, k-mer hits as evidence), with updated unit and Pfam presence and the function × species table. Later, a continuous lineage model on a pseudo-phylogeny. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; function × taxon abundance L1 and (taxon, function) F1 no worse than HUMAnN 3.9's stratified output on KO; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. Species model, on the UHGG strain hold-out benchmark: species detection F1 and abundance L1 within 0.05 of sylph; at 0.1–1× depth, Pfam completeness +10 points at ≤ 2 points purity loss over observed, carriage calibration error ≤ 0.05 on zero-hit units, and calibration better than kfp-prior B1. |
 | 12. Genome profile and functional update (desirable, not essential; planned 2026-10-08, see Genome profile and functional update) | `kfp-genomes` companion (replaces `kfp-prior`): `panel` (per-genome carriage, copies and k-mer survival; cheap distances and nearest-neighbour lists; no trees), `place` (strains placed between nearest references from per-unit likelihoods built from the profile: one strain exactly, several by MCMC, number by marginal likelihood, strain mixtures from depths pooled across units), `update` (unit presence and coverage as posterior marginals, imputed units apart from observed, the function × genome table), opt-in iteration through the query's unit presence prior. | Python | Carriage log loss ≥ 10% below the species model and the lineage prototype; species L1 within 0.05 of sylph; two strains (≥ 1× each, distinct clades) resolved in ≥ 80% with calibrated mixture probability; placement better than nearest-reference; at 0.1–1× Pfam completeness +10 points at ≤ 2 points of purity; zero-hit calibration error ≤ 0.05; model checks flag < 10% of detections. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
@@ -408,6 +408,12 @@ What each step did, and the choices, results and interpretations behind it, newe
   - Abundance and coverage intervals (`*_zi_lo`/`_hi`) need a closed form in the manner of `aai_interval`, before they are reported again.
   - Ambiguity groups and `own_evidence` (phase 4, step 15) are accumulated over draws. If they stay, they are recomputed from the point fit (e.g. each unit's EM share on k-mers it shares with other detected units).
   - `--draws` and `posterior_zi` are no longer supported outputs: no further work on their cost (phase 6, step 33's E2; phase 7, step 11), and the `COPIES_ERROR` re-check, which only calibrated the draws, is dropped. Phase 11's genome-level intervals follow the same rule.
+* **Decided (2026-10-07): species from pangenome prevalence, fitted jointly with the functions they carry; next in phase 11.** The user's request: predict species abundance from the function abundance, with an index linking genomes to functions. Species presence and depth, and each species' carriage of each unit in the sample, are fitted together by a Bayesian model (Genome mode, Species model). Each species' unit prevalence across its conspecific genomes is the prior on carriage; the k-mer hits are the evidence. Functions are updated by what the detected species usually carry and by their own hits, and species by the functions seen. Choices made with the user:
+  - It extends phase 11 in place, as its default genome → function path. G1 (per genome) stays as the strain-level arm and kfp-prior's B1 as a baseline, since this is the joint model (B3) B1 approximated.
+  - Prevalence comes first from MGnify genome catalogue pangenomes (Panaroo presence/absence, so only gene families are hashed), with GTDB later through the genome-set path.
+  - Inference is closed-form variational EM in numpy. The future continuous model, carriage as a smooth function of a pseudo-phylogeny so that sub-species lineages can be placed, is prototyped in NumPyro and ported only if it wins.
+  - The work is on `dev-species` (from `main`, `dev-phase11` merged in).
+
 * **Decided (2026-10-06): release tiers — slim is `slim`, large is `tbase05_all`; standard is chosen from ~120 GB candidates.** From phase 7, step 27. *Slim:* `slim` (*t\_base* 0.01, singletons 0.001, *n\_min* 8; ~91 GB today's format, ~50 GB compact), not sparse: about HUMAnN 4's database size, and better at matched purity (Pfam completeness 0.752 against 0.742; MGnify90 detection ahead on all three metrics at ≥ 2 hits). At an equal threshold it trades a little purity for completeness, as every floor does (`purity_nearest` −0.003, Pfam purity −0.027 at `min_hits` 1). *Large:* `tbase05_all` (*t\_base* 0.05, every candidate up to *t\_g*; ~282 GB today's format), for `aai`, which it calibrates. *Standard:* about 120 GB (compact); `aai` is wanted if an arm of that size supports it. Candidates `tbase02_n16`, `tbase015_all` and `tbase02_all16`, benchmarked in step 28.
 * **Decided (2026-10-06): the default frame mode is `edges:30`** (`query --frames`, `profile(frames=)`; `edges` alone now means 30 aa, `EDGES_MIN_LEN`). The user's choice, from phase 7, step 31. Edges remove the short-gene abundance bias (MiSeq log2 −1.0 → −0.1 to +0.05) at no purity cost at matched thresholds. The user accepted the cost: 1.0–1.3× wall and 1.15–1.55× CPU at 100 M pairs, which misses step 28's 25% limit on the standard-sized index. The ablation configs that compare against stop-free (`frames.config`, `reads.config`) now pass `--frames stopfree` explicitly; the other configs' plain arms now run edges:30.
 * **Decided (2026-10-06): the standard tier is `tbase02_all16`** (`--k 11 --t-base 0.02 --n-min 16 --oversample 1`; the user's choice, from phase 7, step 31). 1.96 GB at 1 in 100: ~196 GB in today's format, ~108 GB compact by `slim`'s ratio. Known costs from step 31: its `aai` does not calibrate (−0.037 at 70%, Spearman 0.22), and at matched purity its MGnify90 detection ≈ `tbase02_all` and below `tbase02_n16`. Its Pfam equals the other candidates.
@@ -1950,6 +1956,243 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - *Decided (user, 2026-10-08):* fix the cause, not the readout: find out how to give these units enough k-mers of their own. Rejected: widening the interval below a k-mer floor, or reporting their coverage as a lower bound. Not started.
     - *Changed.* `rate_mixture` runs only with `--all-estimators` (benchmarks, which query with it, still score `coverage_mix`); a default query no longer has `coverage_mix`/`mix_rates` and skips its cost (~9 s per 50 k units). Test: the default profile lacks `coverage_mix`, the `--all-estimators` one has it, shipped columns unchanged. Python suite 137 passed.
 
+### Phase 10
+
+Developed on the `dev` branch while phase 7's ablations run on HPC; merged to `main` only after phase 7. Steps 3–5 of Additional references, plus its study ladder.
+
+* **Phase 10, step 1 — decoy role (Additional references, step 3).**
+  - *Build:* `index --role decoy` writes `"role": "decoy"` into `meta.json` after the build (no other change to the index; the partitioned build has no flag, since decoys are proteome-sized).
+  - *Query:* a decoy index given as `--extra-index` joins gather, the EM and presence like any extra index. At the end, `collapse_decoys` replaces its units by one row per decoy index: `name` `decoy`, null `unit`, its `source`, and `hits`, `hits_em`, `kmers_hit`, `reads`, `m_g` summed over its hit units (`reads` counts a read once per unit), `coverage` and `coverage_em` over that `m_g`, and `decoy_units` (units hit) and `decoy_detected` (units with EM hits). The sample summary (`--summary`) is computed before the collapse, so reads explained by a decoy count as explained.
+  - *Tie-break:* gather explains away exact duplicates in favour of the lower unit id, and the base comes first, so a decoy unit identical to a base unit gets no hits. Host-derived MGnify clusters therefore keep the reads they share with a host decoy; the mask's `host_like` flag (phase 7, step 4) is what reports them.
+  - Tests: `test_decoy_index_competes_and_reports_one_row` (base rows equal those of the same index joined as a plain extra; the decoy row sums its units' hits and EM hits; an identical decoy gets 0).
+
+* **Phase 10, step 2 — study-index recipe (`workflows/study-index`; Additional references, step 4) and `index --like`.**
+  - *Pipeline:* contigs or MAGs (`--contigs`, one file per MAG) → pyrodigal `-p meta` → MMseqs2 linclust → members table (`study.py members`) and Pfam by `hmmsearch --cut_ga` in `--pfam_chunks` shares (`study.py pfam`) → `index --like BASE --pfam`. `--proteins` skips the gene calling. pyrodigal 3.7.1, MMseqs2 18 and HMMER 3.4 run in biocontainers; the rest in the venv. The steps are a subworkflow, `STUDY_INDEX`, so the study ladder (step 3) can include it.
+  - *Choices:* protein ids from gene calls are prefixed with the input file's name, since contig names repeat across MAGs (an underscore, not `|`, which MMseqs2 may parse as a UniProt-style header). `full_length` is false only for genes Prodigal marks partial, so protein FASTA counts as full length. Proteins linclust leaves out of every cluster become singletons. Clustering defaults to `--min-seq-id 0.9 -c 0.8 --cov-mode 1`, to be checked against the release notes of the base's MGnify release. Every member is searched with Pfam (as MGnify labels every protein), not only representatives; reps only would be cheaper if the search dominates.
+  - *`index --like DIR`:* copies every build parameter from another index's `meta.json` (all but `--batch-residues`, which changes only memory), so a study or decoy index matches the base for a joint query. Refused for a sourmash-hash import.
+  - *Decoys:* the same recipe with `--proteins proteome.fa.gz --role decoy` builds the plan's decoy index from a proteome clustered at 90%.
+  - *Fixed on the way:* a joint query in which no index had a hit failed (`_Joint.rows` concatenated an empty list); it now returns an empty profile (on `dev`; the bug is also on `main`, for any `--extra-index` query of reads that hit nothing).
+  - *Checked:* `-profile test,docker` on the fmh fixture's three genomes: 75 proteins, 75 units (no two genes there are 90% identical), 6 Pfam hits on `Pfam-mini.hmm`, and the study index's build parameters equal the base's. Querying one of those genomes with the base plus the study index gives every EM hit to study units. Test: `test_members_and_index_like` (partial flags, unclustered proteins, the stop removed, domtbl parsing, `--like` overriding `--k`).
+  - Results: the gate's build cost (one study of ~10⁶ proteins in minutes on one node) is pending a real study on HPC; `trace.tsv` records it.
+
+* **Phase 10, step 3 — the study ladder (fmh benchmark `--study_ladder`; Additional references, Evaluation), set up, not run.**
+  - *Design:* per seed, `--study_fraction` (0.5) of the sample's genomes are the study, as if recovered as MAGs; the other half stay unrepresented, so the same samples show what the study adds and what it must leave alone. Study proteins are the genomes' annotated proteins (not pyrodigal calls), so the Pfam labels come from the run's own `PFAM_DOMAINS` and the rebuild can use the DIAMOND truth. The study index is built by `workflows/study-index`'s own processes (linclust, members, `index --like`), skipping its Pfam search.
+  - *Arms:* base alone (plain arm), `study` (base + study index, joint query) and `rebuild` (the base members plus the study's proteins: each joins its nearest MGnify90 cluster where `gene_units` passes `--mgnify_min_id`/`--min_cov`, as MGnify's own clustering would put it, else its linclust cluster; built `--like` the base). The plan's overlay arm waits for step 5, which is built only if this ladder fails.
+  - *Scores:* on Pfam (study units carry Pfam labels; the MGnify90-level truth has no study units). `pfam-profile` takes one label table per index of a joint query, offset by the units before. `study_ladder.tsv`: each arm's completeness and purity and `recovered` = (study − base) / (rebuild − base) completeness. `study_unrelated.tsv`: base units whose components hold no study unit, and how many changed `hits`, `kmers_unique` or `coverage_em`. AAI scoring skips the two arms (their units are not MGnify90 clusters).
+  - *Found on the way: `component_dense`.* In the fixture run with a dense tier, one base unit whose tier-2 `component` held no study unit still moved (`coverage_em` 0.461 → 0.456). With a dense tier, the EM is fitted on components of the dense hits, which link units through k-mers tier 2 never sampled, so `component` does not say which units competed. Profiles with a dense tier now report `component_dense` (null for units gather drops), and the check excludes units linked either way. After that, 0 of 9–10 unrelated units changed in every fixture run. This is real competition, not leakage: the joint query behaves as the union index would.
+  - *Gate (from Additional references):* `recovered` ≥ 0.9 and no unrelated unit changed. Overlays (step 5) only if duplicate units or the `n_groups` approximation cost more than 2 points of completeness or purity against the rebuild.
+  - *Run:* `ablations/study.config` on the 1-in-100 subset with the phase-6 default (`sparse`), 10 seeds; `hpc/kfp-ablations/study-ladder/run.sh` (needs the `dev` checkout). One rebuild of the subset per seed. Checked: `-profile test,docker --study_ladder true` (122 tasks; completeness saturates at 1.0 on the fixture, so `recovered` is null there) and a stub run of the config.
+  - Tests: `test_study_rebuild_and_ladder` (assignment by identity and coverage, string ids, Pfam numbers to accessions, `recovered`).
+  - Results: pending on HPC.
+
+### Phase 11
+
+Developed on the `dev-phase11` branch (from `dev`), one feature branch per step merged into it; kept off `main` until phase 7's ablations are done. Steps follow Genome mode's implementation plan. From step 7 (2026-10-07) on `dev-species`: a branch from `main` with `dev-phase11` merged in (so it also carries phase 10), feature branches per step, still off `main` until phase 7's ablations are done.
+
+* **Phase 11, step 1 — `annotate-genomes` (Genome mode, step 1).**
+  - *Command:* `annotate-genomes INDEX GENOMES.tsv OUT` (columns `genome`, `path` to protein FASTA relative to the TSV, optional GTDB-style `taxonomy`). Each genome's proteins are hashed by `hash_proteins` at tier 2's rate and looked up with `unit_hits` (each unit's own `t_g`), read id = genome; per (genome, unit) it keeps the raw `hits` (every holder counts a k-mer, nothing split) and distinct `kmers`.
+  - *Output:* a unit-major CSR (`unit_offsets.npy`; `genome.npy`, `hits.npy`, `kmers.npy` sorted by unit then genome), memory-mapped so the fit reads the hit units' rows only; the same hits genome-major (`genome_offsets.npy`, `genome_hits.npy`), since the zero-inflated fit needs every unit of a candidate genome, hit or not, for the hits it expects to see; `genomes.tsv` (`genome`, `name`, `path`, `taxonomy`, `proteins`, `units`, `hits` = Σ*c*); the index's `unit_pfam.parquet`, so the function × taxon table needs no index; and `meta.json` with the index's `meta.json` SHA-256 and unit count.
+  - *Amendments:* (1) no Rust protein mode for `FastxHits`: the existing `hash_proteins` kernel on Python-read FASTA batches does it, and per-genome Python overhead is small next to the hashing. (2) Protein FASTA only; nucleotide genomes go through the study-index recipe's pyrodigal step (phase 10, step 2), so the profiler gains no gene-calling dependency. (3) Tier 2 only: `profile.tsv`'s `hits` are tier 2 with or without a dense tier, and the fit uses those. (4) A profile does not record its index, so the checksum is checked when `genomes` is given `--index`; without it only unit ids beyond the annotated index are caught. (5) A query's `--mask` is not applied to the content (masked k-mers would then be expected but never seen); to revisit if genome mode is used with host masking. (6) Storage is ~16 B per (genome, unit) row with the genome-major copy (plan: ~8 B), ~8 GB for 10⁵ genomes; all rows are sorted in memory (`ponytail:` note in `genomes.py`).
+  - Tests: `test_genome_of_member_proteins_carries_their_units`, `test_genomes_annotated_together_equal_each_alone`, `test_reads_at_depth_hit_units_in_proportion_to_content` (error-free reads tiled every codon over N-padded CDS, stop codon cut: every unit's profile `hits` is exactly 44 × *c*), `test_annotate_genomes_cli`.
+
+* **Phase 11, step 2 — `genomes` (Genome mode, step 2): screen, G0 and G1.**
+  - *Command:* `genomes PROFILE.tsv GENOME_INDEX [OUT]` (`--summary`, `--index`, `--min-containment`, `--min-units`). It reads the profile's raw tier-2 `hits` and the hit units' rows of the genome index.
+  - *Screen:* genomes with Σ\_{u hit} *c* / Σ\_u *c* ≥ 0.1 (`MIN_CONTAINMENT`). *G0:* `gather` over (genome, hit unit) pairs with every genome's rate 1, keeping genomes left ≥ 10 hit units (`MIN_UNITS`). Both defaults are guesses to tune on the fmh benchmark's genome arm.
+  - *G1:* `em` gains a per-pair `weight` column (expected hits of item *u* from holder G = λ\_G *w\_{G,u}*; `m_g` is the holder's total weight over all items, hit or not) and an `items_hit` callable for the zero-inflated present fraction: units G would hit if all present, Σ\_u 1 − e^(−λ *c\_{G,u}*) over every unit of G, computed from each genome's distinct content values (the genome-major arrays). Unweighted calls are unchanged (all query tests pass); the present prior stays unweighted only.
+  - *Output:* per detected genome (λ > 0 after the EM): `depth` (λ\_G, in the profile's per-k-mer coverage), `present` (π\_G), `relative_abundance`, `units_hit`, `containment`, `units_unique`, `gather_rank`, `name`, `taxonomy`. Summary: raw `hits`, `explained_fraction` = Σ\_u min(*h\_u*, Σ\_G λ\_G *c\_{G,u}*) / Σ *h* (presence-conditional prediction, as the plan's unclassified rule), `genome_equivalents` = Σ λ, and screen/gather/EM counts.
+  - Tests: `test_weighted_em_with_unit_weights_equals_em` (plain and zero-inflated), `test_disjoint_genomes_recover_their_depths` (3 and 7 recovered to 1%; a genome made of the two's proteins is explained away by gather), `test_relative_missing_content_gets_present_below_one` (a sample strain lacking 3 of 10 units: π in (0.6, 0.8), depth within 20%), `test_unexplained_hits_and_cli`, and the tiled reads of step 1 fitted to depth 44 with π = 1.
+
+* **Phase 11, step 3 — function × taxon table, ambiguity groups and intervals (Genome mode, step 3).**
+  - *Table:* `genomes --function-taxon` (default `function_taxon.tsv`), long format: `function`, `rank` (`total`, then `family`, `genus`, `species`, `genome`), `taxon`, `hits_em`. Unit *u*'s split hits (`hits_em`) have a classified share min(*h\_u*, Σ\_G λ\_G *c\_{G,u}*) / *h\_u*, given to the detected genomes carrying it by the fit's E-step responsibilities ∝ λ\_G π\_G *c\_{G,u}*; the rest, and all of units no detected genome carries, is `unclassified`. Per function and rank, rows sum to `total`. Functions are the genome index's Pfam labels (each label counts its units in full), else the profile's unit `name` (e.g. KO for the KO index). Taxonomy is parsed by GTDB prefix (`d__` … `s__`); a missing rank takes the lowest taxon above it.
+  - *Amendment (plan: responsibilities λ\_G *c\_{G,u}*):* π\_G is included, so the split is exactly G1's E-step; the unclassified excess uses the presence-conditional Σ λ *c*, as planned.
+  - *Ambiguity groups:* closed form, scale-free, so they also cover screened genomes that gather explained away (gather would otherwise hide an identical genome, and the reported one would be arbitrary): two genomes are ambiguous when the cosine of their Poisson information vectors over the hit units (*c\_{G,u}* √*h\_u* / μ\_u, μ floored at *h\_u*) is ≥ 0.95 and so is the ratio of their `containment` (content the sample never hit also tells genomes apart, which the observed information alone ignores). Connected sets with a detected genome are groups; genomes.tsv gains `group` (smallest detected id) and `ambiguous` (other members). In the table a group is labelled at its members' lowest common rank (no common taxon at genome rank: names joined by commas).
+  - *Intervals:* `depth_lo`/`depth_hi` = λ ± 1.96 sd, covariance φ I⁺ from the information over detected genomes (w = π *c*), φ = max(1, Pearson χ² / (units − genomes)) for the composite likelihood. Not per table row (the plan's per-row intervals wait for the benchmark to show they are wanted).
+  - *Found on the way: presence under shared content.* G1's present fraction counted a hit unit toward each holder by its share of the hits, so a unit two genomes carry counted half present in each: on two genomes at depths 1 and 3 sharing one of ten units, π fell to 0.92/0.975 and λ rose 9%/3%; with core genes shared by many genomes it would be large. With `items_hit` (genome mode only; the unit-level estimators are unchanged), a hit item now counts as present in a holder with its posterior given the item's hits, the other holders at their means (sole holder: 1). The same example then fits exactly. The unit-level ZI EM has the same bias on k-mers shared between units; left as is, since phase 7 freezes it (note for the spec).
+  - Tests: `test_function_taxon_table` (a unit of one genome goes to it whole; a unit shared at depths 1 and 3 splits 1:3; hits on a unit no genome carries are all `unclassified`; every rank sums to `total`; intervals bracket the depths), `test_identical_genomes_form_a_group_reported_at_their_common_rank` (the twin gather drops is in the group; species and genome rows read `g__a`).
+  - *Deferred to the evaluation:* the G2 (joint EM on per-(genome, hash) content) and G4 (marker units) ablations, which need the fmh benchmark's genome arm to score them.
+
+* **Phase 11, step 4 — the fmh benchmark's genome arm (Genome mode, step 4 and Evaluation), set up, not run.**
+  - *Design:* `--genome_mode`: every genome of the Zenodo record is the reference set (each sample's 64 plus the rest as distractors), as protein FASTA from the mapping tables (`bench.py genome-set`), annotated once per kfp-hashed index (`ANNOTATE_GENOMES`; not `fmh_compat`, whose sourmash hash `annotate-genomes` refuses). `genomes` runs on every plain-arm unit profile of a plain sample (MGnify indexes: `units.tsv`, not the per-Pfam sums).
+  - *Truth (`genome-truth`):* from the per-gene read truth: genome depth = aligned bases / gene bases over all its genes, relative abundance = share of Σ depth (cells, comparable to ours and sylph's); per (genome, KO) and (genome, Pfam) the summed depth of its genes carrying it (Pfam by whole gene, not domain).
+  - *Scores (`genome-score`, `genome_scores.tsv`):* purity, completeness, F1 over genomes with reads; L1 of relative abundances over the union; Spearman over true positives. Function × genome: `ft_f1` over (genome, function) pairs, `ft_l1` between shares (ours over the total, so `unclassified` counts against), `ft_right`, `ft_unclassified`. A group reported together (names joined) matches no genome: conservative.
+  - *Baseline:* sylph 1.0.0 (biocontainer) on the genomes' DNA at `--sylph_c` 200. sourmash gather on protein sketches is not set up (sylph is the gate's baseline); HUMAnN 3.9's stratified table needs a KEGG genome → MetaPhlAn species map, so the table's gate is not scored yet.
+  - *Package change:* the table reports Pfam functions as accessions (`PF01007`; MGnify stores numbers), as `pfam-profile` does.
+  - *Not built:* a profile pipeline's optional genome step (no profile pipeline exists before phase 9's Nextflow module), and a separate genome-set annotation workflow: `annotate-genomes` is one command, and nucleotide genomes take the study-index recipe's pyrodigal step.
+  - *Run:* `ablations/genomes.config` (KO index `kfp_s1000_floor8`, the 1-in-100 MGnify90 index, and `--mgnify_full` if a full build exists), `hpc/kfp-ablations/genome-mode/run.sh` (needs the `dev-phase11` checkout). Checked: `-profile test,docker --genome_mode true --tools ''` (131 tasks). On the fixture's 2000 reads the low-abundance genome of each sample has < 10 hit units and is missed (F1 0.67; sylph 1.0), and the Pfam-unit indexes detect none: `MIN_UNITS` may need to scale with genome size or depth, to settle on the real run.
+  - Results: pending on HPC.
+
+* **Phase 11, step 5 — `kfp-prior` (Genome-informed unit presence, B1, steps 1–2).**
+  - *Question (2026-10-05): should genome and function profiles update each other, by a prior or EM-style?* Before this step the flow was one-way: `genomes` fits raw unit hits, and the unit-level estimates never saw the genome fit (the function × taxon table only splits `hits_em`). Alternating "unit abundances → genome abundances → unit abundances" to convergence would stop after one round: the genome fit uses raw hits, which do not depend on the unit EM, so nothing the unit side computes changes the genome fit. The useful flow is genome → unit, as a prior. It is the empirical-Bayes (plug-in) form of the joint hierarchical model (B3). The genome depths are its hyperparameters, estimated from all of a genome's ~5×10³ units, so using them on one unit counts that unit about twice in 5×10³ (the cavity correction, an ablation). An EM is still worth having in one place: the unit EM's split of shared k-mers between sibling units. A genome-predicted coverage per unit (λ\_G π\_G *e\_{G,u}*, already computed here as `expected_hits`) is a natural prior for a MAP version of that split, which is what the function × taxon table depends on. That is the next candidate, built only if phase 7's within-component split error shows the split is a problem. The full joint model (B3, or G2's k-mer-level EM with genome and free-unit holders) stays the fallback if B1 is miscalibrated.
+  - *`annotate-genomes` now keeps each protein's best unit* (`genome_best.parquet`: highest containment, k-mers hit over the protein's k-mers sampled at the unit's rate, ≥ 0.2 and ≥ 2 k-mers; guesses), the carriage the prior needs (a constraint the plan set on genome mode).
+  - *Package:* `python/kfp_prior` (CLI `kfp-prior`, shipped in the same wheel via maturin's `python-packages`). It reads files only and does not import the profiler.
+  - *`kfp-prior build GENOME_INDEX OUT`:* carriage counts per family, genus and species (by GTDB prefix; a genome without a species is its own) and over all genomes; α per rank by leave-one-genome-out log loss (≤ 200 held-out genomes per rank, grid 0.01–100), held-out loss also recorded for no shrinkage and for the parent alone. *Amendment:* *q* is computed at update time, for the detected genomes' clades only, not written per (species, unit) (that table grows as species × family units). The parent in the α fit is its raw leave-one-out frequency, not itself shrunk.
+  - *`kfp-prior update PROFILE GENOMES GENOME_INDEX CARRIAGE`:* as the plan's model, with P\_G = 1 unless `genomes.tsv` has `present_prob` (genome detection is not calibrated yet), *e\_{G,u}* = G's own content on *u* if it carries it, else the mean over carriers. The global prior π₀ is not written by the profiler, so it is recovered as Σ `present_prob` / index units, the odds `presence` fitted at; the prior is the noisy-OR 1 − (1 − π₀) Π\_G (1 − ρ), so a unit no detected genome carries keeps `present_prob` exactly. Writes `presence.tsv` (unit, hits, `present_prob`, `prior`, `expected_hits`, `present_prob_updated`, `imputed`, `sibling_hit`) and `pfam_presence.tsv` (`present_prob_observed`, `present_prob_updated`, `imputed`; units taken as independent). *Amendment:* `sibling_hit` is Pfam-level (one of the unit's Pfams observed through another unit), since components are known only among hit units. Checks the carriage table's genome-index checksum. The plan's "*q* = 1 and λπ*e* → ∞ gives P → 0" holds for *q* < 1, which shrinkage guarantees; at ρ = 1 carriage is certain by construction.
+  - Tests: `test_zero_hit_closed_form` (0.92 and 0.11), `test_shrinkage_towards_one_with_more_genomes_and_towards_genus`, `test_held_out_loss_beats_no_shrinkage_and_parent_alone` (simulated genera with core and species accessory sets), `test_update` (no genomes: unchanged; units 7–8 of a detected genome with zero hits imputed at depth 10⁻⁴, absent at depth 1; a unit one of three species members lacks gets less; an undetected species' hit unit unchanged), `test_cli_and_checksum`, `test_best_unit_per_protein`.
+  - *Not done yet:* the sylph adapter (B2), the cavity, π\_G and shrinkage ablations, imputed abundance, the depth-ladder evaluation and Nextflow (B1, steps 3–4).
+
+* **Phase 11, step 6 — kfp-prior's depth ladder (Genome-informed unit presence, Evaluation), set up, not run.**
+  - *Design:* `--depth_ladder` (fmh benchmark, with `--genome_mode`): each plain sample is also subsampled to those read-pair fractions (`bench.py subsample`; sample `<seed>d<fraction>`), queried raw, and fitted by `genomes`. These samples join only the genome-mode branch: no truth is mapped for them, so the other scores skip them. `kfp-prior build` runs once per genome index and `update` on every fitted sample, the full ones included (fraction 1).
+  - *Truth and scores (`bench.py prior-score`; `prior_scores.tsv`, `prior_calibration.tsv`):* units = the sample genomes' proteins' best units (`genome_best`); Pfams = their genes' hmmsearch domains (MGnify indexes, which have Pfam labels). Each true item is binned by the depth of the deepest sample genome carrying it, taken as the full sample's genome depth × the fraction (expected, not re-mapped). Per bin: completeness observed (`present_prob` ≥ 0.5 with hits) vs updated (`present_prob_updated` ≥ 0.5); over all: purity and calls of each. Calibration: zero-hit units per decile of `present_prob_updated`, mean prediction vs share truly carried.
+  - *Caveats:* the unit truth uses the same best-unit annotation the prior is built from, so unit-level gains are partly by construction; Pfam is the independent level and the one the gate reads. The record's genomes have no taxonomy, and each sample genome is in the reference set, so its prior is its own carriage shrunk towards all genomes, the optimistic case. The hold-out arm (relatives only) and the false-genome control are not built.
+  - *Fixed on the way (`kfp-prior update`):* π₀ is clamped to [1/units, 1 − 10⁻⁶]. A profile whose `present_prob` sums to 0 divided by zero, as did a tiny index where every unit is present. An empty `genomes.tsv` (nothing detected) reads as strings and is now cast. Test: `test_update` covers both.
+  - *Run:* `ablations/genomes.config` now sets `depth_ladder = '0.01,0.03,0.1,0.3'` (same HPC script). Checked: `-profile test,docker --genome_mode true --depth_ladder 0.3` (239 tasks). On the fixture, updated equals observed everywhere: the only unit misses are in the low-abundance genome, which genome mode does not detect (< `MIN_UNITS`), so no prior reaches them. The plumbing is checked, not the gain; the calibration path was checked by hand on real outputs with added zero-hit rows.
+  - Results: pending on HPC.
+
+* **Phase 11, plan revision (2026-10-07) — the species model, and the `dev-species` branch.**
+  - *Plan:* Genome mode gains Species model, Continuous lineage model and their implementation plan (steps 7–12); see the decision of the same date.
+  - *Branch:* `dev-species` from `origin/main` (6a556fe) with `dev-phase11` merged in.
+  - *Conflicts resolved:*
+    - `index --like` keeps main's `t_base_singleton`. It now copies only the parameters the base's `meta.json` has, so indexes built before that field still work.
+    - `em` keeps both main's `start` and phase 11's `items_hit`.
+    - The query's `min_aai` filter is applied only when > 0, as on main, before `collapse_decoys`.
+    - `run_ablations.sh` lists both branches' configs.
+    - `genomes.py`'s `report` is typed `dict[str, float]`, as main's `em` now is.
+  - *Checked:* ruff and mypy clean; 144 tests pass.
+
+* **Phase 11, step 7 — the species index (`species-index`; Species model, step 7).**
+  - *Command:* `species-index INDEX OUT --catalogue DIR` (an MGnify genome catalogue laid out as on the FTP site: `genomes-all_metadata.tsv`, `species_catalogue/<prefix>/<rep>/`) or `--genomes GENOME_INDEX` (`annotate-genomes` output with taxonomy); `--exclude` (genome names left out of every count, their carried units written to `held_out.parquet` as benchmark truth); `--species` (catalogue representatives to keep).
+  - *Catalogue path:* each species' Panaroo families (`pan-genome.fna`, translated by table 11, frame 0, terminal stop dropped; k-mers spanning internal stops are never hashed) are hashed by `protein_hits` and given best units by `best_units` (both split out of `genome_content`, unchanged). The family × genome presence comes from `gene_presence_absence.Rtab`, so a genome carries *u* when a family it holds has *u* as its best unit. Its content on *u* sums its families' hits there, over all links. A species with no pangenome (one genome) uses its representative's `.faa`.
+  - *Genome-set path:* carriage from `genome_best`, content from the unit-major CSR. `annotate-genomes` now passes an optional `completeness` column (percent) through to `genomes.tsv`.
+  - *Aggregation (one function for both):*
+    - Counts per clade, with clade sizes N = Σ completeness, so a unit a 50%-complete MAG misses costs half a genome.
+    - α per rank by leave-one-genome-out (raw counts), moved from kfp-prior unchanged.
+    - *q* shrunk root → family → genus → species, capped at 1, for every unit the species' genus carries (its own when it has no genus); pairs with *q* < 0.05 are dropped.
+    - *e* is the mean content of the species' carriers, else the genus', family's or all genomes'.
+    - Written as species-major and unit-major CSRs (`s_*`, `u_*`), `species.tsv`, `genomes.parquet`, kfp-prior's carriage files, `unit_pfam.parquet` and `meta.json` with the index checksum.
+  - *Amendment (plan: kfp-prior reads q from the species index):* kfp-prior's `build` command is removed. `kfp-prior update` takes the species index of `species-index --genomes` as its carriage table (same files), and the fmh benchmark's `PRIOR_BUILD` became `SPECIES_INDEX`. It still recomputes its own *q* per detected genome, so its results are unchanged apart from N now being Σ completeness.
+  - *Size:* every (genome, carried unit) row of a catalogue is held in memory, ~12 B each, ~10 GB for human-gut (`ponytail:` note).
+  - Tests: `test_translate_matches_the_proteins`, `test_species_index_from_catalogue` (*q* = 1 on units every genome carries, *e* equal to the genome index's content, a one-genome species shrunk towards its genus and given its genus' units at a small prior, the unit-major view), `test_completeness_raises_prevalence_of_units_incomplete_genomes_miss`, `test_genome_set_path_equals_catalogue_path` (identical pairs, *q* and *e*), `test_exclude_and_cli`; the shrinkage tests moved from kfp-prior.
+
+* **Phase 11, step 8 — `species`: the joint fit (Species model, step 8).**
+  - *Command:* `species PROFILE SPECIES_INDEX [OUT]` (`--units`, `--presence`, `--pfam-presence`, `--function-taxon`, `--summary`, `--index` checksum, `--min-containment`, `--min-units`, `--prior`).
+  - *Screen:* genome mode's rule on prevalence-weighted content, Σ\_{u hit} *q e* / Σ\_u *q e* ≥ 0.1 on ≥ 10 hit units. Every unit of a screened species enters the fit, hit or not.
+  - *Fit (`fit_species`):* the plan's variational EM, vectorised over (species, unit) pairs.
+    - Starts from prevalence-weighted depths, every screened species present.
+    - Each round updates, in order: carriage *r* (the conditional posterior with the other sources at their means); the background; the allocation and the depth's Gamma posterior; presence.
+    - Stops when depths (relative) and presence change by < 10⁻⁶.
+    - In the synthetic checks it converges in 5–20 rounds and well under a second.
+  - *Amendment: the background is spike-and-slab per unit.* The planned per-unit Gamma background (shape 0.1) kept whatever share of a unit's hits it started with: exp E log β ≈ its own allocation, so nothing pulls it back. Depths came out 8–17% low on simulated samples. Now each unit's background is off, or with probability 0.05 on with Gamma(0.1, 0.01) hits. It is on with its posterior given the species' predicted mean *M\_u*, and then takes the excess max(*h* − *M\_u*, 0). The posterior compares a Poisson at *M\_u* against ℓ = max(Pois(*h*; *M*), NB(*h*) e^(−*M*)): the background may add hits, but never remove them. The same ℓ scores presence, so hits a species does not need cost it nothing, and hits it cannot explain earn it nothing.
+  - *Amendment: `depth` is reported at the posterior mode less the prior's shape (allocated hits / Σ r e, the MLE).* The posterior mean adds the prior's one hit, +18% at 0.01× on 50 units. The mean is still used inside the fit.
+  - *Presence:* logit *p* = logit ρ (0.01) + Σ\_u [log(*q* ℓ(μ₋ₛ + λ*e*) + (1 − *q*) ℓ(μ₋ₛ)) − log ℓ(μ₋ₛ)] + log Gamma(λ̂) + ½ log(2π var λ). This is the per-unit carriage marginal with the depth's Laplace term.
+  - *Synthetic checks (scratch):* six species × 10 genomes, 300 core and 200 accessory units each, prevalence 0.1–0.9, strains drawn from the prevalences, Poisson hits.
+    - Depths within 2–8% from 0.02× to 5×.
+    - On zero-hit accessory units the mean *r* matched the share truly carried (0.26/0.25, 0.47/0.52, 0.10/0.10, 0.36/0.38).
+    - An outside organism hitting 20–40% of an absent species' core units, at 3 or 30 hits each, gave that species *p* ≈ 10⁻⁹, with the present species' depth unchanged.
+  - Tests:
+    - `test_one_core_species_recovers_its_depth`;
+    - `test_accessory_units_follow_depth_and_hits`: at 5×, zero-hit accessory units have *r* < 10⁻³; at 0.01×, *r* stays within 10% of *q*; at zero hits with one source, *r* is kfp-prior's closed form;
+    - `test_background_and_a_species_whose_core_is_missing`;
+    - `test_two_species_sharing_core_units`: depths recovered, and a shared unit's hits split 1:3.
+  - *Not built:* species ambiguity groups (step 3's rule one level up), left to the benchmark to show whether near-identical species split badly.
+
+* **Phase 11, step 9 — function outputs (Species model, step 9).**
+  - `species.tsv`: detected species (*p* ≥ 0.5) with `id`, `name`, `taxonomy`, `present_prob`, `depth` and a 95% interval from the Gamma posterior. The interval's variance is inflated by the Pearson φ over the detected species' units, as in step 3. Also `relative_abundance`, `units_hit`, `containment`, `core_hit` (share of *q* ≥ 0.9 units hit) and `accessory_called`. `species_units.tsv` lists their pairs, with prevalence, carriage, expected and assigned hits.
+  - `presence.tsv` and `pfam_presence.tsv` are in kfp-prior's format, so `prior-score` reads them.
+    - Hit units: 1 − (1 − `present_prob`)(1 − Π-carriage). Zero-hit units with a prior ≥ 0.05: Π-carriage, where Π-carriage = 1 − Π\_s(1 − *p\_s r\_{s,u}*).
+    - A unit no screened species carries keeps `present_prob`, which is taken as 1 when the profile has none.
+    - *Amendment:* the planned `coverage_species` is `expected_hits` (raw hits, Σ *p r* λ *e*). The Pfam roll-up and `sibling_hit` repeat kfp-prior's, since neither package imports the other.
+  - `function_species.tsv`: `hits_em` split by the allocation over the detected species; the background, undetected species and uncarried units go to `unclassified`. Ranks are family, genus and species, through `taxon_labels`; functions through `unit_functions` (split out of `function_taxon`).
+  - Summary: `explained_fraction` (hits assigned to detected species), `genome_equivalents`, φ, iterations, imputed units.
+  - Tests: `test_profile_and_outputs` (interval brackets the depth at 0.15×; missed core units imputed; an uncarried unit's presence unchanged and its hits unclassified; every rank sums to the total), `test_no_species_leaves_presence_unchanged`, `test_species_cli` (fixture index: Pfam functions, checksum refusal).
+
+* **Phase 11, step 10 — the strain hold-out benchmark (`workflows/species-benchmark`; Species model, step 10), set up, not run.**
+  - *Amendment (plan: a new arm of the fmh benchmark):* a workflow of its own. Its samples, references and truth share nothing with the fmh record, only `bench.py`'s helpers (`_f1`, `_by_depth`, the `iss` wrapper), so its steps live there.
+  - *Design:*
+    - `uhgg-pick` takes the species with ≥ 20 genomes. Each of 5 samples gets 30 of them, one non-representative genome each (CheckM ≥ 90% complete, ≤ 5% contaminated, never reused), at a depth log-uniform on 0.05–10×. 300 distractor species join the index.
+    - `fetch.sh` takes from the EBI FTP: each species' `genome/` and `pan-genome/`, and each held-out genome's DNA (the FASTA section of its `all_genomes` GFF).
+    - InSilicoSeq (NovaSeq) simulates by `--coverage_file`.
+    - The query runs against a given `--index`, or one built from `--members`/`--pfam`; the HPC script defaults to the 1-in-100 subset.
+    - One species index per variant is built with the held-out genomes excluded (`--exclude`). Its `held_out.parquet` (the held-out genomes' carried units, from their Rtab columns) is the unit truth.
+  - *Arms:*
+    - `species`; `species_nobg` (`--background-prior 0`); `species_noshrink` (an index at `--alpha 1e-9`); `species_nocompl` (`--no-completeness`).
+    - `genomes`: G1 on the representatives' proteins.
+    - `kfp_prior`: B1 on G1, with a reps-only species index as its carriage table.
+    - `sylph` on the representatives' DNA.
+  - *Scores (`uhgg-score`, long format, since arms report different metrics):*
+    - Detection by species id.
+    - Unit and Pfam presence by carrier depth, observed against updated, and calibration of zero-hit units.
+    - Carriage AUROC and log loss against the prevalence's, on the true species' zero-hit accessory units (0.1 < *q* < 0.9).
+    - The function × species table against (species, Pfam) shares ∝ depth × content.
+  - *fmh benchmark:* genome mode gains the species arm (`SPECIES_INDEX`, `SPECIES_FIT`, scored as `species_<name>` by `GENOME_SCORE` with `--rank species`, and by `PRIOR_SCORE`). The record's genomes are one per species, so this only checks the code path.
+  - *Fit changes found on the way (step 8's fit, revised):*
+    1. *Gather before the fit (G0 one level up, as the plan's model section said).* On the fmh KO index every genome carries the same 11 KO units. All three species were updated at once against the others' inflated means, and every carriage collapsed to 0. Hit units with *q* ≥ 0.5 now go through `gather`, and species left < `min_units` units drop out. Starting depths come from 50 rounds of Poisson EM with carriage at its prior, so shared hits are split.
+    2. *Each species is measured as if present.* Carriage, depth and presence compare the species against the other species at their means, and ℓ gives the background its alternative. Measuring against a background that had taken the species' hits *because* its presence was in doubt fed back: presence fell from 0.18 to 10⁻⁷ for a real two-unit species in the mini catalogue.
+    3. *ℓ includes the background's prior*: log[(1 − π) Pois + π NB e^(−m)], π = 0.05. Without it, a hit unit's carriage and a species' presence were judged against a background that explained hits for free.
+    4. *Quasi-likelihood:* every likelihood term is divided by φ. φ is the median squared Pearson residual / 0.455 over hit units with *q* ≥ 0.5, every species present (presence-weighted means made φ run away to 10⁵). In the fmh KO test, one species carries a mixture of two genomes (φ ≈ 6–93). Poisson evidence there switched off most units' carriage and set presence to 10⁻³³; now gaa is found at 11.4×, as G1 finds it. Synthetic Poisson data give φ ≈ 1–1.6, with the carriage calibration unchanged (0.26/0.25, 0.49/0.52, 0.15/0.10, 0.39/0.38).
+  - *Known limit (synthetic check):* an outside organism carrying 20–40% of an absent species' core units, with ~3 hits each, makes that species present at 0.01–0.07×. Under the model, that is likelier than the background explaining 50–100 units. A per-species present fraction (G1's π) is the candidate fix if the benchmark's species purity suffers. Before change 3 these were rejected, but real two-unit species were too.
+  - *Checked:*
+    - `-profile test,docker` of the new workflow on `tests/data/mini_uhgg` (41 tasks): the mini_fmh genomes as three species, two with three genomes and Panaroo-style families, one single-genome. Every species arm finds the sampled species (F1 1.0, L1 0.018), as do G1 and sylph.
+    - The fmh genome-mode test (319 tasks): the species arm matches G1 on the KO indexes (F1 0.67). On the mini MGnify index it detects nothing, since ~8 carried units per genome is under `min_units` 10, a fixture limit.
+  - Tests:
+    - `test_uhgg_pick_sample_and_score`;
+    - `test_identical_species_are_explained_away`;
+    - `test_overdispersed_hits_keep_the_species_and_its_core`: gamma-Poisson hits, φ > 3, presence > 0.99, every hit unit carried.
+  - *Run:* `hpc/kfp-ablations/species-benchmark/run.sh` (dev-species checkout; `INDEX=<built index>` to profile against a full build).
+  - Results: pending on HPC.
+
+* **Phase 11, step 11 — the GTDB species index (`workflows/gtdb-species-index`; Species model, step 11), set up, not run.**
+  - *Recipe:* `gtdb.py` picks genomes from the release's bac120/ar53 metadata, then each genome's DNA comes from NCBI, pyrodigal calls its genes, `annotate-genomes` annotates them and `species-index --genomes` aggregates by GTDB species. No profiler code changed: the genome-set path of step 7 takes the GTDB taxonomy (species from `s__`) and CheckM2 completeness as they are.
+  - *Pick:*
+    - Genomes with CheckM2 completeness ≥ 50 and contamination ≤ 10 (CheckM where CheckM2 is missing).
+    - At most `--max_per_species` (20) per species: the representative, then by completeness − 5 × contamination.
+    - `--species` or `--max_species` keep a subset.
+    - The NCBI URL is built from the accession and `ncbi_assembly_name`, with characters other than letters, digits, `.`, `_` and `-` made `_` (checked against r226 assemblies with spaces in their names).
+  - *Amendments (plan: representatives' GTDB proteins plus pyrodigal'd non-representatives):*
+    1. Every genome is gene-called by pyrodigal from NCBI DNA, representatives included, so all proteins come from one caller and the workflow has one path. GTDB's representative proteins would save gene calling on ~1 in 5 genomes only.
+    2. `-p single` per genome (isolates and MAGs alike), falling back to `-p meta` below the 20 kb it needs to train. Table 11 throughout: GTDB's few table-4 genomes (Mycoplasmatota) get truncated genes at TGA (`ponytail:` candidate: `-g` from `ncbi_translation_table` if they matter).
+    3. At most 20 genomes per species, not all: prevalence beyond ~20 genomes changes little after shrinkage, and the largest species have thousands of genomes in r226.
+  - *Licence check:* GTDB's taxonomy and metadata are CC BY-SA 4.0. A shipped species index carries GTDB names, so it is a derivative: distributed under CC BY-SA 4.0 with credit to GTDB, apart from the GPL code. NCBI places no restrictions on the genome data, and the index keeps only unit counts derived from it (workflow README, Licence).
+  - *Size:* `ANNOTATE` is one task over every genome (step 1's in-memory sort, ~16 B per (genome, unit) row): ~2×10⁵ genomes at 20 per species would need ~10 GB for the rows, and its time is unmeasured. Sharding it needs a merge of genome indexes, built only if the HPC run shows the need. The HPC script defaults to 1000 sampled species.
+  - Tests: `test_ncbi_url` (an r226 assembly name with spaces), `test_pick_keeps_representative_then_best_per_species`; `-profile test,docker` on `tests/data/mini_gtdb` (the mini_uhgg genomes as a GTDB release and an NCBI mirror: 8 tasks, 3 species, 5 of 8 genomes kept).
+  - *Run:* `hpc/kfp-ablations/gtdb-species-index/run.sh` (`INDEX=<built index>`), after step 10 reads well on MGnify, as planned.
+  - Results: pending on HPC.
+
+* **Phase 11, step 12 — the continuous lineage model prototype (`lineage`; Continuous lineage model, step 12), set up, not run.**
+  - *Command:* `lineage PROFILE SPECIES_INDEX [OUT]` (`--units`, `--summary`, `--lineages` K = 2, `--dim` d = 2, `--starts` 4, `--seed`, and the species fit's screen and priors). Module `lineage.py`, NumPyro SVI with `AutoDelta` (MAP). JAX and NumPyro are the optional `phylo` dependency group; the CLI imports the module only when the command runs, so nothing else needs them.
+  - *Per species* (each detected species with ≥ 2 genomes):
+    - The species fit runs first.
+    - A logistic factor model is fitted on its genomes' carriage of its units, logit P(*g* carries *u*) = *b\_u* + *w\_u* · *x\_g*, with Normal priors. *b* starts at the logit frequency; *w* and *x* start at random, since zero is a saddle.
+    - K lineages are fitted to the sample: depth λ\_k \~ Gamma(0.5, 10⁻³) and *x\_k* from a mixture of N(*x\_g*, σ²) over the reference genomes, with σ the median nearest-neighbour distance between genomes.
+    - Carriage is summed out over its 2^K patterns per unit. The species model's ℓ gives the background its say, and φ comes from the species fit.
+    - The other species are fixed at the hits the species fit did not assign to this one (block coordinate ascent).
+    - It keeps the best of 4 starts, each at K random reference genomes.
+    - Lineages within σ of a deeper one merge into it, and lineages under 10% of the species' depth are dropped.
+  - *Outputs:*
+    - `lineages.tsv`: species, `lineage` (0 the deepest), `depth`, `share`, `relative_abundance`, `nearest` (3 closest reference genomes), `distance` (to the closest, in σ), `accessory_called`.
+    - `lineage_units.tsv`: species, lineage, unit, `prevalence`, `hits`, `carriage_prob` (posterior over the patterns), `hits_assigned`.
+    - One-genome species keep the species fit's depth and carriage as one lineage.
+  - *Species index:* writes `genome_units.parquet` (each kept genome's carried units), the per-genome carriage the factor fit needs. Step 7 planned to keep the family map and Rtab per species instead; the unit-level rows are what the fit reads.
+  - *Amendments (plan: a GP or Brownian prior along `mashtree.nwk`, fitted once per species):*
+    1. No tree. *x\_g* \~ N(0, I) is the plan's "embedding of content where no tree exists", used for every species: the benchmark's `fetch.sh` does not fetch `mashtree.nwk`, and the embedding already places strains by shared accessory content. A Brownian covariance from the tree is the upgrade if the gate is missed narrowly.
+    2. The factor fit runs per sample and detected species, not once per species and stored (~2 s per species here). It moves to the species index if the model is ported.
+    3. MAP rather than a variational posterior on λ and *x*; carriage is still a posterior, given them.
+    4. *Function × lineage table not built:* `hits_assigned` per (lineage, unit) is its input; it is built with the port.
+  - *Benchmark (step 10's workflow):*
+    - `uhgg-pick --two-strain-replicates` adds samples in which each species has two held-out genomes at independent depths (3 samples by default; the plan's "two-strain arm").
+    - `LINEAGE_FIT` runs `lineage` on every sample with the default species index, and `uhgg-score --kind lineage` scores it:
+      - detection, with lineages summed per species;
+      - carriage from the deepest lineage, on the same zero-hit accessory pairs as the species arms;
+      - `two_strain_resolved`: the share of species whose two strains are both ≥ 1× and which get ≥ 2 lineages.
+    - Detection truth is now summed per species. Carriage is scored on one-strain species only, for every arm, since two strains have no single carriage truth.
+    - `workflows/setup.sh` and CI install the `phylo` group.
+  - *Synthetic check (`test_lineage.py`):*
+    - Setup: 24 genomes in two clades (30 core units; 25 accessory units per clade, carried at 0.9 within the clade and 0.1 outside it).
+    - A new clade-0 strain at 0.05× (e = 10, so most units have no hits): on zero-hit accessory units, log loss 0.26 against the species model's 0.69. That is the closed-form *r* at the same depth with the species' prevalence.
+    - Strains of both clades at 3× and 2× gave two lineages at depths within 15%, each nearest its own clade.
+    - A fit takes ~3 s per species on a laptop CPU (4 starts, 1500 steps), plus ~2 s for the factor model.
+  - *Gate (unchanged):* port the model if:
+    - its `carriage_logloss` on held-out strains' accessory units is ≥ 10% below the species model's;
+    - species depth L1 is no worse;
+    - `two_strain_resolved` ≥ 0.8 at ≥ 1× each.
+  - Tests:
+    - `test_lineage_predicts_accessory_units_from_the_ones_seen_and_splits_two_strains`;
+    - `test_lineage_cli` (through a species index and the CLI);
+    - `test_uhgg_two_strain_samples_and_lineage_score`.
+  - *Checked:*
+    - `-profile test,docker` of the species benchmark (45 tasks). The mini catalogue has no genomes left for two-strain samples, so these are tested in `bench.py` only.
+    - ruff and mypy clean; 164 tests pass.
+  - Results: pending on HPC (`hpc/kfp-ablations/species-benchmark/run.sh`).
+
 ### Phase 12
 
 Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-species` merged in), one feature branch per step, kept off `main` until phase 7's ablations are done.
@@ -2235,6 +2478,120 @@ A primary output: per sample, abundance of each Pfam (and unit) attributed to ea
 
 
 **Reference sets.** GTDB species representatives (CC BY-SA 4.0: check share-alike before shipping a precomputed table), MGnify genome catalogues per biome, and a study's own MAGs through the study-index recipe's pyrodigal step. Units carried by no candidate genome are left out of the fit and counted as unexplained.
+
+### Species model: joint Bayesian fit from pangenome prevalence
+
+Added 2026-10-07; the default genome → function path from phase 11, step 7 on. G1 explains a sample by individual reference genomes. The sample's strain is rarely one of them, so G1 reports a relative with π\_G < 1, and that genome's content says nothing about which accessory functions the sample's strain carries. A species' pangenome does: how often each unit occurs among its strains. Core units (prevalence ≈ 1) should be present if the species is, and accessory units need the reads to decide. Fitting species and their carriage together gives both answers from one likelihood: which species are present at what depth, and which units each carries in this sample. This is the joint model kfp-prior set aside (B3). The reads are used once, so the cavity problem of B1 does not arise.
+
+**Functions are MGnify90 clusters.** A unit is the index's unit: a MGnify Proteins 90% identity cluster for the release indexes, so the species index links genomes to MGnify90 clusters and the fit works on them alone. Pfam (or KO, on the fmh benchmark's KO indexes) is only a label: outputs roll up to it and benchmarks score on it, but it never enters prevalence, carriage, depth or presence.
+
+**Data.**
+
+- *h\_u*: the profile's raw tier-2 `hits` per unit, as G1.
+- Species index, per species *s*:
+  - *N\_s* genomes, and *n\_{s,u}* of them carrying unit *u*.
+  - *e\_{s,u}*: the expected raw hits per genome copy at depth 1, i.e. the mean content *c* over carriers, so paralogs count.
+  - Prevalence prior *q\_{s,u}*: (*n* + α *q\_parent*) / (*N* + α), with kfp-prior's rank shrinkage (species → genus → family). *n* is corrected for MAG incompleteness (below).
+
+**Model.**
+
+- *Species presence* *b\_s* \~ Bernoulli(ρ), with small ρ for sparsity. *Depth* λ\_s | *b\_s* = 1 \~ Gamma(*a*₀, *b*₀), weak; λ\_s = 0 when *b\_s* = 0.
+- *Carriage in this sample* *z\_{s,u}* \~ Bernoulli(*q\_{s,u}*): one strain per species per sample. Strain mixtures are left to the continuous model below.
+- *Background* β\_u \~ Gamma(*a*\_β < 1, *b*\_β) per unit, in coverage units (× *m\_u* kept k-mers). It stands for organisms outside the reference set, so unit hits no species explains do not force a species in. It is the free-unit holder that G1's `unclassified` already implies.
+- *Likelihood* *h\_u* \~ Poisson(β\_u *m\_u* + Σ\_s *b\_s* *z\_{s,u}* λ\_s *e\_{s,u}*) over every unit of every candidate species, hit or not, plus every hit unit.
+
+**Inference: variational EM, closed form throughout (numpy, no new dependency).** Structured mean field: *q*(*b\_s*, λ\_s), *q*(*z\_{s,u}*) and *q*(β\_u), with hits allocated among sources Poisson-factorisation style (Gopalan et al.; the binary carriage is ExpoMF's exposure, Liang et al. 2016).
+
+- *Allocation:* E[*y\_{s,u}*] = *h\_u* φ\_{s,u}, with φ\_{s,u} ∝ *p\_s* *r\_{s,u}* exp(E log λ\_s) *e\_{s,u}*, and the background share ∝ exp(E log β\_u) *m\_u*.
+- *Carriage:* *r\_{s,u}* = P(*z\_{s,u}* = 1 | *h\_u*) with the other sources at their current means, μ₋ₛ:
+  *q* Pois(*h*; μ₋ₛ + λ*e*) / [*q* Pois(*h*; μ₋ₛ + λ*e*) + (1 − *q*) Pois(*h*; μ₋ₛ)].
+  This is genome mode's posterior present fraction (`items_hit`, step 3) with the species' prevalence as the prior. At *h* = 0 and one source it is kfp-prior's closed form exactly: *q* e^(−λ*e*) / (1 − *q* + *q* e^(−λ*e*)).
+- *Depth:* Gamma(*a*₀ + Σ\_u E[*y\_{s,u}*], *b*₀ + Σ\_u *r\_{s,u}* *e\_{s,u}*), summed over all of the species' units, read species-major as G1 reads genomes. A missed core unit keeps *r* high and so lowers λ; a missed accessory unit switches off cheaply.
+- *Presence:* logit *p\_s* = logit ρ + the Gamma–Poisson log marginal-likelihood ratio of the species' allocated counts against its expected content (slab against spike), in closed form. Species falling below a floor leave the allocation.
+- *Background:* a Gamma posterior per unit.
+- *Fitting:* gather over hit units with *q* ≥ 0.5 (G0 one level up) first. Starts come from Poisson EM with carriage at its prior. Every likelihood term is tempered by the dispersion φ (quasi-likelihood), and each species is scored as if present (step 10's revisions, Progress log). Per connected component of the (species, unit) graph, as `_fit_components` does, if the vectorised global fit gets slow; with phase 7, step 30's multi-start check.
+
+**Uncertainty.** Closed form, as decided 2026-10-02.
+
+- Depth intervals come from the Gamma posterior, inflated by the Pearson overdispersion φ as in step 3, since VB is overconfident.
+- *p\_s* is reported as the detection probability, calibrated on the benchmark before it is trusted.
+- *r\_{s,u}* is already a probability.
+
+**Outputs** (separate files; `profile.tsv` is not modified, so the profile stays evidence-only):
+
+- `species.tsv`: species, taxonomy, `present_prob` (*p\_s*), `depth` and `depth_lo`/`depth_hi`, `relative_abundance`, `genome_equivalents`, `units_hit`, `core_hit` (share of *q* ≥ 0.9 units hit) and `accessory_called` (*q* < 0.9 and *r* ≥ 0.5).
+- `species_units.tsv`, sparse: for detected species, every unit with *q* ≥ `Q_FLOOR` or hits. Columns: species, unit, `prevalence` (*q*), `carriage_prob` (*r*), `expected_hits`, `hits_assigned` (E[*y*]).
+- `presence.tsv` and `pfam_presence.tsv` in kfp-prior's format, so the depth ladder's scoring (`prior-score`) reads them unchanged.
+  - Updated presence: 1 − (1 − P\_bg) Π\_s (1 − *p\_s* *r\_{s,u}*), where P\_bg is the background's posterior probability of a nonzero rate.
+  - `imputed` where *h* = 0, as before.
+  - `coverage_species` = Σ\_s *p\_s* *r* λ *e* / *m\_u*: an abundance for imputed units, reported apart from observed abundance.
+- Function × species table: step 3's `function_taxon` with the allocation E[*y*] as responsibilities, species as the finest rank, and background hits as `unclassified`.
+
+**Relation to what is built.** G1 (per genome) becomes the strain-level arm, run inside detected species to name the nearest reference genome. kfp-prior's B1 becomes a baseline arm. Its update is this model with one source, no background and λ fixed.
+
+- The rank-shrinkage code moves from `kfp_prior.model` into the profiler's species module.
+- `kfp-prior` reads *q* from the species index, through files, so it still never imports the profiler.
+
+**Building the species index: what links genomes to functions.**
+
+- *MGnify genome catalogues (first).* Each species directory of a catalogue (e.g. human-gut v2.0.2: 289,232 genomes, 4,744 species) has:
+  - `pan-genome/pan-genome.fna`: Panaroo gene-family reference sequences, nucleotide CDS;
+  - `gene_presence_absence.Rtab`: gene family × conspecific genome;
+  - `mashtree.nwk`;
+  - and, for single-genome species, only `genome/` with the representative's `.faa`.
+
+  `genomes-all_metadata.tsv` gives taxonomy and CheckM completeness and contamination. Gene families are translated (table 11, terminal stop dropped, internal stops flagged) and annotated as records (read id = species:family) through `annotate-genomes`' path (`hash_proteins` and `unit_hits`). A genome carries *u* when any of its Rtab families maps to *u* (best unit, as `genome_best`); *e\_{s,u}* is the mean over carriers of the summed family content. Only the pangenome is hashed, not every genome. Size: ~5×10³ families per multi-genome species gives on the order of 10⁷ families, a few deep metagenomes' worth of hashing, to measure. The species × unit table is about 10⁷–10⁸ rows. The family → (unit, *c*) map and the Rtab are kept per species, so genome-level carriage can be computed on demand for G1 on non-representatives and for the continuous model.
+- *MAG incompleteness.* Catalogue genomes are ≥ 50% complete, so raw prevalence understates core carriage. Each genome *g* sees a carried unit with probability ≈ completeness\_g. *n* is replaced by its expectation under that thinning: *q̂* = Σ\_g carried\_{g,u} / Σ\_g completeness\_g, capped at 1, before shrinkage.
+- *Any genome set with taxonomy (GTDB later).* `annotate-genomes` output plus a species column, aggregated per species. GTDB ships protein FASTA for representatives only, so its non-representative genomes need an NCBI download and pyrodigal (the study-index recipe). That build waits until the MGnify path is benchmarked.
+- Both carry the index's `meta.json` checksum; `species` refuses a profile from another index.
+
+### Continuous lineage model (pseudo-phylogeny), later
+
+A species is a 95% ANI cluster, and its strains differ in accessory content that tracks their phylogeny: close strains share accessory genes. The species model ignores that. Once the reads show a few accessory units, the rest should be predicted from the strains that carry the same ones. This also lets two strains of one species in one sample be told apart.
+
+- *Carriage as a smooth function of lineage.* Each genome has coordinates *x\_g* ∈ ℝᵈ on a pseudo-phylogeny: a GP or Brownian prior along the species' `mashtree.nwk` (covariance = shared branch length), tied across species by the catalogue's bac120 tree, or an embedding of content where no tree exists. Carriage is a phylogenetic logistic factor model, logit P(*g* carries *u*) = *b\_u* + *w\_u* · *x\_g* (phylogenetic factor analysis, Tolkoff et al. 2018). It is fitted once per species, or per genus for small species, on the Rtab.
+- *The sample.* Each species holds *K* lineages (small *K*, sparse), each a latent point *x\_k* with depth λ\_k. The prior on *x\_k* is centred on the reference genomes with Brownian spread, so a lineage can sit between or beyond them. Carriage *z\_{k,u}* \~ Bernoulli(σ(*b\_u* + *w\_u* · *x\_k*)), with the same Poisson likelihood and background. It reduces to the species model at *d* = 0, *K* = 1.
+- *Outputs.* Per lineage: its placement (nearest reference genomes and the distance to them) and carriage probabilities; the function × lineage table.
+- *Implementation.* A NumPyro SVI prototype in an optional dependency group (`phylo`, JAX; not a runtime dependency), run per detected species with the other species' contributions fixed from the species fit (block coordinate ascent). It is ported to numpy closed form, or JAX is made a dependency, only if it passes its gate.
+- *Prior art.* PICRUSt2 (castor hidden-state prediction on a tree, taxa only, no reads); PanPhlAn and StrainPhlAn (strain profiles from gene content and markers); DESMAN and StrainFinder (strain deconvolution from coverage and variants); phylogenetic factor analysis (Tolkoff et al. 2018).
+
+### Species model: implementation plan (phase 11, steps 7–12)
+
+Next after step 6, on `dev-species` (from `main` with `dev-phase11` merged), one feature branch per step.
+
+7. **Species index.**
+   - Commands: `species-index INDEX CATALOGUE OUT` (MGnify catalogue directory or FTP mirror) and `species-index INDEX --genomes GENOME_INDEX OUT` (annotated genome set with taxonomy).
+   - Steps: translate and annotate pangenome families; aggregate the Rtab to *n*, *N* and *e*; correct for completeness; rank shrinkage moved from kfp-prior, with α by leave-one-genome-out.
+   - Writes a species-major and a unit-major CSR of (species, unit, *n*, *e*), plus `species.tsv`, the per-species family map and Rtab, and `meta.json` with checksums.
+   - Nextflow `workflows/species-index`: fetch per species, shard by species, merge; for HPC, run by the user.
+   - Tests:
+     - a fixture catalogue of two species, built from an index's member proteins, gives the expected *n*, *N* and *e*;
+     - the genome-set path equals the catalogue path on the same genomes;
+     - completeness correction lifts a unit carried by every complete genome to *q* = 1;
+     - a one-genome species shrinks towards its genus.
+8. **`species PROFILE SPECIES_INDEX OUT`: the variational EM.** Screen, start, the updates above, per component; `species.tsv` and `species_units.tsv`; intervals. Tests:
+   - one species with all *q* = 1 and no background fits as G1 with π = 1 on that content;
+   - an accessory unit with zero hits at high depth gives *r* → 0, and at low depth *r* stays ≈ *q*;
+   - a hit accessory unit gives *r* = 1;
+   - hits on units no species carries go to the background, and a species whose core is unhit gets *p\_s* → 0;
+   - two species sharing core units recover their depths;
+   - with no species detected, `presence.tsv` equals the profile's `present_prob`.
+9. **Function outputs.**
+   - Files: `presence.tsv`, `pfam_presence.tsv` and the function × species table, in the formats of kfp-prior and step 3.
+   - kfp-prior is changed to read *q* from the species index.
+   - Tests: kfp-prior's worked example (0.92 and 0.11) is reproduced by the one-source case; table rows sum to `total` at every rank.
+10. **Strain hold-out benchmark (UHGG)**, a new arm of the fmh benchmark.
+    - *Samples:* species with ≥ 20 conspecific genomes; per sample, 20–50 species, each from one non-representative genome (DNA from `all_genomes/`), simulated with InSilicoSeq at 0.05–10× depth.
+    - *Hold-out:* the source genomes are removed from the prevalence counts (subtract their Rtab columns), so each sample strain is new to the index.
+    - *Truth:* species depths; each source genome's units (its Rtab families' units); and Pfam on its genes (hmmsearch).
+    - *Arms:* species model; G1 on representatives; kfp-prior B1 on G1; sylph on representatives' DNA. Ablations: no background, no shrinkage, no completeness correction.
+    - *Metrics:* species F1, abundance L1 and Spearman; unit and Pfam completeness and purity, observed against updated, by depth bin; calibration of *r* on zero-hit units; accessory-unit AUROC (0.1 < *q* < 0.9); function × species L1.
+    - Config and HPC script for the user to run. The existing genome arm and depth ladder gain a species arm (KEGG genomes are one per species, so prevalence is degenerate there: a code-path check only).
+11. **GTDB species index:** representatives plus pyrodigal'd non-representatives through the genome-set path, after step 10 reads well on MGnify. Licence check (CC BY-SA) before shipping the table.
+12. **Continuous lineage model prototype (NumPyro).**
+    - Per-species phylogenetic logistic factor fit on the Rtab, then per-sample lineage SVI.
+    - Evaluated on step 10's benchmark plus a two-strain arm (two genomes of one species per sample).
+    - *Gate to port it:* log loss on held-out strains' accessory units below the species model's by ≥ 10%, species depth L1 no worse, and two co-occurring strains resolved into two lineages in ≥ 80% of samples at ≥ 1× each.
 
 ### Implementation plan
 
@@ -2612,6 +2969,10 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
 
 ## Sources
 
+- [MGnify genome catalogues (FTP; pangenomes per species)](https://ftp.ebi.ac.uk/pub/databases/metagenomics/mgnify_genomes/)
+- [Gopalan, Hofman & Blei, Scalable recommendation with hierarchical Poisson factorization (UAI 2015)](https://arxiv.org/abs/1311.1704)
+- [Liang et al., Modeling user exposure in recommendation (ExpoMF, WWW 2016)](https://arxiv.org/abs/1510.07025)
+- [Tolkoff et al., Phylogenetic factor analysis (Systematic Biology 2018)](https://doi.org/10.1093/sysbio/syx066)
 - [Metagenomic functional profiling: to sketch or not to sketch? (Bioinformatics 2024)](https://academic.oup.com/bioinformatics/article/40/Supplement_2/ii165/7749078)
 - [fmh-funprofiler repository](https://github.com/KoslickiLab/fmh-funprofiler)
 - [fmh-funprofiler preprint v2 (completeness discussion)](https://www.biorxiv.org/content/10.1101/2023.11.06.565843v2.full.pdf)

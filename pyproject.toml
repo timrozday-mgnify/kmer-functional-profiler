@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 kmer-functional-profiler = "kmer_functional_profiler.cli:app"
+kfp-prior = "kfp_prior.cli:app"
 
 [dependency-groups]
 bench = ["insilicoseq>=2.0.1", "mappy>=2.31"]
@@ -29,6 +30,7 @@ dev = [
   "ruff",
   "scipy-stubs>=1.17.1.5",
 ]
+phylo = ["jax>=0.10.2", "numpyro>=0.22.0"]
 
 [build-system]
 requires = ["maturin>=1.15,<2"]
@@ -38,6 +40,9 @@ build-backend = "maturin"
 manifest-path = "crates/py/Cargo.toml"
 python-source = "python"
 module-name = "kmer_functional_profiler._core"
+python-packages = [
+  "kfp_prior",
+] # the companion (plan: Genome-informed unit presence)
 features = ["pyo3/extension-module"]
 profile = "release"
 
@@ -70,5 +75,5 @@ files = ["python"]
 testpaths = ["tests/python"]
 
 [[tool.mypy.overrides]]
-module = ["sourmash", "screed"]
+module = ["sourmash", "screed", "numpyro", "numpyro.*"]
 ignore_missing_imports = true

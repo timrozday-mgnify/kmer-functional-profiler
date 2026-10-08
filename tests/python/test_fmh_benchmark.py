@@ -557,3 +557,143 @@ def test_divergence_abundance() -> None:
     assert got["abund_genes_zi_bias_2"] == pytest.approx(-1.0)
     assert got["abund_genes_mix_bias_2"] == pytest.approx(0.0) and got["abund_genes_split_2"] == 1
     assert got["abund_genes_n_4"] == 0 and got["abund_genes_mix_bias_4"] is None
+
+
+def test_study_rebuild_and_ladder(tmp_path: Path) -> None:
+    # Base: two MGnify clusters with integer ids and Pfam numbers.
+    base = {"protein_id": [1, 2], "cluster_rep": [1, 1], "full_length": [True, True],
+            "sequence": ["MAAA", "MAAC"]}  # fmt: skip
+    pl.DataFrame(base).write_parquet(tmp_path / "base.parquet")
+    pl.DataFrame({"protein_id": [1], "pfam_accession": [1007]}).write_parquet(
+        tmp_path / "bp.parquet"
+    )
+    # Study: g1 is 95% identical to cluster 1, g2 only 80%, g3 has no hit; linclust put all
+    # three in g1's cluster.
+    pl.DataFrame({"protein_id": ["g1", "g2", "g3"], "cluster_rep": ["g1", "g1", "g1"],
+                  "full_length": [True, True, False], "sequence": ["MAAD", "MAAE", "MAAF"]}
+                 ).write_parquet(tmp_path / "sm.parquet")  # fmt: skip
+    pl.DataFrame({"protein_id": ["g3"], "pfam_accession": ["PF00042"]}).write_parquet(
+        tmp_path / "sp.parquet"
+    )
+    pl.DataFrame({"gene_name": ["g1", "g2", "g1"], "cluster_rep": [1, 1, 2],
+                  "identity": [0.95, 0.8, 0.95], "qcov": [1.0, 1.0, 1.0], "scov": [1.0, 1.0, 1.0],
+                  "rank": [1, 1, 2]}).write_parquet(tmp_path / "gu.parquet")  # fmt: skip
+    run(tmp_path, "study-rebuild", "--members", "base.parquet", "--pfam", "bp.parquet",
+        "--study-members", "sm.parquet", "--study-pfam", "sp.parquet", "--gene-units",
+        "gu.parquet")  # fmt: skip
+    members = pl.read_parquet(tmp_path / "members.parquet")
+    assert members.select("protein_id", "cluster_rep").rows() == [
+        ("1", "1"), ("2", "1"), ("g1", "1"), ("g2", "g1"), ("g3", "g1")
+    ]  # fmt: skip
+    assert pl.read_parquet(tmp_path / "pfam.parquet").rows() == [
+        ("1", "PF01007"),
+        ("g3", "PF00042"),
+    ]
+
+    # The joint query recovers 3/4 of the rebuild's completeness gain.
+    keys = {"index": "m", "count": "kmers_unique", "abundance": "coverage_em", "min_hits": 1,
+            "label": "pfam", "sample": "seed1"}  # fmt: skip
+    for i, (arm, completeness) in enumerate((("", 0.5), ("study", 0.65), ("rebuild", 0.7))):
+        pl.DataFrame([keys | {"arm": arm, "completeness": completeness, "purity": 0.9}]).write_csv(
+            tmp_path / f"s{i}.tsv", separator="\t"
+        )
+    run(tmp_path, "study-ladder", "--scores", "s0.tsv", "s1.tsv", "s2.tsv")
+    ladder = pl.read_csv(tmp_path / "study_ladder.tsv", separator="\t")
+    assert ladder["recovered"].to_list() == pytest.approx([0.75])
+
+
+def test_uhgg_pick_sample_and_score(tmp_path: Path) -> None:
+    """The species benchmark's steps on the mini catalogue (tests/data/mini_uhgg)."""
+    catalogue = ROOT / "tests" / "data" / "mini_uhgg"
+    run(tmp_path, "uhgg-pick", "--metadata", str(catalogue / "genomes-all_metadata.tsv"),
+        "--replicates", "2", "--per-sample", "2", "--min-genomes", "3", "--distractors", "1",
+        "--depth-min", "1", "--depth-max", "4")  # fmt: skip
+    samples = pl.read_csv(tmp_path / "samples.tsv", separator="\t")
+    # held-out genomes: non-representatives of >= 3-genome species, >= 90% complete, unique
+    assert set(samples["genome"]) <= {"MGYG000000002", "MGYG000000005", "MGYG000000006"}
+    assert samples["genome"].n_unique() == samples.height
+    assert samples["depth"].is_between(1, 4).all()
+    assert (tmp_path / "exclude.txt").read_text().split() == samples["genome"].to_list()
+    species = (tmp_path / "species.txt").read_text().split()
+    assert (
+        set(samples["species"]) < set(species) and len(species) == samples["species"].n_unique() + 1
+    )
+
+    genome = samples["genome"][0]
+    (tmp_path / "g").mkdir()
+    (tmp_path / "g" / f"{genome}.fna").write_text(">c1 x\nACGT\n>c2\nGG\n")
+    one = samples.filter(pl.col("genome") == genome).with_columns(sample=pl.lit(1))
+    one.write_csv(tmp_path / "one.tsv", separator="\t")
+    run(tmp_path, "uhgg-sample", "--samples", "one.tsv", "--sample", "1", "--genomes-dir", "g")
+    assert (tmp_path / "sample.fna").read_text() == f">{genome}|c1\nACGT\n>{genome}|c2\nGG\n"
+    depth = one["depth"][0]
+    assert (
+        tmp_path / "coverage.txt"
+    ).read_text() == f"{genome}|c1\t{depth}\n{genome}|c2\t{depth}\n"
+
+    # scoring: a species index whose held-out genome carries units 1-3; we call A at the
+    # right depth plus a false B, and units 1, 2 and a false 9 present
+    si = tmp_path / "si"
+    si.mkdir()
+    pl.DataFrame({"species": [0, 1], "id": ["SA", "SB"], "name": ["A", "B"]}).write_csv(
+        si / "species.tsv", separator="\t"
+    )
+    pl.DataFrame({"name": ["G"] * 3, "species": ["SA"] * 3, "unit": [1, 2, 3],
+                  "c": [1.0] * 3}).write_parquet(si / "held_out.parquet")  # fmt: skip
+    pl.DataFrame({"sample": [1], "genome": ["G"], "species": ["SA"], "depth": [2.0]}).write_csv(
+        tmp_path / "truth.tsv", separator="\t"
+    )
+    pl.DataFrame({"id": ["SA", "SB"], "relative_abundance": [0.75, 0.25]}).write_csv(
+        tmp_path / "species.tsv", separator="\t"
+    )
+    pl.DataFrame({"unit": [1, 2, 9, 3], "hits": [5.0, 0.0, 3.0, 0.0],
+                  "present_prob": [0.9, None, 0.8, None],
+                  "present_prob_updated": [0.95, 0.7, 0.8, 0.2]}).write_csv(
+        tmp_path / "presence.tsv", separator="\t")  # fmt: skip
+    pl.DataFrame({"species": [0, 0], "unit": [3, 4], "prevalence": [0.5, 0.5], "hits": [0.0, 0.0],
+                  "carriage_prob": [0.8, 0.2]}).write_csv(
+        tmp_path / "units.tsv", separator="\t")  # fmt: skip
+    run(tmp_path, "uhgg-score", "--truth", "truth.tsv", "--species-index", "si", "--sample", "1",
+        "--arm", "species", "--pred", "species.tsv", "--presence", "presence.tsv",
+        "--units", "units.tsv")  # fmt: skip
+    got = dict(pl.read_csv(tmp_path / "species_score.tsv", separator="\t")
+               .select("metric", "value").iter_rows())  # fmt: skip
+    assert got["purity"] == 0.5 and got["completeness"] == 1.0 and got["l1"] == pytest.approx(0.5)
+    assert got["unit_all_completeness_observed"] == pytest.approx(1 / 3)
+    assert got["unit_all_completeness_updated"] == pytest.approx(2 / 3)
+    assert got["unit_all_purity_updated"] == pytest.approx(2 / 3)
+    assert got["carriage_auc"] == 1.0 and got["accessory_pairs"] == 2
+    calibration = pl.read_csv(tmp_path / "species_calibration.tsv", separator="\t")
+    assert calibration["n"].sum() == 2  # the zero-hit units 2 and 3
+
+
+def test_uhgg_two_strain_samples_and_lineage_score(tmp_path: Path) -> None:
+    """Two-strain samples (phase 11, step 12) and the lineage arm's scoring."""
+    catalogue = ROOT / "tests" / "data" / "mini_uhgg"
+    run(tmp_path, "uhgg-pick", "--metadata", str(catalogue / "genomes-all_metadata.tsv"),
+        "--replicates", "0", "--two-strain-replicates", "1", "--per-sample", "2",
+        "--min-genomes", "3", "--distractors", "0")  # fmt: skip
+    samples = pl.read_csv(tmp_path / "samples.tsv", separator="\t")
+    # only beta has two eligible genomes (alpha's 3 is 80% complete)
+    assert sorted(samples["genome"]) == ["MGYG000000005", "MGYG000000006"]
+
+    si = tmp_path / "si"
+    si.mkdir()
+    pl.DataFrame({"species": [0, 1], "id": ["SA", "SB"], "name": ["A", "B"]}).write_csv(
+        si / "species.tsv", separator="\t"
+    )
+    pl.DataFrame({"name": ["G1", "G2"], "species": ["SA"] * 2, "unit": [1, 2],
+                  "c": [1.0] * 2}).write_parquet(si / "held_out.parquet")  # fmt: skip
+    pl.DataFrame({"sample": [1, 1], "genome": ["G1", "G2"], "species": ["SA", "SA"],
+                  "depth": [2.0, 3.0]}).write_csv(
+        tmp_path / "truth.tsv", separator="\t")  # fmt: skip
+    pl.DataFrame({"id": ["SA", "SA", "SB"], "lineage": [0, 1, 0],
+                  "relative_abundance": [0.5, 0.3, 0.2]}).write_csv(
+        tmp_path / "lineages.tsv", separator="\t")  # fmt: skip
+    run(tmp_path, "uhgg-score", "--truth", "truth.tsv", "--species-index", "si", "--sample", "1",
+        "--arm", "lineage", "--kind", "lineage", "--pred", "lineages.tsv")  # fmt: skip
+    got = dict(pl.read_csv(tmp_path / "species_score.tsv", separator="\t")
+               .select("metric", "value").iter_rows())  # fmt: skip
+    assert got["n_truth"] == 1 and got["completeness"] == 1.0 and got["purity"] == 0.5
+    assert got["l1"] == pytest.approx(0.4)
+    assert got["two_strain_species"] == 1 and got["two_strain_resolved"] == 1.0
