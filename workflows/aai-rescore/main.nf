@@ -46,6 +46,7 @@ process NEAREST {
     path hits, stageAs: 'hits/*'
     path gene_units, stageAs: 'reps.parquet'
     path clusters
+    path code, stageAs: 'code/*'  // bench.py and the package: only here so -resume reruns on a change
 
     output:
     path 'gene_units.parquet'
@@ -67,6 +68,7 @@ process SCORE {
     input:
     tuple val(sid), val(index), val(arm), path(units), path(genes), val(model_name), val(model)
     path gene_units
+    path code, stageAs: 'code/*'
 
     output:
     path 'aai_score.tsv'
@@ -88,6 +90,7 @@ process SUMMARY {
 
     input:
     path scores, stageAs: 'aai*.tsv'
+    path code, stageAs: 'code/*'
 
     output:
     path 'aai_summary.tsv'
@@ -108,7 +111,11 @@ workflow {
         MGNIFY_DB(MEMBERS.out.faa).combine(PROTEINS(file(params.genomes, checkIfExists: true)).flatten()),
         params.nearest_diamond_args,
     )
-    NEAREST(MGNIFY_ANNOTATE.out.hits.map { _name, hits -> hits }.collect(), reps, MEMBERS.out.clusters)
+    // ponytail: the scoring steps track bench.py and the Python package; PROTEINS and MEMBERS
+    // do not, so a code change never reruns DIAMOND (their outputs do not depend on scoring)
+    def code = channel.fromPath("${projectDir}/../fmh-benchmark/bench.py")
+        .mix(channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py")).collect()
+    NEAREST(MGNIFY_ANNOTATE.out.hits.map { _name, hits -> hits }.collect(), reps, MEMBERS.out.clusters, code)
     // units/seed<sid>_<index>[~<arm>].tsv, as the fmh-benchmark run published them
     def ch_units = channel.fromPath("${run}/units/seed*.tsv").map { f ->
         def m = (f.baseName =~ /^seed([^_]+)_([^~]+)(?:~(.*))?$/)
@@ -120,5 +127,5 @@ workflow {
     def ch_models = channel.of(['', '']).mix(
         channel.fromList(params.models).map { m -> [m.name, file(m.path, checkIfExists: true).toString()] }
     )
-    SUMMARY(SCORE(ch_units.combine(ch_models), NEAREST.out).collect())
+    SUMMARY(SCORE(ch_units.combine(ch_models), NEAREST.out, code).collect(), code)
 }

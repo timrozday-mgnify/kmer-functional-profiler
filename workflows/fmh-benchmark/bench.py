@@ -537,6 +537,12 @@ def aai_score(
     - ``aai_bias_members<lo>``, ``aai_cover_members<lo>``, ``aai_n_members<lo>``: the same
       by the unit's members (``n_members``, ``MEMBER_BINS``): the survival model's union term
       takes one member's window correlation for a union's (step 34).
+    - ``aai_bias_single_<lo>``, ``aai_cover_single_<lo>``, ``aai_cover_single``,
+      ``aai_n_single``, and by ``aai_kmers`` (``aai_*_single_kmers<lo>``): units one present
+      gene hits, against its identity. With several (related strains), the union truth's
+      independent a^k combination overstates the union and the estimate follows the k-mers
+      seen, weighted by depth, so no identity truth is right there (step 34's one-member
+      check); step 25's decision rule is read on these.
 
     The ``aai`` and ``aai_naive`` truths are identity to each cluster's nearest member where
     ``gene_units`` has it (:func:`aai_identity`; ``aai_truth`` "nearest", else "rep");
@@ -632,6 +638,22 @@ def aai_score(
                 part = a.filter(pl.col("aai_kmers").is_between(lo, hi, closed="left"))
                 out[f"aai_n_kmers{lo}"] = part.height
                 bias_cover(part, "true_union", f"kmers{lo}")
+        # one present gene hitting the unit: the truth is that gene's identity, unambiguous
+        single = a.filter(pl.col("hit_genes") == 1)
+        out["aai_n_single"] = single.height
+        for lo, hi in IDENTITY_BINS:
+            bias_cover(
+                single.filter(pl.col("true_union").is_between(lo, hi, closed="left")),
+                "true_union",
+                f"single_{lo}",
+            )
+        bias_cover(single, "true_union", "single")
+        del out["aai_bias_single"]
+        if "aai_kmers" in single.columns:
+            for lo, hi in AAI_KMER_BINS:
+                part = single.filter(pl.col("aai_kmers").is_between(lo, hi, closed="left"))
+                out[f"aai_n_single_kmers{lo}"] = part.height
+                bias_cover(part, "true_union", f"single_kmers{lo}")
         if "n_members" in a.columns:
             for lo, hi in MEMBER_BINS:
                 part = a.filter(pl.col("n_members").is_between(lo, hi, closed="left"))
@@ -661,7 +683,8 @@ def union_truth(hits: pl.DataFrame, k: int = 11) -> pl.DataFrame:
     phase 7, step 23). a^k, not the fitted survival model, so the truth does not depend on
     the model it scores."""
     return hits.group_by("cluster_rep").agg(
-        true_union=(1 - (1 - pl.col("identity") ** k).log().sum().exp()) ** (1 / k)
+        true_union=(1 - (1 - pl.col("identity") ** k).log().sum().exp()) ** (1 / k),
+        hit_genes=pl.len(),
     )
 
 
