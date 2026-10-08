@@ -1,0 +1,24 @@
+{
+ "survival": "markov_beta",
+ "concentration": 5.493948023095155,
+ "region": 6.713569793404415,
+ "ends": 0.9360876879771391,
+ "union": 0.1935853436071196,
+ "union_slope": 0.02930916472402979,
+ "spread": 0.2995835148587807,
+ "spread_power": 0.27249157465287577,
+ "categories": 16,
+ "k": 11,
+ "alphabet": "protein",
+ "fit": {
+  "n_one": 70111,
+  "rmse_one": 0.0071491713069734815,
+  "rmse_both_one": 0.007666291530340762,
+  "n_union": 29465,
+  "rmse_union": 0.021274445696094234,
+  "rmse_independent_union": 0.14386495959631204,
+  "rmse_log_scatter": 0.5178293627138261,
+  "rmse_log_scatter_without": 2.662179493107774,
+  "source": "aai-model run of 2026-10-07 (main after PR #100): its survival.parquet refitted offline by fit_model.py fit (three stages, on the query's measure: survival = shared / pin_sum, clipped at 1; step 34)"
+ }
+}

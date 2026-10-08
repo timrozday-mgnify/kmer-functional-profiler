@@ -78,7 +78,7 @@ def test_fit_model_recovers_markov_beta_and_end_loss() -> None:
         for i in range(len(win)):
             w = win[i]
             both = {f"both_{j}": (w[:-j] & w[j:]).mean() for j in fit_model.LAGS}
-            rows.append({"identity": same[i].mean(), "window_survival": w.mean(),
+            rows.append({"identity": same[i].mean(), "survival": w.mean(),
                          "n_windows": len(w)} | both)  # fmt: skip
     got = fit_model.fit_model(pl.DataFrame(rows), 11, categories=8)
     assert got["ends"] == pytest.approx(c, abs=0.02)
@@ -119,8 +119,8 @@ def test_pairs_take_the_nearest_member_of_each_candidate_cluster(tmp_path: Path)
     assert stats["with_member_hit_by_size"] == {"1": 1.0, "2-3": 1.0}
 
 
-def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: Path) -> None:
-    # Multi-member pairs whose window survival is the union model's plus noise: union_fit
+def test_union_fit_recovers_the_union_term_and_fit_writes_every_stage(tmp_path: Path) -> None:
+    # Multi-member pairs whose survival is the union model's plus noise: union_fit
     # finds (g0, g1). fit() then writes the one-member model and the union term.
     rng = np.random.default_rng(7)
     base = SurvivalModel(11, None, 5.0, categories=8, concentration=4.0, ends=0.95)
@@ -129,7 +129,9 @@ def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: 
     a = rng.uniform(0.6, 1.0, 20_000)
     n = np.exp(rng.uniform(np.log(2), np.log(500), a.size)).round()
     noisy = true.union_survival(a, n) + rng.normal(0, 0.05, a.size)
-    many = pl.DataFrame({"identity": a, "n_members": n, "window_survival": noisy})
+    many = pl.DataFrame(
+        {"identity": a, "n_members": n, "survival": noisy, "n_windows": np.full(a.size, 300)}
+    )
     got = fit_model.union_fit(many, base, 11)
     assert got["union"] == pytest.approx(0.08, abs=0.02)
     assert got["union_slope"] == pytest.approx(0.3, abs=0.1)
@@ -146,7 +148,7 @@ def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: 
         for i in range(len(win)):
             w = win[i]
             both = {f"both_{j}": (w[:-j] & w[j:]).mean() for j in fit_model.LAGS}
-            rows.append({"identity": same[i].mean(), "window_survival": w.mean(),
+            rows.append({"identity": same[i].mean(), "survival": w.mean(),
                          "n_windows": len(w), "n_members": 1.0} | both)  # fmt: skip
     one = pl.DataFrame(rows)
     path = tmp_path / "survival.parquet"
@@ -158,5 +160,8 @@ def test_union_fit_recovers_the_union_term_and_fit_writes_both_stages(tmp_path: 
     model = __import__("json").loads(out.read_text())
     assert model["survival"] == "markov_beta" and model["ends"] == pytest.approx(0.95, abs=0.02)
     assert model["union"] > 0 and model["union_slope"] > 0
+    # the union pairs' additive noise is scatter beyond window sampling
+    assert model["spread"] > 0 and model["spread_power"] >= 0
+    assert model["fit"]["rmse_log_scatter"] < model["fit"]["rmse_log_scatter_without"]
     names = pl.read_csv(strata, separator="\t")["stratum"].to_list()
     assert names[0] == "members 1" and "members 2+" in names and "members 101+" in names

@@ -7,13 +7,16 @@ a Markov chain that starts a new region with probability 1/`region` per site. Ea
 identity scatters around the pair's identity as Beta(a φ, (1 − a) φ), φ = `concentration`.
 `ends` is the share of a unit's windows inside the region a homolog aligns to. A unit of n
 members keeps more than one member does: its survival is 1 − (1 − S)^m, with m = n^(g₀ + g₁(a − 0.8))
-effective members (`union`, `union_slope`). Identity,
+effective members (`union`, `union_slope`), and its survival scatters about that with relative
+SD `spread` (1 − S_n)^`spread_power` (1 − 1/n). Identity,
 window survival and the co-survival of windows j apart then follow exactly, from small
 matrix products tabulated once per model.
 
 The parameters come from protein pairs, not from a benchmark. A pair is a protein P and an
-MGnify90 cluster C it aligns to (both coverages >= 0.8). Survival is the share of P's
-windows found in the union of C's members' k-mers, which is what the query measures.
+MGnify90 cluster C it aligns to (both coverages >= 0.8). Survival is P's k-mers found in
+the union of C's members' k-mers over an average member's (`shared` / `pin_sum`, clipped at
+1), which is what the query inverts. The share of P's windows (`window_survival`) runs lower
+in multi-member clusters and is kept for co-survival only (step 34).
 Identity is DIAMOND's, P against its **nearest member of C**. Identity to C's representative
 (step 25) made survival in large clusters far exceed what it predicts, because P has closer
 members. When P is a member of C, it is left out of C. Co-survival of P's windows j apart
@@ -28,9 +31,10 @@ NEAREST_ALIGN  DIAMOND blastp of P against those members             (--chunks j
 PAIRS       per candidate, the member of C with the highest identity (coverage filter, not P),
             <= per_bin pairs per 0.02 of that identity; identity_rep kept for comparison
 SURVIVAL    per pair: P's windows in C's union, pin_sum, co-survival by lag (every k-mer)
-FIT         aai_model.json, two stages on the bins' means: phi, region and ends from one-member
-            pairs (bins of 0.01 identity), then union and union_slope from multi-member pairs
-            (bins of identity x cluster size); model_strata.tsv (one-member model by identity
+FIT         aai_model.json, three stages on the bins' means: phi, region and ends from
+            one-member pairs (bins of 0.01 identity), then union and union_slope from
+            multi-member pairs (bins of identity x cluster size), then spread and spread_power
+            from those pairs' squared residuals beyond window sampling; model_strata.tsv (one-member model by identity
             band, union term by cluster size, and the overall model's error per size)
 ```
 
