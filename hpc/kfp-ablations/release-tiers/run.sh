@@ -16,6 +16,7 @@ source ../common.sh
 # -resume reuses the release extraction (MEMBERSHIP, EXTRACT, MERGE: ~1.3 TB read, ~1 TB of
 # cluster buckets linked under each results-<tier>/) and only the build runs again.
 # RELEASE=<local mirror> sbatch run.sh reads a mirror instead of the FTP site.
+# Each index gets the aai survival model step34q attached (plan, decided 2026-10-08).
 for tier in "slim:--t-base 0.01 --t-base-singleton 0.001 --n-min 8:128" \
             "standard:--t-base 0.02 --n-min 16 --oversample 1:256" \
             "large:--t-base 0.05 --n-min 32 --oversample 1:256"; do
@@ -36,4 +37,6 @@ CFG
     nextflow run "$WF/mgnify-subset" -c ../site.config -c "$name.config" ${RELEASE:+--release "$RELEASE"} \
         --biome root --sample 1 --shards 256 --buckets 256 --ranges 256 --index false --build true \
         --publish_mode link --outdir "results-$name" -resume
+    "$REPO/.venv/bin/kmer-functional-profiler" aai-model "results-$name/index" \
+        "$WF/fmh-benchmark/ablations/aai_models/step34q.json"
 done
