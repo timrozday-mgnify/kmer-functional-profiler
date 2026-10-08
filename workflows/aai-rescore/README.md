@@ -12,7 +12,8 @@ MEMBERS          members of every cluster in the run's mgnify/<annotation>_gene_
 PROTEINS         the benchmark genomes' proteins, in --chunks FASTA files
 MGNIFY_DB, MGNIFY_ANNOTATE
                  DIAMOND blastp of those proteins against the members
-NEAREST          per (gene, cluster) the nearest member -> results/gene_units.parquet
+NEAREST          per (gene, cluster) the nearest member, among hits at query and subject
+                 coverage >= --nearest_min_cov (0.8, as aai-model's pairs) -> results/gene_units.parquet
 SCORE, SUMMARY   aai-score of every units/seed<sid>_<index>[~arm].tsv, as profiled and under
                  each --models entry (arm '<arm>+<name>') -> aai_summary.tsv, aai_scores.tsv
 ```

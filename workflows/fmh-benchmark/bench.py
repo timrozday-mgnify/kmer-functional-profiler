@@ -447,17 +447,23 @@ def mgnify_members(args: argparse.Namespace) -> None:
 
 def mgnify_nearest(args: argparse.Namespace) -> None:
     """``--gene-units`` with ``identity_nearest`` and ``nearest``: per (gene, cluster), the
-    member of the cluster with the highest identity among the gene's hits to members (query
-    coverage >= 0.5, as the truth's hits). Where the member pass found none (its
-    ``--max-target-seqs`` filled by other clusters' members; ``member_hit`` false), the
-    representative's identity, which is a member's."""
+    member of the cluster with the highest identity among the gene's hits to members with
+    query and subject coverage >= ``--min-cov``, as aai-model's pairs define the identity
+    its fit maps survival to. At query coverage 0.5 alone, shorter local hits to some of a
+    large cluster's members read higher, and ``aai`` read low against them as clusters grew
+    (step 34's rescore). The representative is a member: its identity is a floor where its
+    hit passes the same coverage, and the fallback where the member pass found none (its
+    ``--max-target-seqs`` filled by other clusters' members; ``member_hit`` false)."""
     clusters = pl.read_parquet(args.member_clusters).rename({"protein_id": "nearest"})
     # reduced one chunk at a time (a gene's hits are all in its chunk's file): with up to
     # 1000 member targets per gene, all chunks' hits at once crashed polars (exit 139)
     best = pl.concat(
         pl.scan_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
         .rename({"cluster_rep": "nearest"})  # the subject is a member
-        .filter(pl.col("length") / pl.col("qlen") >= 0.5)
+        .filter(
+            pl.col("length") / pl.col("qlen") >= args.min_cov,
+            pl.col("length") / pl.col("slen") >= args.min_cov,
+        )
         .join(clusters.lazy(), on="nearest")
         .group_by("gene_name", "cluster_rep")
         .agg(pl.all().sort_by("pident", "bitscore").last())
@@ -466,10 +472,12 @@ def mgnify_nearest(args: argparse.Namespace) -> None:
         for p in args.hits
     )
     units = pl.read_parquet(args.gene_units).join(best, on=["gene_name", "cluster_rep"], how="left")
+    rep_ok = (pl.col("qcov") >= args.min_cov) & (pl.col("scov") >= args.min_cov)
     units.with_columns(
         member_hit=pl.col("nearest").is_not_null(),
         identity_nearest=pl.max_horizontal(
-            pl.col("identity_nearest").fill_null(pl.col("identity")), "identity"
+            pl.col("identity_nearest").fill_null(pl.col("identity")),
+            pl.when(rep_ok).then("identity"),
         ),
         nearest=pl.col("nearest").fill_null(pl.col("cluster_rep")),
     ).write_parquet(args.out)
@@ -1303,6 +1311,7 @@ def main() -> None:
     p.add_argument("--hits", required=True, nargs="+")
     p.add_argument("--gene-units", required=True)
     p.add_argument("--member-clusters", required=True)
+    p.add_argument("--min-cov", type=float, default=0.8)  # aai-model's --min-cov
     p.add_argument("--out", default="gene_units_nearest.parquet")
     p = sub.add_parser("aai-score")
     for name in ("profile", "gene-units", "genes", "sample", "index"):

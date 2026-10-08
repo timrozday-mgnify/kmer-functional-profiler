@@ -53,7 +53,7 @@ process NEAREST {
     script:
     """
     ${params.bench} mgnify-nearest --hits hits/* --gene-units reps.parquet \\
-        --member-clusters ${clusters} --out gene_units.parquet
+        --member-clusters ${clusters} --min-cov ${params.nearest_min_cov} --out gene_units.parquet
     """
 
     stub:
