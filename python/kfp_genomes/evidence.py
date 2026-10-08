@@ -37,6 +37,7 @@ from typing import Final
 import numpy as np
 import polars as pl
 from scipy.special import logsumexp
+from scipy.stats import norm
 
 from kmer_functional_profiler.query import (
     _ztnb_logpmf,
@@ -48,6 +49,10 @@ D_GRID: Final = np.geomspace(1e-2, 1e3, 81)  # the generic depth prior (log-unif
 F_GRID: Final = (np.arange(40) + 0.5) / 40  # the generic survival prior (uniform)
 F_FLOOR: Final = 1e-3  # survival below this is taken as this (an allele always keeps some)
 CHUNK: Final = 2**21  # grid cells per batch of the generic marginal
+# The background slab: units present from outside the panel at a depth log-normal around one
+# of these (sd BG_SD in ln), the centre fitted per species by marginal likelihood (place.py).
+BG_DEPTHS: Final = np.geomspace(0.01, 100, 17)
+BG_SD: Final = 1.0
 
 
 def log_likelihood(
@@ -70,28 +75,52 @@ def log_likelihood(
     return np.asarray(term / np.asarray(w, dtype=np.float64))
 
 
-def log_marginal(k: np.ndarray, h: np.ndarray, m: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """log M per unit: L averaged over the generic prior (``D_GRID`` x ``F_GRID``)."""
-    out = np.empty(len(k))
+def _background_log_prior() -> np.ndarray:
+    """Per slab centre (``BG_DEPTHS``), the log prior weight of each ``D_GRID`` point:
+    log-normal of sd ``BG_SD`` (in ln) x trapezoid on log D, normalised over the grid."""
+    x = np.log(D_GRID)
+    lp = norm.logpdf(x[None], np.log(BG_DEPTHS)[:, None], BG_SD) + np.log(np.gradient(x))
+    return np.asarray(lp - logsumexp(lp, axis=1, keepdims=True))
+
+
+def log_marginals(
+    k: np.ndarray, h: np.ndarray, m: np.ndarray, w: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per unit, log M (L averaged over the generic prior: log-uniform ``D_GRID`` x uniform
+    ``F_GRID``) and log M_j under each background slab (log-normal *D* around
+    ``BG_DEPTHS``[j], uniform *f*)."""
+    gen, bg = np.empty(len(k)), np.empty((len(k), len(BG_DEPTHS)))
+    prior = _background_log_prior()
     cells = len(D_GRID) * len(F_GRID)
     step = max(1, CHUNK // cells)
     d, f = D_GRID[None, :, None], F_GRID[None, None, :]
     for i in range(0, len(k), step):
         s = slice(i, i + step)
         ll = log_likelihood(k[s, None, None], h[s, None, None], m[s, None, None], d, f,
-                     w[s, None, None])  # fmt: skip
-        out[s] = logsumexp(ll.reshape(len(ll), -1), axis=1) - np.log(cells)
-    return out
+                            w[s, None, None])  # fmt: skip
+        over_f = logsumexp(ll, axis=2) - np.log(len(F_GRID))  # units x D
+        gen[s] = logsumexp(over_f, axis=1) - np.log(len(D_GRID))
+        bg[s] = logsumexp(over_f[:, None, :] + prior[None], axis=2)
+    return gen, bg
+
+
+def log_marginal(k: np.ndarray, h: np.ndarray, m: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """log M per unit under the generic prior (:func:`log_marginals`)."""
+    return log_marginals(k, h, m, w)[0]
 
 
 def zero_hit_present(m: np.ndarray) -> np.ndarray:
     """ε: P(no hits | present) under the generic prior, for units of ``m`` kept k-mers."""
+    return zero_hit_marginals(m)[0]
+
+
+def zero_hit_marginals(m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """P(no hits | present) for units of ``m`` kept k-mers, under the generic prior and
+    under each background slab (units x slabs)."""
     values, inverse = np.unique(np.asarray(m, dtype=np.float64), return_inverse=True)
-    ll = log_likelihood(
-        0.0, 0.0, values[:, None, None], D_GRID[None, :, None], F_GRID[None, None, :]
-    )
-    eps = np.exp(logsumexp(ll.reshape(len(values), -1), axis=1) - np.log(ll[0].size))
-    return np.asarray(eps[inverse])
+    gen, bg = log_marginals(np.zeros(len(values)), np.zeros(len(values)), values,
+                            np.ones(len(values)))  # fmt: skip
+    return np.exp(gen)[inverse], np.exp(bg)[inverse]
 
 
 def prior_odds(profile: pl.DataFrame) -> float:
@@ -175,7 +204,8 @@ class Evidence:
 @dataclass(frozen=True)
 class UnitTerms:
     """The evidence of a fixed set of units (hit or not), ready for :meth:`log_ratio`:
-    hit units' k, H, m, w, log M and llr; zero-hit units' tier-2 m and ε."""
+    hit units' k, H, m, w, llr and log M (generic, and per background slab, relative to the
+    generic); zero-hit units' tier-2 m and ε (generic, and per slab)."""
 
     hit: np.ndarray  # bool: unit is hit and informative
     blank: np.ndarray  # bool: hit but explained away (ratio 1)
@@ -186,6 +216,8 @@ class UnitTerms:
     log_m: np.ndarray
     llr: np.ndarray
     eps: np.ndarray
+    log_m_bg: np.ndarray  # units x slabs: log M_j - log M (hit units)
+    eps_bg: np.ndarray  # units x slabs (zero-hit units)
 
     @classmethod
     def build(cls, ev: Evidence, units: np.ndarray, m_tier2: np.ndarray) -> "UnitTerms":
@@ -201,17 +233,30 @@ class UnitTerms:
         m = np.where(hit, ev.m[rows], np.asarray(m_tier2, dtype=np.float64))
         w = np.where(hit, ev.w[rows], 1.0)
         log_m = np.zeros(len(units))
+        log_m_bg = np.zeros((len(units), len(BG_DEPTHS)))
         if hit.any():
-            log_m[hit] = log_marginal(k[hit], h[hit], m[hit], w[hit])
-        eps = np.where(hit | blank, 0.0, zero_hit_present(m))
-        return cls(hit, blank, k, h, m, w, log_m, np.where(hit, ev.llr[rows], 0.0), eps)
+            gen, bg = log_marginals(k[hit], h[hit], m[hit], w[hit])
+            log_m[hit] = gen
+            log_m_bg[hit] = bg - gen[:, None]
+        zero = ~hit & ~blank
+        eps = np.zeros(len(units))
+        eps_bg = np.zeros((len(units), len(BG_DEPTHS)))
+        if zero.any():
+            eps[zero], eps_bg[zero] = zero_hit_marginals(m[zero])
+        return cls(hit, blank, k, h, m, w, log_m, np.where(hit, ev.llr[rows], 0.0), eps,
+                   log_m_bg, eps_bg)  # fmt: skip
 
-    def log_not_carried(self, beta: float | np.ndarray) -> np.ndarray:
-        """log L(not carried) per unit, hit units relative to M (``beta`` per unit or one)."""
-        beta = np.asarray(beta, dtype=np.float64)
+    def log_not_carried(self, beta: float, slab: int | None = None) -> np.ndarray:
+        """log L(not carried) per unit, hit units relative to M: present from outside the
+        panel (prior ``beta``; depth from background ``slab``, else the generic prior), or
+        absent."""
+        rel = self.log_m_bg[:, slab] if slab is not None else 0.0
+        eps = self.eps_bg[:, slab] if slab is not None else self.eps
         with np.errstate(divide="ignore"):
-            hit = np.logaddexp(np.log(beta), np.log1p(-beta) - self.llr)
-        return np.where(self.hit, hit, np.where(self.blank, 0.0, np.log1p(-beta * (1 - self.eps))))
+            hit = np.logaddexp(np.log(beta) + rel, np.log1p(-beta) - self.llr)
+        return np.asarray(
+            np.where(self.hit, hit, np.where(self.blank, 0.0, np.log1p(-beta * (1 - eps))))
+        )
 
     def log_carried(
         self, d: np.ndarray, f: np.ndarray, rows: np.ndarray | slice = slice(None)
@@ -225,11 +270,16 @@ class UnitTerms:
         return np.where(blank, 0.0, log_likelihood(k, h, m, d, f, w) - log_m)
 
     def log_ratio(
-        self, d: np.ndarray, f: np.ndarray, beta: float, rows: np.ndarray | slice = slice(None)
+        self,
+        d: np.ndarray,
+        f: np.ndarray,
+        beta: float,
+        rows: np.ndarray | slice = slice(None),
+        slab: int | None = None,
     ) -> np.ndarray:
         """log L(carried at ``d``, ``f``) / L(not carried) of units ``rows``."""
         shape = (-1,) + (1,) * (np.ndim(d) - 1)
-        nc = self.log_not_carried(beta)[rows].reshape(shape)
+        nc = self.log_not_carried(beta, slab)[rows].reshape(shape)
         return np.asarray(self.log_carried(d, f, rows) - nc)
 
 
