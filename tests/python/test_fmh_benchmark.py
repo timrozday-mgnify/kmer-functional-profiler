@@ -350,6 +350,11 @@ def test_mgnify_genes_and_aai_score(tmp_path: Path) -> None:
     assert got["aai_cover_union"] == 0.5  # 10 covered, 20 (85%) not
     assert got["aai_n_kmers5"] == 1 and got["aai_bias_kmers5"] == pytest.approx(0.95 - union)
     assert got["aai_n_kmers10"] == 1 and got["aai_n_kmers0"] == 0
+    # single-gene units: 20 (g2 alone, 85%, interval 0.70-0.84 misses); 10 has two genes
+    assert got["aai_n_single"] == 1 and got["aai_cover_single"] == 0.0
+    assert got["aai_bias_single_0.8"] == pytest.approx(0.80 - 0.85)
+    assert got["aai_bias_single_0.95"] is None
+    assert got["aai_n_single_kmers10"] == 1 and got["aai_n_single_kmers5"] == 0
     # aai_naive on every hit unit, near hits included: 11 against g1's 80%
     assert got["naive_n"] == 3 and got["naive_bias_0.8"] == pytest.approx(
         (0.86 - 0.85 + 0.79 - 0.8) / 2
