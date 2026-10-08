@@ -368,7 +368,7 @@ def mixture_loglik(
     n, r = rates.shape
     lp_c = _ztnb_logpmf(hist.h[:, None], np.maximum(rates[hist.row], 1e-9), hist.v)
     w = np.full((n, r), 1 / r) if weights is None else weights
-    ll = np.zeros(n)
+    ll: np.ndarray = np.zeros(n)
     for _ in range(1 if weights is not None else iterations):
         lp = np.log(np.maximum(w[hist.row], 1e-300)) + lp_c
         mx = lp.max(1, keepdims=True)
