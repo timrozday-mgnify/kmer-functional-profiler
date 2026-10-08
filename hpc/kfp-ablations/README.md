@@ -46,7 +46,7 @@ cd kfp-ablations/aai-rescore && sbatch run.sh
 # reads the whole release (RELEASE=<local mirror> to use one), ~1 TB of buckets in results-*/:
 cd kfp-ablations/release-tiers && sbatch run.sh
 # abundance under divergence (plan, phase 7, step 35): finished runs' indexes queried again
-# with the shipped coverage_zi and its interval (no index rebuilt); after floor-novaseq,
+# with the shipped coverage_zi, its interval and coverage_mix (no index rebuilt); after floor-novaseq,
 # floor-1.65M and tiers-novaseq respectively:
 for r in abundance-novaseq abundance-1.65M abundance-tiers; do (cd kfp-ablations/$r && sbatch run.sh); done
 ```

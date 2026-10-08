@@ -676,8 +676,9 @@ def aai_score(
     return out | divergence_abundance(profile, aai_hits)
 
 
-ABUND_ESTIMATES = ("coverage_em", "coverage_zi", "abundance_zi")
+ABUND_ESTIMATES = ("coverage_em", "coverage_zi", "abundance_zi", "coverage_mix")
 DEPTH_BINS = ((0, 1), (1, 2), (2, 5), (5, float("inf")))  # true depth
+GENE_BINS = ((1, 2), (2, 4), (4, 1_000_000))  # present genes nearest a unit: 1, 2-3, 4+
 
 
 def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str, float | None]:
@@ -691,10 +692,14 @@ def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str,
       absolute deviation by identity (``IDENTITY_BINS``), for ``ABUND_ESTIMATES``;
     - ``abund_zi_bias_depth<lo>``, ``abund_zi_err_depth<lo>``, ``abund_zi_cover_depth<lo>``
       and ``abund_zi_cover``: ``coverage_zi`` by true depth (``DEPTH_BINS``), and how often
-      ``coverage_zi_lo``/``_hi`` hold c x depth; ``abund_n_depth<lo>`` units per bin.
+      ``coverage_zi_lo``/``_hi`` hold c x depth; ``abund_n_depth<lo>`` units per bin;
+    - strain mixes (open item 3): on detected units by how many present genes they are
+      nearest to (``GENE_BINS``), against c x those genes' summed depth,
+      ``abund_genes_{zi,mix}_{bias,err}_<lo>``, ``abund_genes_split_<lo>`` (share with
+      ``mix_rates`` > 1; at 1 gene, false splits) and ``abund_genes_n_<lo>``.
 
-    Units several genes hit are left out: one rate cannot resolve strains at different
-    depths (step 35)."""
+    The other metrics leave out units several genes hit: one rate cannot resolve strains at
+    different depths (step 35)."""
     out: dict[str, float | None] = {}
     if "coverage_zi" not in profile.columns or "depth" not in hits.columns:
         return out
@@ -703,8 +708,8 @@ def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str,
         .agg(n=pl.len(), a=pl.col("identity").first(), depth=pl.col("depth").first())
         .filter(pl.col("n") == 1)
     )
-    keep = [c for c in (*ABUND_ESTIMATES, "coverage_zi_lo", "coverage_zi_hi", "n_members")
-            if c in profile.columns]  # fmt: skip
+    keep = [c for c in (*ABUND_ESTIMATES, "coverage_zi_lo", "coverage_zi_hi", "n_members",
+                        "mix_rates") if c in profile.columns]  # fmt: skip
     u = (
         profile.filter(pl.col("kmers_unique") >= 1, pl.col("coverage_zi") > 0)
         .select("cluster_rep", *keep)
@@ -739,6 +744,28 @@ def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str,
         )
         if has_ci:
             out[f"abund_zi_cover_depth{lo}"] = x["inside"].mean() if x.height else None  # type: ignore[assignment]
+    if "coverage_mix" in u.columns:
+        nearest = (
+            hits.filter(pl.col("rank") == 1)
+            .group_by("cluster_rep")
+            .agg(genes=pl.len(), truth=c * pl.col("depth").sum())
+        )
+        g = (
+            profile.filter(pl.col("kmers_unique") >= 1, pl.col("coverage_zi") > 0)
+            .select("cluster_rep", "coverage_zi", "coverage_mix", "mix_rates")
+            .join(nearest, on="cluster_rep")
+        )
+        for lo, hi in GENE_BINS:
+            x = g.filter(pl.col("genes").is_between(lo, hi, closed="left"))
+            out[f"abund_genes_n_{lo}"] = x.height
+            out[f"abund_genes_split_{lo}"] = (x["mix_rates"] > 1).mean() if x.height else None  # type: ignore[assignment]
+            for est in ("coverage_zi", "coverage_mix"):
+                lr = (x[est] / x["truth"]).log(2)
+                name = est.removeprefix("coverage_")
+                out[f"abund_genes_{name}_bias_{lo}"] = lr.median() if x.height else None  # type: ignore[assignment]
+                out[f"abund_genes_{name}_err_{lo}"] = (
+                    (lr - lr.median()).abs().median() if x.height else None  # type: ignore[operator]
+                )
     return out
 
 
