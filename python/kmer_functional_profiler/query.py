@@ -786,6 +786,7 @@ def em(
     max_iter: int = 1000,
     report: dict[str, float] | None = None,
     start: np.random.Generator | None = None,
+    items_hit: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
 ) -> pl.DataFrame:
     """Per-unit k-mer ``coverage`` (and ``present`` fraction) by EM over k-mer hit counts.
 
@@ -817,12 +818,26 @@ def em(
     ``em_unconverged_units`` (units of components stopped at ``max_iter``), summed over
     calls, and ``em_max_change`` (how far the furthest of those was from converging: see
     :func:`_fit_components`).
+
+    A ``weight`` column (genome mode: holder = genome, item = unit, weight = the genome's
+    content on it) makes a holder's expected hits on an item coverage x weight, and
+    ``m_g`` its total weight over all items, hit or not; all weights 1 is the plain EM.
+    The zero-inflated present fraction then needs ``items_hit(holders, coverage)``: the
+    items each holder would have hit if all present, sum over its items of
+    1 - exp(-coverage x weight) (default ``m_g`` (1 - exp(-coverage))); with it, a hit
+    item counts as present in a holder with its posterior probability given the item's hits
+    (the other holders at their means), not by the holder's share of its hits, so items
+    many holders carry (core genes) do not lower each one's present fraction. ``prior``
+    is for unweighted k-mers only.
     """
+    if prior is not None and (items_hit is not None or "weight" in kmers.columns):
+        raise ValueError("a present prior needs unweighted items")
     kmers = kmers.sort("unit", "hash")  # sums in a fixed order: results independent of input order
     units, col = _ids(kmers["unit"].to_numpy())
     hashes, row = _ids(kmers["hash"].to_numpy())
     hits = np.zeros(len(hashes))
     hits[row] = kmers["hits"].to_numpy()
+    weight = kmers["weight"].to_numpy().astype(np.float64) if "weight" in kmers.columns else None
     del kmers, hashes  # the sorted copy is not needed through the fit
     m = m_g[units].astype(np.float64)
     lam = np.bincount(col, weights=hits[row], minlength=len(units)) / m
@@ -834,18 +849,35 @@ def em(
 
     def make_step(b: _Block) -> Step:
         h, mb, per_unit = hits[b.kmer], m[b.unit], len(b.unit)
+        wb = None if weight is None else weight[b.pairs]
 
         def over_units(x: np.ndarray) -> np.ndarray:  # per unit, sum of x over its k-mers
-            return np.bincount(b.c, weights=x[b.r], minlength=per_unit)
+            y = x[b.r] if wb is None else x[b.r] * wb
+            return np.bincount(b.c, weights=y, minlength=per_unit)
 
         def step(la: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             w = la * p
-            mu = np.bincount(b.r, weights=w[b.c], minlength=len(b.kmer)) + b.offset
+            per_pair = w[b.c] if wb is None else w[b.c] * wb
+            mu = np.bincount(b.r, weights=per_pair, minlength=len(b.kmer)) + b.offset
             attributed = w * over_units(_div(h, mu))  # expected hits from each unit
             if zero_inflated:
                 kmers_hit = w * over_units(_div(np.ones_like(mu), mu))  # expected hit k-mers
                 seen = -np.expm1(-la)  # chance a present k-mer is hit
-                if prior is None:
+                if items_hit is not None:
+                    # A hit item is present in a holder with its posterior given the item's
+                    # hits, the other holders at their means; not by its share of the hits,
+                    # which would count an item two holders both carry as half present.
+                    own = la[b.c] if wb is None else la[b.c] * wb
+                    others = np.maximum(mu[b.r] - p[b.c] * own, 0.0)
+                    log_lr = np.full(len(own), np.inf)  # sole holder of a hit item: present
+                    np.divide(own, others, out=log_lr, where=others > 0)
+                    log_lr = h[b.r] * np.log1p(log_lr) - own
+                    q = p[b.c]
+                    odds_out = (1 - q) * np.exp(np.minimum(-log_lr, 700.0))
+                    post = _div(q, q + odds_out)
+                    present = np.bincount(b.c, weights=post, minlength=per_unit)
+                    new_p = np.minimum(1.0, _div(present, items_hit(units[b.unit], la)))
+                elif prior is None:
                     new_p = np.minimum(1.0, _div(kmers_hit, mb * seen))
                 else:
                     # Unhit k-mers are present with odds p (1 - seen) : (1 - p).
@@ -867,7 +899,7 @@ def em(
         tol,
         max_iter,
         report,
-        pair_weight=lambda p: lam[col[p]] * pi[col[p]],
+        pair_weight=lambda p: lam[col[p]] * pi[col[p]] * (1.0 if weight is None else weight[p]),
     )
     # Units explained away by others converge towards 0 without reaching it.
     lam[attributed < EXPLAINED_AWAY] = 0.0
@@ -987,6 +1019,7 @@ def fit_present_prior(
 BACKGROUND: Final = 1e-6
 CLUMP: Final = 0.3
 H_CAP: Final = 20  # hit counts pooled at and above this in the present-unit distribution
+LLR_CAP: Final = 100.0  # |present_llr| capped: units at H_CAP are never background (+inf)
 
 
 def presence(
@@ -1044,6 +1077,7 @@ def presence(
     )
     prob = np.ones(len(units))
     it, done = 0, False
+    w: np.ndarray = np.zeros(H_CAP + 1)
     while not done and it < max_iter:
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
         new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
@@ -1053,9 +1087,14 @@ def presence(
     if report is not None:
         report["presence_iterations"] = it
         report["presence_converged"] = int(done)
+    # The evidence alone, prior separable (phase 12, step 1): log P(h | present) / P(h |
+    # absent), with P(h | present) = w_h / Σ w; present_prob = expit(present_llr + log(Σ w /
+    # A)), one prior odds for every unit of the sample.
+    with np.errstate(divide="ignore"):
+        llr = np.log(w[capped] / max(w.sum(), 1e-300)) - np.log(absent)
     return pl.DataFrame(
-        {"unit": units, "present_prob": prob},
-        schema={"unit": pl.UInt32, "present_prob": pl.Float64},
+        {"unit": units, "present_prob": prob, "present_llr": np.clip(llr, -LLR_CAP, LLR_CAP)},
+        schema={"unit": pl.UInt32, "present_prob": pl.Float64, "present_llr": pl.Float64},
     )
 
 
@@ -1614,6 +1653,45 @@ def _ztnb_mean(mean: np.ndarray, v: float, iterations: int = 60) -> np.ndarray:
     return np.asarray(mu)
 
 
+def ztnb_one_rate(
+    u: np.ndarray, h: np.ndarray, c: np.ndarray, v: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per unit (ids ``u`` 0..n-1), the one-rate zero-truncated negative binomial fit of
+    hit-count histogram rows (``h`` hits, ``c`` k-mers with them) at squared CV ``v``: its
+    mean mu (closed form) and log-likelihood (without the log h! terms)."""
+    n = int(u.max()) + 1 if len(u) else 0
+    cnt = np.bincount(u, c, n)
+    mu = _ztnb_mean(np.bincount(u, c * h, n) / np.maximum(cnt, 1e-300), v)
+    return mu, np.bincount(u, c * _ztnb_logpmf(h, mu[u], v), n)
+
+
+def mix_shape(u: np.ndarray, h: np.ndarray, c: np.ndarray) -> float:
+    """The sample's squared CV of uneven coverage along a gene (:func:`rate_mixture`): the
+    median of each unit's best one-rate shape over units with mean hits >=
+    ``MIX_SHAPE_DEPTH`` (rows as :func:`ztnb_one_rate`'s, units with enough k-mers only)."""
+    n = int(u.max()) + 1 if len(u) else 0
+    mean = np.bincount(u, c * h, n) / np.maximum(np.bincount(u, c, n), 1e-300)
+    ll = np.stack([ztnb_one_rate(u, h, c, v)[1] for v in MIX_SHAPES], 1)
+    deep = mean >= MIX_SHAPE_DEPTH
+    # ponytail: one shape per sample; per-gene-length shapes if short genes' ends dominate
+    return float(np.median(np.asarray(MIX_SHAPES)[ll[deep].argmax(1)])) if deep.any() else 0.0
+
+
+def own_histogram(kmers: pl.DataFrame) -> pl.DataFrame:
+    """Per unit, the histogram of hits over the hit k-mers only it holds in ``kmers``
+    (``unit``, ``hash``, ``hits``): ``unit``, ``hits``, ``kmers`` (how many such k-mers had
+    that many hits), units with ``MIN_DISPERSION_KMERS`` such k-mers only. :func:`rate_mixture`'s
+    input, and the strain-mixture sidecar of ``query --own-hist`` (phase 12, step 1)."""
+    own = kmers.filter(pl.len().over("hash") == 1)
+    enough = own.group_by("unit").agg(n=pl.len()).filter(pl.col("n") >= MIN_DISPERSION_KMERS)
+    return (
+        own.join(enough, on="unit", how="semi")
+        .group_by("unit", "hits")
+        .agg(kmers=pl.len().cast(pl.UInt32))
+        .sort("unit", "hits")
+    )
+
+
 def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
     """Per unit, ``coverage`` (``unit``, ``coverage``) corrected for a strain mix:
     ``coverage_mix`` and ``mix_rates`` (step 35, open item 3).
@@ -1639,20 +1717,13 @@ def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
     c = rows["c"].to_numpy().astype(np.float64)
     cnt = np.bincount(u, c, n)
     mean = np.bincount(u, c * h, n) / cnt
-
-    def one(v: float) -> tuple[np.ndarray, np.ndarray]:  # one rate: closed form
-        mu = _ztnb_mean(mean, v)
-        return mu, np.bincount(u, c * _ztnb_logpmf(h, mu[u], v), n)
-
-    ll = np.stack([one(v)[1] for v in MIX_SHAPES], 1)
-    deep = mean >= MIX_SHAPE_DEPTH
-    # ponytail: one shape per sample; per-gene-length shapes if short genes' ends dominate
-    v = float(np.median(np.asarray(MIX_SHAPES)[ll[deep].argmax(1)])) if deep.any() else 0.0
-    mu1, ll1 = one(v)
+    v = mix_shape(u, h, c)
+    mu1, ll1 = ztnb_one_rate(u, h, c, v)
     best, top, rates = -2 * ll1 + np.log(cnt), mu1.copy(), np.ones(n, dtype=np.uint8)
     for k in (2, 3):
         mu = np.maximum(mean[:, None] * np.exp(np.linspace(-1, 1, k))[None], 0.5)
-        w, ll = np.full((n, k), 1 / k), np.zeros(n)
+        w = np.full((n, k), 1 / k)
+        ll: np.ndarray = np.zeros(n)
         for _ in range(MIX_ITERATIONS):
             lp = np.log(w[u]) + _ztnb_logpmf(h[:, None], mu[u], v)
             mx = lp.max(1, keepdims=True)
@@ -2019,6 +2090,7 @@ def profile(
     batch_reads: int = 100_000,
     draws: int = 0,
     kmers_out: str | Path | None = None,
+    own_hist_out: str | Path | None = None,
     timer: Timer | None = None,
     all_estimators: bool = False,
     low_memory: bool = False,
@@ -2055,7 +2127,9 @@ def profile(
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
-    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
+    gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit, and
+    ``component_dense`` labels the components the EM is fitted on (units linked by shared
+    dense hits, which tier 2 may not have sampled; null for units gather drops).
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
     present rather than hit by background, from the tier-2 k-mers gather gave it; units
@@ -2066,7 +2140,10 @@ def profile(
     are kept from the first pass over the reads, or with ``low_memory`` rebuilt by a second
     pass for the detected units' k-mers only (same result; a read pass more, the rows of
     all hit units never held). ``kmers_out`` writes
-    the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
+    the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet;
+    ``own_hist_out`` the strain-mixture sidecar (:func:`own_histogram`, over the k-mers the
+    zero-inflated EM is fitted on). ``present_llr`` is ``present_prob``'s evidence alone
+    (:func:`presence`), null for units gather drops.
 
     Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
     unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` on the units gather keeps
@@ -2084,6 +2161,8 @@ def profile(
     ``extra`` indexes (same k, alphabet and hash scheme) are queried jointly with ``index``:
     their units compete with its units in gather, EM and the posterior, with ids offset by
     the units of the indexes before, and a ``source`` column (0 = ``index``) in the output.
+    An index built with ``role: decoy`` in its ``meta.json`` competes the same way, but its
+    units are reported as one row (:func:`collapse_decoys`).
 
     ``mask`` (:class:`~kmer_functional_profiler.mask.Mask`, built against ``index``) drops
     masked sampled hashes before any lookup and subtracts the masked postings from the unit
@@ -2373,6 +2452,10 @@ def profile(
         if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
             fitted_zi = fitted_zi.hstack(estimate)
         unit_kmers = detected.select("unit", "hash", "hits")
+        if own_hist_out is not None:  # back to the index's unit ids
+            own_histogram(unit_kmers).join(hit_info.select("unit", "index"), on="unit").select(
+                unit="index", hits="hits", kmers="kmers"
+            ).sort("unit", "hits").write_parquet(own_hist_out)
         if all_estimators:  # experimental: rarely splits real units (step 35, HPC results)
             fitted_zi = fitted_zi.join(rate_mixture(unit_kmers, zi), on="unit", how="left")
         if draws == 0:  # with draws, the posterior gives coverage_zi's interval
@@ -2464,6 +2547,10 @@ def profile(
             on="unit",
             how="left",
         ).with_columns(pl.col("kmers_dense").fill_null(0))
+        dense_components = component_labels(detected.select("unit", "hash"))
+        result = result.join(
+            dense_components.rename({"component": "component_dense"}), on="unit", how="left"
+        )
     if all_estimators:
         rated = kmer_hits.join(hit_info.select("unit", "m_g", "t_g"), on="unit")
         with timer("baselines"):
@@ -2497,6 +2584,12 @@ def profile(
         .drop("index")
         .sort("unit")
     )
+    if joint.dense:
+        result = result.with_columns(
+            component_dense=pl.when(pl.col("component_dense").is_not_null()).then(
+                pl.col("unit").min().over("component_dense")
+            )
+        )
     result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.
@@ -2509,4 +2602,33 @@ def profile(
             None if census_max is None else (census[0], census[1]),
             joint.max_hash("tier2") / 2**64,
         )
-    return result.filter(pl.col("aai_naive") >= min_aai) if min_aai > 0 else result
+    if min_aai > 0:
+        result = result.filter(pl.col("aai_naive") >= min_aai)
+    decoys = [i for i, ix in enumerate(joint.indexes) if ix.meta.get("role") == "decoy"]
+    return collapse_decoys(result, decoys) if decoys and "source" in result.columns else result
+
+
+def collapse_decoys(result: pl.DataFrame, decoys: list[int]) -> pl.DataFrame:
+    """Replace the units of each decoy index (``source`` in ``decoys``) by one row named
+    ``decoy``: ``hits``, ``hits_em``, ``kmers_hit``, ``reads`` and ``m_g`` summed over its
+    hit units (``reads`` counts a read once per unit it hits), ``coverage`` and
+    ``coverage_em`` over that ``m_g``, and ``decoy_units`` (units hit) and
+    ``decoy_detected`` (units given hits by the EM). Decoy units have already competed in
+    gather and the EM; this only keeps them out of the unit and label tables."""
+    is_decoy = pl.col("source").is_in(decoys)
+    rows = (
+        result.filter(is_decoy)
+        .group_by("source")
+        .agg(
+            pl.col("hits", "hits_em", "kmers_hit", "reads", "m_g").sum(),
+            decoy_units=pl.len().cast(pl.UInt32),
+            decoy_detected=(pl.col("hits_em") > 0).sum().cast(pl.UInt32),
+        )
+        .with_columns(
+            name=pl.lit("decoy"),
+            coverage=pl.col("hits") / pl.col("m_g"),
+            coverage_em=pl.col("hits_em") / pl.col("m_g"),
+        )
+        .sort("source")
+    )
+    return pl.concat([result.filter(~is_decoy), rows], how="diagonal_relaxed")

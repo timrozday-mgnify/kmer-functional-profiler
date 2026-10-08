@@ -1,13 +1,22 @@
 """Prototype CLI; mirrors the planned Rust one."""
 
 import json
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
 from kmer_functional_profiler import __version__
 from kmer_functional_profiler.compat import import_signatures
+from kmer_functional_profiler.genomes import (
+    MIN_CONTAINMENT,
+    MIN_UNITS,
+    GenomeIndex,
+    genome_profile,
+)
+from kmer_functional_profiler.genomes import annotate_genomes as annotate
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
     AAI_MODEL,
@@ -18,6 +27,14 @@ from kmer_functional_profiler.index import (
 )
 from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
+from kmer_functional_profiler.species import (
+    BG_PRIOR,
+    PRIOR_PRESENT,
+    SpeciesIndex,
+    species_index_from_catalogue,
+    species_index_from_genomes,
+    species_profile,
+)
 from kmer_functional_profiler.survival import check_aai_model
 
 app = typer.Typer(no_args_is_help=True)
@@ -50,23 +67,57 @@ def index(
     t_dense: float = DEFAULTS.t_dense,
     batch_residues: int = DEFAULTS.batch_residues,
     postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
+    like: Annotated[
+        Path | None,
+        typer.Option(
+            help="An index whose build parameters to copy (all but --batch-residues), so "
+            "the new one can be queried jointly with it"
+        ),
+    ] = None,
+    role: Annotated[
+        str | None,
+        typer.Option(
+            help="decoy: when queried as an --extra-index, its units compete but are "
+            "reported as one row (host or contaminant proteomes)"
+        ),
+    ] = None,
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
-    params = IndexParams(
-        k=k,
-        alphabet=alphabet,
-        t_base=t_base,
-        t_base_singleton=t_base_singleton,
-        n_min=n_min,
-        t_cap=t_cap,
-        oversample=oversample,
-        mask_adapters=mask_adapters,
-        max_groups=max_groups,
-        fp_bits=fp_bits,
-        t_dense=t_dense,
-        batch_residues=batch_residues,
+    if role not in (None, "decoy"):
+        raise typer.BadParameter("role must be decoy")
+    if like is not None:
+        base = json.loads((like / "meta.json").read_text())
+        if base.get("hash") != "kfp":
+            raise typer.BadParameter("--like needs an index built by `index` (kfp hash)")
+    params = (
+        IndexParams(
+            **{
+                f.name: base["params"][f.name]
+                for f in fields(IndexParams)
+                if f.name in base["params"]
+            }
+        )
+        if like is not None
+        else IndexParams(
+            k=k,
+            alphabet=alphabet,
+            t_base=t_base,
+            t_base_singleton=t_base_singleton,
+            n_min=n_min,
+            t_cap=t_cap,
+            oversample=oversample,
+            mask_adapters=mask_adapters,
+            max_groups=max_groups,
+            fp_bits=fp_bits,
+            t_dense=t_dense,
+        )
     )
-    typer.echo(json.dumps(build_index(members, out_dir, params, pfam, postings), indent=2))
+    params = replace(params, batch_residues=batch_residues)
+    stats = build_index(members, out_dir, params, pfam, postings)
+    if role is not None:
+        meta = json.loads((out_dir / "meta.json").read_text())
+        (out_dir / "meta.json").write_text(json.dumps(meta | {"role": role}, indent=2) + "\n")
+    typer.echo(json.dumps(stats, indent=2))
 
 
 @app.command()
@@ -143,6 +194,225 @@ def mask_command(
 
 
 @app.command()
+def annotate_genomes(
+    index_dir: Path,
+    genomes: Annotated[
+        Path,
+        typer.Argument(
+            help="TSV: genome (name), path (protein FASTA, relative to the TSV), optional "
+            "taxonomy (GTDB-style d__;p__;...;s__)"
+        ),
+    ],
+    out_dir: Path,
+) -> None:
+    """Annotate reference genomes with the index: each genome's raw tier-2 hits per unit,
+    the content `genomes` fits a profile with."""
+    typer.echo(json.dumps(annotate(index_dir, genomes, out_dir), indent=2))
+
+
+@app.command(name="genomes")
+def genomes_command(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    genome_index: Annotated[Path, typer.Argument(help="Output of `annotate-genomes`")],
+    out: Annotated[Path, typer.Argument(help="TSV of detected genomes")] = Path("genomes.tsv"),
+    summary: Annotated[
+        Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
+    ] = None,
+    function_taxon: Annotated[
+        Path,
+        typer.Option(
+            help="TSV of each function's split hits (hits_em) per taxon and rank, with "
+            "unclassified and the total (Pfam if the genome index has labels, else unit name)"
+        ),
+    ] = Path("function_taxon.tsv"),
+    index: Annotated[
+        Path | None,
+        typer.Option(help="The profile's index, checked against the one annotated with"),
+    ] = None,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+) -> None:
+    """Genomes present and their depths, from a profile's per-unit hits."""
+    gi = GenomeIndex(genome_index)
+    if index is not None:
+        try:
+            gi.check_index(index)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    table, sample, stratified = genome_profile(
+        prof, gi, min_containment=min_containment, min_units=min_units
+    )
+    if stratified is None:
+        typer.echo("profile has no hits_em: no function x taxon table", err=True)
+    else:
+        stratified.write_csv(function_taxon, separator="\t")
+    table.write_csv(out, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(sample, indent=2) + "\n")
+    typer.echo(f"{table.height} genomes detected -> {out}", err=True)
+
+
+@app.command()
+def species_index(
+    index_dir: Path,
+    out_dir: Path,
+    catalogue: Annotated[
+        Path | None,
+        typer.Option(
+            help="MGnify genome catalogue directory (genomes-all_metadata.tsv and "
+            "species_catalogue/ as on the FTP site): pangenome families annotated, carriage "
+            "from gene_presence_absence.Rtab"
+        ),
+    ] = None,
+    genomes: Annotated[
+        Path | None,
+        typer.Option(help="Output of `annotate-genomes` with taxonomy (species from s__), instead"),
+    ] = None,
+    exclude: Annotated[
+        Path | None,
+        typer.Option(
+            help="Genome names (one per line) left out of every count; their carried units "
+            "go to held_out.parquet (benchmark truth)"
+        ),
+    ] = None,
+    species: Annotated[
+        Path | None,
+        typer.Option(help="With --catalogue: species representatives (one per line) to keep"),
+    ] = None,
+    alpha: Annotated[
+        float | None,
+        typer.Option(help="Fix the shrinkage α at every rank (ablation; ~0: no shrinkage)"),
+    ] = None,
+    completeness: Annotated[
+        bool, typer.Option(help="Weight genomes by completeness (off: an ablation)")
+    ] = True,
+) -> None:
+    """Build a species index: per (species, unit) the prevalence prior and the expected
+    hits per genome copy, from a genome catalogue's pangenomes or an annotated genome set."""
+    if (catalogue is None) == (genomes is None):
+        raise typer.BadParameter("give one of --catalogue and --genomes")
+    names = frozenset(exclude.read_text().split()) if exclude is not None else frozenset()
+    if catalogue is not None:
+        keep = set(species.read_text().split()) if species is not None else None
+        meta = species_index_from_catalogue(
+            index_dir, catalogue, out_dir, names, keep, alpha, completeness
+        )
+    else:
+        assert genomes is not None
+        meta = species_index_from_genomes(index_dir, genomes, out_dir, names, alpha, completeness)
+    typer.echo(json.dumps(meta, indent=2))
+
+
+@app.command(name="species")
+def species_command(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    species_index: Annotated[Path, typer.Argument(help="Output of `species-index`")],
+    out: Annotated[Path, typer.Argument(help="TSV of detected species")] = Path("species.tsv"),
+    units: Annotated[
+        Path, typer.Option(help="TSV of the detected species' units: prevalence, carriage")
+    ] = Path("species_units.tsv"),
+    presence: Annotated[
+        Path, typer.Option(help="TSV of unit presence updated by the species (kfp-prior format)")
+    ] = Path("presence.tsv"),
+    pfam_presence: Annotated[
+        Path, typer.Option(help="TSV of Pfam presence, observed and updated")
+    ] = Path("pfam_presence.tsv"),
+    function_taxon: Annotated[
+        Path,
+        typer.Option(
+            help="TSV of each function's split hits (hits_em) per species, genus and family, "
+            "with unclassified and the total"
+        ),
+    ] = Path("function_species.tsv"),
+    summary: Annotated[
+        Path | None, typer.Option(help="JSON: explained fraction, genome-equivalents, counts")
+    ] = None,
+    index: Annotated[
+        Path | None,
+        typer.Option(help="The profile's index, checked against the species index's"),
+    ] = None,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: Annotated[
+        float, typer.Option(help="Prior probability that a screened species is present")
+    ] = PRIOR_PRESENT,
+    background_prior: Annotated[
+        float,
+        typer.Option(help="Prior probability that a unit has background hits (0: none)"),
+    ] = BG_PRIOR,
+) -> None:
+    """Species present and their depths, fitted jointly with the units each carries in the
+    sample (prevalence as prior, the profile's hits as evidence); updated unit and Pfam
+    presence; the function x species table. The profile is not modified."""
+    si = SpeciesIndex(species_index)
+    if index is not None:
+        try:
+            si.check_index(index)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    result = species_profile(
+        prof, si, min_containment=min_containment, min_units=min_units, prior=prior,
+        background_prior=background_prior,
+    )  # fmt: skip
+    outputs = {"species": out, "units": units, "presence": presence,
+               "pfam_presence": pfam_presence, "function_species": function_taxon}  # fmt: skip
+    for key, path in outputs.items():
+        table = result[key]
+        if isinstance(table, pl.DataFrame):
+            table.write_csv(path, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(result["summary"], indent=2) + "\n")
+    detected = result["species"]
+    assert isinstance(detected, pl.DataFrame)
+    typer.echo(f"{detected.height} species detected -> {out}", err=True)
+
+
+@app.command()
+def lineage(
+    profile_tsv: Annotated[Path, typer.Argument(help="profile.tsv from `query`")],
+    species_index: Annotated[Path, typer.Argument(help="Output of `species-index`")],
+    out: Annotated[Path, typer.Argument(help="TSV of lineages")] = Path("lineages.tsv"),
+    units: Annotated[
+        Path, typer.Option(help="TSV of each lineage's units: prevalence, carriage, hits")
+    ] = Path("lineage_units.tsv"),
+    summary: Annotated[Path | None, typer.Option(help="JSON: the species fit's report")] = None,
+    lineages: Annotated[int, typer.Option(help="Lineages fitted per species (K)")] = 2,
+    dim: Annotated[int, typer.Option(help="Dimensions of the lineage coordinates")] = 2,
+    starts: Annotated[int, typer.Option(help="MAP starts per species")] = 4,
+    seed: int = 0,
+    min_containment: float = MIN_CONTAINMENT,
+    min_units: int = MIN_UNITS,
+    prior: Annotated[
+        float, typer.Option(help="Prior probability that a screened species is present")
+    ] = PRIOR_PRESENT,
+    background_prior: Annotated[
+        float,
+        typer.Option(help="Prior probability that a unit has background hits (0: none)"),
+    ] = BG_PRIOR,
+) -> None:
+    """Prototype (phase 11, step 12): lineages within each detected species, placed among
+    its reference genomes, with their depths and carriage. Needs the `phylo` dependency
+    group (JAX, NumPyro)."""
+    try:
+        from kmer_functional_profiler.lineage import lineage_profile
+    except ImportError as e:
+        raise typer.BadParameter(f"needs the phylo dependency group ({e})") from e
+    prof = pl.read_csv(profile_tsv, separator="\t")
+    result = lineage_profile(
+        prof, SpeciesIndex(species_index), dim=dim, k=lineages, starts=starts, seed=seed,
+        prior=prior, background_prior=background_prior, min_containment=min_containment,
+        min_units=min_units,
+    )  # fmt: skip
+    result["lineages"].write_csv(out, separator="\t")
+    result["units"].write_csv(units, separator="\t")
+    if summary is not None:
+        summary.write_text(json.dumps(result["summary"], indent=2) + "\n")
+    typer.echo(f"{result['lineages'].height} lineages -> {out}", err=True)
+
+
+@app.command()
 def query(
     index_dir: Path,
     r1: Path,
@@ -164,6 +434,13 @@ def query(
     ] = 0,
     kmers: Annotated[
         Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
+    ] = None,
+    own_hist: Annotated[
+        Path | None,
+        typer.Option(
+            help="Parquet of each unit's hit histogram over the k-mers only it holds (unit, "
+            "hits, kmers): the strain-mixture evidence of kfp-genomes place"
+        ),
     ] = None,
     stats: Annotated[
         Path | None,
@@ -258,6 +535,7 @@ def query(
             min_qual=min_qual,
             draws=draws,
             kmers_out=kmers,
+            own_hist_out=own_hist,
             timer=timer if stats else None,
             all_estimators=all_estimators,
             low_memory=low_memory,

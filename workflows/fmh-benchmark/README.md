@@ -392,6 +392,111 @@ Not here: the divergence ladder and containment-AAI calibration (truth needs hel
 genomes with relatives at known identity; the simulation benchmark has them), and the
 other tools on Pfam.
 
+## Study ladder (phase 10)
+
+`--study_ladder` asks whether a study's own proteins, as an index queried with the base
+(`--extra-index`), do nearly as well as rebuilding the base with them (plan: Additional
+references, Evaluation). Per seed and per `--mgnify_indexes` entry built from members:
+
+```text
+STUDY_FAA             --study_fraction of the sample's genomes (as if recovered as MAGs):
+                      their proteins and Pfam domains (PFAM_DOMAINS)
+STUDY_CLUSTER, STUDY_MEMBERS, STUDY_INDEX_BUILD
+                      workflows/study-index's steps: linclust (--study_cluster_args) and
+                      `index --like` the MGnify index -> study/seed<N>_<name>/
+STUDY_REBUILD_TABLES, REBUILD_INDEX
+                      the MGnify members plus the study's proteins, each in its nearest
+                      MGnify90 cluster where the DIAMOND truth puts it (--mgnify_min_id,
+                      --mgnify_min_cov), else in its linclust cluster; built --like the base
+                      (kept in work/ only)
+PROFILE               arms study (base + study index; profiles summed per Pfam over both
+                      indexes' labels) and rebuild, beside the plain arm (base alone)
+STUDY_LADDER          study_ladder.tsv: per sample, index, count and threshold, completeness
+                      and purity of each arm and recovered = (study - base) / (rebuild - base)
+                      completeness (null when the rebuild gains nothing)
+STUDY_UNRELATED       study_unrelated.tsv: base units whose components in the joint query
+                      (tier 2 and, with a dense tier, component_dense) hold no study unit,
+                      and how many changed hits, kmers_unique or coverage_em
+```
+
+The gate: `recovered` ≥ 0.9 and `unrelated_changed` 0. Ablation config:
+`ablations/study.config` (`hpc/kfp-ablations/study-ladder`). Locally:
+
+```bash
+nextflow run workflows/fmh-benchmark -profile test,docker --study_ladder true --tools '' --outdir results-test-ladder
+```
+
+The fixture saturates completeness (1.0 in every arm), so it checks the plumbing only.
+
+## Genome mode (phase 11)
+
+`--genome_mode` asks which genomes a function profile comes from (plan: Genome mode,
+Evaluation). Every genome of the Zenodo record is the reference set, so each sample's
+genomes compete with all the others as distractors:
+
+```text
+GENOME_SET        every genome's proteins (from its mapping table) + genomes.tsv
+ANNOTATE_GENOMES  `annotate-genomes` per kfp-hashed index (not fmh_compat) -> genomes_<name>/
+GENOME_FIT        `genomes` per plain-arm unit profile of a plain sample (MGnify indexes:
+                  units.tsv) -> genomes/seed<N>_<name>_{genomes.tsv,function_taxon.tsv,
+                  summary.json}
+GENOME_TRUTH      per genome its read depth over its genes and relative abundance (cells),
+                  per (genome, KO or Pfam) the depth of its genes carrying it
+SYLPH_DB, SYLPH   sylph (DNA) on the same genomes, --sylph_c subsampling -> the baseline
+GENOME_SCORE      genome_scores.tsv: purity, completeness, F1, L1 of relative abundances,
+                  Spearman over true positives; and for kfp the function x genome table:
+                  ft_f1 over (genome, function) pairs, ft_l1 between shares (unclassified
+                  counts against), ft_right (classified hits on true pairs), ft_unclassified
+```
+
+The gate: F1 and L1 within 0.05 of sylph's; the table no worse than HUMAnN 3.9's stratified
+output (not scored yet: KEGG genomes need mapping to HUMAnN's species). The record's
+genomes carry no taxonomy, so the table is scored at genome rank. Ablation config:
+`ablations/genomes.config` (`hpc/kfp-ablations/genome-mode`). Locally:
+
+```bash
+nextflow run workflows/fmh-benchmark -profile test,docker --genome_mode true --depth_ladder 0.3 --tools '' --outdir results-test-genomes
+```
+
+### Species model arm
+
+With genome mode on, the species model (plan: Genome mode, Species model) runs beside G1
+on the same genomes. `SPECIES_INDEX` runs `species-index --genomes` per genome index;
+`SPECIES_FIT` runs `species` per profile, writing `species/seed<sid>_<name>_*`. It is scored
+by `GENOME_SCORE` as index `species_<name>`, its table at rank species, and its
+`presence.tsv` by `PRIOR_SCORE`. The record's genomes have no taxonomy, so each is its own
+one-genome species: this arm checks the code path. The species model's own benchmark is
+`workflows/species-benchmark`.
+
+### kfp-prior and the depth ladder
+
+With genome mode on, `kfp-prior` runs on every fitted sample, and `--depth_ladder`
+(e.g. `0.01,0.03,0.1,0.3`) adds each plain sample subsampled to those read-pair fractions
+(queried raw and used by genome mode only):
+
+```text
+SUBSAMPLE      read pairs kept at each fraction -> sample <seed>d<fraction>
+SPECIES_INDEX  `species-index --genomes` per genome index -> species_<name>/ (kfp-prior carriage)
+PRIOR_UPDATE   `kfp-prior update` per fitted sample -> prior/seed<sid>_<name>_{presence,pfam_presence}.tsv
+PRIOR_SCORE    prior_scores.tsv: unit and Pfam completeness, observed (present_prob >= 0.5 with
+               hits) vs updated (present_prob_updated >= 0.5), per bin of carrier depth (the
+               deepest sample genome carrying it: full-sample depth x fraction), and purity;
+               prior_calibration.tsv: zero-hit units per bin of present_prob_updated, mean
+               prediction vs share truly carried
+```
+
+Truth: units are the sample genomes' proteins' best units in the genome index; Pfams their
+genes' domains (MGnify indexes only, which carry Pfam labels). The gate: at 0.1-1x, Pfam
+completeness +10 points at <= 2 points of purity; calibration error <= 0.05; no change
+when no genomes are detected. Caveat: the record's genomes have no taxonomy, and each
+sample genome is itself in the reference set, so the prior is that genome's own carriage
+shrunk towards all genomes: the optimistic case. The plan's hold-out arm (relatives only)
+is not built yet.
+
+On the fixture (2000 reads) the low-abundance genome of each sample has fewer than
+`MIN_UNITS` (10) hit units and is missed; the Pfam-unit indexes detect none. It checks the
+plumbing only.
+
 ## Other tools
 
 Each tool profiles the same 10 metagenomes and is scored against the same truth; its rows

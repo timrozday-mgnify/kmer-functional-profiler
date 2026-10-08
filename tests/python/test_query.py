@@ -551,6 +551,36 @@ def test_joint_query_equals_one_index_of_the_union(
     assert with_unrelated.select(keep).equals(alone.select(keep))
 
 
+def test_decoy_index_competes_and_reports_one_row(tmp_path: Path) -> None:
+    seqs = list(proteins().values())
+    half = len(seqs) // 2
+    a = write_members(tmp_path / "a.parquet", seqs[:half])
+    b = write_members(tmp_path / "b.parquet", seqs[half:], half)
+    opts = ["--k", str(K), "--t-base", "1.0"]
+    runner = CliRunner()
+    for args in (
+        [str(a), str(tmp_path / "a")],
+        [str(b), str(tmp_path / "b")],
+        [str(b), str(tmp_path / "decoy"), "--role", "decoy"],
+        [str(a), str(tmp_path / "a_decoy"), "--role", "decoy"],
+    ):
+        assert runner.invoke(app, ["index", *args, *opts]).exit_code == 0
+    base, plain, decoy, a_decoy = (Index.load(tmp_path / n) for n in ("a", "b", "decoy", "a_decoy"))
+    assert decoy.meta["role"] == "decoy" and "role" not in plain.meta
+    joint = profile(base, *READS, extra=[plain])
+    with_decoy = profile(base, *READS, extra=[decoy])
+    own = joint.filter(pl.col("source") == 0)
+    assert with_decoy.filter(pl.col("source") == 0).select(own.columns).equals(own)
+    (row,) = with_decoy.filter(pl.col("source") == 1).iter_rows(named=True)
+    theirs = joint.filter(pl.col("source") == 1)
+    assert row["name"] == "decoy" and row["unit"] is None
+    assert row["hits"] == theirs["hits"].sum() and row["decoy_units"] == theirs.height
+    assert row["hits_em"] == pytest.approx(theirs["hits_em"].sum())
+    # Gather breaks ties by unit id: a decoy identical to the base gets nothing.
+    copied = profile(base, *READS, extra=[a_decoy])
+    assert copied.filter(pl.col("source") == 1)["hits_em"].to_list() == [0.0]
+
+
 def test_joint_query_rejects_a_different_scheme(tmp_path: Path) -> None:
     seqs = list(proteins().values())[:3]
     path = write_members(tmp_path / "m.parquet", seqs)
@@ -802,12 +832,16 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
     summary = tmp_path / "summary.json"
-    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary)])
+    own_hist = tmp_path / "own.parquet"
+    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary),
+                                 "--own-hist", str(own_hist)])  # fmt: skip
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
-    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
-        table.columns
-    )
+    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component",
+            "present_llr"} <= set(table.columns)  # fmt: skip
+    hist = pl.read_parquet(own_hist)
+    assert hist.columns == ["unit", "hits", "kmers"]
+    assert set(hist["unit"]) <= set(table["unit"])
     sample = json.loads(summary.read_text())
     assert sample["explained_fraction"] > 0 and 0 <= sample["census_containment"] <= 1
     got = json.loads(stats.read_text())
@@ -887,6 +921,13 @@ def test_presence_doubts_few_and_shared_hits() -> None:
     # Ten times fewer reads: less background, so one k-mer is more credible.
     fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
     assert fewer[400] > unique
+    # present_llr is the evidence alone: one prior odds for every unit (phase 12, step 1)
+    table = presence(own, t_g, 3_000_000, 2000)
+    finite = table.filter(pl.col("present_prob") < 1 - 1e-9)
+    p, llr = finite["present_prob"].to_numpy(), finite["present_llr"].to_numpy()
+    log_odds = np.log(p / (1 - p)) - llr
+    assert finite.height > 100 and np.ptp(log_odds) < 1e-6
+    assert (table.filter(pl.col("present_prob") >= 1 - 1e-9)["present_llr"] > 10).all()
     report: dict[str, int] = {}
     presence(own, t_g, 3_000_000, 2000, report=report)
     assert report["presence_converged"] == 1 and 1 < report["presence_iterations"] < 500

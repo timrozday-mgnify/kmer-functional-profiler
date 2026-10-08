@@ -1,0 +1,9 @@
+accession	ncbi_assembly_name	gtdb_taxonomy	gtdb_representative	checkm2_completeness	checkm2_contamination
+GB_GCA_000000001.1	mini MAG 1	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha	t	100	0.5
+GB_GCA_000000002.1	mini MAG 2	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha	f	100	0.5
+GB_GCA_000000003.1	mini MAG 3	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha	f	80	0.5
+GB_GCA_000000004.1	mini MAG 4	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta	t	100	0.5
+GB_GCA_000000005.1	mini MAG 5	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta	f	100	0.5
+GB_GCA_000000006.1	mini MAG 6	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 beta	f	100	0.5
+GB_GCA_000000007.1	mini MAG 7	d__Bacteria;p__P;c__C;o__O;f__F2;g__G2;s__G2 gamma	t	100	0.5
+GB_GCA_000000008.1	mini MAG 8	d__Bacteria;p__P;c__C;o__O;f__F1;g__G1;s__G1 alpha	f	100	20
