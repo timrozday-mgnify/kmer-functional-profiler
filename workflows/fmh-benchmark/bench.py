@@ -459,16 +459,16 @@ def mgnify_nearest(args: argparse.Namespace) -> None:
     # 1000 member targets per gene, all chunks' hits at once crashed polars (exit 139)
     best = pl.concat(
         pl.scan_csv(p, separator="\t", has_header=False, schema=MGNIFY_HIT_SCHEMA)
-        .rename({"cluster_rep": "nearest"})  # the subject is a member
         .filter(
             pl.col("length") / pl.col("qlen") >= args.min_cov,
             pl.col("length") / pl.col("slen") >= args.min_cov,
         )
+        .select("gene_name", "pident", "bitscore", nearest="cluster_rep")  # subject: a member
         .join(clusters.lazy(), on="nearest")
         .group_by("gene_name", "cluster_rep")
-        .agg(pl.all().sort_by("pident", "bitscore").last())
+        .agg(pl.col("nearest", "pident").sort_by("pident", "bitscore").last())
         .select("gene_name", "cluster_rep", "nearest", identity_nearest=pl.col("pident") / 100)
-        .collect()
+        .collect(engine="streaming")  # only the four columns, filtered, are held (exit 137)
         for p in args.hits
     )
     units = pl.read_parquet(args.gene_units).join(best, on=["gene_name", "cluster_rep"], how="left")
