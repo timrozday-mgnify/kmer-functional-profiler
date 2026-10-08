@@ -1071,11 +1071,13 @@ def test_default_fits_em_and_zi(members: Path) -> None:
         "coverage_zi",
         "coverage_zi_lo",
         "coverage_zi_hi",
-        "coverage_mix",
     } <= set(default.columns)
     assert not any(c.endswith(("_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
     assert "aai" not in default.columns
-    assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta"} <= set(full.columns)
+    assert "coverage_mix" not in default.columns  # experimental (step 35)
+    assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta", "coverage_mix"} <= set(
+        full.columns
+    )
     assert default.equals(full.select(default.columns))
 
 
