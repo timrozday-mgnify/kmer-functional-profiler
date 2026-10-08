@@ -1066,9 +1066,13 @@ def test_default_fits_em_and_zi(members: Path) -> None:
     # and leave the shipped columns unchanged.
     index = build(members, t_base=1.0, fp_bits=64)
     default, full = profile(index, *READS), profile(index, *READS, all_estimators=True)
-    assert {"coverage_em", "coverage_zi", "coverage_zi_lo", "coverage_zi_hi"} <= set(
-        default.columns
-    )
+    assert {
+        "coverage_em",
+        "coverage_zi",
+        "coverage_zi_lo",
+        "coverage_zi_hi",
+        "coverage_mix",
+    } <= set(default.columns)
     assert not any(c.endswith(("_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
     assert "aai" not in default.columns
     assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta"} <= set(full.columns)
@@ -1101,6 +1105,35 @@ def test_coverage_interval_and_kmer_dispersion() -> None:
     cov = pl.DataFrame({"unit": np.array([0, 1], dtype=np.uint32), "coverage": [lam[0], mix_lam]})
     got = dict(query.kmer_dispersion(kmers, cov).iter_rows())
     assert got[0] == pytest.approx(1.0, abs=0.3) and got[1] > 5
+
+
+def test_rate_mixture() -> None:
+    # 40 one-strain units at depth 10 with uneven coverage (cv 0.3) keep one rate and their
+    # coverage; a mix of strains at 20 and 2 (shared k-mers at 22) is split, its top rate
+    # near the summed depth; a unit with < MIN_DISPERSION_KMERS own k-mers keeps one rate.
+    rng = np.random.default_rng(5)
+
+    def hits(rate: float, n: int) -> np.ndarray:
+        return rng.poisson(rate * rng.gamma(1 / 0.09, 0.09, n))
+
+    units = [hits(10.0, 150) for _ in range(40)]
+    units += [np.r_[hits(22.0, 60), hits(20.0, 45), hits(2.0, 45)], hits(10.0, 5)]
+    units = [x[x > 0] for x in units]
+    kmers = pl.DataFrame({
+        "unit": np.concatenate([np.full(x.size, i) for i, x in enumerate(units)]).astype(np.uint32),
+        "hash": np.arange(sum(x.size for x in units)),
+        "hits": np.concatenate(units),
+    })  # fmt: skip
+    lam = query.ztp_lambda(np.array([x.mean() for x in units]))
+    cov = pl.DataFrame({"unit": np.arange(len(units), dtype=np.uint32), "coverage": lam})
+    got = query.rate_mixture(kmers, cov).sort("unit")
+    single = got.head(40)
+    assert (single["mix_rates"] == 1).mean() >= 0.9  # type: ignore[operator]
+    ratio = (single["coverage_mix"] / cov["coverage"].head(40)).to_numpy()
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.05)
+    assert got["mix_rates"][40] > 1
+    assert got["coverage_mix"][40] == pytest.approx(22.0 * lam[40] / units[40].mean(), rel=0.2)
+    assert got["mix_rates"][41] == 1 and got["coverage_mix"][41] == lam[41]
 
 
 def test_summed_batches_equal_one_aggregation() -> None:

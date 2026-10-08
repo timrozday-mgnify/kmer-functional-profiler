@@ -523,13 +523,15 @@ def test_divergence_abundance() -> None:
 
     # 12 one-member units at 98% set the scale (coverage_zi = 2 x depth); unit 100 at 85%
     # reads coverage_em at a quarter of 2 x depth, coverage_zi at it, inside its interval;
-    # unit 200 has two genes and is left out
+    # unit 200 has two genes and is left out, but for the strain-mix metrics: against
+    # 2 x (3 + 3), coverage_zi reads half and coverage_mix (split) the sum
     n = 12
     hits = pl.DataFrame({
         "gene_name": [f"g{i}" for i in range(n)] + ["d", "s1", "s2"],
         "cluster_rep": list(range(n)) + [100, 200, 200],
         "identity": [0.98] * n + [0.85, 0.9, 0.9],
         "depth": [float(i + 1) for i in range(n)] + [4.0, 3.0, 3.0],
+        "rank": [1] * (n + 3),
     })  # fmt: skip
     depth = np.r_[np.arange(1, n + 1), 4.0]
     profile = pl.DataFrame({
@@ -541,6 +543,8 @@ def test_divergence_abundance() -> None:
         "abundance_zi": list(2 * depth) + [6.0],
         "coverage_zi_lo": list(1.9 * depth) + [5.0],
         "coverage_zi_hi": list(2.1 * depth[:n]) + [9.0, 7.0],
+        "coverage_mix": list(2 * depth) + [12.0],
+        "mix_rates": [1] * (n + 1) + [2],
     }).with_columns(coverage_em=pl.when(pl.col("cluster_rep") == 100).then(2.0)
                     .otherwise(pl.col("coverage_em")))  # fmt: skip
     got = bench.divergence_abundance(profile, hits)
@@ -549,3 +553,7 @@ def test_divergence_abundance() -> None:
     assert got["abund_zi_bias_0.8"] == pytest.approx(0.0) and got["abund_zi_bias_0.95"] == 0
     assert got["abund_zi_cover"] == pytest.approx(13 / 13)  # 8 is inside [5, 9]
     assert got["abund_n_depth2"] == 4 and got["abund_n_depth5"] == 8
+    assert got["abund_genes_n_1"] == n + 1 and got["abund_genes_split_1"] == 0
+    assert got["abund_genes_zi_bias_2"] == pytest.approx(-1.0)
+    assert got["abund_genes_mix_bias_2"] == pytest.approx(0.0) and got["abund_genes_split_2"] == 1
+    assert got["abund_genes_n_4"] == 0 and got["abund_genes_mix_bias_4"] is None

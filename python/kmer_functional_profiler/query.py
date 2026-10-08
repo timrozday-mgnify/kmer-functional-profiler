@@ -39,7 +39,7 @@ import numpy as np
 import polars as pl
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components, reverse_cuthill_mckee
-from scipy.special import betainc, gammaincc
+from scipy.special import betainc, gammaincc, gammaln
 from scipy.stats import chi2, norm
 
 from kmer_functional_profiler import _core
@@ -1586,6 +1586,100 @@ def kmer_dispersion(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame
     )
 
 
+MIX_SHAPES: Final = (0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.6)  # v = cv^2 of uneven coverage
+MIX_SHAPE_DEPTH: Final = 3.0  # units the sample's shape is read from: mean hits >= this
+MIX_ITERATIONS: Final = 50  # p99 change in coverage_mix vs 150: 0.05 log2
+
+
+def _ztnb_logpmf(h: np.ndarray, mu: np.ndarray, v: float) -> np.ndarray:
+    """log P(h | h > 0) of a negative binomial of mean ``mu`` and squared CV ``v``
+    (Poisson at v = 0), without the log h! term (constant in the fit)."""
+    if v == 0:
+        return np.asarray(h * np.log(mu) - mu - np.log(-np.expm1(-mu)))
+    r = 1 / v
+    p0 = r * np.log(r / (r + mu))
+    return np.asarray(
+        gammaln(h + r) - gammaln(r) + p0 + h * np.log(mu / (r + mu)) - np.log(-np.expm1(p0))
+    )
+
+
+def _ztnb_mean(mean: np.ndarray, v: float, iterations: int = 60) -> np.ndarray:
+    """mu whose zero-truncated mean mu / (1 - P(0)) is ``mean``, by fixed point (to ~0 where
+    ``mean`` <= 1)."""
+    mean = np.asarray(mean, dtype=np.float64)
+    mu = np.maximum(mean, 1e-3)
+    for _ in range(iterations):
+        p0 = np.exp(-mu) if v == 0 else (1 + v * mu) ** (-1 / v)
+        mu = np.maximum(mean * (1 - p0), 1e-3)
+    return np.asarray(mu)
+
+
+def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
+    """Per unit, ``coverage`` (``unit``, ``coverage``) corrected for a strain mix:
+    ``coverage_mix`` and ``mix_rates`` (step 35, open item 3).
+
+    Strains at different depths in one unit give its k-mers several rates: one strain's own
+    k-mers its depth, the k-mers they share the sum. The hits of the hit k-mers only the unit
+    holds in ``kmers`` (``unit``, ``hash``, ``hits``) are fitted as a mixture of 1-3
+    zero-truncated negative binomials, chosen by BIC; the top rate is the summed depth of the
+    strains sharing its k-mers. ``coverage_mix`` = ``coverage`` x top rate / one-rate fit
+    (``coverage`` itself with one rate). The shape (squared CV of uneven coverage along a
+    gene) is the sample's: the median of each unit's best one-rate shape over units with
+    ``MIN_DISPERSION_KMERS`` such k-mers and mean hits >= ``MIX_SHAPE_DEPTH``. A per-unit
+    shape absorbs a second rate into a wide one; a Poisson mixture splits uneven coverage
+    into rates (simulation: top rate +0.45 log2 on one strain at cv 0.3, depth 10)."""
+    own = kmers.filter(pl.len().over("hash") == 1)
+    ids = own.group_by("unit").agg(n=pl.len()).filter(pl.col("n") >= MIN_DISPERSION_KMERS)
+    rows = own.join(ids.with_row_index("i"), on="unit").group_by("i", "hits").agg(c=pl.len())
+    if ids.height == 0:
+        return coverage.select("unit", coverage_mix="coverage", mix_rates=pl.lit(1, pl.UInt8))
+    n = ids.height
+    u = rows["i"].to_numpy().astype(np.int64)
+    h = rows["hits"].to_numpy().astype(np.float64)
+    c = rows["c"].to_numpy().astype(np.float64)
+    cnt = np.bincount(u, c, n)
+    mean = np.bincount(u, c * h, n) / cnt
+
+    def one(v: float) -> tuple[np.ndarray, np.ndarray]:  # one rate: closed form
+        mu = _ztnb_mean(mean, v)
+        return mu, np.bincount(u, c * _ztnb_logpmf(h, mu[u], v), n)
+
+    ll = np.stack([one(v)[1] for v in MIX_SHAPES], 1)
+    deep = mean >= MIX_SHAPE_DEPTH
+    # ponytail: one shape per sample; per-gene-length shapes if short genes' ends dominate
+    v = float(np.median(np.asarray(MIX_SHAPES)[ll[deep].argmax(1)])) if deep.any() else 0.0
+    mu1, ll1 = one(v)
+    best, top, rates = -2 * ll1 + np.log(cnt), mu1.copy(), np.ones(n, dtype=np.uint8)
+    for k in (2, 3):
+        mu = np.maximum(mean[:, None] * np.exp(np.linspace(-1, 1, k))[None], 0.5)
+        w, ll = np.full((n, k), 1 / k), np.zeros(n)
+        for _ in range(MIX_ITERATIONS):
+            lp = np.log(w[u]) + _ztnb_logpmf(h[:, None], mu[u], v)
+            mx = lp.max(1, keepdims=True)
+            r = np.exp(lp - mx)
+            s = r.sum(1, keepdims=True)
+            r /= s
+            ll = np.bincount(u, c * (mx + np.log(s))[:, 0], n)  # at the mixture before this M step
+            rs = np.stack([np.bincount(u, c * r[:, j], n) for j in range(k)], 1)
+            rh = np.stack([np.bincount(u, c * r[:, j] * h, n) for j in range(k)], 1)
+            w = np.maximum(rs / cnt[:, None], 1e-12)
+            mu = _ztnb_mean(rh / np.maximum(rs, 1e-12), v)
+        bic = -2 * ll + (2 * k - 1) * np.log(cnt)
+        better = bic < best
+        best, top = np.where(better, bic, best), np.where(better, mu.max(1), top)
+        rates[better] = k
+    ids = ids.select("unit", ratio=pl.Series(top / mu1), mix_rates=pl.Series(rates))
+    return (
+        coverage.select("unit", "coverage")
+        .join(ids, on="unit", how="left")
+        .select(
+            "unit",
+            coverage_mix=pl.col("coverage") * pl.col("ratio").fill_null(1.0),
+            mix_rates=pl.col("mix_rates").fill_null(1).cast(pl.UInt8),
+        )
+    )
+
+
 def coverage_interval(
     coverage: np.ndarray,
     hit_kmers: np.ndarray,
@@ -1952,7 +2046,9 @@ def profile(
     are omitted. ``coverage_zi`` is the shipped coverage, with a likelihood-ratio interval
     ``coverage_zi_lo``/``_hi`` (:func:`coverage_interval`, widened by read clumping and by
     ``coverage_zi_dispersion``, :func:`kmer_dispersion`; with ``draws`` > 0 the posterior's
-    instead); ``coverage_em`` and ``hits_em`` stay. ``aai`` is fitted with ``with_aai``,
+    instead); ``coverage_em`` and ``hits_em`` stay. ``coverage_mix`` and ``mix_rates``
+    correct ``coverage_zi`` for strains at several depths (:func:`rate_mixture`).
+    ``aai`` is fitted with ``with_aai``,
     ``draws``, ``summary`` or ``all_estimators``; the other estimators (``_zib``, ``_zip``,
     ``_wta``, ``_ufirst``) only with ``all_estimators`` (benchmarks).
 
@@ -2275,8 +2371,10 @@ def profile(
         )
         if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
             fitted_zi = fitted_zi.hstack(estimate)
+        unit_kmers = detected.select("unit", "hash", "hits")
+        fitted_zi = fitted_zi.join(rate_mixture(unit_kmers, zi), on="unit", how="left")
         if draws == 0:  # with draws, the posterior gives coverage_zi's interval
-            spread = kmer_dispersion(detected.select("unit", "hash", "hits"), zi)
+            spread = kmer_dispersion(unit_kmers, zi)
             zi = zi.join(spread, on="unit", how="left")
             lam = zi["coverage"].to_numpy()
             hit_kmers = zi["present"].to_numpy() * zi["m"].to_numpy() * -np.expm1(-lam)
