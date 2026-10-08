@@ -515,3 +515,37 @@ def test_aai_calibrate_transfers_a_map_between_runs(tmp_path: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         run(tmp_path, "aai-calibrate", "--profiles", "c.tsv", *common, "--index", "idx_c",
             "--map", "a.json", "--scores-out", "a_to_c.tsv")  # fmt: skip
+
+
+def test_divergence_abundance() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    # 12 one-member units at 98% set the scale (coverage_zi = 2 x depth); unit 100 at 85%
+    # reads coverage_em at a quarter of 2 x depth, coverage_zi at it, inside its interval;
+    # unit 200 has two genes and is left out
+    n = 12
+    hits = pl.DataFrame({
+        "gene_name": [f"g{i}" for i in range(n)] + ["d", "s1", "s2"],
+        "cluster_rep": list(range(n)) + [100, 200, 200],
+        "identity": [0.98] * n + [0.85, 0.9, 0.9],
+        "depth": [float(i + 1) for i in range(n)] + [4.0, 3.0, 3.0],
+    })  # fmt: skip
+    depth = np.r_[np.arange(1, n + 1), 4.0]
+    profile = pl.DataFrame({
+        "cluster_rep": list(range(n)) + [100, 200],
+        "kmers_unique": [5] * (n + 2),
+        "n_members": [1] * (n + 2),
+        "coverage_em": list(2 * depth) + [6.0],
+        "coverage_zi": list(2 * depth) + [6.0],
+        "abundance_zi": list(2 * depth) + [6.0],
+        "coverage_zi_lo": list(1.9 * depth) + [5.0],
+        "coverage_zi_hi": list(2.1 * depth[:n]) + [9.0, 7.0],
+    }).with_columns(coverage_em=pl.when(pl.col("cluster_rep") == 100).then(2.0)
+                    .otherwise(pl.col("coverage_em")))  # fmt: skip
+    got = bench.divergence_abundance(profile, hits)
+    assert got["abund_scale"] == pytest.approx(2.0)
+    assert got["abund_em_bias_0.8"] == pytest.approx(np.log2(2.0 / 8.0))
+    assert got["abund_zi_bias_0.8"] == pytest.approx(0.0) and got["abund_zi_bias_0.95"] == 0
+    assert got["abund_zi_cover"] == pytest.approx(13 / 13)  # 8 is inside [5, 9]
+    assert got["abund_n_depth2"] == 4 and got["abund_n_depth5"] == 8

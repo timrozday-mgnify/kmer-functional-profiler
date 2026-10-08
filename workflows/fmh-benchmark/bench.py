@@ -673,6 +673,72 @@ def aai_score(
             err = part["aai_naive"] - part["true"]
             out[f"naive_bias_{lo}"] = err.median() if part.height else None  # type: ignore[assignment]
             out[f"naive_within05_{lo}"] = (err.abs() <= 0.05).mean() if part.height else None
+    return out | divergence_abundance(profile, aai_hits)
+
+
+ABUND_ESTIMATES = ("coverage_em", "coverage_zi", "abundance_zi")
+DEPTH_BINS = ((0, 1), (1, 2), (2, 5), (5, float("inf")))  # true depth
+
+
+def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str, float | None]:
+    """Abundance against true depth under divergence (plan, phase 7, step 35), on detected
+    units one present gene hits (``hits``: present genes' hits at query coverage >= 0.5, with
+    ``identity`` to the nearest member and ``depth``). A unit's estimates are in k-mer
+    coverage; the sample's scale c (``abund_scale``) is the median ``coverage_zi`` / depth
+    of one-member units at >= 95%, so the metrics are log2(estimate / (c depth)):
+
+    - ``abund_<estimate>_bias_<lo>``, ``abund_<estimate>_err_<lo>``: median and median
+      absolute deviation by identity (``IDENTITY_BINS``), for ``ABUND_ESTIMATES``;
+    - ``abund_zi_bias_depth<lo>``, ``abund_zi_err_depth<lo>``, ``abund_zi_cover_depth<lo>``
+      and ``abund_zi_cover``: ``coverage_zi`` by true depth (``DEPTH_BINS``), and how often
+      ``coverage_zi_lo``/``_hi`` hold c x depth; ``abund_n_depth<lo>`` units per bin.
+
+    Units several genes hit are left out: one rate cannot resolve strains at different
+    depths (step 35)."""
+    out: dict[str, float | None] = {}
+    if "coverage_zi" not in profile.columns or "depth" not in hits.columns:
+        return out
+    single = (
+        hits.group_by("cluster_rep")
+        .agg(n=pl.len(), a=pl.col("identity").first(), depth=pl.col("depth").first())
+        .filter(pl.col("n") == 1)
+    )
+    keep = [c for c in (*ABUND_ESTIMATES, "coverage_zi_lo", "coverage_zi_hi", "n_members")
+            if c in profile.columns]  # fmt: skip
+    u = (
+        profile.filter(pl.col("kmers_unique") >= 1, pl.col("coverage_zi") > 0)
+        .select("cluster_rep", *keep)
+        .join(single, on="cluster_rep")
+    )
+    base = u.filter(pl.col("a") >= 0.95)
+    if "n_members" in u.columns:
+        base = base.filter(pl.col("n_members") == 1)
+    if base.height < 10:
+        return out
+    c = base.select((pl.col("coverage_zi") / pl.col("depth")).median()).item()
+    out["abund_scale"] = c
+    u = u.with_columns(truth=c * pl.col("depth"))
+    for est in (e for e in ABUND_ESTIMATES if e in u.columns):
+        r = u.filter(pl.col(est) > 0).with_columns(lr=(pl.col(est) / pl.col("truth")).log(2))
+        name = est.removeprefix("coverage_")
+        for lo, hi in IDENTITY_BINS:
+            x = r.filter(pl.col("a").is_between(lo, hi, closed="left"))["lr"]
+            out[f"abund_{name}_bias_{lo}"] = x.median() if x.len() else None  # type: ignore[assignment]
+            out[f"abund_{name}_err_{lo}"] = (x - x.median()).abs().median() if x.len() else None  # type: ignore[operator, assignment]
+    z = u.with_columns(lr=(pl.col("coverage_zi") / pl.col("truth")).log(2))
+    has_ci = "coverage_zi_lo" in z.columns
+    if has_ci:
+        z = z.with_columns(inside=pl.col("truth").is_between("coverage_zi_lo", "coverage_zi_hi"))
+        out["abund_zi_cover"] = z["inside"].mean()  # type: ignore[assignment]
+    for lo, hi in DEPTH_BINS:
+        x = z.filter(pl.col("depth").is_between(lo, hi, closed="left"))
+        out[f"abund_n_depth{lo}"] = x.height
+        out[f"abund_zi_bias_depth{lo}"] = x["lr"].median() if x.height else None  # type: ignore[assignment]
+        out[f"abund_zi_err_depth{lo}"] = (
+            (x["lr"] - x["lr"].median()).abs().median() if x.height else None  # type: ignore[operator]
+        )
+        if has_ci:
+            out[f"abund_zi_cover_depth{lo}"] = x["inside"].mean() if x.height else None  # type: ignore[assignment]
     return out
 
 

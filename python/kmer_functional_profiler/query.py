@@ -10,7 +10,9 @@ and ``genetic_code`` then do not apply.
 Shared k-mers count for every unit that holds them in ``kmers_hit``; ``kmers_unique`` is
 what a gather-style greedy assignment leaves each unit (the phase-4 detection baseline).
 ``coverage_em`` re-splits the hits of the units gather keeps by EM (phase-4 quantification);
-``coverage_zi`` fits coverage to the k-mers present only (zero-inflated EM).
+``coverage_zi`` fits coverage to the k-mers present only (zero-inflated EM), the shipped
+coverage: a diverged gene hits only part of a unit's k-mers, so ``coverage_em`` reads its depth
+low (phase 7, step 35).
 Two more baselines give each hit k-mer to one unit (:func:`assign_best`): winner-take-all
 (``kmers_wta``) and uniqueness-first (``kmers_ufirst``), each with the coverage its k-mers'
 hits give.
@@ -38,7 +40,7 @@ import polars as pl
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components, reverse_cuthill_mckee
 from scipy.special import betainc, gammaincc
-from scipy.stats import norm
+from scipy.stats import chi2, norm
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
@@ -1552,6 +1554,77 @@ def _calibrated(result: pl.DataFrame, calibrations: list[dict[str, Any] | None])
     ).sort("unit")
 
 
+MIN_DISPERSION_KMERS: Final = 10  # unique hit k-mers below which a unit's dispersion is 1
+
+
+def kmer_dispersion(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
+    """Per unit, how much its k-mers' hit counts vary beyond a zero-truncated Poisson at its
+    fitted ``coverage`` (``unit``, ``coverage``): the observed variance of hits over the hit
+    k-mers only it holds in ``kmers`` (``unit``, ``hash``, ``hits``), over the zero-truncated
+    variance E (1 + c - E), E = c / (1 - e^-c); floored at 1, and 1 with fewer than
+    ``MIN_DISPERSION_KMERS`` such k-mers. Uneven read coverage along a gene, and strains at
+    different depths in one unit, raise it (step 35); without it intervals of deep units
+    were too narrow."""
+    own = kmers.filter(pl.len().over("hash") == 1)
+    moments = own.group_by("unit").agg(
+        n=pl.len(), mean=pl.col("hits").mean(), var=pl.col("hits").var()
+    )
+    c = pl.col("coverage").clip(lower_bound=1e-9)
+    expect = c / (1 - (-c).exp())
+    ztp_var = expect * (1 + c - expect)
+    return (
+        coverage.select("unit", "coverage")
+        .join(moments, on="unit", how="left")
+        .select(
+            "unit",
+            dispersion=pl.when(pl.col("n") >= MIN_DISPERSION_KMERS)
+            .then((pl.col("var") / ztp_var).clip(lower_bound=1.0))
+            .otherwise(1.0)
+            .fill_null(1.0)
+            .fill_nan(1.0),
+        )
+    )
+
+
+def coverage_interval(
+    coverage: np.ndarray,
+    hit_kmers: np.ndarray,
+    inflation: np.ndarray,
+    level: float = 0.95,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(lower, upper) of a ``level`` likelihood-ratio interval for zero-truncated Poisson
+    coverage, per unit: ``hit_kmers`` k-mers hit (present x m x seen), their hits
+    ``hit_kmers`` x E at the fitted ``coverage`` (the MLE), the log-likelihood
+    H log c - K c - K log(1 - e^-c) divided by ``inflation`` (dispersion x clumping, a
+    quasi-likelihood). Where every hit k-mer was hit about once the likelihood is flat
+    towards 0 and the lower bound is 0: depth below ~1 is not identifiable from hit counts
+    (step 35). Bisection on log c, 60 steps each side."""
+    c = np.maximum(np.asarray(coverage, dtype=np.float64), 1e-9)
+    k = np.asarray(hit_kmers, dtype=np.float64)
+    h = k * c / -np.expm1(-c)
+    w = np.maximum(np.asarray(inflation, dtype=np.float64), 1.0)
+    cut = float(chi2.ppf(level, 1)) / 2
+
+    def drop(x: np.ndarray) -> np.ndarray:  # log-likelihood below the maximum, scaled
+        def ll(y: np.ndarray) -> np.ndarray:
+            return np.asarray(h * np.log(y) - k * y - k * np.log(-np.expm1(-y)))
+
+        return np.asarray((ll(c) - ll(x)) / w)
+
+    def bound(far: np.ndarray) -> np.ndarray:
+        near, out = np.log(c), np.log(far)  # drop(near) = 0 <= cut < drop(out), or none
+        reach = drop(far) > cut
+        for _ in range(60):
+            mid = (near + out) / 2
+            beyond = drop(np.exp(mid)) > cut
+            near, out = np.where(beyond, near, mid), np.where(beyond, mid, out)
+        return np.where(reach, np.exp((near + out) / 2), far)
+
+    lower = bound(np.full_like(c, 1e-6))
+    upper = bound(np.maximum(c * 1e3, 1e3))
+    return np.where(lower <= 1e-6 * 1.0001, 0.0, lower), upper
+
+
 def aai_fit(
     coverage: np.ndarray,
     present: np.ndarray,
@@ -1876,10 +1949,12 @@ def profile(
     unit whose members come from many genomes (a KO), total depth over its gene copies.
     ``kmers_wta``/``coverage_wta`` and ``kmers_ufirst``/``coverage_ufirst`` are the k-mers
     :func:`assign_best` gives each unit and their hits per kept k-mer. Units without hits
-    are omitted. ``coverage_em`` is the shipped estimate; the others (``_zi`` and its
-    ``copies``/``abundance``, ``_zib``, ``_zip``, ``_wta``, ``_ufirst``) are fitted only
-    with ``all_estimators`` (benchmarks), except that ``draws`` > 0 fits ``_zi``, whose
-    intervals the posterior gives.
+    are omitted. ``coverage_zi`` is the shipped coverage, with a likelihood-ratio interval
+    ``coverage_zi_lo``/``_hi`` (:func:`coverage_interval`, widened by read clumping and by
+    ``coverage_zi_dispersion``, :func:`kmer_dispersion`; with ``draws`` > 0 the posterior's
+    instead); ``coverage_em`` and ``hits_em`` stay. ``aai`` is fitted with ``with_aai``,
+    ``draws``, ``summary`` or ``all_estimators``; the other estimators (``_zib``, ``_zip``,
+    ``_wta``, ``_ufirst``) only with ``all_estimators`` (benchmarks).
 
     With a dense tier, the reads are streamed a second time at its rate and the EM
     estimates (``coverage_em``, ``_zi``, ``_zib``) are fitted on the dense hits of the units
@@ -2158,7 +2233,7 @@ def profile(
     )
     mu_tier2 = np.zeros(len(m_g))
     mu_tier2[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
-    if all_estimators or draws > 0 or with_aai or summary is not None:
+    if True:  # coverage_zi is the shipped coverage (step 35): the zero-inflated fit always runs
         with timer("fit_zi"):
             inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True, start=start))
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
@@ -2191,15 +2266,28 @@ def profile(
             min_aai_kmers,
             zi["n_members"].to_numpy(),
         )
-        fits.append(
-            zi.select(
-                "unit",
-                coverage_zi="coverage",
-                present_zi="present",
-                copies_zi=copies,
-                abundance_zi=pl.col("coverage") * copies,
-            ).hstack(estimate)
+        fitted_zi = zi.select(
+            "unit",
+            coverage_zi="coverage",
+            present_zi="present",
+            copies_zi=copies,
+            abundance_zi=pl.col("coverage") * copies,
         )
+        if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
+            fitted_zi = fitted_zi.hstack(estimate)
+        if draws == 0:  # with draws, the posterior gives coverage_zi's interval
+            spread = kmer_dispersion(detected.select("unit", "hash", "hits"), zi)
+            zi = zi.join(spread, on="unit", how="left")
+            lam = zi["coverage"].to_numpy()
+            hit_kmers = zi["present"].to_numpy() * zi["m"].to_numpy() * -np.expm1(-lam)
+            inflation = zi["dispersion"].fill_null(1.0).to_numpy() * (1 + mu[zi["unit"].to_numpy()])
+            lo, hi = coverage_interval(lam, hit_kmers, inflation)
+            fitted_zi = fitted_zi.with_columns(
+                coverage_zi_lo=pl.Series(np.where(lam > 0, lo, 0.0)),
+                coverage_zi_hi=pl.Series(np.where(lam > 0, hi, 0.0)),
+                coverage_zi_dispersion=zi["dispersion"].fill_null(1.0),
+            )
+        fits.append(fitted_zi)
     if all_estimators:
         with timer("fit_zib"):
             prior = fit_present_prior(inflated)
