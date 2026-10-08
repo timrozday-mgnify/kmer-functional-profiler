@@ -832,12 +832,16 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
     summary = tmp_path / "summary.json"
-    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary)])
+    own_hist = tmp_path / "own.parquet"
+    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary),
+                                 "--own-hist", str(own_hist)])  # fmt: skip
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
-    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
-        table.columns
-    )
+    assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component",
+            "present_llr"} <= set(table.columns)  # fmt: skip
+    hist = pl.read_parquet(own_hist)
+    assert hist.columns == ["unit", "hits", "kmers"]
+    assert set(hist["unit"]) <= set(table["unit"])
     sample = json.loads(summary.read_text())
     assert sample["explained_fraction"] > 0 and 0 <= sample["census_containment"] <= 1
     got = json.loads(stats.read_text())
@@ -917,6 +921,13 @@ def test_presence_doubts_few_and_shared_hits() -> None:
     # Ten times fewer reads: less background, so one k-mer is more credible.
     fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
     assert fewer[400] > unique
+    # present_llr is the evidence alone: one prior odds for every unit (phase 12, step 1)
+    table = presence(own, t_g, 3_000_000, 2000)
+    finite = table.filter(pl.col("present_prob") < 1 - 1e-9)
+    p, llr = finite["present_prob"].to_numpy(), finite["present_llr"].to_numpy()
+    log_odds = np.log(p / (1 - p)) - llr
+    assert finite.height > 100 and np.ptp(log_odds) < 1e-6
+    assert (table.filter(pl.col("present_prob") >= 1 - 1e-9)["present_llr"] > 10).all()
     report: dict[str, int] = {}
     presence(own, t_g, 3_000_000, 2000, report=report)
     assert report["presence_converged"] == 1 and 1 < report["presence_iterations"] < 500
