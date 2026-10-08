@@ -190,12 +190,13 @@ def prevalence(
     n: pl.DataFrame,
     sizes: pl.DataFrame,
     alpha: dict[str, float],
+    floor: float = Q_FLOOR,
 ) -> pl.DataFrame:
     """Per species and candidate unit (any unit its genus carries; its own where it has no
     genus): ``q``, the species' completeness-corrected carriage frequency shrunk down the
     ranks from all genomes, (n + α q_parent) / (N + α) at family, genus and species, capped
     at 1; and ``e``, the mean content of the species' carriers (else its genus', family's,
-    all genomes'). Pairs with q < ``Q_FLOOR`` are dropped."""
+    all genomes'). Pairs with q < ``floor`` are dropped."""
     species = lineage.unique("species", keep="first").select(RANKS)
     top = pl.coalesce("genus", "species")
     top_rank = (
@@ -230,7 +231,7 @@ def prevalence(
     assert e is not None
     return (
         pairs.select("species", "unit", q=pl.min_horizontal("q", 1.0), e=pl.coalesce(e, "e_root"))
-        .filter(pl.col("q") >= Q_FLOOR)
+        .filter(pl.col("q") >= floor)
         .sort("species", "unit")
     )
 

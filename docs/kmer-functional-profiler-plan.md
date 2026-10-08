@@ -2228,6 +2228,26 @@ Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-spe
     - `present_llr`'s single prior odds in `test_presence_doubts_few_and_shared_hits`;
     - `--own-hist` and `present_llr` in `test_cli_query`.
 
+* **Phase 12, step 2 — the panel (`kfp-genomes panel`; `kfp_genomes/panel.py`).**
+  - *Command:* `kfp-genomes panel INDEX OUT --catalogue DIR | --genomes GENOME_INDEX`, with `--exclude`, `--species`, `--max-per-species` (50), `--neighbours` (10), and ablations `--alpha`, `--no-completeness`, as for `species-index`.
+  - *Carriage rows:* per (genome, unit), carriage when a protein (family) has the unit as best unit, and copies *n* (how many do). Survival *f* is the share of the unit's tier-2 kept k-mers that are hit (`kmers` / `m_g`).
+    - A genome set takes `kmers` from its genome index: all of a genome's proteins.
+    - A catalogue takes the best family's distinct k-mers on the unit, the maximum over the genome's families with that best unit. Panaroo gives one sequence per family, so a catalogue's *f* is the same for every genome carrying a family.
+  - *q:* species.py's shrinkage, completeness-weighted and computed from every kept genome, not only the panel's. Units with *q* ≥ 0.05 are kept, plus every unit a panel genome carries; below 0.05, *q* is the species' raw weighted frequency. `prevalence` gained a `floor` argument (default unchanged).
+    - `f_mean` and `n_mean` are the species carriers' means, else the genus', else all genomes', else 0.5 and 1. They stand in where a reference lacks a unit.
+  - *Distance:* d = 1 − J_c (1 − mean |f_g − f_h| on shared units). J_c is Jaccard with each unit one genome lacks weighted by that genome's completeness.
+    - Farthest-point sampling starts from the catalogue representative (a genome set: the most complete genome).
+    - Neighbour lists are among the selected genomes only. A one-genome species gets the self-edge (0, 0).
+  - *Reading it:* `Panel.species_panel(s)` gives dense G × U arrays (≤ 50 genomes). These are carriage x̃: 1 when carried, *q*(1 − c)/(1 − *q c*) otherwise. Copies and survival take the carriers' means where a genome lacks the unit. The directed edges have prior 1 / (G × degree). `carriage(g, h, t, ℓ)` is the plan's *p_u*.
+  - *Workflow:* `gtdb-species-index` gains `PANEL` (`kfp-genomes panel --genomes`, `--panel` on by default, `--panel_args`). It is the genome-panel workflow for GTDB sets. Catalogue panels are built in the species benchmark (step 8). The stub run parses; the `-profile test,docker` run is not done.
+  - Tests:
+    - `test_panel_carriage_at_a_reference_and_at_the_species_average`: t = 0, ℓ = 0 gives the reference's carriage; ℓ = 1 gives the rank-shrunk *q*; t = ½ is the mean of the two references.
+    - `test_incomplete_mag_missing_unit_is_shrunk_by_its_completeness`;
+    - `test_farthest_point_selection_keeps_both_clades`: 30 + 5 genomes with 3 kept, both clades; *q* still from all 35;
+    - `test_panel_from_catalogue_and_genome_set`: same carriage and *q* from either source;
+    - `test_panel_cli`.
+  - *Not tested here:* human-gut panel build time. It is to be measured with the step 8 benchmark's catalogue panel on HPC.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

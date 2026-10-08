@@ -1,10 +1,18 @@
 """kfp-genomes (phase 12): evidence layer, panel, place and update."""
 
+# ruff: noqa: F811  (index_dir: the fixture imported from test_genomes)
+
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import polars as pl
 import pytest
 from scipy.stats import chi2
+from test_genomes import index_dir  # noqa: F401  (fixture)
+from typer.testing import CliRunner
 
+from kfp_genomes.cli import app
 from kfp_genomes.evidence import (
     Evidence,
     Histogram,
@@ -13,6 +21,7 @@ from kfp_genomes.evidence import (
     mixture_loglik,
     zero_hit_present,
 )
+from kfp_genomes.panel import Panel, panel_from_catalogue, panel_from_genomes, write_panel
 from kmer_functional_profiler.query import coverage_interval, ztnb_one_rate
 
 # --- Evidence layer (step 1) ---
@@ -97,3 +106,131 @@ def test_unit_ratios_favour_the_fitted_depth_and_doubt_missed_units() -> None:
     # a zero-hit unit: carried at depth 2 is unlikely, against no hits from elsewhere
     expect = log_likelihood(0, 0, 50, 2.0, 0.8) - np.log1p(-0.01 * (1 - terms.eps[3]))
     assert lr[3, 0] == pytest.approx(expect) and lr[3, 0] < -30
+
+
+# --- Panel (step 2) ---
+
+TAXONOMY = "d__B;p__P;c__C;o__O;f__F;g__G;s__"
+
+
+def synthetic_panel(
+    tmp: Path,
+    carried: dict[str, set[int]],
+    species: dict[str, str],
+    completeness: dict[str, float] | None = None,
+    f: float = 0.8,
+    **kwargs: Any,
+) -> Panel:
+    """A panel of genomes carrying the units listed (every unit at survival ``f``, one copy),
+    each in the species named; index ``meta.json`` faked; 100 kept k-mers per unit."""
+    names = list(carried)
+    genomes = pl.DataFrame({
+        "genome": range(len(names)), "name": names,
+        "taxonomy": [TAXONOMY + species[n] for n in names],
+        "completeness": [(completeness or {}).get(n, 1.0) for n in names],
+    }).cast({"genome": pl.UInt32})  # fmt: skip
+    rows = pl.DataFrame(
+        [(g, u, 1, f) for g, n in enumerate(names) for u in sorted(carried[n])],
+        schema={"genome": pl.UInt32, "unit": pl.UInt32, "n": pl.UInt16, "f": pl.Float64},
+        orient="row",
+    )
+    index_dir = tmp / "index"
+    index_dir.mkdir(exist_ok=True)
+    (index_dir / "meta.json").write_text("{}")
+    m_g = np.full(1 + max(max(c) for c in carried.values()), 100)
+    write_panel(tmp / "panel", index_dir, m_g, genomes, rows, **kwargs)
+    return Panel(tmp / "panel")
+
+
+def test_panel_carriage_at_a_reference_and_at_the_species_average(tmp_path: Path) -> None:
+    rng = np.random.default_rng(3)
+    core = set(range(40))
+    carried = {f"g{i}": core | set((40 + rng.choice(60, 20, replace=False)).tolist())
+               for i in range(8)}  # fmt: skip
+    panel = synthetic_panel(tmp_path, carried, dict.fromkeys(carried, "A"))
+    sp = panel.species_panel(0)
+    assert sp.carried.shape == (8, sp.units.size) and (sp.edges.shape[0] == 8 * 7)
+    for g in range(8):  # a complete reference with t = 0, ell = 0: its own carriage
+        assert np.array_equal(sp.carriage(g, sp.edges[g * 7, 1], 0.0, 0.0), sp.carried[g])
+    # ell = 1: the rank-shrunk prevalence (species.py's q, from all genomes)
+    genomes = panel.genomes.join(pl.DataFrame({"name": list(carried)}), on="name")
+    assert genomes.height == 8
+    q = dict(panel.species_units.select("unit", "q").iter_rows())
+    assert np.allclose(sp.carriage(0, 1, 0.3, 1.0), [q[u] for u in sp.units])
+    assert all(q[u] > 0.95 for u in core)
+    # half-way between two references: the mean of their carriage
+    g, h = sp.edges[0]
+    assert np.allclose(sp.carriage(g, h, 0.5, 0.0), (sp.carried[g] * 1.0 + sp.carried[h]) / 2)
+
+
+def test_incomplete_mag_missing_unit_is_shrunk_by_its_completeness(tmp_path: Path) -> None:
+    carried = {f"g{i}": set(range(10)) for i in range(6)} | {"mag": set(range(8))}
+    panel = synthetic_panel(tmp_path, carried, dict.fromkeys(carried, "A"), {"mag": 0.6})
+    sp = panel.species_panel(0)
+    mag = sp.names.index("mag")
+    q = sp.q[8]
+    assert sp.xt[mag, 8] == pytest.approx(q * 0.4 / (1 - q * 0.6))
+    assert sp.xt[mag, 0] == 1.0 and 0 < sp.xt[mag, 8] < q
+
+
+def test_farthest_point_selection_keeps_both_clades(tmp_path: Path) -> None:
+    rng = np.random.default_rng(4)
+    core = set(range(50))
+    a_set, b_set = set(range(50, 80)), set(range(80, 110))
+    carried = {f"a{i}": core | {u for u in a_set if rng.random() < 0.9} for i in range(30)}
+    carried |= {f"b{i}": core | {u for u in b_set if rng.random() < 0.9} for i in range(5)}
+    panel = synthetic_panel(tmp_path, carried, dict.fromkeys(carried, "A"), max_per_species=3,
+                            neighbours=2)  # fmt: skip
+    chosen = panel.genomes["name"].to_list()
+    assert len(chosen) == 3 and {c[0] for c in chosen} == {"a", "b"}
+    assert panel.species["genomes"].to_list() == [35] and panel.species["panel"].to_list() == [3]
+    assert panel.neighbours.height == 3 * 2
+    # q still counts every genome: clade a's accessory units are more common
+    q = dict(panel.species_units.select("unit", "q").iter_rows())
+    assert np.mean([q[u] for u in a_set]) > np.mean([q[u] for u in b_set])
+
+
+def test_panel_from_catalogue_and_genome_set(tmp_path: Path, index_dir: Path) -> None:
+    from test_species import A_GENOMES, annotate_genomes_for, fake_catalogue
+
+    panel_from_catalogue(index_dir, fake_catalogue(tmp_path), tmp_path / "cat")
+    cat = Panel(tmp_path / "cat")
+    cat.check_index(index_dir)
+    assert cat.species["id"].to_list() == ["MGYG000000001", "MGYG000000004"]
+    # FPS starts at the representative; every genome fits under the cap
+    a = cat.genomes.filter(pl.col("species") == 0).sort("fps_rank")
+    assert a["name"][0] == "MGYG000000001" and a.height == 3
+    rows = cat.carriage_rows.join(cat.genomes.select("genome", "name"), on="genome")
+    assert (
+        rows.filter(pl.col("name") == "MGYG000000002").height
+        < rows.filter(pl.col("name") == "MGYG000000001").height
+    )
+    assert rows["f"].is_between(0.0, 1.0).all() and (rows["n"] >= 1).all()
+    genomes = {g: list(m) for g, m in A_GENOMES.items()} | {"MGYG000000004": list(range(10, 20))}
+    gi = annotate_genomes_for(tmp_path, index_dir, genomes)
+    panel_from_genomes(index_dir, gi, tmp_path / "set")
+    gset = Panel(tmp_path / "set")
+    # the same proteins either way: the same carriage and the same q
+    key = ["name", "unit"]
+    a_rows = rows.select(*key, "n").sort(key)
+    b_rows = (gset.carriage_rows.join(gset.genomes.select("genome", "name"), on="genome")
+              .select(*key, "n").sort(key))  # fmt: skip
+    assert a_rows.equals(b_rows)
+    assert np.allclose(cat.species_units.sort("species", "unit")["q"],
+                       gset.species_units.sort("species", "unit")["q"])  # fmt: skip
+
+
+def test_panel_cli(tmp_path: Path, index_dir: Path) -> None:
+    from test_species import fake_catalogue
+
+    (tmp_path / "exclude.txt").write_text("MGYG000000002\n")
+    args = ["panel", str(index_dir), str(tmp_path / "p"), "--catalogue",
+            str(fake_catalogue(tmp_path)), "--exclude", str(tmp_path / "exclude.txt"),
+            "--max-per-species", "1"]  # fmt: skip
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    panel = Panel(tmp_path / "p")
+    assert panel.genomes["name"].to_list() == ["MGYG000000001", "MGYG000000004"]
+    assert panel.neighbours.height == 0
+    assert set(pl.read_parquet(tmp_path / "p" / "held_out.parquet")["name"]) == {"MGYG000000002"}
+    assert panel.species_panel(0).edges.tolist() == [[0, 0]]
