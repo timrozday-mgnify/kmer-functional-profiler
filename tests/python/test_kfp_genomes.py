@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 import pytest
+from genome_sim import Strain, simulate
 from scipy.stats import chi2
 from test_genomes import index_dir  # noqa: F401  (fixture)
 from typer.testing import CliRunner
@@ -21,7 +22,14 @@ from kfp_genomes.evidence import (
     mixture_loglik,
     zero_hit_present,
 )
-from kfp_genomes.panel import Panel, panel_from_catalogue, panel_from_genomes, write_panel
+from kfp_genomes.panel import (
+    Panel,
+    SpeciesPanel,
+    panel_from_catalogue,
+    panel_from_genomes,
+    write_panel,
+)
+from kfp_genomes.place import NOVEL, OneStrain, place_species, screen
 from kmer_functional_profiler.query import coverage_interval, ztnb_one_rate
 
 # --- Evidence layer (step 1) ---
@@ -234,3 +242,104 @@ def test_panel_cli(tmp_path: Path, index_dir: Path) -> None:
     assert panel.neighbours.height == 0
     assert set(pl.read_parquet(tmp_path / "p" / "held_out.parquet")["name"]) == {"MGYG000000002"}
     assert panel.species_panel(0).edges.tolist() == [[0, 0]]
+
+
+# --- place, one strain (step 3) ---
+
+
+def two_clade_species(rng: np.random.Generator, n: int = 6) -> dict[str, set[int]]:
+    """Clades a and b of species A: a core of 300 units, each clade 100 accessory units
+    carried at 85% by its genomes."""
+    core = set(range(300))
+    pools = {"a": range(300, 400), "b": range(400, 500)}
+    return {f"{c}{i}": core | {u for u in pools[c] if rng.random() < 0.85}
+            for c in "ab" for i in range(n)}  # fmt: skip
+
+
+def placed_on(fit: OneStrain, sp: SpeciesPanel, prefix: str) -> float:
+    """Posterior mass of placements whose references are all in the clade ``prefix``
+    (ℓ < 1)."""
+    post = fit.point_posterior()
+    names = np.array(sp.names)
+    ok = (np.char.startswith(names[fit.grid.g], prefix)
+          & np.char.startswith(names[fit.grid.h], prefix) & (fit.grid.ell < 1))  # fmt: skip
+    return float(post[ok].sum())
+
+
+def test_held_out_strain_is_placed_in_its_clade_at_its_depth(tmp_path: Path) -> None:
+    rng = np.random.default_rng(5)
+    refs = two_clade_species(rng)
+    held = next(iter(two_clade_species(rng, 1).values()))  # a new clade-a genome
+    panel = synthetic_panel(tmp_path, refs, dict.fromkeys(refs, "A"))
+    for depth in (1.0, 3.0):
+        prof = simulate([Strain(held, depth)], seed=int(depth))
+        placed = place_species(prof, panel, species=[0])
+        fit = placed.fits[0]
+        assert fit.present_prob > 0.99
+        assert placed_on(fit, placed.panels[0], "a") > 0.9
+        mean, lo, hi = fit.depth_summary()
+        assert mean == pytest.approx(depth, rel=0.1) and lo < depth < hi
+        # accessory units of clade a the strain lacks, with no hits: doubted, not imputed
+        sp = placed.panels[0]
+        missing = [i for i, u in enumerate(sp.units) if 300 <= u < 400 and u not in held]
+        assert fit.unit_carriage[missing].max() < 0.5
+
+
+def test_absent_species_is_absent(tmp_path: Path) -> None:
+    rng = np.random.default_rng(6)
+    a = {f"a{i}": set(range(200)) | {u for u in range(200, 260) if rng.random() < 0.5}
+         for i in range(5)}  # fmt: skip
+    b = {f"b{i}": set(range(1000, 1200)) for i in range(5)}
+    panel = synthetic_panel(tmp_path, a | b, dict.fromkeys(a, "A") | dict.fromkeys(b, "B"))
+    prof = simulate([Strain(set(range(1000, 1200)), 2.0)])
+    placed = place_species(prof, panel, species=[0, 1])
+    assert placed.fits[0].present_prob < 0.01 and placed.fits[1].present_prob > 0.99
+    assert screen(Evidence.from_profile(prof), panel)["species"].to_list() == [1]
+
+
+def test_outside_organism_sharing_part_of_a_core_is_not_the_species(tmp_path: Path) -> None:
+    """Phase 11's known failure: an organism outside the panel carrying 20-40% of an absent
+    species' core units at about 3 hits each. No heuristic: the species' background β."""
+    rng = np.random.default_rng(7)
+    core = set(range(400))
+    a = {f"a{i}": core | {u for u in range(400, 500) if rng.random() < 0.5} for i in range(6)}
+    b = {f"b{i}": set(range(1000, 1300)) for i in range(4)}
+    panel = synthetic_panel(tmp_path, a | b, dict.fromkeys(a, "A") | dict.fromkeys(b, "B"))
+    for share in (0.2, 0.4):
+        outside = set(rng.choice(400, int(400 * share), replace=False).tolist())
+        outside |= set(range(2000, 2600))  # its own units, in no panel species
+        prof = simulate([Strain(outside, 3 / (0.8 * 100)), Strain(set(range(1000, 1300)), 2.0)])
+        placed = place_species(prof, panel, species=[0, 1])
+        assert placed.fits[0].present_prob < 0.5, (share, placed.fits[0].log_bf)
+        assert placed.fits[1].present_prob > 0.99
+
+
+def test_strain_unlike_every_reference_is_novel(tmp_path: Path) -> None:
+    rng = np.random.default_rng(8)
+    core = set(range(200))
+    pool = range(200, 400)
+    genomes = {f"g{i}": core | {u for u in pool if rng.random() < 0.3} for i in range(40)}
+    panel = synthetic_panel(tmp_path, genomes, dict.fromkeys(genomes, "A"), max_per_species=6)
+    novel = core | {u for u in pool if rng.random() < 0.3}
+    near = genomes[panel.genomes["name"][2]]  # a panel genome itself
+    for strain, expect in ((novel, True), (near, False)):
+        placed = place_species(simulate([Strain(strain, 2.0)]), panel, species=[0])
+        fit = placed.fits[0]
+        post = fit.point_posterior()
+        assert (post[fit.grid.ell > NOVEL].sum() > 0.5) == expect
+
+
+def test_species_sharing_units_are_fitted_together(tmp_path: Path) -> None:
+    shared = set(range(100))  # MGnify90 clusters both species' genomes fall in
+    a = {f"a{i}": shared | set(range(100, 400)) for i in range(4)}
+    b = {f"b{i}": shared | set(range(1000, 1300)) for i in range(4)}
+    panel = synthetic_panel(tmp_path, a | b, dict.fromkeys(a, "A") | dict.fromkeys(b, "B"))
+    prof = simulate([Strain(a["a0"], 2.0), Strain(b["b0"], 1.0)])
+    placed = place_species(prof, panel)
+    assert placed.candidates["species"].to_list() == [0, 1] and placed.report["components"] == 1
+    for s, depth in ((0, 2.0), (1, 1.0)):
+        fit = placed.fits[s]
+        assert fit.present_prob > 0.99
+        assert fit.depth_summary()[0] == pytest.approx(depth, rel=0.1)
+        sp = placed.panels[s]
+        assert fit.unit_carriage[np.isin(sp.units, list(shared))].min() > 0.9

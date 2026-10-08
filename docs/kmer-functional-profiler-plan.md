@@ -2248,6 +2248,35 @@ Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-spe
     - `test_panel_cli`.
   - *Not tested here:* human-gut panel build time. It is to be measured with the step 8 benchmark's catalogue panel on HPC.
 
+* **Phase 12, step 3 — `place`, one strain (`kfp_genomes/place.py`: `fit_one`, `place_species`).**
+  - *Likelihood (amendment: copy sources).* Each unit copies from *g*, from *h* or from the species average, with weights (1 − ℓ)(1 − t), (1 − ℓ) t and ℓ. From source σ it is carried with probability x̃_σ, at depth λ n_σ and survival f_σ. So L(θ, λ) = Π_u Σ_σ w_σ [x̃_σ L(carried at λ n_σ, f_σ) + (1 − x̃_σ) L(not)].
+    - This is the Li–Stephens copying model the plan names, without linkage. The plan's form interpolated *p*, *f* and took the nearer reference's copies; here each source keeps its own copies and survival, so a unit two references carry at different copy numbers is not averaged.
+    - Per (source, unit, λ) the term is computed once. A placement is then a weighted sum and a log per unit.
+  - *Grid:*
+    - Placements: reference nodes, each neighbour pair (edges g → h and h → g merged) at t = ¼, ½, ¾, and ℓ ∈ {0, 0.1, 0.25, 0.5, 0.75} plus one ℓ = 1 point.
+    - Prior: anchor uniform, neighbour uniform, t by the trapezoid on {0, ¼, ½, ¾, 1}, ℓ by Beta(1, 4) cell masses.
+    - λ: log-normal (median 1×, sd 1.5 in ln), truncated to [0.01, 1000]. A 25-point log grid is zoomed onto the posterior until its sd spans ≥ 2 steps, and the last grid is the mean ± 8 sd (21 points).
+    - Later zooms evaluate only placements within 30 nats of the best. Pairs are evaluated at the λ where some node is within 30 nats.
+  - *Bug found and fixed while testing:* a zoom window mixed with coarse points gave its end points half the gap to the next coarse point (trapezoid weights). That pulled λ's mode onto the window edge. Zoomed grids are now uniform over their window, weighted by the prior normalised over the full range.
+  - *Background (amendment: a fitted slab).* A unit not carried is present from outside the panel with prior β, at a depth log-normal (sd 1) around one of 17 centres between 0.01× and 100×. β and the centre are fitted per species by marginal likelihood (type II ML), separately under K = 0 and under K = 1 (at ℓ = 1).
+    - First version: one generic depth prior (log-uniform 0.01–1000×) and β only. It failed the phase-11 regression: an outside organism sharing 40% of an absent species' core, at about 3 hits per unit, was called present (log BF +9.7). Its units sat at one low depth, which the diffuse slab made improbable as background, so a strain explained them better.
+    - With the slab's depth fitted, that case gives log BF −251, −199 and −113 at 20%, 40% and 60% sharing. At 80% it is called present, which is arguably right.
+    - A true strain at 0.05× gives log BF +318.
+    - No threshold or heuristic was added. The slab is the plan's spike-and-slab background, with its depth prior fitted as well as its weight.
+  - *Presence:* P(K ≥ 1) = expit(log π/(1 − π) + log BF). π is fitted by EM over the candidates as a MAP under Beta(1, 9) (most screened species are absent).
+  - *Screen:* species with ≥ 5 and ≥ 10% of their core units (q ≥ 0.9) detected (`present_prob` ≥ 0.5), then gathered over those units (G0).
+  - *Components:* candidates linked by shared hit units are fitted in up to 3 rounds. In later rounds each sees the others at their posterior means: per unit, the chance one carries it, their depth and survival.
+    - Where both carry a unit, its k-mers are in either allele (1 − (1 − f)(1 − f_o)), at the depth that keeps the expected hits (moment matching). The plain sum of depths biased both species ~5% low.
+    - *Bug found and fixed:* a species refitted within a round lost its presence (0 until the round's update), so the others saw it as absent.
+  - *Outputs so far (Python):* `OneStrain` holds the log BF, both βs and slab centres, the posterior over (placement, λ), and per unit P(carried), E[depth | carried] and E[f | carried] (`_unit_summaries`, over cells with ≥ 10⁻⁶ of the posterior). The CLI and output files are step 5.
+  - *Cost:* a 50-genome, 6000-unit species takes 2.1 s; the test species (≤ 12 genomes, ≤ 600 units) take ~0.3 s. Real samples are to be measured in the benchmark (gate: under the query's time).
+  - Tests (simulated profiles, `tests/python/genome_sim.py`: strains' k-mers kept with survival *f*, hit ~ Poisson, fitted as the zero-truncated EM does):
+    - `test_held_out_strain_is_placed_in_its_clade_at_its_depth`: ≥ 0.9 of the posterior in its clade, depth within 10% at 1× and 3×, inside its interval; clade accessory units it lacks get carriage < 0.5;
+    - `test_absent_species_is_absent`: P < 0.01, and the screen drops it;
+    - `test_outside_organism_sharing_part_of_a_core_is_not_the_species`: 20% and 40% sharing, P < 0.5 (the regression);
+    - `test_strain_unlike_every_reference_is_novel`: P(ℓ > 0.5) > 0.5 for a random accessory set, and not for a panel genome;
+    - `test_species_sharing_units_are_fitted_together`: two species sharing 100 units, depths within 10% (2.01 and 1.01), shared units carried by both.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
