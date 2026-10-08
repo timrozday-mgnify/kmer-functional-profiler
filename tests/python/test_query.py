@@ -177,10 +177,14 @@ def test_posterior_intervals_bracket_estimates(members: Path) -> None:
     index = build(members, t_base=1.0, fp_bits=64)
     plain = profile(index, *READS, all_estimators=True)
     got = profile(index, *READS, draws=60, all_estimators=True)
-    assert "coverage_zi_lo" not in plain.columns
+    # without draws the interval is closed-form (coverage_interval), with them the posterior's
+    assert "coverage_zi_dispersion" in plain.columns and "coverage_zi_dispersion" not in got
+    closed = ("coverage_zi_lo", "coverage_zi_hi", "coverage_zi_dispersion")
     # intervals and groups change nothing else
     posterior = ("^coverage_zi_(lo|hi)$", "^.*abundance_zi_(lo|hi)$", "^group_coverage.*$")
-    assert got.drop(*posterior, "ambiguity_group", "group_size", "own_evidence").equals(plain)
+    assert got.drop(*posterior, "ambiguity_group", "group_size", "own_evidence").equals(
+        plain.drop(*closed)
+    )
     assert got["own_evidence"].drop_nulls().is_between(0, 1).all()
     found = got.filter(pl.col("coverage_zi") > 0)
     assert (found["coverage_zi_lo"] <= found["coverage_zi_hi"]).all()
@@ -1057,13 +1061,46 @@ def test_em_fits_components_independently() -> None:
             assert got[col].to_list() == pytest.approx(alone[col].to_list(), rel=1e-12)
 
 
-def test_default_fits_em_only(members: Path) -> None:
-    # The benchmark estimators are opt-in and leave the shipped columns unchanged.
+def test_default_fits_em_and_zi(members: Path) -> None:
+    # coverage_zi (with its interval) is shipped; the benchmark estimators and aai are opt-in
+    # and leave the shipped columns unchanged.
     index = build(members, t_base=1.0, fp_bits=64)
     default, full = profile(index, *READS), profile(index, *READS, all_estimators=True)
-    assert not any(c.endswith(("_zi", "_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
+    assert {"coverage_em", "coverage_zi", "coverage_zi_lo", "coverage_zi_hi"} <= set(
+        default.columns
+    )
+    assert not any(c.endswith(("_zib", "_zip", "_wta", "_ufirst")) for c in default.columns)
+    assert "aai" not in default.columns
     assert {"coverage_zi", "coverage_zib", "coverage_zip", "kmers_wta"} <= set(full.columns)
     assert default.equals(full.select(default.columns))
+
+
+def test_coverage_interval_and_kmer_dispersion() -> None:
+    # Poisson hits at coverage 4 on 400 k-mers: the interval holds 4 and is narrow; with
+    # each k-mer hit about once (coverage ~0) the lower bound is ~0; inflation widens it.
+    rng = np.random.default_rng(3)
+    hits = rng.poisson(4.0, 400)
+    hits = hits[hits > 0]
+    lam = query.ztp_lambda(np.array([hits.mean()]))
+    lo, hi = query.coverage_interval(lam, np.array([hits.size], dtype=float), np.ones(1))
+    assert lo[0] < 4.0 < hi[0] and hi[0] / lo[0] < 1.5
+    lo1, hi1 = query.coverage_interval(np.array([0.05]), np.array([20.0]), np.ones(1))
+    assert lo1[0] < 0.01 and 0.05 < hi1[0] < 2
+    lo4, hi4 = query.coverage_interval(lam, np.array([hits.size], dtype=float), np.full(1, 4.0))
+    assert lo4[0] < lo[0] and hi4[0] > hi[0]
+    # dispersion: Poisson k-mers ~1; a two-depth mix (strains at 2 and 20) well above 1;
+    # k-mers another unit also holds do not count
+    mix = np.r_[rng.poisson(2.0, 200), rng.poisson(20.0, 200)]
+    mix = mix[mix > 0]
+    kmers = pl.DataFrame({
+        "unit": np.r_[np.zeros(hits.size), np.ones(mix.size), [0, 1]].astype(np.uint32),
+        "hash": np.r_[np.arange(hits.size), 10_000 + np.arange(mix.size), [99_999, 99_999]],
+        "hits": np.r_[hits, mix, [500, 500]],
+    })  # fmt: skip
+    mix_lam = query.ztp_lambda(np.array([mix.mean()]))[0]
+    cov = pl.DataFrame({"unit": np.array([0, 1], dtype=np.uint32), "coverage": [lam[0], mix_lam]})
+    got = dict(query.kmer_dispersion(kmers, cov).iter_rows())
+    assert got[0] == pytest.approx(1.0, abs=0.3) and got[1] > 5
 
 
 def test_summed_batches_equal_one_aggregation() -> None:

@@ -229,7 +229,7 @@ def query(
         bool,
         typer.Option(
             help="Also fit the benchmark estimators (zero-inflated, empirical-Bayes, p_in-"
-            "weighted EM; winner-take-all, uniqueness-first); coverage_em is the default"
+            "weighted EM; winner-take-all, uniqueness-first); coverage_zi is the default"
         ),
     ] = False,
     em_start: Annotated[
