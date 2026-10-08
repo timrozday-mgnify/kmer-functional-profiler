@@ -176,7 +176,7 @@ process MGNIFY_MEMBERS {
 
 process MGNIFY_NEAREST {
     tag "${name}"
-    label 'process_medium'
+    label 'process_high_memory'
     publishDir "${params.outdir}/mgnify", mode: 'copy', saveAs: { "${name}_gene_units.parquet" }
 
     input:
