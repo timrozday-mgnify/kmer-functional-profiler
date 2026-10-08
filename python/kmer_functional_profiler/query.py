@@ -1611,7 +1611,7 @@ def _ztnb_mean(mean: np.ndarray, v: float, iterations: int = 60) -> np.ndarray:
     for _ in range(iterations):
         p0 = np.exp(-mu) if v == 0 else (1 + v * mu) ** (-1 / v)
         mu = np.maximum(mean * (1 - p0), 1e-3)
-    return mu
+    return np.asarray(mu)
 
 
 def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
