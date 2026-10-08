@@ -2047,7 +2047,8 @@ def profile(
     ``coverage_zi_lo``/``_hi`` (:func:`coverage_interval`, widened by read clumping and by
     ``coverage_zi_dispersion``, :func:`kmer_dispersion`; with ``draws`` > 0 the posterior's
     instead); ``coverage_em`` and ``hits_em`` stay. ``coverage_mix`` and ``mix_rates``
-    correct ``coverage_zi`` for strains at several depths (:func:`rate_mixture`).
+    (:func:`rate_mixture`, strains at several depths) are experimental, with
+    ``all_estimators`` only.
     ``aai`` is fitted with ``with_aai``,
     ``draws``, ``summary`` or ``all_estimators``; the other estimators (``_zib``, ``_zip``,
     ``_wta``, ``_ufirst``) only with ``all_estimators`` (benchmarks).
@@ -2372,7 +2373,8 @@ def profile(
         if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
             fitted_zi = fitted_zi.hstack(estimate)
         unit_kmers = detected.select("unit", "hash", "hits")
-        fitted_zi = fitted_zi.join(rate_mixture(unit_kmers, zi), on="unit", how="left")
+        if all_estimators:  # experimental: rarely splits real units (step 35, HPC results)
+            fitted_zi = fitted_zi.join(rate_mixture(unit_kmers, zi), on="unit", how="left")
         if draws == 0:  # with draws, the posterior gives coverage_zi's interval
             spread = kmer_dispersion(unit_kmers, zi)
             zi = zi.join(spread, on="unit", how="left")
