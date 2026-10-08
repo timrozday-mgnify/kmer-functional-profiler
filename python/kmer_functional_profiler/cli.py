@@ -435,6 +435,13 @@ def query(
     kmers: Annotated[
         Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
     ] = None,
+    own_hist: Annotated[
+        Path | None,
+        typer.Option(
+            help="Parquet of each unit's hit histogram over the k-mers only it holds (unit, "
+            "hits, kmers): the strain-mixture evidence of kfp-genomes place"
+        ),
+    ] = None,
     stats: Annotated[
         Path | None,
         typer.Option(
@@ -528,6 +535,7 @@ def query(
             min_qual=min_qual,
             draws=draws,
             kmers_out=kmers,
+            own_hist_out=own_hist,
             timer=timer if stats else None,
             all_estimators=all_estimators,
             low_memory=low_memory,

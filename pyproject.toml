@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 kmer-functional-profiler = "kmer_functional_profiler.cli:app"
 kfp-prior = "kfp_prior.cli:app"
+kfp-genomes = "kfp_genomes.cli:app"
 
 [dependency-groups]
 bench = ["insilicoseq>=2.0.1", "mappy>=2.31"]
@@ -42,6 +43,7 @@ python-source = "python"
 module-name = "kmer_functional_profiler._core"
 python-packages = [
   "kfp_prior",
+  "kfp_genomes",
 ] # the companion (plan: Genome-informed unit presence)
 features = ["pyo3/extension-module"]
 profile = "release"

@@ -2199,6 +2199,35 @@ Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-spe
 
 * **Phase 12, plan (2026-10-08).** Genome profile and functional update, written from the user's design (Decided 2026-10-08). It replaces Genome-informed unit presence (`kfp-prior`). That section is removed; its rationale, qualifications, worked example and evaluation are carried over. No code yet.
 
+* **Phase 12, step 0 — `dev-genomes` (2026-10-08).** Branched from `origin/main` (step 35's evidence columns) with `origin/dev-species` merged in. The plan's conflicts were resolved by keeping main's phase 12 design and adding dev-species' phase 10/11 progress-log entries and table rows. In `bench.py`, kfp-prior's `DEPTH_BINS` was renamed `PRIOR_DEPTH_BINS`, because it clashed with step 35's. 174 tests pass.
+  - *Amendment:* `kfp_prior` is deleted at step 6, not step 0. Its replacement, `update --genomes`, lands there, and the fmh and species benchmarks call `kfp-prior update` until then.
+  - *Amendment:* `species-index`'s builders are reused by `panel` (imported from `species.py`), not moved. The species model is still a baseline arm and needs them. They move when its commands are removed (step 9).
+
+* **Phase 12, step 1 — evidence layer (`kfp_genomes/evidence.py`; query: `present_llr`, `--own-hist`).**
+  - *Package:* `python/kfp_genomes` (`kfp-genomes` CLI, commands added per step) imports the profiler but is never imported by it.
+  - *Query:*
+    - `present_llr` is `present_prob`'s evidence alone: log P(own hits | present) / P(own hits | absent), with P(h | present) = w_h / Σ w at `presence`'s fixed point. So `present_prob` = expit(`present_llr` + log(Σ w / A)), with one prior odds per sample. It is capped at ±100 (units at `H_CAP` have no background chance) and null for units gather drops.
+    - `query --own-hist` writes the strain-mixture sidecar: per unit, the histogram of hits over the k-mers only it holds (`unit`, `hits`, `kmers`), for units with ≥ 10 such k-mers. These are `rate_mixture`'s input, so it runs without `--all-estimators`.
+    - `rate_mixture`'s one-rate fit and shape rule were split out unchanged (`ztnb_one_rate`, `mix_shape`, `own_histogram`) so that `kfp-genomes` uses the same ones.
+  - *Unit likelihood (amendment: survival per k-mer).* A unit carried at depth *D* by an allele keeping a share *f* of its *m* kept k-mers is modelled as follows. Each k-mer is present with probability *f* and, if present, hit ~ Poisson(*D*). So log L = k log f + (m − k) log(1 − f(1 − e^−D)) + H log D − k D, tempered by dispersion × clumping.
+    - The plan's form was a binomial on a fixed *m f* k-mers. It is −∞ whenever the sample's allele keeps more k-mers than the reference's survival predicts, which is the normal case for a strain closer to the unit than its reference.
+    - The per-k-mer form is exact when survival is random per k-mer (the AAI model's assumption). It has the same maximum, (`coverage_zi`, `present_zi`). Profiled over *f*, it is the zero-truncated Poisson, so its likelihood-ratio interval is `coverage_interval`.
+    - The zero-hit term is (1 − f(1 − e^−D))^m, which is e^(−D m) at f = 1 (the plan's e^(−D m f) holds only for a fixed *m f* k-mers).
+    - *k* and *H* are rebuilt from the profile: k = π m (1 − e^−c) and H = π m c, at `coverage_zi` c and `present_zi` π. *m* is the fit's tier (`m_dense` when the index has one). Zero-hit units use tier-2 `m_g` from the panel.
+  - *Not carried, and the background (amendment).* A hit unit not carried by a strain is either present from outside the panel (prior β), with the generic marginal M = ∫ L over log-uniform *D* ∈ [0.01, 1000] and uniform *f*, or absent and hit by background. Taking `present_llr` as log M / P(evidence | absent), L(not carried) / M = β + (1 − β) e^−llr. A zero-hit unit not carried has likelihood 1 − β(1 − ε), with ε = P(no hits | present) under the same generic prior.
+    - A strain model then needs only the ratio L(carried) / L(not carried) per unit (`UnitTerms.log_ratio`).
+    - Units gather explained away get ratio 1: their own k-mers are unknown to the profile, so they carry no evidence either way.
+    - β is fitted per species in `place` (step 3), not once per sample (see there).
+  - *Strain mixtures:* `mixture_loglik` is the own-k-mer histogram's likelihood at fixed rates, with weights maximised by EM. With one rate it equals `rate_mixture`'s one-rate fit.
+  - Tests:
+    - `test_likelihood_peaks_at_coverage_zi_and_present_zi`;
+    - `test_profile_interval_over_survival_is_coverage_interval`;
+    - `test_zero_hit_term_matches_simulation`;
+    - `test_histogram_with_one_rate_is_rate_mixtures_one_rate_fit`;
+    - `test_unit_ratios_favour_the_fitted_depth_and_doubt_missed_units`;
+    - `present_llr`'s single prior odds in `test_presence_doubts_few_and_shared_hits`;
+    - `--own-hist` and `present_llr` in `test_cli_query`.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.

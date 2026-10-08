@@ -1019,6 +1019,7 @@ def fit_present_prior(
 BACKGROUND: Final = 1e-6
 CLUMP: Final = 0.3
 H_CAP: Final = 20  # hit counts pooled at and above this in the present-unit distribution
+LLR_CAP: Final = 100.0  # |present_llr| capped: units at H_CAP are never background (+inf)
 
 
 def presence(
@@ -1076,6 +1077,7 @@ def presence(
     )
     prob = np.ones(len(units))
     it, done = 0, False
+    w = np.zeros(H_CAP + 1)
     while not done and it < max_iter:
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
         new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
@@ -1085,9 +1087,14 @@ def presence(
     if report is not None:
         report["presence_iterations"] = it
         report["presence_converged"] = int(done)
+    # The evidence alone, prior separable (phase 12, step 1): log P(h | present) / P(h |
+    # absent), with P(h | present) = w_h / Σ w; present_prob = expit(present_llr + log(Σ w /
+    # A)), one prior odds for every unit of the sample.
+    with np.errstate(divide="ignore"):
+        llr = np.log(w[capped] / max(w.sum(), 1e-300)) - np.log(absent)
     return pl.DataFrame(
-        {"unit": units, "present_prob": prob},
-        schema={"unit": pl.UInt32, "present_prob": pl.Float64},
+        {"unit": units, "present_prob": prob, "present_llr": np.clip(llr, -LLR_CAP, LLR_CAP)},
+        schema={"unit": pl.UInt32, "present_prob": pl.Float64, "present_llr": pl.Float64},
     )
 
 
@@ -1646,6 +1653,45 @@ def _ztnb_mean(mean: np.ndarray, v: float, iterations: int = 60) -> np.ndarray:
     return np.asarray(mu)
 
 
+def ztnb_one_rate(
+    u: np.ndarray, h: np.ndarray, c: np.ndarray, v: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per unit (ids ``u`` 0..n-1), the one-rate zero-truncated negative binomial fit of
+    hit-count histogram rows (``h`` hits, ``c`` k-mers with them) at squared CV ``v``: its
+    mean mu (closed form) and log-likelihood (without the log h! terms)."""
+    n = int(u.max()) + 1 if len(u) else 0
+    cnt = np.bincount(u, c, n)
+    mu = _ztnb_mean(np.bincount(u, c * h, n) / np.maximum(cnt, 1e-300), v)
+    return mu, np.bincount(u, c * _ztnb_logpmf(h, mu[u], v), n)
+
+
+def mix_shape(u: np.ndarray, h: np.ndarray, c: np.ndarray) -> float:
+    """The sample's squared CV of uneven coverage along a gene (:func:`rate_mixture`): the
+    median of each unit's best one-rate shape over units with mean hits >=
+    ``MIX_SHAPE_DEPTH`` (rows as :func:`ztnb_one_rate`'s, units with enough k-mers only)."""
+    n = int(u.max()) + 1 if len(u) else 0
+    mean = np.bincount(u, c * h, n) / np.maximum(np.bincount(u, c, n), 1e-300)
+    ll = np.stack([ztnb_one_rate(u, h, c, v)[1] for v in MIX_SHAPES], 1)
+    deep = mean >= MIX_SHAPE_DEPTH
+    # ponytail: one shape per sample; per-gene-length shapes if short genes' ends dominate
+    return float(np.median(np.asarray(MIX_SHAPES)[ll[deep].argmax(1)])) if deep.any() else 0.0
+
+
+def own_histogram(kmers: pl.DataFrame) -> pl.DataFrame:
+    """Per unit, the histogram of hits over the hit k-mers only it holds in ``kmers``
+    (``unit``, ``hash``, ``hits``): ``unit``, ``hits``, ``kmers`` (how many such k-mers had
+    that many hits), units with ``MIN_DISPERSION_KMERS`` such k-mers only. :func:`rate_mixture`'s
+    input, and the strain-mixture sidecar of ``query --own-hist`` (phase 12, step 1)."""
+    own = kmers.filter(pl.len().over("hash") == 1)
+    enough = own.group_by("unit").agg(n=pl.len()).filter(pl.col("n") >= MIN_DISPERSION_KMERS)
+    return (
+        own.join(enough, on="unit", how="semi")
+        .group_by("unit", "hits")
+        .agg(kmers=pl.len().cast(pl.UInt32))
+        .sort("unit", "hits")
+    )
+
+
 def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
     """Per unit, ``coverage`` (``unit``, ``coverage``) corrected for a strain mix:
     ``coverage_mix`` and ``mix_rates`` (step 35, open item 3).
@@ -1671,16 +1717,8 @@ def rate_mixture(kmers: pl.DataFrame, coverage: pl.DataFrame) -> pl.DataFrame:
     c = rows["c"].to_numpy().astype(np.float64)
     cnt = np.bincount(u, c, n)
     mean = np.bincount(u, c * h, n) / cnt
-
-    def one(v: float) -> tuple[np.ndarray, np.ndarray]:  # one rate: closed form
-        mu = _ztnb_mean(mean, v)
-        return mu, np.bincount(u, c * _ztnb_logpmf(h, mu[u], v), n)
-
-    ll = np.stack([one(v)[1] for v in MIX_SHAPES], 1)
-    deep = mean >= MIX_SHAPE_DEPTH
-    # ponytail: one shape per sample; per-gene-length shapes if short genes' ends dominate
-    v = float(np.median(np.asarray(MIX_SHAPES)[ll[deep].argmax(1)])) if deep.any() else 0.0
-    mu1, ll1 = one(v)
+    v = mix_shape(u, h, c)
+    mu1, ll1 = ztnb_one_rate(u, h, c, v)
     best, top, rates = -2 * ll1 + np.log(cnt), mu1.copy(), np.ones(n, dtype=np.uint8)
     for k in (2, 3):
         mu = np.maximum(mean[:, None] * np.exp(np.linspace(-1, 1, k))[None], 0.5)
@@ -2051,6 +2089,7 @@ def profile(
     batch_reads: int = 100_000,
     draws: int = 0,
     kmers_out: str | Path | None = None,
+    own_hist_out: str | Path | None = None,
     timer: Timer | None = None,
     all_estimators: bool = False,
     low_memory: bool = False,
@@ -2100,7 +2139,10 @@ def profile(
     are kept from the first pass over the reads, or with ``low_memory`` rebuilt by a second
     pass for the detected units' k-mers only (same result; a read pass more, the rows of
     all hit units never held). ``kmers_out`` writes
-    the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
+    the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet;
+    ``own_hist_out`` the strain-mixture sidecar (:func:`own_histogram`, over the k-mers the
+    zero-inflated EM is fitted on). ``present_llr`` is ``present_prob``'s evidence alone
+    (:func:`presence`), null for units gather drops.
 
     Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
     unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` on the units gather keeps
@@ -2409,6 +2451,10 @@ def profile(
         if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
             fitted_zi = fitted_zi.hstack(estimate)
         unit_kmers = detected.select("unit", "hash", "hits")
+        if own_hist_out is not None:  # back to the index's unit ids
+            own_histogram(unit_kmers).join(hit_info.select("unit", "index"), on="unit").select(
+                unit="index", hits="hits", kmers="kmers"
+            ).sort("unit", "hits").write_parquet(own_hist_out)
         if all_estimators:  # experimental: rarely splits real units (step 35, HPC results)
             fitted_zi = fitted_zi.join(rate_mixture(unit_kmers, zi), on="unit", how="left")
         if draws == 0:  # with draws, the posterior gives coverage_zi's interval
