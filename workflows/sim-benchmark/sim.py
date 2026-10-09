@@ -2,7 +2,8 @@
 
 Reference: ``--families`` full-length seed proteins (200-600 aa) from ``--seed-fasta``,
 by default the MGnify sample (``scripts/fetch_mgnify_sample.py``; ``FL=0`` records
-skipped). Each family has ``--paralogs`` units: the seed mutated to 85-95% identity, so
+skipped). Each family has ``--paralogs`` units: the seed mutated to 85-95% identity
+(``--paralog-identity``), so
 paralogs share k-mers as close MGnify90 clusters do. A unit's
 ``--members`` members are its centroid mutated to 97%, as in a 90% cluster.
 
@@ -101,9 +102,29 @@ def seed_proteins(path: Path, n: int) -> list[str]:
     return full[:n]
 
 
+SITE_GAMMA: float | None = None  # --site-gamma: shape of per-site rates; None = uniform
+SITE_RATES: dict[int, np.ndarray] = {}  # site rates by sequence length
+
+
 def mutate(seq: str, identity: float, rng: random.Random) -> str:
-    out = list(seq)
-    for i in rng.sample(range(len(seq)), round((1 - identity) * len(seq))):
+    """Substitute (1 - identity) of the sites: uniformly, or by gamma site rates
+    (``--site-gamma``). Lengths never change, so one rate vector per length gives a family's
+    paralogs, members and strains the same conserved sites (families of equal length share
+    theirs)."""
+    out, n = list(seq), round((1 - identity) * len(seq))
+    rates = None
+    if SITE_GAMMA:
+        rates = SITE_RATES.setdefault(
+            len(seq), np.random.default_rng(len(seq)).gamma(SITE_GAMMA, 1.0, len(seq))
+        )
+    sites = (
+        rng.sample(range(len(seq)), n)
+        if rates is None
+        else np.random.default_rng(rng.randrange(2**32)).choice(
+            len(seq), n, replace=False, p=rates / rates.sum()
+        )
+    )
+    for i in sites:
         out[i] = rng.choice(AMINO.replace(seq[i], ""))
     return "".join(out)
 
@@ -126,7 +147,7 @@ def reference(args: argparse.Namespace) -> tuple[pl.DataFrame, pl.DataFrame]:
     for family, seed in enumerate(seed_proteins(args.seed_fasta, args.families)):
         first = len(units)
         for _ in range(args.paralogs):
-            add(family, mutate(seed, rng.uniform(0.85, 0.95), rng), None)
+            add(family, mutate(seed, rng.uniform(*args.paralog_identity), rng), None)
         if rng.random() < args.twins:  # a near-identical paralog: barely separable
             add(family, mutate(units[first][2], 0.99, rng), first)
     return (
@@ -147,33 +168,43 @@ def reference(args: argparse.Namespace) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def sample(units: pl.DataFrame, args: argparse.Namespace, seed: int, fasta: Path) -> pl.DataFrame:
-    """Write the sample's reads to ``fasta``; return truth (``unit``, ``depth``, ``identity``,
-    ``strain``)."""
+    """Write the sample's reads to ``fasta`` (FASTQ, Phred from ``--error``, if it ends in
+    ``.fq``); return truth (``unit``, ``depth``, ``identity``, ``strain``, and the read bases
+    in its CDS and in its flanks, ``cds_bases`` and ``flank_bases``). Strains are at
+    ``--identity`` if set, else drawn from ``IDENTITIES``."""
     rng = random.Random(seed)
+    identities = (args.identity,) if getattr(args, "identity", None) else IDENTITIES
     chosen = rng.sample(range(units.height), round(args.present * units.height))
     truth, reads = [], []
     for unit in chosen:
-        identity = rng.choice(IDENTITIES)
+        identity = rng.choice(identities)
         depth = min(math.exp(rng.gauss(1.0, 1.0)), 50.0)
         strain = mutate(units["centroid"][unit], identity, rng)
         cds = "".join(rng.choice(SYNONYMS[aa]) for aa in strain) + "TAA"
         seq = "".join(rng.choices(BASES, k=FLANK)) + cds + "".join(rng.choices(BASES, k=FLANK))
         n = round(depth * len(seq) / READ)
+        cds_bases = 0
         for _ in range(n):
             start = rng.randrange(len(seq) - READ + 1)
+            cds_bases += max(0, min(start + READ, FLANK + len(cds)) - max(start, FLANK))
             read = seq[start : start + READ]
             if rng.random() < 0.5:
                 read = reverse_complement(read.encode()).decode()
             reads.append(read)
-        truth.append((unit, depth, identity, strain))
+        truth.append((unit, depth, identity, strain, cds_bases, n * READ - cds_bases))
     n_decoys = round(args.decoys * len(reads))
     reads += ["".join(rng.choices(BASES, k=READ)) for _ in range(n_decoys)]
     reads = [
         "".join(rng.choice(BASES.replace(b, "")) if rng.random() < args.error else b for b in r)
         for r in reads
     ]
-    fasta.write_text("".join(f">r{i}\n{r}\n" for i, r in enumerate(reads)))
-    return pl.DataFrame(truth, schema=["unit", "depth", "identity", "strain"], orient="row")
+    if fasta.suffix == ".fq":
+        qual = chr(33 + round(-10 * math.log10(max(args.error, 1e-4))))
+        fasta.write_text("".join(f"@r{i}\n{r}\n+\n{qual * len(r)}\n" for i, r in enumerate(reads)))
+    else:
+        fasta.write_text("".join(f">r{i}\n{r}\n" for i, r in enumerate(reads)))
+    schema = ["unit", "depth", "identity", "strain", "cds_bases", "flank_bases"]
+    return pl.DataFrame(truth, schema=schema, orient="row")
 
 
 def score(truth: pl.DataFrame, found: pl.DataFrame, families: pl.DataFrame) -> dict[str, float]:
@@ -385,12 +416,76 @@ def calibration(truth: pl.DataFrame, result: pl.DataFrame, units: pl.DataFrame) 
     }
 
 
+def unknown_ladder(args: argparse.Namespace, members: pl.DataFrame, units: pl.DataFrame) -> None:
+    """Phase 7, step 14's evaluation of the unknown fraction: per ``--holdout`` fraction h,
+    the first h of the families (in a fixed shuffled order, so the ladder is nested) are left
+    out of the index, whole, so their reads have no relative in it. Each seed's sample (FASTQ,
+    so ``error_thinning`` sees ``--error``) is profiled with ``summary``; truth is the share of
+    read bases in CDSs of indexed units (``truth_known``), of held-out units
+    (``truth_heldout``), in flanks (``truth_noncoding``) and decoys (``truth_decoy``).
+    ``explained_err`` = ``explained_fraction`` - ``truth_known``. Writes
+    ``unknown_scores.tsv`` and ``unknown_summary.tsv``."""
+    order = list(range(int(units["family"].max()) + 1))  # type: ignore[arg-type]
+    random.Random(1).shuffle(order)
+    rows = []
+    for config, h in itertools.product(args.configs, args.holdout):
+        held = set(order[: round(h * len(order))])
+        kept = units.filter(~pl.col("family").is_in(held))["unit"]
+        name = f"{config}_h{round(h * 100)}"
+        members.filter(pl.col("cluster_rep").is_in(kept.to_list())).write_parquet(
+            args.out / "kept.parquet"
+        )
+        build_index(args.out / "kept.parquet", args.out / f"index_{name}", CONFIGS[config])
+        index = Index.load(args.out / f"index_{name}")
+        for seed in range(1, args.seeds + 1):
+            reads = args.out / f"reads_{seed}.fq"
+            truth = sample(units, args, seed, reads).join(units.select("unit", "family"), on="unit")
+            summary: dict[str, float | int | None] = {}
+            profile(index, reads, summary=summary)
+            bases = summary["bases"]
+            assert bases
+            is_held = pl.col("family").is_in(held)
+            cds = truth.select(
+                known=pl.col("cds_bases").filter(~is_held).sum(),
+                heldout=pl.col("cds_bases").filter(is_held).sum(),
+                flanks=pl.col("flank_bases").sum(),
+            ).row(0, named=True)
+            row = {
+                "config": config, "holdout": h, "identity": args.identity, "seed": seed,
+                "truth_known": cds["known"] / bases, "truth_heldout": cds["heldout"] / bases,
+                "truth_noncoding": cds["flanks"] / bases,
+                "truth_decoy": 1 - (cds["known"] + cds["heldout"] + cds["flanks"]) / bases,
+                **{k: summary[k] for k in ("explained_fraction", "census_containment",
+                                           "error_thinning", "census_kmers")},
+            }  # fmt: skip
+            row["explained_err"] = (row["explained_fraction"] or 0.0) - row["truth_known"]
+            rows.append(row)
+    scores = pl.DataFrame(rows, infer_schema_length=None)
+    scores.write_csv(args.out / "unknown_scores.tsv", separator="\t")
+    summary_df = (
+        scores.group_by("config", "holdout", maintain_order=True)
+        .agg(pl.exclude("seed", "identity").mean())
+        .with_columns(pl.selectors.float().round(3))
+    )
+    summary_df.write_csv(args.out / "unknown_summary.tsv", separator="\t")
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200):
+        print(summary_df)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed-fasta", type=Path, default=SEEDS_FASTA)
     parser.add_argument("--families", type=int, default=100)
     parser.add_argument("--paralogs", type=int, default=3)
     parser.add_argument("--members", type=int, default=4)
+    parser.add_argument(
+        "--paralog-identity",
+        type=float,
+        nargs=2,
+        default=(0.85, 0.95),
+        metavar=("LO", "HI"),
+        help="paralog centroids' identity to the seed",
+    )
     parser.add_argument("--present", type=float, default=0.5)
     parser.add_argument("--error", type=float, default=0.002)
     parser.add_argument("--decoys", type=float, default=0.2)
@@ -401,11 +496,28 @@ def main() -> None:
     parser.add_argument("--frames", nargs="+", default=["stopfree"],
                         help="frame modes queried, e.g. stopfree edges:20 all")  # fmt: skip
     parser.add_argument("--out", type=Path, default=Path("sim-results"))
+    parser.add_argument(
+        "--holdout",
+        type=float,
+        nargs="+",
+        help="run the unknown-fraction ladder: shares of families held out",
+    )
+    parser.add_argument("--identity", type=float, help="every strain at this identity")
+    parser.add_argument(
+        "--site-gamma",
+        type=float,
+        help="gamma shape of per-site substitution rates (clustered variation)",
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    global SITE_GAMMA
+    SITE_GAMMA = args.site_gamma
 
     members, units = reference(args)
     members.write_parquet(args.out / "members.parquet")
+    if args.holdout:
+        unknown_ladder(args, members, units)
+        return
     families = units.select("unit", "family", length=pl.col("centroid").str.len_chars())
     rows = []
     for config in args.configs:

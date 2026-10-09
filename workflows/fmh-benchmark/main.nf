@@ -197,6 +197,71 @@ process MGNIFY_NEAREST {
     "touch gene_units_nearest.parquet"
 }
 
+process HOLDOUT_MEMBERS {
+    tag "${name} h${fraction}"
+    label 'process_medium'
+
+    input:
+    tuple val(name), val(fraction), val(args), path(members, stageAs: 'members/*'), path(gene_units)
+    path genomes
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(name), val(args), path('held/members.parquet'), emit: members
+
+    script:
+    """
+    mkdir held
+    ${params.bench} holdout-members --members ${members} --gene-units ${gene_units} \
+        --genomes-dir ${genomes} --fraction ${fraction} --min-id ${params.holdout_min_id} \
+        --out held/members.parquet
+    """
+
+    stub:
+    "mkdir held && touch held/members.parquet"
+}
+
+process UNKNOWN_SCORE {
+    tag "seed ${sid} ${name}${arm ? '~' + arm : ''}"
+    label 'process_single'
+
+    input:
+    tuple val(sid), val(name), val(arm), val(fraction), path(summary), path(gene_units), path(genes)
+    path genomes
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'unknown_score.tsv', emit: score
+
+    script:
+    """
+    ${params.bench} unknown-score --summary ${summary} --gene-units ${gene_units} --genes ${genes} \
+        --genomes-dir ${genomes} --fraction ${fraction} --min-id ${params.holdout_min_id} \
+        --sample seed${sid} --index ${name} --arm '${arm}'
+    """
+
+    stub:
+    "touch unknown_score.tsv"
+}
+
+process UNKNOWN_SUMMARY {
+    label 'process_single'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path scores, stageAs: 'unknown*.tsv'
+
+    output:
+    path 'unknown_summary.tsv'
+    path 'unknown_scores.tsv'
+
+    script:
+    "${params.bench} summary ${scores} --keys index arm holdout --out unknown_summary.tsv --scores-out unknown_scores.tsv"
+
+    stub:
+    "touch unknown_summary.tsv unknown_scores.tsv"
+}
+
 process AAI_SCORE {
     tag "seed ${sid} ${name}${arm ? '~' + arm : ''}${model_name ? '+' + model_name : ''}"
     label 'process_single'
@@ -417,7 +482,8 @@ process PROFILE {
     // one saveAs for both outputs: without the per-file branch they overwrite each other
     publishDir params.outdir, mode: 'copy', saveAs: { f ->
         def id = "seed${sid}_${name}${arm ? '~' + arm : ''}"
-        f.endsWith('.parquet') ? "kmers/${id}.parquet" : f == 'units.tsv' ? "units/${id}.tsv" : "profiles/${id}.tsv"
+        f.endsWith('.parquet') ? "kmers/${id}.parquet" : f == 'units.tsv' ? "units/${id}.tsv" :
+            f == 'summary.json' ? "summaries/${id}.json" : "profiles/${id}.tsv"
     }
 
     input:
@@ -427,12 +493,14 @@ process PROFILE {
     output:
     tuple val(sid), val(label), val(name), val(arm), path('profile.tsv'), path('kmers.parquet'), emit: profile
     tuple val(sid), val(name), val(arm), path('units.tsv'), emit: units, optional: true
+    tuple val(sid), val(name), val(arm), path('summary.json'), emit: summary, optional: true
 
     script:
     // by_pfam: units carry Pfam labels (MGnify90 clusters), and the profile is summed per Pfam
     def out = by_pfam ? 'units.tsv' : 'profile.tsv'
     def per_pfam = "${params.bench} pfam-profile --profile units.tsv --unit-pfam ${index}/unit_pfam.parquet"
-    def extra = (mask ? ' --mask mask' : '') + (decoy ? ' --extra-index decoy' : '')
+    def extra = (mask ? ' --mask mask' : '') + (decoy ? ' --extra-index decoy' : '') +
+        (params.holdout && by_pfam ? ' --summary summary.json' : '')
     """
     ${params.kfp} query ${index} ${r1} ${r2} --out ${out} --draws ${params.draws} --kmers kmers.parquet \\
         --all-estimators ${args}${extra}
@@ -1039,6 +1107,7 @@ workflow BENCHMARK {
         error "Unknown --labels: ${(labels - ['ko', 'pfam']).join(', ')}"
     }
     def ch_members = channel.of('ko').combine(MEMBERS.out.members)
+    def holdout_fractions = params.holdout.toString().tokenize(',')*.trim()*.toDouble().findAll { it > 0 }
     def ch_domains = channel.value([])
     // MGnify90 indexes: [name, path] (built elsewhere) and/or [members, pfam, args] (built here);
     // members (files or directories) also give the cluster representatives for annotation
@@ -1070,19 +1139,8 @@ workflow BENCHMARK {
     ch_indexes = INDEX.out.index.mix(IMPORT_SKETCHES.out.index)
         .filter { it[0] in labels }
         .map { it + [false] }
-    def ch_mgnify = channel.fromList(mgnify.findAll { it.path }).map { cfg -> [cfg.name, file(cfg.path, checkIfExists: true)] }
-    if (mgnify.any { !it.path }) {
-        MGNIFY_INDEX(
-            channel.fromList(mgnify.findAll { !it.path }).map { cfg ->
-                [cfg.name, cfg.args, files(cfg.members), cfg.pfam ? file(cfg.pfam, checkIfExists: true) : []]
-            },
-            ch_code,
-        )
-        ch_mgnify = ch_mgnify.mix(MGNIFY_INDEX.out.index)
-    }
-    // MGnify indexes are profiled whatever the labels: their unit profiles carry the AAI truth
-    ch_indexes = ch_indexes.mix(ch_mgnify.map { name, index -> ['pfam', name, index, true] })
     def ch_gene_units = channel.empty()  // name, gene_units
+    def ch_rep_units = channel.empty()  // name, gene_units against the representatives
     if (mgnify.any { it.members }) {
         // Entries with the same members (e.g. sparse and dense builds of one subset) share one
         // annotation, run under the first entry's name and handed to the others.
@@ -1113,7 +1171,52 @@ workflow BENCHMARK {
             bench_py,
         )
         ch_gene_units = MGNIFY_NEAREST.out.genes.flatMap { name, genes -> sharing[name].collect { n -> [n, genes] } }
+        ch_rep_units = MGNIFY_GENES.out.genes.flatMap { name, genes -> sharing[name].collect { n -> [n, genes] } }
     }
+    // Unknown-fraction hold-out ladder (plan, phase 7, step 36): each entry built here is also
+    // built without the units the held-out genomes hit, as <name>_h<pct>; holdout_of maps every
+    // index in the ladder to [entry, fraction] (the entry itself is fraction 0).
+    def holdout_of = [:]
+    if (params.holdout) {
+        def built = mgnify.findAll { it.members && !it.path }
+        if (!built || built.any { !it.pfam }) {
+            error "--holdout needs mgnify_indexes entries built here, with members, pfam and args"
+        }
+        built.each { cfg ->
+            holdout_of[cfg.name] = [cfg.name, 0d]
+            holdout_fractions.each { h -> holdout_of["${cfg.name}_h${Math.round(h * 100)}".toString()] = [cfg.name, h] }
+        }
+        HOLDOUT_MEMBERS(
+            channel.fromList(built).flatMap { cfg ->
+                holdout_fractions.collect { h ->
+                    [cfg.name, "${cfg.name}_h${Math.round(h * 100)}".toString(), h, cfg.args, files(cfg.members)]
+                }
+            }
+                .combine(ch_rep_units, by: 0)
+                .map { _base, hname, h, args, members, gene_units -> [hname, h, args, members, gene_units] },
+            FETCH.out.genomes,
+            bench_py,
+        )
+    }
+    def ch_mgnify = channel.fromList(mgnify.findAll { it.path }).map { cfg -> [cfg.name, file(cfg.path, checkIfExists: true)] }
+    if (mgnify.any { !it.path }) {
+        MGNIFY_INDEX(
+            channel.fromList(mgnify.findAll { !it.path }).map { cfg ->
+                [cfg.name, cfg.args, files(cfg.members), cfg.pfam ? file(cfg.pfam, checkIfExists: true) : []]
+            }.mix(
+                // the entry's Pfam table as is: the build joins it on the members kept
+                params.holdout
+                    ? HOLDOUT_MEMBERS.out.members.map { hname, args, members ->
+                        [hname, args, members, file(mgnify.find { it.name == holdout_of[hname][0] }.pfam)]
+                    }
+                    : channel.empty()
+            ),
+            ch_code,
+        )
+        ch_mgnify = ch_mgnify.mix(MGNIFY_INDEX.out.index)
+    }
+    // MGnify indexes are profiled whatever the labels: their unit profiles carry the AAI truth
+    ch_indexes = ch_indexes.mix(ch_mgnify.map { name, index -> ['pfam', name, index, true] })
 
     // Query arms (phase 7): which reads (raw, fastp, hostile), extra query options, and
     // whether the host mask and the human-proteome decoy are used. Default: one plain arm.
@@ -1268,6 +1371,20 @@ workflow BENCHMARK {
     )
     AAI_SCORE(ch_aai.combine(ch_models), bench_py)
     AAI_SUMMARY(AAI_SCORE.out.score.collect())
+    if (params.holdout) {
+        // sid, name, arm, fraction, summary, gene_units (the entry's), truth genes
+        UNKNOWN_SCORE(
+            PROFILE.out.summary
+                .filter { _sid, name, _arm, _summary -> holdout_of.containsKey(name) }
+                .map { sid, name, arm, summary -> [holdout_of[name][0], sid, name, arm, holdout_of[name][1], summary] }
+                .combine(ch_rep_units, by: 0)
+                .map { _base, sid, name, arm, h, summary, gene_units -> [sid, name, arm, h, summary, gene_units] }
+                .combine(TRUTH.out.genes, by: 0),
+            FETCH.out.genomes,
+            bench_py,
+        )
+        UNKNOWN_SUMMARY(UNKNOWN_SCORE.out.score.collect())
+    }
     // aai -> identity map per index and arm, fitted on half the clusters of every seed
     AAI_CALIBRATE(
         ch_aai

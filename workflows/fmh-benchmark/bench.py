@@ -32,6 +32,12 @@
 - ``aai-calibrate``: an inverse map from ``aai`` to alignment identity, fitted on half of
   the clusters of several samples' unit profiles and scored on the other half (see
   :func:`fit_aai_calibration`).
+- ``holdout-members``: an MGnify members table without the units
+  held-out genomes hit (:func:`holdout_units`): the index side of the unknown-fraction
+  hold-out ladder (plan, phase 7, steps 14 and 36).
+- ``unknown-score``: a query's ``--summary`` (``explained_fraction``,
+  ``census_containment``) against the share of read bases from genes that still have a unit
+  in the hold-out index (see :func:`unknown_score`).
 - ``pfam-profile``: a profile against an index with Pfam labels (``unit_pfam.parquet``, e.g.
   MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams.
 - ``score``: purity and completeness of one profile against a truth table, one row per
@@ -445,6 +451,97 @@ def mgnify_members(args: argparse.Namespace) -> None:
     )
 
 
+def holdout_units(
+    genomes_dir: str | Path, gene_units: pl.DataFrame, fraction: float, min_id: float
+) -> tuple[pl.Series, pl.Series]:
+    """Genes of held-out genomes and the units they take with them, for the unknown-fraction
+    ladder (plan, phase 7, step 36). Genomes are shuffled in a fixed order (seed 1), so the
+    ladder is nested: the first ``fraction`` of them are held out. Every unit one of their
+    genes hits at identity >= ``min_id`` (to the representative) and query coverage >= 0.5 is
+    dropped, whichever genome else hits it: a kept genome's gene can lose its unit too, which
+    the truth sees."""
+    genomes = sorted(p.name for p in Path(genomes_dir).iterdir() if p.is_dir())
+    random.Random(1).shuffle(genomes)
+    held = sorted(genomes[: round(fraction * len(genomes))])
+    genes = pl.Series("gene_name", [], pl.String)
+    if held:
+        genes = pl.concat(
+            pl.read_csv(Path(genomes_dir) / g / f"{g}_mapping.csv", columns=["gene_name"])
+            for g in held
+        )["gene_name"].unique()
+    dropped = gene_units.filter(
+        pl.col("gene_name").is_in(genes.implode()),
+        pl.col("identity") >= min_id,
+        pl.col("qcov") >= 0.5,
+    )["cluster_rep"].unique()
+    return genes, dropped
+
+
+def holdout_members(args: argparse.Namespace) -> None:
+    gene_units = pl.read_parquet(args.gene_units)
+    genes, dropped = holdout_units(args.genomes_dir, gene_units, args.fraction, args.min_id)
+    keep = ~pl.col("cluster_rep").is_in(dropped.implode())
+    paths = [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in args.members]
+    pl.scan_parquet(paths).filter(keep).sink_parquet(args.out)  # Pfam rows join on members
+    print(f"held out {genes.len()} genes, dropped {dropped.len()} units", file=sys.stderr)
+
+
+def unknown_score(
+    summary: dict[str, Any],
+    genes: pl.DataFrame,
+    gene_units: pl.DataFrame,
+    held_genes: pl.Series,
+    dropped: pl.Series,
+) -> dict[str, float | None]:
+    """A query's sample summary against read-base truth (plan, phase 7, steps 14 and 36).
+
+    ``genes`` is TRUTH's per-gene table (``gene_name``, ``bases``: aligned read bases over
+    the gene); shares are of the summary's ``bases`` (every read base). A gene is known at
+    t if a unit still in the index matches it at identity >= t (to the representative) and
+    query coverage >= 0.5: ``truth_known_<t>`` for t in 0.9, 0.8, 0.7 and any hit
+    (``truth_known_any``), with ``explained_err_<t>`` = ``explained_fraction`` minus it.
+    ``truth_coding`` is every gene's share, ``truth_heldout`` that of ``held_genes``."""
+    bases = summary.get("bases") or 0
+    out: dict[str, float | None] = {
+        k: summary.get(k)
+        for k in ("explained_fraction", "census_containment", "error_thinning", "census_kmers")
+    }
+    if not bases:
+        return out
+    best = (
+        gene_units.filter(~pl.col("cluster_rep").is_in(dropped.implode()), pl.col("qcov") >= 0.5)
+        .group_by("gene_name")
+        .agg(best=pl.col("identity").max())
+    )
+    g = genes.select("gene_name", "bases").join(best, on="gene_name", how="left")
+
+    def share(e: pl.Expr) -> float:
+        return float(g.filter(e)["bases"].sum()) / bases
+
+    out["truth_coding"] = share(pl.lit(True))
+    out["truth_heldout"] = share(pl.col("gene_name").is_in(held_genes.implode()))
+    explained = out["explained_fraction"]
+    for t, name in ((0.9, "0.9"), (0.8, "0.8"), (0.7, "0.7"), (0.0, "any")):
+        known = share(pl.col("best") >= t)
+        out[f"truth_known_{name}"] = known
+        out[f"explained_err_{name}"] = None if explained is None else explained - known
+    return out
+
+
+def unknown_score_step(args: argparse.Namespace) -> None:
+    gene_units = pl.read_parquet(args.gene_units)
+    held_genes, dropped = holdout_units(args.genomes_dir, gene_units, args.fraction, args.min_id)
+    row = unknown_score(
+        json.loads(Path(args.summary).read_text()),
+        pl.read_csv(args.genes, schema_overrides={"gene_name": pl.String}),
+        gene_units,
+        held_genes,
+        dropped,
+    )
+    key = {"sample": args.sample, "index": args.index, "arm": args.arm, "holdout": args.fraction}
+    pl.DataFrame([key | row]).write_csv(args.out, separator="\t")
+
+
 def mgnify_nearest(args: argparse.Namespace) -> None:
     """``--gene-units`` with ``identity_nearest`` and ``nearest``: per (gene, cluster), the
     member of the cluster with the highest identity among the gene's hits to members with
@@ -678,6 +775,7 @@ def aai_score(
 
 ABUND_ESTIMATES = ("coverage_em", "coverage_zi", "abundance_zi", "coverage_mix")
 DEPTH_BINS = ((0, 1), (1, 2), (2, 5), (5, float("inf")))  # true depth
+SCALE_MIN_DEPTH = 2.0  # true depth of the units that set abund_scale
 GENE_BINS = ((1, 2), (2, 4), (4, 1_000_000))  # present genes nearest a unit: 1, 2-3, 4+
 
 
@@ -686,7 +784,9 @@ def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str,
     units one present gene hits (``hits``: present genes' hits at query coverage >= 0.5, with
     ``identity`` to the nearest member and ``depth``). A unit's estimates are in k-mer
     coverage; the sample's scale c (``abund_scale``) is the median ``coverage_zi`` / depth
-    of one-member units at >= 95%, so the metrics are log2(estimate / (c depth)):
+    of one-member units at >= 95% and true depth >= ``SCALE_MIN_DEPTH`` (all depths if fewer
+    than 10 such units; ``abund_scale_n`` units used), so the metrics are
+    log2(estimate / (c depth)):
 
     - ``abund_<estimate>_bias_<lo>``, ``abund_<estimate>_err_<lo>``: median and median
       absolute deviation by identity (``IDENTITY_BINS``), for ``ABUND_ESTIMATES``;
@@ -720,6 +820,9 @@ def divergence_abundance(profile: pl.DataFrame, hits: pl.DataFrame) -> dict[str,
         base = base.filter(pl.col("n_members") == 1)
     if base.height < 10:
         return out
+    if (deep := base.filter(pl.col("depth") >= SCALE_MIN_DEPTH)).height >= 10:
+        base = deep  # low depth reads noisy and biased (step 35), which moved c between seeds
+    out["abund_scale_n"] = base.height
     c = base.select((pl.col("coverage_zi") / pl.col("depth")).median()).item()
     out["abund_scale"] = c
     u = u.with_columns(truth=c * pl.col("depth"))
@@ -1429,6 +1532,20 @@ def main() -> None:
     p.add_argument("--member-clusters", required=True)
     p.add_argument("--min-cov", type=float, default=0.8)  # aai-model's --min-cov
     p.add_argument("--out", default="gene_units_nearest.parquet")
+    p = sub.add_parser("holdout-members")
+    p.add_argument("--members", required=True, nargs="+", help="parquet files or directories")
+    p.add_argument("--gene-units", required=True, help="mgnify-genes output")
+    p.add_argument("--genomes-dir", required=True)
+    p.add_argument("--fraction", type=float, required=True)
+    p.add_argument("--min-id", type=float, default=0.7)
+    p.add_argument("--out", default="members.parquet")
+    p = sub.add_parser("unknown-score")
+    for name in ("summary", "genes", "gene-units", "genomes-dir", "sample", "index"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--arm", default="")
+    p.add_argument("--fraction", type=float, default=0.0)
+    p.add_argument("--min-id", type=float, default=0.7)
+    p.add_argument("--out", default="unknown_score.tsv")
     p = sub.add_parser("aai-score")
     for name in ("profile", "gene-units", "genes", "sample", "index"):
         p.add_argument(f"--{name}", required=True)
@@ -1478,7 +1595,8 @@ def main() -> None:
              "pfam-profile": pfam_profile, "mix": mix, "host-abundance": host_abundance,
              "decoy-members": decoy_members, "reps": reps, "mgnify-genes": mgnify_genes,
              "mgnify-members": mgnify_members, "mgnify-nearest": mgnify_nearest,
-             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate}  # fmt: skip
+             "aai-score": aai_score_step, "aai-calibrate": aai_calibrate,
+             "holdout-members": holdout_members, "unknown-score": unknown_score_step}  # fmt: skip
     steps[args.step](args)
 
 

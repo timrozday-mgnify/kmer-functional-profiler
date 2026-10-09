@@ -49,6 +49,9 @@ cd kfp-ablations/release-tiers && sbatch run.sh
 # with the shipped coverage_zi, its interval and coverage_mix (no index rebuilt); after floor-novaseq,
 # floor-1.65M and tiers-novaseq respectively:
 for r in abundance-novaseq abundance-1.65M abundance-tiers; do (cd kfp-ablations/$r && sbatch run.sh); done
+# unknown fraction (plan, phase 7, steps 14, 36 and 38): slim and standard built on the subset
+# and without the units 10/30/50% of the genomes hit, queried with --summary; after 00-dbs:
+cd kfp-ablations/unknown-novaseq && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a

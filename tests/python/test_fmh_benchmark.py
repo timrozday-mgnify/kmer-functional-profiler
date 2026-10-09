@@ -557,3 +557,55 @@ def test_divergence_abundance() -> None:
     assert got["abund_genes_zi_bias_2"] == pytest.approx(-1.0)
     assert got["abund_genes_mix_bias_2"] == pytest.approx(0.0) and got["abund_genes_split_2"] == 1
     assert got["abund_genes_n_4"] == 0 and got["abund_genes_mix_bias_4"] is None
+    assert got["abund_scale_n"] == n - 1  # depth 1 left out of the scale
+    # 14 shallow units reading 4x high do not move the scale: it is set at depth >= 2
+    m = 14  # profile's rows
+    shallow_hits = pl.DataFrame({
+        "gene_name": [f"z{i}" for i in range(m)], "cluster_rep": list(range(300, 300 + m)),
+        "identity": [0.98] * m, "depth": [0.5] * m, "rank": [1] * m,
+    })  # fmt: skip
+    shallow = profile.head(m).with_columns(
+        cluster_rep=pl.Series(range(300, 300 + m)), coverage_zi=pl.lit(4.0)
+    )
+    got = bench.divergence_abundance(pl.concat([profile, shallow]), pl.concat([hits, shallow_hits]))
+    assert got["abund_scale"] == pytest.approx(2.0) and got["abund_scale_n"] == n - 1
+
+
+def test_holdout_unknown_score() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    import bench
+
+    genomes = MINI / "genomes_extracted_from_kegg"
+    # the ladder is nested: one of three genomes at 1/3 is among the two at 2/3
+    gene_units = pl.DataFrame({"gene_name": [], "cluster_rep": [], "identity": [], "qcov": []},
+                              schema={"gene_name": pl.String, "cluster_rep": pl.Int64,
+                                      "identity": pl.Float64, "qcov": pl.Float64})  # fmt: skip
+    one, _ = bench.holdout_units(genomes, gene_units, 1 / 3, 0.7)
+    two, _ = bench.holdout_units(genomes, gene_units, 2 / 3, 0.7)
+    assert one.len() > 0 and set(one) < set(two)
+    held = one[0]
+    all_genes = pl.concat(
+        pl.read_csv(f, columns=["gene_name"]) for f in genomes.glob("*/*_mapping.csv")
+    )
+    kept = next(g for g in all_genes["gene_name"] if g not in set(one))
+    # unit 1: the held-out gene at 95% (dropped) and the kept gene at 85% (so it loses it);
+    # unit 2: the kept gene at 75% (stays); unit 3: held-out gene at 60% (below min_id: stays)
+    gene_units = pl.DataFrame({
+        "gene_name": [held, kept, kept, held],
+        "cluster_rep": [1, 1, 2, 3],
+        "identity": [0.95, 0.85, 0.75, 0.6],
+        "qcov": [0.9, 0.9, 0.9, 0.9],
+    })  # fmt: skip
+    held_genes, dropped = bench.holdout_units(genomes, gene_units, 1 / 3, 0.7)
+    assert dropped.to_list() == [1]
+    genes = pl.DataFrame({"gene_name": [held, kept, "other"], "bases": [100, 300, 100]})
+    summary = {"bases": 1000, "explained_fraction": 0.25, "census_containment": 0.2,
+               "error_thinning": 0.9, "census_kmers": 50}  # fmt: skip
+    got = bench.unknown_score(summary, genes, gene_units, held_genes, dropped)
+    assert got["truth_coding"] == pytest.approx(0.5) and got["truth_heldout"] == pytest.approx(0.1)
+    # kept gene known at 75% via unit 2; held gene only via unit 3 at 60%
+    assert got["truth_known_0.9"] == 0 and got["truth_known_0.8"] == 0
+    assert got["truth_known_0.7"] == pytest.approx(0.3) and got["truth_known_any"] == pytest.approx(
+        0.4
+    )
+    assert got["explained_err_0.7"] == pytest.approx(-0.05)
