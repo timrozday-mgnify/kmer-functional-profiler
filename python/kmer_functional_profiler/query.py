@@ -223,6 +223,8 @@ def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
 
 
 LINK_TAUS: Final = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)  # A1's sweep of link-strength cuts
+# a stricter promiscuity cut (build's max_groups, 64) for the largest component (step 40)
+HOLDER_CUTS: Final = (2, 4, 8, 16, 32)
 
 
 def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
@@ -235,6 +237,12 @@ def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
     the weak ones (``links_one_kmer``: one shared k-mer;
     ``links_le2_hits``: at most 2 hits on the shared k-mers), and per cut tau the links below
     it (``cut_links_{tau}``) and the largest component left (``cut_largest_units_{tau}``).
+
+    With ``holders`` (units holding the k-mer in the index), per h in ``HOLDER_CUTS`` what
+    dropping k-mers held by more than h units would leave, as a build's ``max_groups`` h
+    would (bar the floored units' refill from other candidates, which the build does):
+    ``holders_cut_pairs_{h}`` (pairs of the component dropped) and the largest component
+    left, ``holders_cut_largest_units_{h}`` and ``_pairs_{h}``.
     """
     units, col = _ids(kmers["unit"].to_numpy())
     _, row = _ids(kmers["hash"].to_numpy())
@@ -268,6 +276,16 @@ def link_cuts(kmers: pl.DataFrame) -> dict[str, int]:
         left = connected_components(graph, directed=False)[1][np.unique(col[keep])]
         out[f"cut_links_{tau}"] = int((~kept).sum())
         out[f"cut_largest_units_{tau}"] = int(np.bincount(left).max())
+    if "holders" in kmers.columns:
+        holders = kmers["holders"].to_numpy()[keep]
+        c, r = col[keep], row[keep]
+        for h in HOLDER_CUTS:
+            kept = holders <= h
+            label = _unit_components(c[kept], r[kept], len(units))[c[kept]]
+            pairs = np.bincount(label) if kept.any() else np.zeros(1, dtype=np.intp)
+            out[f"holders_cut_pairs_{h}"] = int((~kept).sum())
+            out[f"holders_cut_largest_pairs_{h}"] = int(pairs.max())
+            out[f"holders_cut_largest_units_{h}"] = len(np.unique(c[kept][label == pairs.argmax()]))
     return out
 
 
@@ -323,7 +341,10 @@ Step = Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarr
 # pairs -> each pair's weight in its k-mer's expected hits, at the current lam and other
 PairWeight = Callable[[np.ndarray], np.ndarray]
 
-MAX_FIT_PAIRS: Final = 10_000_000  # a component with more pairs is fitted block-wise (~1.5 GB)
+# a component with more pairs is fitted block-wise (query --max-fit-pairs); a whole fit takes
+# ~65 bytes per pair, block-wise ~90 in two blocks (step 41, synthetic): it saves memory only
+# with many blocks
+MAX_FIT_PAIRS = 10_000_000
 BLOCK_STEPS: Final = 30  # EM steps per block per round of a block-wise fit
 MAX_BLOCK_ROUNDS: Final = 1000  # rounds over a block-wise component's blocks
 
@@ -1933,7 +1954,6 @@ def census_counts(
 
 
 def sample_summary(
-    result: pl.DataFrame,
     k: int,
     reads: int,
     mates: int,
@@ -1941,18 +1961,13 @@ def sample_summary(
     census: tuple[int, int] | None,
     t_max: float,
 ) -> dict[str, float | int | None]:
-    """How much of the sample the units explain (Phase 7, step 14), as sylph's
-    ``--estimate-unknown`` does for genomes.
-
-    ``explained_fraction`` (model-based): each detected unit's ``coverage_zi``, the depth
-    of its present k-mers, raised to base depth by ``rho`` = (L / 3) / ((L - 2) / 3 - k + 1)
-    (L the mean mate length in bases; a frame holds (L - 2) / 3 whole codons on average) and
-    by 1 / ``error_thinning``, times ``len_mean`` x 3 bases, summed
-    and divided by the sample's bases. Units below detection and non-coding reads count as
-    unknown; strain mixtures inflate it. ``error_thinning`` r = (1 - d)^(3k), with d the
+    """How much of the sample the index knows (Phase 7, step 14), as sylph's
+    ``--estimate-unknown`` does for genomes. ``error_thinning`` r = (1 - d)^(3k), with d the
     per-base chance of losing a k-mer window: bases masked or not A/C/G/T, plus
     ``SENSE_CHANGE`` x the mean Phred error probability. Errors clustered in read tails make
-    r too low, and the explained fraction too high.
+    r too low, and the containment too high. (A model-based ``explained_fraction``, summed
+    over detected units, was dropped in step 40: a gene hit by several units counted once
+    per unit, up to 0.59 of read bases against 0.41 truth on the fmh benchmark.)
 
     ``census_containment`` (model-free): the fraction of census k-mers (:func:`census_counts`)
     found in the index, over r and capped at 1: includes units below detection, but exact
@@ -1960,16 +1975,15 @@ def sample_summary(
     of a mate has no sampled k-mer, so the mate passes as one-frame and its off-frame
     k-mers lower the census.
 
-    ``result`` is :func:`profile`'s, with ``coverage_zi`` and ``len_mean``; ``base_stats``
-    is :attr:`FastxHits.base_stats` (None for sourmash-hashed queries); ``census`` the
-    summed (census k-mers, hits), None when the indexes do not support one. Values that
-    cannot be computed are None. The unknown fractions are 1 minus the others, floored at 0.
+    ``base_stats`` is :attr:`FastxHits.base_stats` (None for sourmash-hashed queries);
+    ``census`` the summed (census k-mers, hits), None when the indexes do not support one.
+    Values that cannot be computed are None. ``census_unknown`` is 1 minus the containment.
     """
     out: dict[str, float | int | None] = dict.fromkeys(
         (
             "bases", "lost_bases", "expected_errors", "mean_read_length", "error_thinning",
-            "explained_bases", "explained_fraction", "unknown_fraction", "census_kmers",
-            "census_hits", "census_containment", "census_unknown", "census_frame_miss",
+            "census_kmers", "census_hits", "census_containment", "census_unknown",
+            "census_frame_miss",
         )
     )  # fmt: skip
     out["reads"], out["mates"] = reads, mates
@@ -1988,17 +2002,6 @@ def sample_summary(
             "error_thinning": r,
             "census_frame_miss": float((1 - t_max) ** max(windows, 0)),
         }
-        if "len_mean" in result.columns and "coverage_zi" in result.columns and r > 0:
-            rho = mate_nt / 3 / windows if windows > 0 else None
-            depth = result.select(
-                (pl.col("coverage_zi") * 3 * pl.col("len_mean")).sum(),
-                pl.col("len_mean").is_not_null().any(),
-            ).row(0)
-            if rho is not None and depth[1]:
-                explained = float(depth[0]) * rho / r
-                out["explained_bases"] = explained
-                out["explained_fraction"] = explained / bases
-                out["unknown_fraction"] = max(0.0, 1 - explained / bases)
     if census is not None:
         out["census_kmers"], out["census_hits"] = census
         if census[0] > 0 and r is not None and r > 0:
@@ -2089,8 +2092,8 @@ def profile(
     masked sampled hashes before any lookup and subtracts the masked postings from the unit
     rows' expected counts; ``masked_fraction`` and ``host_like`` are added.
 
-    ``summary``, if given, is filled with :func:`sample_summary`'s sample-level explained
-    and unknown fractions; it fits ``_zi``. The census needs every index to have a complete
+    ``summary``, if given, is filled with :func:`sample_summary`'s sample-level stats and
+    known-k-mer census. The census needs every index to have a complete
     base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash; an index
     built without ``promiscuous.npy`` counts its promiscuous k-mers as unknown.
 
@@ -2237,7 +2240,7 @@ def profile(
             hit_info = mask.adjust(hit_info)
     with timer("components"):
         component = component_labels(kmer_hits)
-        if record:
+        if record and kmer_hits.height:  # a sample with no hit has no component
             per_unit = component.group_by("component").len()
             counts["components"] = per_unit.height
             largest = per_unit.sort("len", "component", descending=[True, False]).row(0)
@@ -2332,7 +2335,11 @@ def profile(
     mu_tier2[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
     if True:  # coverage_zi is the shipped coverage (step 35): the zero-inflated fit always runs
         with timer("fit_zi"):
-            inflated = per_batch(lambda part: em(part, m_g, zero_inflated=True, start=start))
+            zi_report: dict[str, float] = {}  # its em_* (step 40: 9,059 s block-wise, unreported)
+            inflated = per_batch(
+                lambda part: em(part, m_g, zero_inflated=True, report=zi_report, start=start)
+            )
+            counts |= {f"zi_{key}": value for key, value in zi_report.items()}
         # Present k-mers over an average member's kept k-mers: member-equivalents present.
         copies = pl.col("present") * pl.col("m") / pl.col("pin_sum")
         zi = inflated.join(
@@ -2501,7 +2508,6 @@ def profile(
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.
         summary |= sample_summary(
-            result,
             params.k,
             n_reads if not sources else sources[0].n_reads,
             2 if r2 is not None else 1,

@@ -794,6 +794,34 @@ def test_unit_hits_matches_numpy_reference(tmp_path: Path) -> None:
     assert np.array_equal(table.lookup(query), reference_lookup(table, query))
 
 
+def test_cli_query_stats_with_no_hits(members: Path, tmp_path: Path) -> None:
+    # Reads that hit no unit: --stats used to fail on the largest component of none.
+    runner = CliRunner()
+    idx = tmp_path / "idx"
+    assert runner.invoke(app, ["index", str(members), str(idx), "--k", str(K)]).exit_code == 0
+    reads = tmp_path / "reads.fa"
+    reads.write_text(">1\n" + "A" * 150 + "\n")
+    stats = tmp_path / "stats.json"
+    args = ["query", str(idx), str(reads), "--out", str(tmp_path / "p.tsv"), "--stats", str(stats)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(stats.read_text())["counts"]["hit_units"] == 0
+
+
+def test_cli_query_max_fit_pairs(
+    members: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The block-wise threshold (block-wise fits: test_blockwise_em_*) is set for the query.
+    monkeypatch.setattr(query, "MAX_FIT_PAIRS", query.MAX_FIT_PAIRS)  # restored afterwards
+    runner = CliRunner()
+    idx = tmp_path / "idx"
+    assert runner.invoke(app, ["index", str(members), str(idx), "--k", str(K)]).exit_code == 0
+    args = ["query", str(idx), *map(str, READS), "--out", str(tmp_path / "p.tsv")]
+    result = runner.invoke(app, [*args, "--max-fit-pairs", "1"])
+    assert result.exit_code == 0, result.output
+    assert query.MAX_FIT_PAIRS == 1
+
+
 def test_cli_query(members: Path, tmp_path: Path) -> None:
     runner = CliRunner()
     idx = tmp_path / "idx"
@@ -809,7 +837,7 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
         table.columns
     )
     sample = json.loads(summary.read_text())
-    assert sample["explained_fraction"] > 0 and 0 <= sample["census_containment"] <= 1
+    assert 0 < sample["census_containment"] <= 1
     got = json.loads(stats.read_text())
     assert {"load", "hash", "lookup", "gather", "fit_zi", "posterior", "total"} <= set(
         got["stages"]
@@ -824,6 +852,7 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     assert counts["hit_rows"] == table["hits"].sum()
     assert counts["sampled_kmers"] >= counts["hit_kmers"] > 0
     assert counts["largest_component_units"] <= counts["hit_units"]
+    assert {"zi_em_iterations", "zi_em_unconverged_units", "holders_cut_pairs_8"} <= set(counts)
     assert got["running"] == ""
     # Tiers read into memory give the same profile as memory-mapped ones.
     mapped, loaded = tmp_path / "mapped.tsv", tmp_path / "loaded.tsv"
@@ -1280,6 +1309,16 @@ def test_link_cuts_on_largest_component() -> None:
     assert got["detected_largest_component_pairs"] == 4 + 15 + 10
     assert got["cut_links_0.1"] == 0 and got["cut_largest_units_0.1"] == 3
     assert got["cut_links_0.2"] == 1 and got["cut_largest_units_0.2"] == 2
+    assert "holders_cut_pairs_2" not in got
+    # The 1-2 link's k-mer is held by 3 units in the index (one undetected): a cut at 2
+    # drops it (2 pairs), leaving 0-1 (4 + 14 pairs); at 4 nothing goes.
+    held = kmers.with_columns(
+        holders=pl.when(pl.col("hash") == 4).then(3).otherwise(pl.len().over("hash"))
+    )
+    got = query.link_cuts(held)
+    assert got["holders_cut_pairs_2"] == 2
+    assert got["holders_cut_largest_units_2"] == 2 and got["holders_cut_largest_pairs_2"] == 18
+    assert got["holders_cut_pairs_4"] == 0 and got["holders_cut_largest_units_4"] == 3
 
 
 def test_posterior_in_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1312,29 +1351,24 @@ CODONS = [
 
 
 def test_sample_summary_by_hand() -> None:
-    result = pl.DataFrame({"coverage_zi": [2.0, 0.0], "len_mean": [100.0, 50.0]})
     stats = {"bases": 10_000.0, "lost": 0.0, "expected_errors": 0.0}
-    got = sample_summary(result, 11, 100, 1, stats, (200, 150), 0.2)
-    # 100 reads of 100 bp: 98 / 3 whole codons per frame, 98 / 3 - 10 windows; no errors.
-    rho = (100 / 3) / (98 / 3 - 10)
+    got = sample_summary(11, 100, 1, stats, (200, 150), 0.2)
+    # 100 reads of 100 bp: 98 / 3 - 10 k-mer windows per frame; no errors.
     assert got["error_thinning"] == 1.0
-    assert got["explained_bases"] == pytest.approx(2.0 * 300 * rho)
-    assert got["explained_fraction"] == pytest.approx(600 * rho / 10_000)
-    assert got["unknown_fraction"] == pytest.approx(1 - 600 * rho / 10_000)
+    assert "explained_fraction" not in got  # dropped (phase 7, step 40)
     assert got["census_containment"] == pytest.approx(0.75)
     assert got["census_frame_miss"] == pytest.approx(0.8 ** (98 / 3 - 10))
     # Errors thin k-mer depth: per-base loss d gives r = (1 - d)^(3k), which both estimates
-    # divide out; masked bases count in full, Phred errors at SENSE_CHANGE.
+    # divides out; masked bases count in full, Phred errors at SENSE_CHANGE.
     noisy = sample_summary(
-        result, 11, 100, 1, stats | {"lost": 20.0, "expected_errors": 40.0}, (200, 150), 0.2
+        11, 100, 1, stats | {"lost": 20.0, "expected_errors": 40.0}, (200, 150), 0.2
     )
     r = (1 - (20 + query.SENSE_CHANGE * 40) / 10_000) ** 33
     assert noisy["error_thinning"] == pytest.approx(r)
-    assert noisy["explained_fraction"] == pytest.approx(got["explained_fraction"] / r)  # type: ignore[operator]
     assert noisy["census_containment"] == pytest.approx(min(1.0, 0.75 / r))
     # Without base counts (sourmash hashing) or a census, those values are None.
-    bare = sample_summary(result, 11, 100, 1, None, None, 0.2)
-    assert bare["explained_fraction"] is None and bare["census_containment"] is None
+    bare = sample_summary(11, 100, 1, None, None, 0.2)
+    assert bare["error_thinning"] is None and bare["census_containment"] is None
 
 
 def test_unknown_fraction_of_known_and_random_reads(tmp_path: Path) -> None:
@@ -1373,16 +1407,12 @@ def test_unknown_fraction_of_known_and_random_reads(tmp_path: Path) -> None:
 
     known, unknown = reads(400, genes), reads(400, None)
     mixed = summary(known + unknown)
-    # Reads never cross the genes' ends here, so end k-mers are thinly covered, and taken as
-    # absent they lift coverage_zi: explained runs ~10% high on known reads.
     assert mixed["bases"] == 800 * 150 and mixed["error_thinning"] == 1.0
-    assert mixed["explained_fraction"] == pytest.approx(0.5, abs=0.08)
     only_known = summary(known)
-    assert only_known["explained_fraction"] == pytest.approx(1.0, abs=0.12)
     assert only_known["census_containment"] > 0.85  # type: ignore[operator]
+    assert 0.3 < mixed["census_containment"] < 0.7  # type: ignore[operator]
     only_random = summary(unknown)
     assert only_random["census_containment"] < 0.05  # type: ignore[operator]
-    assert (only_random["explained_fraction"] or 0.0) < 0.05
 
 
 def test_census_counts_promiscuous_kmers_as_known(tmp_path: Path) -> None:

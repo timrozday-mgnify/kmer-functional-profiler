@@ -204,6 +204,7 @@ process HOLDOUT_MEMBERS {
     input:
     tuple val(name), val(fraction), val(args), path(members, stageAs: 'members/*'), path(gene_units)
     path genomes
+    path sampled
     path code, stageAs: 'code/*'
 
     output:
@@ -213,8 +214,8 @@ process HOLDOUT_MEMBERS {
     """
     mkdir held
     ${params.bench} holdout-members --members ${members} --gene-units ${gene_units} \
-        --genomes-dir ${genomes} --fraction ${fraction} --min-id ${params.holdout_min_id} \
-        --out held/members.parquet
+        --genomes-dir ${genomes} --genomes-list ${sampled} --fraction ${fraction} \
+        --min-id ${params.holdout_min_id} --out held/members.parquet
     """
 
     stub:
@@ -228,6 +229,7 @@ process UNKNOWN_SCORE {
     input:
     tuple val(sid), val(name), val(arm), val(fraction), path(summary), path(gene_units), path(genes)
     path genomes
+    path sampled
     path code, stageAs: 'code/*'
 
     output:
@@ -236,8 +238,8 @@ process UNKNOWN_SCORE {
     script:
     """
     ${params.bench} unknown-score --summary ${summary} --gene-units ${gene_units} --genes ${genes} \
-        --genomes-dir ${genomes} --fraction ${fraction} --min-id ${params.holdout_min_id} \
-        --sample seed${sid} --index ${name} --arm '${arm}'
+        --genomes-dir ${genomes} --genomes-list ${sampled} --fraction ${fraction} \
+        --min-id ${params.holdout_min_id} --sample seed${sid} --index ${name} --arm '${arm}'
     """
 
     stub:
@@ -1177,6 +1179,10 @@ workflow BENCHMARK {
     // built without the units the held-out genomes hit, as <name>_h<pct>; holdout_of maps every
     // index in the ladder to [entry, fraction] (the entry itself is fraction 0).
     def holdout_of = [:]
+    SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
+    // genomes the samples drew: the ladder holds out among these only (step 39: from the
+    // whole pool it took most shared units while holding out few sampled genomes)
+    def ch_sampled = SAMPLE.out[1].collectFile(name: 'sampled_genomes.txt', sort: true).first()
     if (params.holdout) {
         def built = mgnify.findAll { it.members && !it.path }
         if (!built || built.any { !it.pfam }) {
@@ -1195,6 +1201,7 @@ workflow BENCHMARK {
                 .combine(ch_rep_units, by: 0)
                 .map { _base, hname, h, args, members, gene_units -> [hname, h, args, members, gene_units] },
             FETCH.out.genomes,
+            ch_sampled,
             bench_py,
         )
     }
@@ -1230,7 +1237,6 @@ workflow BENCHMARK {
     def fractions = params.host_fractions.toString().tokenize(',')*.trim()*.toDouble()
     def host_fractions = fractions.findAll { it > 0 }
 
-    SAMPLE(channel.of(1..params.replicates), FETCH.out.genomes)
     SIMULATE(SAMPLE.out.sample.map { seed, fna, _genes -> [seed, fna] })
     // sid: the sample's id, the seed, or seed + host percentage (1h90) for spike-in samples
     def ch_reads = SIMULATE.out.reads.filter { 0d in fractions }.map { seed, r1, r2 -> [seed.toString(), seed, r1, r2] }
@@ -1381,6 +1387,7 @@ workflow BENCHMARK {
                 .map { _base, sid, name, arm, h, summary, gene_units -> [sid, name, arm, h, summary, gene_units] }
                 .combine(TRUTH.out.genes, by: 0),
             FETCH.out.genomes,
+            ch_sampled,
             bench_py,
         )
         UNKNOWN_SUMMARY(UNKNOWN_SCORE.out.score.collect())
