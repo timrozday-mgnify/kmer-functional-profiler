@@ -7,6 +7,7 @@ from typing import Annotated
 import typer
 
 from kmer_functional_profiler import __version__
+from kmer_functional_profiler import query as query_module
 from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
@@ -220,9 +221,8 @@ def query(
     summary: Annotated[
         Path | None,
         typer.Option(
-            help="JSON of sample-level explained and unknown fractions: model-based "
-            "(explained_fraction) and a census of known k-mers (census_containment); fits "
-            "the zero-inflated EM"
+            help="JSON of sample-level stats: bases, error thinning and the census of known "
+            "k-mers (census_containment)"
         ),
     ] = None,
     all_estimators: Annotated[
@@ -240,8 +240,17 @@ def query(
             "several seeds agree where the EM converged, a check needing no truth"
         ),
     ] = 0,
+    max_fit_pairs: Annotated[
+        int,
+        typer.Option(
+            help="Components with more (unit, k-mer) pairs are fitted block-wise, to bound "
+            "memory (~70-100 bytes per pair either way); 0 = the default, 10 M"
+        ),
+    ] = 0,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
+    if max_fit_pairs:  # ponytail: a module setting, as the tests set it; a parameter if it ships
+        query_module.MAX_FIT_PAIRS = max_fit_pairs
     timer = Timer(stats, log=stats is not None)
     sample: dict[str, float | int | None] | None = None if summary is None else {}
     with timer("total"):

@@ -293,9 +293,9 @@ def query_cost(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
             row |= {f"{stage}_{k}": v for k, v in cost.items()}
         rows.append(row)
     table = pl.DataFrame(rows, infer_schema_length=None).sort("index", "pairs", "draws", "em_start")
-    if "em_max_change" in table.columns:  # against tol 1e-8: 3 decimals would read 0.000
+    for c in {"em_max_change", "zi_em_max_change"} & set(table.columns):  # tol 1e-8: not 0.000
         table = table.with_columns(
-            pl.col("em_max_change").map_elements(lambda x: f"{x:.2e}", return_dtype=pl.String)
+            pl.col(c).map_elements(lambda x: f"{x:.2e}", return_dtype=pl.String)
         )
     table.write_csv("query_cost.tsv", separator="\t", float_precision=3)
 

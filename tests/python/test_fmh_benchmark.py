@@ -583,6 +583,13 @@ def test_holdout_unknown_score() -> None:
     one, _ = bench.holdout_units(genomes, gene_units, 1 / 3, 0.7)
     two, _ = bench.holdout_units(genomes, gene_units, 2 / 3, 0.7)
     assert one.len() > 0 and set(one) < set(two)
+    # among: held out from the sampled genomes only (one of the two listed at 1/2)
+    sampled = sorted(p.name for p in genomes.iterdir() if p.is_dir())[:2]
+    half, _ = bench.holdout_units(genomes, gene_units, 1 / 2, 0.7, among=sampled * 2)
+    from_sampled = pl.concat(
+        pl.read_csv(genomes / g / f"{g}_mapping.csv", columns=["gene_name"]) for g in sampled
+    )["gene_name"]
+    assert half.len() > 0 and set(half) < set(from_sampled)
     held = one[0]
     all_genes = pl.concat(
         pl.read_csv(f, columns=["gene_name"]) for f in genomes.glob("*/*_mapping.csv")
@@ -599,8 +606,7 @@ def test_holdout_unknown_score() -> None:
     held_genes, dropped = bench.holdout_units(genomes, gene_units, 1 / 3, 0.7)
     assert dropped.to_list() == [1]
     genes = pl.DataFrame({"gene_name": [held, kept, "other"], "bases": [100, 300, 100]})
-    summary = {"bases": 1000, "explained_fraction": 0.25, "census_containment": 0.2,
-               "error_thinning": 0.9, "census_kmers": 50}  # fmt: skip
+    summary = {"bases": 1000, "census_containment": 0.2, "error_thinning": 0.9, "census_kmers": 50}
     got = bench.unknown_score(summary, genes, gene_units, held_genes, dropped)
     assert got["truth_coding"] == pytest.approx(0.5) and got["truth_heldout"] == pytest.approx(0.1)
     # kept gene known at 75% via unit 2; held gene only via unit 3 at 60%
@@ -608,4 +614,4 @@ def test_holdout_unknown_score() -> None:
     assert got["truth_known_0.7"] == pytest.approx(0.3) and got["truth_known_any"] == pytest.approx(
         0.4
     )
-    assert got["explained_err_0.7"] == pytest.approx(-0.05)
+    assert got["census_containment"] == 0.2 and "explained_err_0.7" not in got

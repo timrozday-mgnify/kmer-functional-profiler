@@ -7,7 +7,8 @@
 #SBATCH --mem=8G
 #SBATCH --export=ALL
 source ../common.sh
-# Unknown fraction (plan, phase 7, steps 14 and 36): slim and standard built on the 1-in-100
-# subset and without the units 10/30/50% of the genomes hit, 10 NovaSeq metagenomes queried
-# with --summary; read unknown_summary.tsv. Needs 00-dbs (Pfam); independent of the other runs.
+# Unknown fraction (plan, phase 7, steps 14, 36 and 40): slim and standard built on the 1-in-100
+# subset and without the units 10/30/50% of the sampled genomes hit, 10 NovaSeq metagenomes
+# queried with --summary; read census_containment in unknown_summary.tsv. Needs 00-dbs (Pfam);
+# independent of the other runs. Step 40 resubmits it: -resume reuses the DIAMOND passes.
 fmh unknown --aai_subset "$SUBSET"

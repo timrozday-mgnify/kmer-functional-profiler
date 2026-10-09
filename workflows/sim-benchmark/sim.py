@@ -423,8 +423,8 @@ def unknown_ladder(args: argparse.Namespace, members: pl.DataFrame, units: pl.Da
     so ``error_thinning`` sees ``--error``) is profiled with ``summary``; truth is the share of
     read bases in CDSs of indexed units (``truth_known``), of held-out units
     (``truth_heldout``), in flanks (``truth_noncoding``) and decoys (``truth_decoy``).
-    ``explained_err`` = ``explained_fraction`` - ``truth_known``. Writes
-    ``unknown_scores.tsv`` and ``unknown_summary.tsv``."""
+    ``census_containment`` is read against them (``explained_fraction`` was dropped in
+    step 40). Writes ``unknown_scores.tsv`` and ``unknown_summary.tsv``."""
     order = list(range(int(units["family"].max()) + 1))  # type: ignore[arg-type]
     random.Random(1).shuffle(order)
     rows = []
@@ -455,10 +455,9 @@ def unknown_ladder(args: argparse.Namespace, members: pl.DataFrame, units: pl.Da
                 "truth_known": cds["known"] / bases, "truth_heldout": cds["heldout"] / bases,
                 "truth_noncoding": cds["flanks"] / bases,
                 "truth_decoy": 1 - (cds["known"] + cds["heldout"] + cds["flanks"]) / bases,
-                **{k: summary[k] for k in ("explained_fraction", "census_containment",
-                                           "error_thinning", "census_kmers")},
+                **{k: summary[k] for k in ("census_containment", "error_thinning",
+                                           "census_kmers")},
             }  # fmt: skip
-            row["explained_err"] = (row["explained_fraction"] or 0.0) - row["truth_known"]
             rows.append(row)
     scores = pl.DataFrame(rows, infer_schema_length=None)
     scores.write_csv(args.out / "unknown_scores.tsv", separator="\t")

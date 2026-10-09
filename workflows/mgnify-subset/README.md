@@ -211,7 +211,10 @@ these are mostly units sharing all their hit k-mers, drifting along a flat likel
 (`em_block_rounds` when a component above 10 M pairs was fitted block-wise), `presence_iterations` and `presence_converged` for
 `presence`'s; `detected_largest_component_units` and `_pairs` (the largest component the fits see; `largest_component_*` counts all hit units, before gather); `links`, `links_one_kmer`, `links_le2_hits`, `cut_links_{tau}` and
 `cut_largest_units_{tau}` for the largest component of detected units and what a weak-link
-cut at tau would leave of it, plan step 33's A1) and `{stage}_wall_s`, `_cpu_s` and
+cut at tau would leave of it, plan step 33's A1; `holders_cut_pairs_{h}`,
+`holders_cut_largest_units_{h}` and `_pairs_{h}` for what dropping its k-mers held by more
+than h units would leave, a stricter promiscuity cut, phase 7, step 40; `zi_em_*` (with
+`zi_em_block_rounds`) for the zero-inflated fit's convergence, as `em_*` for the plain one) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
 the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
 `RssAnon` sampled every 50 ms) per stage. Queries that exceed

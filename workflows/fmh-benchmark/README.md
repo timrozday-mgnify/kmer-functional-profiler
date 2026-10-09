@@ -173,7 +173,7 @@ To download them ahead of (or apart from) the benchmark, e.g. on a node with int
 | `--mgnify_diamond_args` | `--sensitive --max-target-seqs 25 --id 50 --query-cover 50` | Which near hits are kept |
 | `--mgnify_nearest_diamond_args` | `--sensitive --max-target-seqs 1000 --id 50 --query-cover 50` | The nearest-member pass, against the hit clusters' members (`member_hit` false where a gene's targets filled with other clusters' members) |
 | `--mgnify_nearest_min_cov` | `0.8` | The nearest member counts only hits at this query and subject coverage, as aai-model's pairs |
-| `--holdout` | `''` | Unknown-fraction hold-out ladder, e.g. `0,0.1,0.3,0.5`: shares of the genomes held out (nested, fixed order). Each MGnify entry built here is also built without the units the held-out genomes hit (`<name>_h<pct>`); MGnify profiles run with `--summary` (`summaries/`) and `unknown_summary.tsv` compares `explained_fraction` and `census_containment` with the read-base truth (`bench.py unknown-score`) |
+| `--holdout` | `''` | Unknown-fraction hold-out ladder, e.g. `0,0.1,0.3,0.5`: shares of the sampled genomes (those the `--replicates` samples drew) held out (nested, fixed order). Each MGnify entry built here is also built without the units the held-out genomes hit (`<name>_h<pct>`); MGnify profiles run with `--summary` (`summaries/`) and `unknown_summary.tsv` compares `census_containment` with the read-base truth (`bench.py unknown-score`) |
 | `--holdout_min_id` | `0.7` | A held-out gene takes the units it hits at this identity (to the representative) and query coverage ≥ 0.5 |
 | `--aai_models` | `[]` | `[name:, path:]` maps of `aai_model.json` files (config file only): each MGnify profile is also scored with `aai` re-estimated under it, as arm `<arm>+<name>` |
 | `--query_arms` | one plain arm | `[name:, args:, reads:, mask:, decoy:]` maps (config file only; see [Ablations](#ablations)) |
@@ -346,7 +346,8 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
 | `reads` | On the base and *t_base* 0.02 indexes: frames stop-free, edges *m* = 15/20/30, all six; quality mask *q* = 10/20/30; fastp then raw; mask × edges; fastp × edges. Once per read model | 5 indexes × 11 arms × 10 |
 | `host` | 0/50/90/99% host read pairs (T2T-CHM13 + rCRS chrM + PhiX, simulated with the same read model, microbial pairs subsampled to keep depth); no handling, hostile, mask, human-proteome decoy, mask + decoy; on the base and *t_base* 0.02 indexes | 4 shares × 5 arms × 5 indexes × 10 (hostile, mask and decoy: built indexes only) |
 | `aai` | Step 15's sparse/dense ladder (run; superseded by `floor`) | 4 indexes × 2 arms × 10 |
-| `unknown` | Unknown fraction (plan, phase 7, steps 14, 36 and 38): `slim` and `tbase02_all16` built on the subset and with 10/30/50% of the genomes held out (`--holdout`); read `unknown_summary.tsv` | 8 indexes × 10 |
+| `unknown` | Unknown fraction (plan, phase 7, steps 14, 36, 38 and 40): `slim` and `tbase02_all16` built on the subset and with 10/30/50% of the sampled genomes held out (`--holdout`); read `unknown_summary.tsv` | 8 indexes × 10 |
+| `promiscuity` | As `tiers`: `tbase05_all` at `--max-groups` 64 (control), 128, 16, 8, 4 and `tbase10_all` at 64, 8, for the largest component's size and the accuracy cost of a stricter promiscuity cut (plan, phase 7, step 40); published for `promiscuity-query-cost` | 7 indexes × 10 |
 
 **Raised floor against the dense tier** (`floor`, and the floor/dense pairs of `index`,
 `reads`, `host`): *t_base* is a density floor, since every unit keeps all its k-mers with

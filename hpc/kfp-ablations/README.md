@@ -52,6 +52,12 @@ for r in abundance-novaseq abundance-1.65M abundance-tiers; do (cd kfp-ablations
 # unknown fraction (plan, phase 7, steps 14, 36 and 38): slim and standard built on the subset
 # and without the units 10/30/50% of the genomes hit, queried with --summary; after 00-dbs:
 cd kfp-ablations/unknown-novaseq && sbatch run.sh
+# step 40: unknown-novaseq again (resubmit: -resume keeps DIAMOND), holding out sampled genomes only;
+# promiscuity cut on the large tier, then its query cost (40/100/200 M pairs) when it has finished:
+cd kfp-ablations/promiscuity-novaseq && sbatch run.sh
+cd kfp-ablations/promiscuity-query-cost && sbatch run.sh
+# step 41: the two controls again with whole fits (no block-wise), alongside promiscuity-query-cost:
+cd kfp-ablations/whole-fit-query-cost && sbatch run.sh
 ```
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a

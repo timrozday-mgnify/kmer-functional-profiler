@@ -35,9 +35,8 @@
 - ``holdout-members``: an MGnify members table without the units
   held-out genomes hit (:func:`holdout_units`): the index side of the unknown-fraction
   hold-out ladder (plan, phase 7, steps 14 and 36).
-- ``unknown-score``: a query's ``--summary`` (``explained_fraction``,
-  ``census_containment``) against the share of read bases from genes that still have a unit
-  in the hold-out index (see :func:`unknown_score`).
+- ``unknown-score``: a query's ``--summary`` (``census_containment``) against the share of
+  read bases from genes that still have a unit in the hold-out index (see :func:`unknown_score`).
 - ``pfam-profile``: a profile against an index with Pfam labels (``unit_pfam.parquet``, e.g.
   MGnify90 clusters) summed per Pfam, each unit counting for each of its Pfams.
 - ``score``: purity and completeness of one profile against a truth table, one row per
@@ -452,15 +451,23 @@ def mgnify_members(args: argparse.Namespace) -> None:
 
 
 def holdout_units(
-    genomes_dir: str | Path, gene_units: pl.DataFrame, fraction: float, min_id: float
+    genomes_dir: str | Path,
+    gene_units: pl.DataFrame,
+    fraction: float,
+    min_id: float,
+    among: Iterable[str] | None = None,
 ) -> tuple[pl.Series, pl.Series]:
     """Genes of held-out genomes and the units they take with them, for the unknown-fraction
-    ladder (plan, phase 7, step 36). Genomes are shuffled in a fixed order (seed 1), so the
-    ladder is nested: the first ``fraction`` of them are held out. Every unit one of their
-    genes hits at identity >= ``min_id`` (to the representative) and query coverage >= 0.5 is
-    dropped, whichever genome else hits it: a kept genome's gene can lose its unit too, which
-    the truth sees."""
-    genomes = sorted(p.name for p in Path(genomes_dir).iterdir() if p.is_dir())
+    ladder (plan, phase 7, step 36). Genomes (``among``, e.g. those the samples drew; default
+    every genome in ``genomes_dir``) are shuffled in a fixed order (seed 1), so the ladder is
+    nested: the first ``fraction`` of them are held out. Every unit one of their genes hits at
+    identity >= ``min_id`` (to the representative) and query coverage >= 0.5 is dropped,
+    whichever genome else hits it: a kept genome's gene can lose its unit too, which the
+    truth sees. Holding out from the whole pool (step 38's run) took most shared units with
+    few of the samples' own genomes (step 39), hence ``among``."""
+    if among is None:
+        among = (p.name for p in Path(genomes_dir).iterdir() if p.is_dir())
+    genomes = sorted(set(among))
     random.Random(1).shuffle(genomes)
     held = sorted(genomes[: round(fraction * len(genomes))])
     genes = pl.Series("gene_name", [], pl.String)
@@ -477,9 +484,18 @@ def holdout_units(
     return genes, dropped
 
 
+def _among(args: argparse.Namespace) -> list[str] | None:
+    """``--genomes-list`` files (one genome per line, e.g. SAMPLE's ``genomes.txt``) joined."""
+    if not args.genomes_list:
+        return None
+    return [g for f in args.genomes_list for g in Path(f).read_text().split()]
+
+
 def holdout_members(args: argparse.Namespace) -> None:
     gene_units = pl.read_parquet(args.gene_units)
-    genes, dropped = holdout_units(args.genomes_dir, gene_units, args.fraction, args.min_id)
+    genes, dropped = holdout_units(
+        args.genomes_dir, gene_units, args.fraction, args.min_id, _among(args)
+    )
     keep = ~pl.col("cluster_rep").is_in(dropped.implode())
     paths = [str(Path(p) / "*.parquet") if Path(p).is_dir() else p for p in args.members]
     pl.scan_parquet(paths).filter(keep).sink_parquet(args.out)  # Pfam rows join on members
@@ -499,12 +515,11 @@ def unknown_score(
     the gene); shares are of the summary's ``bases`` (every read base). A gene is known at
     t if a unit still in the index matches it at identity >= t (to the representative) and
     query coverage >= 0.5: ``truth_known_<t>`` for t in 0.9, 0.8, 0.7 and any hit
-    (``truth_known_any``), with ``explained_err_<t>`` = ``explained_fraction`` minus it.
+    (``truth_known_any``).
     ``truth_coding`` is every gene's share, ``truth_heldout`` that of ``held_genes``."""
     bases = summary.get("bases") or 0
     out: dict[str, float | None] = {
-        k: summary.get(k)
-        for k in ("explained_fraction", "census_containment", "error_thinning", "census_kmers")
+        k: summary.get(k) for k in ("census_containment", "error_thinning", "census_kmers")
     }
     if not bases:
         return out
@@ -520,17 +535,16 @@ def unknown_score(
 
     out["truth_coding"] = share(pl.lit(True))
     out["truth_heldout"] = share(pl.col("gene_name").is_in(held_genes.implode()))
-    explained = out["explained_fraction"]
     for t, name in ((0.9, "0.9"), (0.8, "0.8"), (0.7, "0.7"), (0.0, "any")):
-        known = share(pl.col("best") >= t)
-        out[f"truth_known_{name}"] = known
-        out[f"explained_err_{name}"] = None if explained is None else explained - known
+        out[f"truth_known_{name}"] = share(pl.col("best") >= t)
     return out
 
 
 def unknown_score_step(args: argparse.Namespace) -> None:
     gene_units = pl.read_parquet(args.gene_units)
-    held_genes, dropped = holdout_units(args.genomes_dir, gene_units, args.fraction, args.min_id)
+    held_genes, dropped = holdout_units(
+        args.genomes_dir, gene_units, args.fraction, args.min_id, _among(args)
+    )
     row = unknown_score(
         json.loads(Path(args.summary).read_text()),
         pl.read_csv(args.genes, schema_overrides={"gene_name": pl.String}),
@@ -1538,6 +1552,7 @@ def main() -> None:
     p.add_argument("--genomes-dir", required=True)
     p.add_argument("--fraction", type=float, required=True)
     p.add_argument("--min-id", type=float, default=0.7)
+    p.add_argument("--genomes-list", nargs="*", help="hold out among these genomes only")
     p.add_argument("--out", default="members.parquet")
     p = sub.add_parser("unknown-score")
     for name in ("summary", "genes", "gene-units", "genomes-dir", "sample", "index"):
@@ -1545,6 +1560,7 @@ def main() -> None:
     p.add_argument("--arm", default="")
     p.add_argument("--fraction", type=float, default=0.0)
     p.add_argument("--min-id", type=float, default=0.7)
+    p.add_argument("--genomes-list", nargs="*", help="hold out among these genomes only")
     p.add_argument("--out", default="unknown_score.tsv")
     p = sub.add_parser("aai-score")
     for name in ("profile", "gene-units", "genes", "sample", "index"):
