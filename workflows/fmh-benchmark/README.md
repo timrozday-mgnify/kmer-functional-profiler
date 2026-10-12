@@ -15,8 +15,9 @@ PFAM_DB          Pfam-A.hmm from --pfam_url (or --pfam_hmm), once into --db_dir
 GENOME_PROTEINS  every genome's proteins, in --pfam_chunks FASTA files
 PFAM_ANNOTATE, PFAM_DOMAINS
                  hmmsearch --cut_ga per chunk ->
-                 pfam/domains.parquet (gene, Pfam, envelope) and the domains as members of
-                 one unit per Pfam
+                 domains.parquet (gene, Pfam, envelope) and the domains as members of
+                 one unit per Pfam; all three stored once under
+                 --db_dir/pfam_annotations/chunks<--pfam_chunks> and reused by later runs
 INDEX            kmer-functional-profiler index, one per --indexes entry and label (KO
                  units as named; Pfam units as pfam_<name>)
 IMPORT_SKETCHES  the KO sketches as a sourmash-compatible index ("fmh_compat")
@@ -157,7 +158,7 @@ To download them ahead of (or apart from) the benchmark, e.g. on a node with int
 | `--tools` | `diamond,fmh_funprofiler,kmermaid,humann,humann4` | Other tools to run and score; `''` for none |
 | `--db_dir` | `--data_dir` | Where tool databases are built once (DIAMOND, kMermaid model, HUMAnN) |
 | `--dbs_only` | `false` | Only fetch the Zenodo inputs and build the `--tools`' and `--dbs`' databases, then stop; later runs with the same `--data_dir`/`--db_dir` reuse them |
-| `--dbs` | `''` | With `--dbs_only`, also any of `pfam` (Pfam-A HMMs), `hostile` (hostile index), `host` (host genome), `decoy` (decoy proteome) |
+| `--dbs` | `''` | With `--dbs_only`, also any of `pfam` (Pfam-A HMMs and the genomes' Pfam annotations), `hostile` (hostile index), `host` (host genome), `decoy` (decoy proteome) |
 | `--sketch_scaled` | `1000` | Scaled of `--sketches`, for fmh-funprofiler |
 | `--diamond_args` | `''` | Extra `diamond blastx` options, e.g. `--sensitive` |
 | `--kmermaid_max_members` | `50` | Proteins sampled per KO to train kMermaid |

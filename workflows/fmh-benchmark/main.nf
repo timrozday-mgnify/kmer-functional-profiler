@@ -333,6 +333,11 @@ process AAI_SUMMARY {
 
 // ---- Pfam labels (Benchmark labels in the plan): the genomes' proteins annotated with
 // Pfam-A (hmmsearch --cut_ga), domains as truth features and as members of Pfam units.
+// The genomes are fixed, so proteins, hits and domains are stored once under
+// --db_dir/pfam_annotations/chunks<--pfam_chunks>, and every run sharing it reuses them;
+// `--dbs_only --dbs pfam` fills it.
+// ponytail: storeDir ignores inputs: delete the store after changing bench.py's
+// pfam-proteins/pfam-domains, --pfam_threshold or Pfam-A.hmm (--pfam_chunks has its own).
 
 process PFAM_DB {
     label 'process_single'
@@ -354,6 +359,7 @@ process PFAM_DB {
 
 process GENOME_PROTEINS {
     label 'process_single'
+    storeDir "${params.db_dir}/pfam_annotations/chunks${params.pfam_chunks}/proteins"
 
     input:
     path genomes
@@ -363,7 +369,12 @@ process GENOME_PROTEINS {
     path 'proteins.*.faa', emit: faa
 
     script:
-    "${params.bench} pfam-proteins --genomes-dir ${genomes} --chunks ${params.pfam_chunks}"
+    // aside, then into place: storeDir keeps a failed task's outputs (see FETCH)
+    """
+    mkdir tmp && cd tmp
+    ${params.bench} pfam-proteins --genomes-dir ../${genomes} --chunks ${params.pfam_chunks}
+    mv proteins.*.faa ..
+    """
 
     stub:
     "touch proteins.0.faa proteins.1.faa"
@@ -373,6 +384,7 @@ process PFAM_ANNOTATE {
     tag "${faa.baseName}"
     label 'process_medium'
     container 'quay.io/biocontainers/hmmer:3.4--hdbdd923_2'
+    storeDir "${params.db_dir}/pfam_annotations/chunks${params.pfam_chunks}/domtbl"
 
     input:
     path faa
@@ -383,8 +395,9 @@ process PFAM_ANNOTATE {
 
     script:
     """
-    hmmsearch --cpu ${task.cpus} ${params.pfam_threshold} --domtblout ${faa.baseName}.domtbl \\
+    hmmsearch --cpu ${task.cpus} ${params.pfam_threshold} --domtblout tmp.domtbl \\
         -o /dev/null ${hmm} ${faa}
+    mv tmp.domtbl ${faa.baseName}.domtbl
     """
 
     stub:
@@ -393,7 +406,7 @@ process PFAM_ANNOTATE {
 
 process PFAM_DOMAINS {
     label 'process_medium'
-    publishDir "${params.outdir}/pfam", mode: 'copy'
+    storeDir "${params.db_dir}/pfam_annotations/chunks${params.pfam_chunks}"
 
     input:
     path domtbl, stageAs: 'tbl/*'
@@ -405,7 +418,7 @@ process PFAM_DOMAINS {
     path 'pfam_members.parquet', emit: members
 
     script:
-    "${params.bench} pfam-domains --domtbl tbl/* --proteins faa/*"
+    "${params.bench} pfam-domains --domtbl tbl/* --proteins faa/* --out tmp.parquet --out-members tmp_members.parquet && mv tmp.parquet domains.parquet && mv tmp_members.parquet pfam_members.parquet"
 
     stub:
     "touch domains.parquet pfam_members.parquet"
@@ -1063,8 +1076,16 @@ workflow DBS {
     if (dbs - ['pfam', 'hostile', 'host', 'decoy']) {
         error "Unknown --dbs: ${(dbs - ['pfam', 'hostile', 'host', 'decoy']).join(', ')}"
     }
+    if ('pfam' in dbs || tools.any { it in ['diamond', 'fmh_funprofiler', 'kmermaid'] }) {
+        FETCH()
+    }
     if ('pfam' in dbs) {
-        PFAM_DB()
+        // the HMMs, and the genomes' proteins annotated with them, stored for later runs
+        def bench_py = file("${projectDir}/bench.py")
+        def hmm = params.pfam_hmm ? channel.value(file(params.pfam_hmm)) : PFAM_DB().hmm
+        GENOME_PROTEINS(FETCH.out.genomes, bench_py)
+        PFAM_ANNOTATE(GENOME_PROTEINS.out.faa.flatten(), hmm)
+        PFAM_DOMAINS(PFAM_ANNOTATE.out.domtbl.collect(), GENOME_PROTEINS.out.faa, bench_py)
     }
     if ('hostile' in dbs) {
         HOSTILE_DB()
@@ -1074,9 +1095,6 @@ workflow DBS {
     }
     if ('decoy' in dbs) {
         DECOY_PROTEOME(channel.fromPath("${projectDir}/../../python/kmer_functional_profiler/*.py").collect())
-    }
-    if (tools.any { it in ['diamond', 'fmh_funprofiler', 'kmermaid'] }) {
-        FETCH()
     }
     if ('diamond' in tools) {
         DIAMOND_DB(FETCH.out.faa)
