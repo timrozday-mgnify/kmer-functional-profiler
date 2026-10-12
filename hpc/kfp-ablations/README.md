@@ -18,6 +18,7 @@ Submit each run from its own directory (`run.sh` checks this):
 
 ```bash
 cd kfp-ablations/00-dbs && sbatch run.sh     # first, alone: Zenodo inputs, Pfam, hostile, host, decoy
+cd kfp-ablations/pfam-annotate && sbatch run.sh  # then: the genomes' Pfam annotations, stored once for every fmh run
 # when it has finished, all at once:
 for r in floor-novaseq floor-miseq floor-perfect floor-1.65M floor-26.4M index reads-novaseq reads-miseq host; do
     (cd kfp-ablations/$r && sbatch run.sh)
