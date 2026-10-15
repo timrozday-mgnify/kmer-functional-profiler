@@ -2146,6 +2146,8 @@ Planned 2026-10-15. To be developed on `dev-pileups` (from `main`), one feature 
   - *Not done:* step 1's sidecar sizes for N = 1, 3, 5; step 6 on the fmh benchmark's metagenomes (the spike benchmark gives it with truth, `pileup-cost` on real reads); real MGnify neighbours as siblings.
   - *HPC (`hpc/kfp-ablations`, all set up, none run):* `spike-protein` (2000 families from the 1-in-100 subset, 10 samples in 10 M pairs of ERR7738575, the three release tiers with `step34q`: the gate, step 6 with truth, step 3's cost against a real-size read set, step 0); `pileup-cost` (after `release-tiers`: the full standard tier with the MERGE store, 10 M pairs of ERR7738575 and 100 M pooled with ERR7746321: step 3's rule, step 0's histogram and step 6 on real reads via `aai-check`). `common.sh` gains `fetch_reads`/`fetch_pairs` (ENA, md5-checked, shared `kfp-ablations/reads/`).
 
+* **Phase 13, plan amendment (2026-10-15, the user's request): the order of the later steps, and out-of-reference recovery noted.** From a report on post-processing the pileups (no code). The crude tool has none: mates scored apart, no abundance prior, insertions not piled, no qualities or error model, no consensus feedback, no haplotypes. On the laptop spike run, ambiguity between units was rare (0.1-0.6% of protein mates hit more than one unit; 85% hit several members of one unit; nucleotide 0% and 3%), and the worst failure was confident reads from a missing source, which an EM over the existing references cannot fix. Steps 7-10 become 7-11: (7) qualities and a learned error model; (8) the joint per-component EM, pair-aware, with effective lengths and a novel-relative class, π started from kfp's `coverage_zi` with a weak prior rather than fixed to it (same reads: double counting, and rare paralogs swallowed); (9) consensus updates, re-alignment and K haplotypes, a highly divergent haplotype reported as a novel relative, gated on `sibling_caught_parent_target`; (10) POA polishing of flagged units; (11) calibration on an extended spike benchmark. The other recovery options (Polypolish, MAFFT `--addfragments`, targeted assembly with PLASS, Penguin, MEGAHIT or MEGAN) are noted and not to be implemented yet; targeted assembly in particular is a candidate further downstream pipeline step, run on flagged components, that hands the problem to standard nucleotide tools.
+
 ### Phase 14
 
 Planned 2026-10-15. To be developed on `dev-targets` (from `main`), one feature branch per step, kept off `main` until phase 7's ablations are done.
@@ -2891,7 +2893,7 @@ So confidence comes from a *joint model per component* (the components the profi
 
 ### Implementation plan (phase 13)
 
-**A crude tool first.** The pileup tool is built only far enough to evaluate how useful kfp's profile is as a front end (recruitment, `aai`, what the reads say about detected targets), not as a complete variant caller. Steps 0–1 are kfp's; steps 2–6 are the crude pileup tool; steps 7–10 come later, if the crude tool shows the follow-up is worth it.
+**A crude tool first.** The pileup tool is built only far enough to evaluate how useful kfp's profile is as a front end (recruitment, `aai`, what the reads say about detected targets), not as a complete variant caller. Steps 0–1 are kfp's; steps 2–6 are the crude pileup tool; steps 7–11 come later, if the crude tool shows the follow-up is worth it.
 
 *kfp (part of its scope):*
 
@@ -2908,12 +2910,24 @@ So confidence comes from a *joint model per component* (the components the profi
 
 Steps 2–4's alignments and read posteriors also feed phase 12's read cross-reference pipeline (joined with sylph + bowtie2 genome assignments on read id).
 
-*Later (on the crude tool's evidence, not planned in detail):*
+*Later (on the crude tool's evidence; order amended 2026-10-15, the user's request: see Progress log, phase 13):* post-processing of the pileups, each step checked on `workflows/spike-benchmark` before the next. Its main job is to resolve reads whose span matches several references, and reads that match one reference confidently but come from a source the reference lacks (the laptop run's withheld siblings: caught 0.07 when the profile called their relative present).
 
-7. **Joint per-component EM** over read sources and allele frequencies, with consensus updates and re-alignment.
-8. **Pileup diagnostics:** linkage, shared-domain location, coverage excess, frequency–abundance match, standard filters.
-9. **Sequence error model** to clean variants: substitution error rates learned from the sample's reads and qualities (as DADA2's error model is), carried through translation, so that residues explained by sequencing error are separated from true variants before frequencies are reported.
-10. **Calibration.** Simulated reads from MGnify neighbours with spiked variants and a withheld sibling. *Rule:* ship confidences only if the empirical FDR is within ~2× of reported across identity bins.
+7. **Base qualities and a learned sequencing error model** in `call` (cheap, and needed by every step after it). Qualities re-read from the FASTQ for recruited reads only (one streaming pass; read positions are already keyed by codon start). Error rates learned from the sample, as DADA2's error model and GATK's base-quality recalibration are: at deep columns with an unambiguous consensus, mismatches by quality, read cycle and substitution type, fitted as a monotone error(quality). Carried through translation (the chance that base errors turn a codon into a given wrong amino acid). Variants tested against it LoFreq-style (a Poisson-binomial over each read's error probability), with strand- and read-position-bias filters and linkage (true variants co-occur across reads, errors do not).
+8. **Joint per-component EM over read sources and abundances.** Per component (kfp's): each read pair's source among targets, neighbours, reversed decoys and one *novel-relative* class; parameters are each source's abundance π_t over its effective length (the positions a fragment can start from, as Salmon's), its sequence, and the error model. E-step: a pair's weight on t is π_t × P(pair | t), the product of both mates with an insert-size term (replacing the crude tool's independent mates). M-step: π from the summed weights. SQUAREM as in kfp's EM.
+   - *kfp's abundances as a start, not a fixed prior:* they come from the same reads, so a fixed prior would count the evidence twice, and a strong one pushes a rare paralog's reads onto the abundant target, where they read as low-frequency variants. π starts at `coverage_zi` with a weak Dirichlet and is estimated from the alignments; kfp's estimate is the prior only for units with too few aligned reads. Reads whose assignment changes between the prior-weighted and the likelihood-only fit are flagged, and variants use likelihood-only weights. Alignment-based π is reported against `coverage_zi`, a second abundance check on real data.
+   - *The novel-relative class:* a likelihood of the read's best alignment discounted to the identity expected of a relative missing from the reference, so confident single-reference reads from a missing source have somewhere else to go.
+   - Measured by read precision and π against truth.
+9. **Consensus updates, re-alignment and haplotypes.** Within the EM, allele frequencies from the weighted pileup; where a source's majority allele changes, its consensus is updated and only that component's reads are re-aligned (EMIRGE's loop, the closest prior art). Then K haplotypes per unit, K chosen by marginal likelihood or BIC. A haplotype diverging from every reference by more than a threshold (~5%, to set on the benchmark) is reported as a *novel relative*, not as variants of the target: a missing sibling differs at 10-20% of columns, carried together by the same reads, where a strain's variants are sparse. The pileup diagnostics feed this step: linkage, shared-domain location, coverage excess, frequency-abundance match, standard filters. *Gate:* `sibling_caught_parent_target` in the spike benchmark (0.07 on the laptop run).
+10. **Polishing of flagged units** to recover sequence the reference lacks (insertions, gene ends beyond the reference): a partial-order-alignment consensus of the unit's reads (spoa or abPOA, the engines inside Racon), only on units with evidence (soft-clipped ends, insertion pile-ups). Milliseconds per unit.
+11. **Calibration.** The spike benchmark extended with strain mixtures, indels, quality-aware errors and siblings as close as MGnify90 neighbours (today's synthetic families put paralogs at 80-90%, so only 0.1-0.6% of mates hit more than one unit, against 85% hitting several members of one unit; full scale has ~1.7 units per hit k-mer). *Rule:* ship confidences only if the empirical FDR is within ~2× of reported across identity bins.
+
+*Out-of-reference sequence recovery, noted and not to be implemented yet* (beyond step 10's polishing):
+
+- *Polishing that keeps every alignment of multi-mapped reads* (Polypolish, nucleotide): for regions shared between references.
+- *Adding reads to the members' alignment* (MAFFT `--addfragments`): a protein-level alignment of a unit's reads against its members.
+- *Targeted assembly of the recruited reads, per component* (PLASS at protein level; Penguin, protein-guided nucleotide; MEGAHIT on the recruited reads; MEGAN's DIAMOND-guided gene-centric assembly): for novel regions and relatives missing from the index. Best kept as a further downstream analysis step added to a pipeline, run on components flagged by step 8's novel-relative class or by heavy clipping. It turns the protein problem into a nucleotide one: per-sample CDS contigs, reads mapped back (bowtie2 or minimap2) and called with standard tools (LoFreq; freebayes `--pooled-continuous`; bcftools consensus; inStrain for microdiversity; Floria or CliqueSNV for strain haplotypes), with base qualities kept and synonymous variants visible. The costliest option (hours at 100 M pairs on every recruited read), hence restricted to flagged components.
+
+*Cost:* DIAMOND dominates the follow-up (3× the query on the laptop's tiny samples; `pileup-cost` measures it at 10 M and 100 M pairs). Steps 7-10 are small beside it: the EM is linear in alignments × iterations per component, the quality pass is one I/O-bound read pass, re-alignment touches only changed units against a tiny reference, and polishing runs on flagged units only.
 
 The pileup tool lives in this repository as its own package and Nextflow pipeline (the user's decision, 2026-10-15). Each step runs as a Nextflow recipe around the tools (DIAMOND, SEG/tantan); its own code covers only the reference builder and the statistics, and it gets target sequences from kfp's `fetch`. Branch: `dev-pileups` from `main`, one feature branch per step, off `main` until phase 7's ablations are done.
 
@@ -2922,9 +2936,9 @@ The pileup tool lives in this repository as its own package and Nextflow pipelin
 - read assignment: ≥ 95% precision on reads simulated from MGnify neighbours with one sibling withheld, with decoys catching ≥ 80% of that sibling's reads;
 - cost: the whole follow-up ≤ 5× pass 1 at 10 M pairs;
 - the `aai` check run and recorded (a report, not a pass/fail);
-- a recorded verdict on usefulness: what the pileups add over the profile, and whether steps 7–10 are worth building.
+- a recorded verdict on usefulness: what the pileups add over the profile, and whether steps 7–11 are worth building.
 
-*Later gate (steps 7–10):* variant confidences with empirical FDR within ~2× of reported across identity bins.
+*Later gate (steps 7–11):* variant confidences with empirical FDR within ~2× of reported across identity bins.
 
 ## Generic targets: nucleotide and amino-acid indexes (phase 14)
 
