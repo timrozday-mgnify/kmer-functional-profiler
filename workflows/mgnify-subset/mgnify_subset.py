@@ -42,6 +42,7 @@ import subprocess
 import sys
 from dataclasses import fields, replace
 from pathlib import Path
+from typing import Final
 
 import duckdb
 import numpy as np
@@ -129,12 +130,17 @@ def extract(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
         ).write_parquet(f"{args.prefix}.pfam.parquet")
 
 
+# Rows per row group of the members tables: with rows sorted by cluster_rep, a fetch of a
+# sample's units reads only the groups whose statistics bracket them (plan, phase 13, step 1).
+MEMBERS_ROW_GROUP: Final = 10_000
+
+
 def merge(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     seqs = f"read_parquet({[f'{p}.seqs.parquet' for p in args.prefixes]})"
     con.sql(
         f"SELECT protein_id, cluster_rep, full_length, sequence FROM {seqs} "
         f"WHERE bucket = {args.bucket} ORDER BY cluster_rep, protein_id"
-    ).write_parquet(args.members)
+    ).write_parquet(args.members, row_group_size=MEMBERS_ROW_GROUP)
     if args.pfam:
         pfam = f"read_parquet({[f'{p}.pfam.parquet' for p in args.prefixes]})"
         con.sql(f"SELECT * FROM {pfam} ORDER BY protein_id").write_parquet(args.pfam)
@@ -149,7 +155,7 @@ def subset(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     con.sql(
         f"SELECT * FROM {members} WHERE cluster_rep % {args.sample} = 0 "
         "ORDER BY cluster_rep, protein_id"
-    ).write_parquet(args.out_members)
+    ).write_parquet(args.out_members, row_group_size=MEMBERS_ROW_GROUP)
     if args.pfam:
         con.sql(
             f"SELECT * FROM read_parquet('{args.pfam}') WHERE protein_id IN "

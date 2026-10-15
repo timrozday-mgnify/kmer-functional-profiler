@@ -22,6 +22,8 @@ from kmer_functional_profiler.index import (
 )
 from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
+from kmer_functional_profiler.store import MEMBERS, write_fasta
+from kmer_functional_profiler.store import fetch as fetch_sequences
 from kmer_functional_profiler.survival import check_aai_model
 
 app = typer.Typer(no_args_is_help=True)
@@ -121,6 +123,30 @@ def import_sourmash(
 ) -> None:
     """Build an index from protein FracMinHash signatures (queried with sourmash hashing)."""
     typer.echo(json.dumps(import_signatures(signatures, out_dir, ksize), indent=2))
+
+
+@app.command()
+def fetch(
+    index_dir: Path,
+    units: Annotated[Path, typer.Argument(help="Unit ids (the index's), one per line")],
+    out: Annotated[Path, typer.Option(help="FASTA, the member id first in each header")] = Path(
+        "targets.fa"
+    ),
+    members: Annotated[
+        int, typer.Option(help="Sequences per unit: the representative and spread others")
+    ] = MEMBERS,
+    store: Annotated[
+        list[Path] | None,
+        typer.Option(
+            help="Members tables to fetch from (repeatable; default the index's own "
+            "targets.parquet), e.g. the partitioned build's MERGE output"
+        ),
+    ] = None,
+) -> None:
+    """Write the target sequences of units as FASTA, ready for ``diamond makedb`` (amino-acid
+    index) or ``bwa-mem2 index`` (nucleotide index)."""
+    ids = [int(line) for line in units.read_text().split()]
+    write_fasta(fetch_sequences(index_dir, ids, members, store or ()), out)
 
 
 @app.command()

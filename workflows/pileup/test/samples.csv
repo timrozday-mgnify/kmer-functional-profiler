@@ -1,0 +1,2 @@
+sample,r1,r2
+fixture,../../../tests/data/reads_1.fastq.gz,../../../tests/data/reads_2.fastq.gz
