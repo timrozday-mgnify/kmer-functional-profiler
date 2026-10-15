@@ -16,6 +16,35 @@ Keep, change, drop:
 
 The harder problems are not sparsity. They are sensitivity to divergent homologs (exact amino-acid k-mers fail below roughly 80% identity), k-mers shared across functions (domains, paralogs), and database licensing (KEGG is not freely redistributable). The plan below addresses those first.
 
+## Tools and scope
+
+Added 2026-10-15, the user's rule: **kfp does one thing well: it estimates the abundances of a large number of short sequence targets in a metagenome.** Targets are MGnify90 units (the functions; see Benchmark labels) in the release, a study's proteins, or any target set (phase 14). Everything downstream of the profile is a separate tool. The taxonomic tool is developed side by side in this repository, but as its own package, CLI, tests and release. The tools meet only through files: the profile and the index's published tables.
+
+| Tool | Scope (one thing) | Activities | Inputs → outputs | Status |
+| --- | --- | --- | --- | --- |
+| **kfp** (`kmer-functional-profiler`; Rust core `crates/core`, bindings `crates/py`, `python/kmer_functional_profiler`) | Abundance of many short targets in a metagenome | *Index:* `index` (members table; phase 14: `--targets` FASTA, nucleotide or amino acid), the partitioned build (`partition.py`, `workflows/mgnify-subset`), `unit-columns`, `import-sourmash` (compat), study indexes (`workflows/study-index`), decoy role, `mask` (host mask sidecar), `calibrate-aai` and `aai-model` (calibration attached to an index), cost model (`cost.py`), the sequence store and `fetch` (target sequences by unit, as an enhanced output; phase 13, step 1). *Query:* `query` (translation, frames, FracMinHash lookup, EM per component, zero-inflated fit, `presence`, intervals, ambiguity groups, `aai`/`aai_naive` (`ani` in phase 14), joint `--extra-index`, `--stats`, evidence for downstream tools: `present_llr`, `--own-hist`, `--kmers`, and phase 12's planned `--unit-prior`). | reads + index → `profile.tsv` (per target: hits, coverage, copies, presence, intervals, similarity, component) and sidecars | Phases 0–10 and 14 |
+| **kfp-genomes** (`python/kfp_genomes`) | Taxonomic estimation from a function profile: genome, species and strain abundance, and function × genome | `panel` (genome-set or catalogue carriage, distances, neighbour lists), `place` (strains among references, mixtures, model checks), `update` (step 6: unit presence given genomes, imputed units, `function_genome.tsv`), iteration through kfp's `--unit-prior`. Moving in (see below): `annotate-genomes`, `genomes` (G1), `species-index`, `species`, `lineage` (phase 11), now in kfp's CLI. Workflows: `gtdb-species-index`, `species-benchmark`, the read cross-reference pipeline. | profile (+ index's unit tables) + genome panel → genome profile, placements, `function_genome.tsv`, `profile_updated.tsv` | Phase 12 (with phase 11's work as baselines) |
+| **Pileup tool** (name to choose; phase 13; this repository, own package) | Read-level variants on detected targets; crude for now, enough to evaluate kfp | Per-sample reference (detected units, neighbours, decoys) from a profile and kfp's `fetch`, DIAMOND (minimap2/bowtie2 for nucleotide targets) run as a Nextflow pipeline, read posteriors, crude pileups, the `aai` check against kfp's profile. Later: joint per-component allele EM, diagnostics, a sequence error model to clean variants, calibration | reads + profile + sequence store → alignments, read assignments, variants with confidence | Phase 13, not started |
+| `kfp-prior` (`python/kfp_prior`) | (retired) unit presence from genomes | `update` | — | Deleted in phase 12 (at step 6, by `dev-genomes`' amendment); replaced by `kfp-genomes update` |
+| Benchmarks and ablations (`workflows/fmh-benchmark`, `sim-benchmark`, `aai-model`, `aai-rescore`, `hpc/kfp-ablations`) | Not tools; development only | Scoring at MGnify90-unit, Pfam and KO levels, tool comparisons, ablations, survival-model fits | — | Ongoing |
+
+The table describes the repository with its development branches: on `main` only kfp exists today; `kfp-prior` and phase 11's genome commands are on `dev-phase11`/`dev-species`, and `kfp-genomes` on `dev-genomes`, until phase 7's ablations are done.
+
+**Rules.**
+
+- *Direction of dependency:* downstream tools read kfp's files and may import its library for shared kernels (hashing, the index reader), never the reverse. kfp's CLI has no genome, taxonomy or pileup commands.
+- *The interface is kfp's file contract:* `profile.tsv`'s documented columns, the index's unit tables (Pfam and KO labels, components, `pin_sum`), the evidence sidecars (`--own-hist`, `--kmers`) and per-target prior inputs (`--unit-prior`). A downstream need is met by adding evidence to that contract, not by moving downstream logic into kfp.
+- *Inside kfp's scope* (kept): `aai`/`ani` (how far the sample's variant is from each target, as sylph's ANI is part of its profile); host masks, decoys and joint queries (they change the abundance estimate); the hits-per-pair histogram (`--stats`); scoring the profile per target.
+- *Outside it:* genome, species and strain estimation; function × taxon and function × genome tables; read classification, alignments and variants; follow-up pipelines (the read cross-reference pipeline, phase 13).
+- *Release:* kfp ships as the Rust binary (phase 9). Downstream tools have their own versions, and each records the kfp index checksum and contract version it was built against.
+
+**Moves this implies (no code yet).**
+
+1. Phase 11's commands leave kfp's CLI: `annotate-genomes` and `genomes` (G1, a baseline arm) move to `kfp-genomes` (`panel` already uses them); `species-index`, `species` and `lineage` move too, as baseline arms until phase 12's step 9 removes them. `genomes.py`, `species.py` and `lineage.py` move to `kfp_genomes`; `annotate-genomes` runs kfp's pass 1 through the library, with genomes as read sets.
+2. The `kfp-genomes` package gets its own entry in `pyproject.toml` (already), tests directory, changelog and version.
+3. Phase 13's pileup tool is its own package and Nextflow pipeline in this repository (decided 2026-10-15). The sequence store and `fetch` are kfp's.
+4. Phase 9's release is kfp alone; the Nextflow module for the hybrid pipeline is kfp's query step, with downstream tools as optional modules of their own.
+
 ## Prior art
 
 The closest tool is fmh-funprofiler; everything in your plan except the density control and frame handling has a precedent.
@@ -342,7 +371,7 @@ Prototype the algorithm in Python, with stable hot loops in Rust from day one vi
 
 ## Implementation plan
 
-Ten phases, each with a go/no-go gate, plus three optional ones; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index, and phase 11 (desirable, not essential) predicts which genomes are present from the function profile. Phase 12 (desirable, not essential) is a companion tool. It places the sample's species and strains among their nearest reference genomes from the function profile, then updates the function profile from them, including which functions belong to which genomes (see Genome profile and functional update). Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
+Ten phases, each with a go/no-go gate, plus five optional ones; phases 1–5 are the Python prototype with Rust kernels, phase 6 makes the method run on all of MGnify Proteins at a reasonable cost, phase 7 runs the ablations against that full-scale method and freezes it, phase 8 ports the rest to Rust, and phase 10 (desirable, not essential) lets users add their own proteins to a released index, and phase 11 (desirable, not essential) predicts which genomes are present from the function profile. Phases 12 and 13 build separate tools, not kfp features (see Tools and scope). Phase 12 (desirable, not essential) is the taxonomic tool, `kfp-genomes`. It places the sample's species and strains among their nearest reference genomes from the function profile, then updates the function profile from them, including which functions belong to which genomes (see Genome profile and functional update). Phase 13 (desirable, not essential) is a separate pileup tool: it recruits reads onto detected units and hands them to DIAMOND for pileups and amino-acid variants, which also checks `aai` on real data (see Read recruitment and variant pileups). Phase 14 (desirable, not essential) makes kfp itself a general estimator of short targets' abundance, with nucleotide and amino-acid indexes queried by different methods (see Generic targets). Phase 3 is the first point where the prototype must at least match fmh-funprofiler, or the project should stop.
 
 | Phase | Deliverable | Language | Gate |
 | --- | --- | --- | --- |
@@ -358,7 +387,9 @@ Ten phases, each with a go/no-go gate, plus three optional ones; phases 1–5 ar
 | 9. Release | Rust binary via cargo-dist, bioconda recipe, Nextflow module for the hybrid profiling pipeline; optional Python wheel of the bindings. | Rust | Tagged release reproduces phase 7 results. |
 | 10. Additional references (desirable, not essential) | Decoy role for contaminant proteomes; a Nextflow recipe for study indexes (contigs or MAGs → pyrodigal → linclust 90% → `index`) queried jointly with the base; `extend` overlays and `compact` only if joint queries prove too approximate. Joint query and host mask come earlier, in phase 7. See Additional references below. | Rust (+ Nextflow module) | Base + study index recovers ≥ 90% of the completeness gain of a rebuild that includes the study's proteins, with no change to unrelated base units; extending with one study (~10⁶ proteins) takes minutes on one node. |
 | 11. Genome mode (desirable, not essential) | `annotate-genomes`: a set of reference genomes (protein FASTA; nucleotide through pyrodigal) streamed through the query's first pass with read id = genome, giving each genome's raw hits per unit. `genomes`: genome abundances from a profile's per-unit hits by gather and weighted, zero-inflated EM over those contents; unexplained fraction; the per-sample function × taxon table (Pfam × genome, rolled up to species and genus, with an unclassified remainder), a primary output. See Genome mode below. | Python, then Rust (+ Nextflow module) | On the fmh benchmark's 64 genomes plus distractors, genome detection and abundance within 0.05 (F1, L1) of sylph on the same genomes; function × taxon abundance L1 and (taxon, function) F1 no worse than HUMAnN 3.9's stratified output on KO; 10⁵ genomes annotated in ≤ 1 day on one node; the genome fit ≤ 10% of the query's time. |
-| 12. Genome profile and functional update (desirable, not essential; planned 2026-10-08, see Genome profile and functional update) | `kfp-genomes` companion (replaces `kfp-prior`): `panel` (per-genome carriage, copies and k-mer survival; cheap distances and nearest-neighbour lists; no trees), `place` (strains placed between nearest references from per-unit likelihoods built from the profile: one strain exactly, several by MCMC, number by marginal likelihood, strain mixtures from depths pooled across units), `update` (unit presence and coverage as posterior marginals, imputed units apart from observed, the function × genome table), opt-in iteration through the query's unit presence prior. | Python | Carriage log loss ≥ 10% below the species model and the lineage prototype; species L1 within 0.05 of sylph; two strains (≥ 1× each, distinct clades) resolved in ≥ 80% with calibrated mixture probability; placement better than nearest-reference; at 0.1–1× Pfam completeness +10 points at ≤ 2 points of purity; zero-hit calibration error ≤ 0.05; model checks flag < 10% of detections. |
+| 12. Genome profile and functional update (the separate taxonomic tool `kfp-genomes`; desirable, not essential; planned 2026-10-08, see Genome profile and functional update) | `kfp-genomes` companion (replaces `kfp-prior`): `panel` (per-genome carriage, copies and k-mer survival; cheap distances and nearest-neighbour lists; no trees), `place` (strains placed between nearest references from per-unit likelihoods built from the profile: one strain exactly, several by MCMC, number by marginal likelihood, strain mixtures from depths pooled across units), `update` (unit presence and coverage as posterior marginals, imputed units apart from observed, the function × genome table), opt-in iteration through the query's unit presence prior. | Python | Carriage log loss ≥ 10% below the species model and the lineage prototype; species L1 within 0.05 of sylph; two strains (≥ 1× each, distinct clades) resolved in ≥ 80% with calibrated mixture probability; placement better than nearest-reference; at 0.1–1× Pfam completeness +10 points at ≤ 2 points of purity; zero-hit calibration error ≤ 0.05; model checks flag < 10% of detections; function (MGnify90 unit) × genome L1 within 0.05 of the read cross-reference pipeline (DIAMOND × sylph + bowtie2 on read ids) on CAMI II. |
+| 13. Read recruitment and variant pileups (a separate tool; desirable, not essential; planned 2026-10-15, not started; step 0, the hits-per-pair histogram, can land now; see Read recruitment and variant pileups) | Optional follow-up after profiling, built from existing tools. In kfp: a cluster-keyed sequence store from MERGE's output (`fetch`, target sequences as an enhanced output). In the pileup tool, crude first: a per-sample reference (detected units, component neighbours, reversed decoys) for `diamond makedb`, `diamond blastx` keeping several hits per read; then per-read posteriors with decoy drop and crude pileups; later, a joint per-component EM over read sources and allele frequencies, pileup diagnostics, a sequence error model and calibrated per-variant confidence. A dense second-round k-mer query stays an option (pre-filter, or classifier where no pileup is needed). The alignments give an `aai` check on real metagenomes. | Python + Nextflow (DIAMOND) | Crude tool: ≥ 95% read-assignment precision with decoys catching ≥ 80% of a withheld sibling's reads; follow-up ≤ 5× pass 1 at 10 M pairs; `aai` check and usefulness verdict recorded. Later: variant FDR within ~2× of reported. |
+| 14. Generic targets: nucleotide and amino-acid indexes (desirable, not essential; planned 2026-10-15, not started; see Generic targets) | `index --targets` from any FASTA (optional groups or clustering); `molecule` in the index; canonical nucleotide k-mers with no translation or frames for nucleotide indexes, today's translated query for amino-acid ones; `ani` for nucleotide indexes; phase 13's follow-up with minimap2/bowtie2 and a standard caller for nucleotides. | Rust kernels + Python (+ Nextflow) | MGnify outputs unchanged; nucleotide detection F1 and abundance L1 within 0.05 of KMA on a spike-in benchmark at ≤ its CPU time; FASTA build equals the members-table build; `ani` bias ≤ 0.01 over 0.9–1.0. |
 
 Out of scope initially: long reads (indels break frames; would need FragGeneScan-style frameshift handling), eukaryotic genes, metatranscriptomes.
 
@@ -400,7 +431,7 @@ What each step did, and the choices, results and interpretations behind it, newe
 
 * *Superseded (2026-10-08) by the genome profile and functional update (phase 12): `kfp-prior` and its plan section are removed; its rationale, qualifications and evaluation are carried into Genome profile and functional update.* **Decided (2026-10-01): genome-informed unit presence is a separate companion tool (working name `kfp-prior`), as Bracken is to Kraken; desirable, not essential.** Units missed in low-coverage genomes that almost always carry them should be reported as probably present, and units missed in high-coverage genomes as confident absences. Detected genomes (phase 11) set a per-unit prior from clade carriage frequencies, which each unit's own hits then update. It is imputation from taxonomy: it raises completeness but adds no information beyond the taxonomic profile, so imputed values are reported apart from observed ones. A separate tool keeps the profiler's output evidence-only, and lets the prior take taxa from any source (genome mode or sylph). It talks to the profiler only through files, and needs its own release cycle and genome-set data, not the index. Details: Genome-informed unit presence.
 
-* **Decided (2026-10-01): the function × taxon table is a primary output of genome mode, not an optional `--stratify`.** Users need to know which taxa carry each function in each sample (HUMAnN's stratified output). Genome mode already fits genome depths to unit hits, so each unit's hits split among the genomes that carry it in proportion to the fit's responsibilities, λ\_G *c\_{G,u}* / Σ\_H λ\_H *c\_{H,u}*; summing units by Pfam and genomes by GTDB rank gives the table. Hits no genome explains go to `unclassified`; ambiguity groups of near-identical genomes are reported at their lowest common rank, not split. Phase 11 stays desirable, not essential, but its gate now includes the table. Two consequences for earlier phases: the within-component unit split now matters (sibling units of one Pfam can sit in different taxa), so phase 7 scores it; and the profile keeps per-unit hits after the EM split as well as raw. Details: Genome mode, Function × taxon table.
+* **Decided (2026-10-01): the function × taxon table is a primary output of genome mode, not an optional `--stratify`.** Users need to know which taxa carry each function in each sample (HUMAnN's stratified output). Genome mode already fits genome depths to unit hits, so each unit's hits split among the genomes that carry it in proportion to the fit's responsibilities, λ\_G *c\_{G,u}* / Σ\_H λ\_H *c\_{H,u}*; summing units by Pfam and genomes by GTDB rank gives the table. Hits no genome explains go to `unclassified`; ambiguity groups of near-identical genomes are reported at their lowest common rank, not split. Phase 11 stays desirable, not essential, but its gate now includes the table. Two consequences for earlier phases: the within-component unit split now matters (sibling units of one Pfam can sit in different taxa), so phase 7 scores it; and the profile keeps per-unit hits after the EM split as well as raw. Details: Genome mode, Function × taxon table. *Amended 2026-10-15:* a function is a MGnify90 unit; the table's rows are units × taxa, rolled up to Pfam and KO (see Benchmark labels).
 
 * **Decided (2026-10-01): containment AAI per unit, sylph-style; member-level placement only if the data call for it.** Users asked for sylph's ANI outputs in protein space, both for the matches and as a blanket over references, to place sample functions more finely than MGnify90. The plan is in Sequence similarity (containment AAI). In short: `aai` = min(1, `copies_zi`)^(1/k) on detected units, with intervals from the posterior; `aai_naive` (per-unit zero-truncated Poisson correction, no reassignment) on every hit unit, which the profile already lists, so the blanket mode costs one column; and a `component` column so neighbour AAIs can be read from the profile. Rejected: finer units (95% or member-level) and in-tool alignment. Deferred: a member sidecar for nearest-member placement, built only if calibration data show enough close, diverse-cluster hits. Calibration and its gate go with the phase-7 divergence ladder. Status: steps 1–2 in code (phase 7, step 2); calibration pending.
 
@@ -413,6 +444,9 @@ What each step did, and the choices, results and interpretations behind it, newe
 * **Decided (2026-10-06): the standard tier is `tbase02_all16`** (`--k 11 --t-base 0.02 --n-min 16 --oversample 1`; the user's choice, from phase 7, step 31). 1.96 GB at 1 in 100: ~196 GB in today's format, ~108 GB compact by `slim`'s ratio. Known costs from step 31: its `aai` does not calibrate (−0.037 at 70%, Spearman 0.22), and at matched purity its MGnify90 detection ≈ `tbase02_all` and below `tbase02_n16`. Its Pfam equals the other candidates.
 * **Decided (2026-10-09): the unknown fraction ships as `census_containment` only** (the user's choice, from phase 7, step 39). `explained_fraction` (detected units' depth × length) over-counts genes hit by several units, 0.59 of read bases against 0.41 truth on `tbase02_all16`, and is removed from `--summary` (step 40). The census is a k-mer containment, not a read fraction, and is presented as such.
 * **Decided (2026-10-08): the `aai` survival model is `step34q`** (`workflows/fmh-benchmark/ablations/aai_models/step34q.json`). From phase 7, step 34: Markov-beta with end loss, a union term and union scatter, fitted on aai-model's protein pairs against the query's own measure (hits over an average member's kept k-mers). Over 10 samples per floor run it passes step 25's rule (single-gene units, per true-identity bin) on `tbase05` and `tbase02_all`; `step34` fails at 70–80% everywhere. The release indexes get it attached (`hpc/kfp-ablations/release-tiers/run.sh` runs `kmer-functional-profiler aai-model <index> step34q.json` after each tier's build). `tiers.config` scores `step34q` and `step34` as aai arms, and `hpc/kfp-ablations/aai-rescore/run.sh` also rescores the finished `tiers-novaseq` run, for the check on `tbase05_all`. Unbiased `aai` needs the large tier (`tbase05_all`).
+* **Decided (2026-10-15): read-level follow-up goes to existing tools; no custom read classifier or aligner (phase 13).** From the user's amendment "kfp read classification and variant pileups". Pass 1 alone classifies reads too weakly (estimated 58–75% of gut pairs ≥ 3 hits on the standard tier), so reads are recruited onto a per-sample reference built from the profile and aligned with DIAMOND (minimap2/bowtie2 for nucleotide targets, phase 14). No pre-built dense tier for read classification; a cluster-keyed sequence store instead. Variant confidence comes from a joint per-component model, not per-read weights alone. *Qualification (the user's):* a dense second round of k-mer querying is always an option to consider (as a pre-filter in front of the aligner, or as the classifier where no pileup is needed), but follow-up analysis is better done by existing tools.
+* **Decided (2026-10-15): the tool estimates abundances of short targets generally, with nucleotide and amino-acid indexes (phase 14).** The user's request. The molecule is a property of the index and picks the query method; the nucleotide path (canonical k-mers, no translation or frames) is kept simpler than the amino-acid one. MGnify Proteins stays the main product.
+* **Decided (2026-10-15): kfp does one thing well; pileups and taxonomic estimation are separate tools.** The user's rule. kfp's scope is the abundance of a large number of short targets in a metagenome. The pileup follow-up (phase 13) is its own tool. Taxonomic estimation (`kfp-genomes`, phase 12, with phase 11's genome commands moving into it) is a separate tool developed side by side in this repository. See Tools and scope.
 
 ### Phase 1
 
@@ -1732,6 +1766,8 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
       | edges30 | 1.52× | 1.21 / 1.13 / 1.12× | **1.02** / 1.31 / **1.03**× | 1.27 / 1.55 / 1.15× | 1.35–2.25× | 1.3 / 2.3 / 3.2 |
       | all | 2.29× | 1.34 / 1.21 / 1.20× | 1.10 / 1.43 / 1.28× | 1.73 / 1.74 / 1.38× | 1.85–2.43× | 1.5 / 2.3 / 3.2 |
 
+      - *Note (2026-10-15, phase 13):* these k-mers-hit counts (1.39 / 1.70 per pair for `tbase02_all` / `tbase05_all` at 100 M pairs) come from 1-in-100 cluster-subset indexes. They understate full-scale hits and do not transfer to read-level work; phase 13's step 0 measures full scale.
+
       - *The workload is deterministic; the times are not.* Hashing CPU barely grows with edges (≤ 1.3×; the reads are decoded once whatever the mode), while lookup scales with the sampled k-mers (edges30 1.5×, edges20 1.8×). Wall time is noisy at the 50% level: `tbase05_all` edges30 at 40 M pairs ran 0.91× stop-free, and `slim` stop-free hashing took 132 s against 83 s for edges20. The EM is ≤ 50 s everywhere; it is not what frame mode costs.
       - `tbase05_all` at 4 M pairs: 210,913 (edges20) and 212,307 (all) unconverged units, under both EM versions, with `em_max_change` 3.7 × 10⁻⁸ (all): its largest component on a flat ridge (step 29), not an error.
     - *Against step 28's rule:* lower `abund_err_len0`/`len150` and higher `completeness_90_len0`/`len150` on both read models: **met** (both edges). No purity loss at matched thresholds: **met**, except `slim` at the highest purity. ≤ 25% more query time at 100 M pairs: edges30 **met on `slim` and `tbase05_all` by wall time** (1.02×, 1.03×) and **missed on `tbase02_all`** (1.31×; the nearest measured index to the chosen standard tier, `tbase02_all16`). By CPU it misses on `slim` (1.27×) and `tbase02_all` (1.55×). Edges20 misses on `tbase02_all` either way. All: rejected (no gain over edges, the highest cost).
@@ -2052,6 +2088,31 @@ Planned 2026-10-08. To be developed on `dev-genomes` (from `main`, with `dev-spe
 
 * **Phase 12, plan (2026-10-08).** Genome profile and functional update, written from the user's design (Decided 2026-10-08). It replaces Genome-informed unit presence (`kfp-prior`). That section is removed; its rationale, qualifications, worked example and evaluation are carried over. No code yet.
 
+* **Phase 12, plan amendment (2026-10-15, the user's request). Read cross-reference pipeline as a comparison arm and development aid.** Reads classified to amino-acid targets by DIAMOND and, independently, to genomes by sylph + bowtie2, then joined on read id into a genome × function table (Genome profile and functional update, Read cross-reference pipeline). Added to step 8's arms and metrics, to the gate (within 0.05 L1 of the pipeline on CAMI II at ≤ 1/10 its CPU; threshold proposed in writing it, to confirm) and, on `dev-genomes`, to the CAMI II benchmark's arms (the pause before step 6). It shares phase 13's DIAMOND step and per-read posteriors, so its recruited arm costs only the bowtie2 side once phase 13 exists; the full-reference arm does not depend on phase 13. No code yet.
+  - *Why:* `place` and `update` have so far been tested only on simulated profiles. The pipeline gives read-level, sample-specific labels on real metagenomes (genome depths, which reference genes the sample's strain covers, which genome each function's reads come from) to develop and check them against.
+
+* **Plan amendment (2026-10-15, the user's definition): a function is a MGnify90 unit.** Not a Pfam annotation. Benchmark labels now defines it and scores at three levels: MGnify90 unit, Pfam and KOfam (KofamScan on benchmark genomes and on the representatives of the units an index or panel holds). The function × taxon table (phase 11), `function_genome.tsv` and `update`'s outputs (phase 12) and the read cross-reference pipeline are keyed by unit and rolled up to Pfam and KO. Earlier decisions and gates taken on Pfam (phases 5–7; phases 11–12's Pfam completeness gates) stand as Pfam-level benchmarks.
+
+* **Plan amendment (2026-10-15, the user's rule): tools and scope.** kfp does one thing: abundance of many short targets in a metagenome. New section Tools and scope lists each tool in this repository and its activities: kfp (index, query, calibration, masks, joint queries), `kfp-genomes` (the taxonomic tool: `panel`, `place`, `update`, and phase 11's `annotate-genomes`, `genomes`, `species-index`, `species`, `lineage`, which move out of kfp's CLI), the phase-13 pileup tool, the retired `kfp-prior`, and the benchmark and ablation workflows. No code moved yet.
+* **Plan amendment (2026-10-15, the user's decisions): the pileup tool's place and scope.** It lives in this repository as its own package. The sequence store and `fetch` live in kfp, as an enhanced output of target sequences that a dense second round could also use. The pileup tool is built crude first (steps 2–6: reference, DIAMOND, read posteriors, raw pileups, the `aai` check), enough to evaluate kfp's usefulness; the joint EM, diagnostics, calibration and a future sequence error model to clean variants become later steps 7–10, with the variant-FDR gate moved to them.
+
+### Phase 13
+
+Planned 2026-10-15. To be developed on `dev-pileups` (from `main`), one feature branch per step, kept off `main` until phase 7's ablations are done.
+
+* **Phase 13, plan (2026-10-15).** Read recruitment and variant pileups, from the user's amendment "kfp read classification and variant pileups" (Oct 15, 2026). No code yet.
+  - *Decided in that discussion:* no custom read classifier or aligner (DIAMOND on a per-sample subset); no pre-built dense tier for read classification (a cluster-keyed sequence store instead); variant confidence from a joint per-component model, not per-read weights alone.
+  - *Amendments (the user's, same day):* (1) a dense second round of k-mer querying stays an option at every step, as a pre-filter or as the classifier for outputs with no pileup, but follow-up analysis is preferably done by existing tools such as DIAMOND; (2) the phase is the pipeline for high-resolution sequence variants in a metagenome, kfp upstream and DIAMOND downstream; (3) its alignments are used to test `aai` further (step 6); (4) the same follow-up for nucleotide targets is part of phase 14.
+  - *Corrections made elsewhere:* phase 7, step 31's hit counts are noted as 1-in-100 figures that do not transfer to full scale; Sequence similarity's option D (alignment refinement) is marked superseded by this phase.
+  - *Next:* step 0 (the hits-per-pair histogram in `query --stats`) can land now as phase 6 tooling, then run on `full-build` and the standard tier at 10 M pairs on HPC.
+
+### Phase 14
+
+Planned 2026-10-15. To be developed on `dev-targets` (from `main`), one feature branch per step, kept off `main` until phase 7's ablations are done.
+
+* **Phase 14, plan (2026-10-15).** Generic targets, the user's request: estimate abundances of short targets in a metagenome from nucleotide or amino-acid indexes, with the query method chosen by the index's molecule and the nucleotide case kept simpler (no translation, frames or reduced alphabets). No code yet.
+  - *Choices made in writing it (open to the user):* canonical 2-bit nucleotide k-mers (k ≤ 32) through the same FracMinHash threshold; no mixed-molecule joint queries; `ani` named apart from `aai`; KMA and bowtie2 as the nucleotide baselines, on resistance and marker genes spiked into the fmh benchmark and CAMI II; whole genomes left to sylph and phases 11–12.
+
 ## Libraries
 
 Most of the plumbing exists; the amino-acid k-mer hashing and the translation LUT are small enough to write yourself.
@@ -2090,7 +2151,19 @@ For binaries using the SIMD crates, pin `target-cpu=x86-64-v3` in release builds
 
 ## Benchmark labels
 
-Pfam is the primary label for benchmarking; KO is kept as a secondary label.
+**A function is a MGnify90 unit** (the user's definition, 2026-10-15): a MGnify Proteins 90% amino-acid identity cluster, the index's unit. "Function" in this plan means that, in the function profile, the function × taxon and function × genome tables and the read cross-reference pipeline. Pfam and KO are annotations of functions, used to roll outputs up and to score some benchmarks; they never stand in for the function itself. (For a study index or phase 14's generic targets, the function is that index's unit.)
+
+Benchmarks are scored at three levels:
+
+| Level | Truth | Used for |
+| --- | --- | --- |
+| MGnify90 unit (the function) | Each source protein's nearest MGnify90 cluster (phase 7, step 10's MGnify90-level truth) | Unit detection and abundance (`completeness_90`, `purity_nearest`), `aai`, the function × genome tables of phases 11–12 and the read cross-reference pipeline, phase 13's pileups |
+| Pfam | Pfam-A on the benchmark genomes (below) | Tool comparisons with DIAMOND and HUMAnN; phases 5–7's default choices (those decided on Pfam stay as decided); Pfam roll-ups of the function profile and of function × genome |
+| KOfam | KofamScan (KOfam HMMs, adaptive thresholds) on the benchmark genomes, or KEGG's own KOs for the fmh benchmark's KEGG genomes | Comparisons with fmh-funprofiler, kMermaid and HUMAnN on KO, including HUMAnN's stratified output against the function × taxon table; KO roll-ups of the function profile and of function × genome |
+
+Rolled-up levels label each MGnify90 unit by its representative (Pfam from MGnify's `mgy_proteins_pfam`; KO by KofamScan on the representatives of the units an index or panel holds, not the whole release). A unit with several labels counts towards each.
+
+Before 2026-10-15 the plan read Pfam as the primary label and KO as secondary; the paragraphs below are kept from then, with the three levels above taking precedence.
 
 - **Why Pfam.** The released index labels MGnify90 clusters with MGnify's own Pfam hits (no KO or eggNOG annotation run), so Pfam is what users will report and what defaults should be chosen on. Pfam is also open, so truth sets and indexes can be shared.
 - **Why keep KO.** fmh-funprofiler profiles KEGG orthologs and is the direct predecessor, so a KO benchmark is the only like-for-like comparison with it (the phase-3 gate was passed on KO). KO results are reported beside Pfam results, but decisions and gates from phase 5 on use Pfam.
@@ -2108,7 +2181,7 @@ Three tiers: tiny hand-built fixtures in the repo, a small simulated community f
 | CI community (\~5–10 MB) | 5 complete genomes spanning GC: *S. aureus* (low GC), *E. coli* K-12, *B. subtilis* 168, *P. aeruginosa* PAO1 (high GC), one archaeon. Reads from InSilicoSeq with known origins; truth = per-gene coverage from read origins mapped through annotations. | End-to-end golden output (insta snapshot), GC effect on frame filter, abundance error bounds. | Repo via Git LFS, or Zenodo with a checksum-verified download step. |
 | fmh-funprofiler datasets | Their simulated metagenomes and KO ground truth, plus Pfam truth from the same genomes. | Head-to-head at equal density; compat-mode parity (KO); primary accuracy (Pfam). | Zenodo record from their repo. |
 | Divergence ladder | Hold out the source genomes' proteins from the index, keeping relatives at \~95/90/80/70% amino-acid identity. | Sensitivity decay vs alphabet, k, spaced seeds. The key experiment for any amino-acid k-mer method. | Built by the eval pipeline. |
-| CAMI II (marine, strain madness, plant-associated) | Public simulated metagenomes with genome-level truth. | Functional truth derived by annotating the source genomes with Pfam (primary) and KofamScan KOs (for fmh-funprofiler) and projecting read origins. | CAMI data portal. |
+| CAMI II (marine, strain madness, plant-associated) | Public simulated metagenomes with genome-level truth. | Functional truth derived by mapping the source genomes' proteins to their nearest MGnify90 clusters (the functions) and annotating them with Pfam and KofamScan KOs, then projecting read origins. | CAMI data portal. |
 | Mock communities | ZymoBIOMICS standards (e.g. the gut standard) with published reference genomes. | Real sequencing error and library bias with known composition. | ENA/SRA runs. |
 | Real cohort | A subset of HMP2/IBDMDB with published HUMAnN outputs. | Concordance with HUMAnN; runtime at scale. | IBDMDB portal. |
 | Negative controls | Shuffled reads, human reads, intergenic-only simulated reads. | False-positive rate; human reads also with and without the human mask. | Generated. |
@@ -2321,10 +2394,10 @@ Recommended: G0 detection, G1 abundances, G4 as an ablation and the normaliser, 
 
 ### Function × taxon table
 
-A primary output: per sample, abundance of each Pfam (and unit) attributed to each taxon, as HUMAnN's stratified table.
+A primary output: per sample, abundance of each function (MGnify90 unit) attributed to each taxon, as HUMAnN's stratified table, with Pfam and KO roll-ups.
 
 - **Attribution.** After the G1 fit, unit *u*'s split hits (the unit-level EM's allocation, so a k-mer shared across units is not counted twice) go to genome G with responsibility *r\_{G,u}* = λ\_G *c\_{G,u}* / Σ\_H λ\_H *c\_{H,u}*. Hits above what the fit predicts (*h\_u* − Σ\_G λ\_G *c\_{G,u}*, floored at 0), and all hits on units no candidate genome carries, go to `unclassified`. This is the exact E-step of G1, so it costs nothing beyond the fit.
-- **Ranks.** Genomes roll up to species, genus and family by the `taxonomy` column; rows are `Pfam|rank:taxon` plus `Pfam|unclassified`, with the unstratified total kept so rows sum to it. Units roll up to Pfam as the unstratified profile does (multi-label units count for each label).
+- **Ranks.** Genomes roll up to species, genus and family by the `taxonomy` column; rows are `unit|rank:taxon` plus `unit|unclassified`, with the unstratified total kept so rows sum to it. Units roll up to Pfam and KO as the unstratified profile does (multi-label units count for each label), giving `Pfam|rank:taxon` and `KO|rank:taxon` tables.
 - **Ambiguity.** Genomes in one ambiguity group (near-identical content) are not split; their share is reported at the group's lowest common rank. Intervals per row are closed-form from the genome-depth fit (no draws, 2026-10-02).
 - **Normalisation.** Same units as the profile (hits, coverage, copies per genome-equivalent); a per-taxon option divides by that taxon's genome-equivalents (copies of the function per cell of that taxon).
 - **Limits.** Taxa come only from the reference genome set: a biome the set covers poorly leaves most hits `unclassified`. Within a species, protein k-mers cannot see synonymous differences between strains, so strain attribution is weak; species and genus are the ranks to read. A unit-level fallback (lowest common taxon of a MGnify90 cluster's member contigs, if the release gives contig taxonomy; to check) could label part of `unclassified` and is built only if the unclassified fraction on real samples is large.
@@ -2349,7 +2422,7 @@ A primary output: per sample, abundance of each Pfam (and unit) attributed to ea
 ### Evaluation
 
 - **fmh benchmark** (phase 11): its 64 genomes have exact simulated abundances. Annotate them plus distractors (other KEGG genomes from the same Zenodo record), against the full MGnify index and the KO index. Metrics: genome purity, completeness, F1, abundance L1 and Spearman. Baselines on the same genomes: sylph (DNA) and sourmash gather on protein sketches.
-- **Function × taxon table** (phase 11): truth per (genome, KO or Pfam) from the 64 genomes' annotations and simulated abundances, rolled up to species and genus. Metrics: stratified abundance L1, (taxon, function) F1, and the fraction of hits attributed to the right taxon; baseline HUMAnN 3.9's stratified output (KO), already run in phase 5.
+- **Function × taxon table** (phase 11): truth per (genome, function) at all three levels (MGnify90 unit by nearest cluster, Pfam, KO) from the 64 genomes' annotations and simulated abundances, rolled up to species and genus. Metrics: stratified abundance L1, (taxon, function) F1, and the fraction of hits attributed to the right taxon; baseline HUMAnN 3.9's stratified output (KO), already run in phase 5.
 - **Hold-out ladder:** remove each source genome from the set, keeping relatives at ~95/90% ANI, as the divergence ladder does for proteins: the relative should be reported, with π\_G falling as identity falls.
 - **Cost:** annotation time per genome and per 10⁵ genomes; fit time against the query's.
 - **Gate:** see phase 11 in the table.
@@ -2481,8 +2554,8 @@ The benchmark scores the calibration of each.
   - the share of the function's coverage and `hits_em` assigned to the strain, with intervals;
   - whatever no strain explains goes to `unclassified`.
 
-  Functions are units, rolled up to Pfam as P(any of the Pfam's units carried).
-- *`profile_updated.tsv`* is written beside the original profile, with observed and imputed values in separate columns, at unit and Pfam level.
+  Functions are MGnify90 units, rolled up to Pfam and KO as P(any of the label's units carried).
+- *`profile_updated.tsv`* is written beside the original profile, with observed and imputed values in separate columns, at unit level and rolled up to Pfam and KO.
 - *Genome profiles from elsewhere* (sylph, MetaPhlAn, a user list): `update --genomes` places strains at the given references with ℓ = 0. Depth comes from their abundance and survival *f* from their ANI. A source that does not use the same reads has no double use of them, so it is also the check on that.
 - *Imputed coverage* is reported but never fed into the query's EM; iteration changes only the EM's presence prior (below).
 
@@ -2493,8 +2566,8 @@ The benchmark scores the calibration of each.
   - So observed and imputed values are reported separately, and differential analyses should use observed values only (the PICRUSt critique).
 - *A unit is not a function.*
   - A MGnify90 cluster tracks lineage closely. The sample's strain may carry the function as a sibling cluster at < 90% identity, which is then hit instead of the expected unit.
-  - The zero is then right about the unit and wrong about the function. Such units are marked `sibling_hit` (a detected sibling in the same component) and are not imputed as absent at Pfam level.
-  - Pfam-level presence is the summary users should read.
+  - The zero is then right about the function (the unit) and wrong about its protein family. Such units are marked `sibling_hit` (a detected sibling in the same component) and are not imputed as absent at Pfam or KO level.
+  - For family-level questions, Pfam- or KO-level presence is the summary users should read.
 - *Genome false positives become function false positives.* One falsely placed strain imports thousands of units at its carriage probabilities. Every imputed unit is weighted by its strain's posterior presence, so species presence must be calibrated before `update` can be.
 - *The reads are used once.* The joint posterior conditions on each unit once, so kfp-prior's cavity problem does not arise. The sylph arm still measures any residual circularity.
 - *Benefit is limited to catalogued biomes.* Organisms absent from the panel give no imputation, so human gut gains more than soil.
@@ -2524,10 +2597,29 @@ The benchmark scores the calibration of each.
   - for iteration, `query --kmers` and a new `--unit-prior` input.
 - *On `dev-species`:* `species-index`'s builders (catalogue and genome-set annotation, rank shrinkage, completeness) move into `panel`. The `kfp_prior` package and its CLI are deleted when phase 12 starts; its update is `update --genomes` with fixed strains and no background (step 6's worked-example test).
 
+**Read cross-reference pipeline (comparison and development aid).** Added 2026-10-15, the user's request. A pipeline of existing tools that builds the genome × function table from reads directly, classifying each read twice and independently, then joining on read ids:
+
+1. *Read → function:* DIAMOND `blastx` of every read against the functions (MGnify90 units' representatives and a few members), keeping several hits per read, with phase 13's per-read posteriors and decoys. Two arms: the full reference (every unit the panel's genomes carry, plus the units the profile detects, with neighbour and reversed decoys), and phase 13's recruited per-sample reference, which reuses phase 13's alignments.
+2. *Read → genome:* sylph `profile` against the panel's genome set (catalogue or GTDB) picks the genomes present; bowtie2 maps every read competitively to those genomes' concatenated sequences (`-k` several alignments, fractional split of multi-mapped pairs, MAPQ and identity filters).
+3. *Cross-reference:* join the two assignments on read id (a pair counts once; mates that disagree are split), giving read counts per (genome, function), the function being the MGnify90 unit; divide by unit length and genome depth for coverage; roll up to Pfam and KO (for those benchmarks) and to species and genus. Reads with a function but no genome go to `unclassified`; reads with a genome but no function are counted per genome, not dropped.
+
+It is a comparison, not truth: bowtie2 needs references within ~95% ANI of the sample's strains, so novel strains' reads fall to `unclassified`, and DIAMOND's sensitivity floor and reference bias carry over from phase 13. On CAMI II, which has read-level genome truth, the pipeline is scored as well, so its error on real samples can be read off its error there.
+
+*How it helps develop `place` and `update`* (on real metagenomes, where no truth exists):
+
+- *Genome abundance:* bowtie2 depths per genome against `place`'s strain depths and sylph's abundances.
+- *Carriage in the sample:* breadth of bowtie2 coverage over each mapped genome's annotated genes says which of the reference's units the sample's strain carries (covered) or has lost (uncovered at adequate genome depth). That is a sample-specific carriage label for `panel`'s carriage model and `place`'s placements, and for the calibration of zero-hit units' updated presence, which simulation alone cannot give.
+- *Function to genome:* `function_genome.tsv`'s shares against the pipeline's read-count shares, per function; where they disagree, which side the CAMI II truth supports.
+- *Imputation:* units `update` imputes against units whose genome region has mapped reads but too few k-mer hits to be observed.
+- *Failure modes it isolates:* units shared across species (reads of one unit split between genomes by bowtie2, against `place`'s per-component split), sibling clusters (`sibling_hit`), and strains far from every reference (`novel`, against reads unclassified by bowtie2).
+
+Built as a `kfp-genomes` benchmark workflow (`read-xref`) from bioconda tools, not part of kfp; its own code covers only the join and the tables, in the file formats of `function_genome.tsv` so the two are scored by the same code.
+
 **Prior art.**
 
 | Work | Approach | Taken here |
 | --- | --- | --- |
+| HUMAnN (stratified output) | Taxa from MetaPhlAn, reads mapped to those taxa's pangenomes (bowtie2), the rest searched translated (DIAMOND); each read's gene hit stratified by its taxon. | The read cross-reference pipeline is the same idea with independent classifications joined on read id, used as a comparison arm. |
 | pplacer, EPA-ng | Placement of a query on a fixed tree (edge, position, pendant length). | The placement idea, without a tree: the neighbour graph's edges stand in for branches. |
 | Nearest-neighbour and kernel regression | A point's traits predicted from its nearest labelled neighbours. | Carriage between references, from cheap distances. |
 | PICRUSt2 (castor) | Hidden-state prediction of gene content on a tree, from taxa alone. | The same prediction, from the nearest references instead of a tree, with each unit's read evidence. |
@@ -2568,11 +2660,11 @@ The benchmark scores the calibration of each.
 5. **Outputs and model checks:** `genome_profile.tsv`, `placements.parquet`, `strain_units.parquet`, the predictive checks and convergence diagnostics. Tests:
    - a species simulated with misspecified depths fails the dispersion check;
    - posterior samples reproduce the reported intervals.
-6. **`update`:** posterior marginals for unit presence and coverage, `function_genome.tsv`, `profile_updated.tsv`, unit and Pfam presence tables, `--genomes`. Tests:
+6. **`update`:** posterior marginals for unit presence and coverage, `function_genome.tsv`, `profile_updated.tsv`, unit, Pfam and KO presence tables, `--genomes`. Tests:
    - with a flat genome posterior, updated presence equals the profile's;
    - kfp-prior's worked example is reproduced by one fixed strain with no background. A unit at carriage 0.95 with zero hits gives P(present) 0.92 at 0.5 expected hits (missing is unsurprising) and 0.11 at 5 (a confident absence): q e^(−μ) / (1 − q + q e^(−μ));
    - rows of `function_genome.tsv` sum to each function's total;
-   - Pfam roll-up.
+   - Pfam and KO roll-ups.
 7. **Iteration:** the query's `--unit-prior` and `update --iterate`. Tests:
    - a fixed point on simulated data;
    - no drift when the genome evidence is flat;
@@ -2581,7 +2673,8 @@ The benchmark scores the calibration of each.
    - *Arms:*
      - `place` with K = 1 and with K ≤ 3;
      - ablations: ℓ = 1 (= species model), *t* = 0 (option A), `mashtree.nwk` patristic distances in place of the cheap ones where the catalogue ships them, *f* = 1 (no survival term), no histograms, no iteration, iteration;
-     - baselines: the species model and the lineage prototype (from `dev-species`), G1, `update --genomes` on G1's and on sylph's genomes, and sylph.
+     - baselines: the species model and the lineage prototype (from `dev-species`), G1, `update --genomes` on G1's and on sylph's genomes, and sylph;
+     - the read cross-reference pipeline (DIAMOND × sylph + bowtie2 on read ids), full and recruited reference.
    - *Metrics:*
      - placement error: the held-out genome's distance to the posterior's references, against its distance to its true nearest reference;
      - carriage log loss, AUROC and calibration on zero-hit accessory units;
@@ -2589,6 +2682,7 @@ The benchmark scores the calibration of each.
      - P(K ≥ 2) calibration;
      - species F1, L1 and Spearman;
      - `update`'s unit and Pfam completeness and purity, observed against updated, by carrier depth;
+     - function × genome abundance L1 and (genome, function) F1 at the MGnify90-unit level, and at the Pfam and KO roll-ups, against truth and against the read cross-reference pipeline; on real metagenomes (no truth), agreement with the pipeline and its per-genome gene-coverage carriage labels;
      - calibration of zero-hit units' updated presence;
      - cost.
    - *Also on the fmh benchmark* (kfp-prior's evaluation, kept):
@@ -2605,6 +2699,7 @@ The benchmark scores the calibration of each.
 - at 0.1–1×, Pfam completeness up ≥ 10 points (updated against observed) at ≤ 2 points of purity;
 - calibration error ≤ 0.05 on zero-hit units;
 - no change to any unit when no genome is placed;
+- on CAMI II, function × genome L1 (MGnify90 unit level) within 0.05 of the read cross-reference pipeline's (full reference), at ≤ 1/10 of its CPU time; Pfam and KO roll-ups reported;
 - model checks flag < 10% of detections;
 - cost under the query's.
 
@@ -2616,6 +2711,196 @@ The benchmark scores the calibration of each.
 - *Units shared across species.* MGnify90 clusters that span species need the joint per-component fit. How big those components get on real data is to be measured.
 - *Close strains are not identifiable.* Near-identical strains are reported as one. The benchmark scores calibration, not resolution, below a distance yet to be measured.
 - *Panel size.* At ≤ 50 genomes per species, human-gut's 4,744 species give ≤ 2.4 × 10⁵ genomes' carriage and neighbour lists: a few GB, built in minutes once annotated.
+
+## Read recruitment and variant pileups (phase 13)
+
+Added 2026-10-15, from the user's amendment ("kfp read classification and variant pileups"). A separate tool, not part of kfp (Tools and scope); it reads kfp's profile, index tables and target sequences (kfp's `fetch`). It is built crude first, enough to evaluate how useful kfp is as a front end; the full variant model below (joint EM, diagnostics, a sequence error model, calibration) comes later if that evaluation supports it. An optional follow-up after profiling: recruit reads onto detected units, align them with DIAMOND, and call amino-acid variants with a confidence per variant. The profile shrinks the reference; an existing aligner does the alignment; the custom work is in the statistics. It is the pipeline that places kfp upstream of DIAMOND for high-resolution sequence variants in a metagenome, and it gives `aai` (Sequence similarity) an alignment-based check on real data. It replaces option D (alignment refinement) of that section, which was "external recipe at most". Phase 14 makes the same pipeline work on nucleotide targets, where it is simpler.
+
+**Why not classify reads from pass 1.** Even at full scale the standard tier gives an estimated 58–75% of gut pairs ≥ 3 hits, and many single hits are shared between sibling units. Denser tiers add little: from standard to `tbase10_all`, pairs with ≥ 3 hits rise by ~8–10 points. The ceiling is the share of matchable pairs (coding, from a represented cluster), assumed ~85% in gut, not the sampling rate.
+
+| Tier | Mean hits per pair | ≥ 1 hit | ≥ 3 hits | ≥ 5 hits |
+| --- | --- | --- | --- | --- |
+| sparse (`full-build`, anchor) | ~3.7 | 77–84% | 53–69% | 33–37% |
+| standard (`tbase02_all16`) | ~4.3 | 78–84% | 58–75% | 39–48% |
+| `tbase05` | ~5.1 | 80–85% | 63–80% | 45–61% |
+| `tbase10_all` | ~6.2 | 81–85% | 68–83% | 53–72% |
+| ceiling (every k-mer at 0.2) | ~8.8 | 83–85% | 74–85% | 64–83% |
+
+Estimates, not measurements; ranges run from a negative binomial (shape 2) to a Poisson over matchable pairs. Step 0 measures them.
+
+- *Anchor:* phase 6, step 17 (`full-build`: *t\_base* 0.001, *n\_min* 8, *t\_cap* 0.2), Hadza gut at 40 M pairs, 3.3 hit k-mers per pair with stop-free frames; ×1.13 for `edges:30` (phase 7, step 31).
+- *Per tier:* a sampled k-mer counts at the largest *t\_g* among its holders, capped at 0.2. Many conserved k-mers already reach the cap through a small floored cluster, so raising *t\_base* lifts only the rest. Assumed ~72 true-frame 11-mers per pair and ~0.75 survival.
+- *Not from step 31's hit counts:* phase 7, step 31's 1.39 / 1.70 hit k-mers per pair (`tbase02_all` / `tbase05_all`) come from 1-in-100 cluster-subset indexes and understate full scale. They must not size read-level work.
+- *Caveats:* one full-scale run of one gut sample (soil will be lower); overlapping mates count shared k-mers twice, so independent ≥ 3-hit calls are overstated; step 17 saw ~1.7 units per hit k-mer, so a single hit usually places a read in a Pfam, not one MGnify90 cluster; `tbase10_all` also costs 371 GB, a giant EM component above 40 M pairs and ≥ 4 hits for Pfam purity.
+
+**Design.** The same idea as HUMAnN's prescreen-then-search, with decoys added.
+
+1. *Pass 1 (unchanged):* profile and detect units; components from the hit subgraph as now.
+2. *Per-sample reference:* detected units; the other units in their connected components as neighbour decoys; reversed target sequences as null decoys. Expect ~150–250 k detected units per gut sample, plus neighbours.
+3. *Fetch sequences* from a cluster-keyed sequence store: the representative and a few diverse members per unit.
+4. *Align:* `diamond makedb` on that set (seconds to minutes), then `diamond blastx` on all reads, keeping several hits per read, SAM output.
+5. *Assign:* per-read posteriors over candidates and decoys from bit scores; reads whose best hit is a decoy are dropped.
+6. *Pileups and variants:* the joint per-component model and diagnostics below.
+
+**Follow-up by existing tools; a dense second round always considered.** The user's rule (2026-10-15): follow-up analysis goes to existing, well-tested tools (DIAMOND here; minimap2 or bowtie2 and the standard callers in the nucleotide case, phase 14), not to new kfp code. A dense second-round k-mer query stays an option to weigh at every step, in two forms:
+
+- *Pre-filter* in front of DIAMOND: a dense (*t* = 1) table built in memory from step 3's sequences (~10⁹ k-mers for 500 k units × 5 members × 300 aa, a few GB) drops reads with no hits. Added when DIAMOND dominates run time (step 3's rule).
+- *Second-round classifier* in place of alignment, for outputs that need no pileup (per-read unit calls, finer abundance of detected units): the same in-memory table queried with pass 1's frames and hashes. Reconsidered if DIAMOND's cost cannot be brought down, or if read-level calls turn out to be wanted without variants.
+
+No pre-built dense tier is made for this (see Sequence store).
+
+**Options compared.** DIAMOND on a per-sample subset wins: classification is cheap, and the alignment the pileups need is the hard part, which DIAMOND already does with spaced seeds, double indexing and SIMD extension.
+
+|  | Dense second round (custom) | DIAMOND on per-sample subset | Pseudo-alignment (kallisto, salmon, Themisto, Fulgor) |
+| --- | --- | --- | --- |
+| Reference | Detected units + neighbours | Same sequences, `makedb` per sample | Needs nucleotide CDS, not in the MGnify Proteins release (fits phase 14's nucleotide targets) |
+| Output | Candidate units per read | Per-base alignments (SAM), bit scores, several hits per read | Compatibility classes, no positions |
+| Divergence | Exact 11-mers; weak below ~80–85% AAI | Seeded alignment, sensitive well below that | Exact nucleotide k-mers (k ≈ 31); worst for strains |
+| Gives a pileup | No, still needs an aligner | Yes | No |
+| Work to build | Small for classification (pass 1's kernels on a dense table); an aligner for pileups | Exists, well tested | Needs a protein port first |
+
+A dense pass would gain reuse of pass-1 hashes and frames, skipping the ~15–25% of pairs with no dense hits, and the same k-mer evidence as the profile: small next to rewriting an aligner.
+
+*DIAMOND settings that matter:* keep several hits per read (`--top` with a margin, or a large `--max-target-seqs`; the default ranking drops the secondary hits the posteriors need); compare bit scores across candidates, not e-values (which depend on database size); frameshift-aware alignment (`-F`) only if read indels matter.
+
+**Sequence store.** The follow-up needs random access to sequences by `cluster_rep`, not a larger k-mer index. No k-mer tier stores sequences, so a store is needed whatever the classifier.
+
+- *Not the release file:* `mgy_protein_sequences.parquet` (1.0 TB) is ordered by `protein_id`; a cluster's members are spread across it.
+- *Not the dense tier:* `--t-dense` adds +120 GB at 0.02 and +250 GB at 0.1 (phase 6, step 39's prediction), is hash-major so lookups touch the whole table, is still sampled and holds no sequences. A fully dense (*t* = 1) pre-built table over the release would be terabytes.
+- *It lives in kfp* (the user's decision, 2026-10-15): it is an enhanced output of target sequences, and a dense second round, if ever built, needs it too.
+- *The MERGE output:* EXTRACT/MERGE already writes whole clusters with their sequences per `hash(cluster_rep)` bucket. Keep it, sorted by `cluster_rep` within each bucket with small row groups, so a sample's fetch reads only the rows it needs.
+
+| Store | Contents | Size |
+| --- | --- | --- |
+| Full | Every member of every cluster | ~1 TB, disk or object storage |
+| Release sidecar | Reps + up to N diverse members for the ~5.3×10⁸ units with postings, zstd parquet | Probably a few hundred GB (to measure) |
+| Reps only | All 1.66×10⁹ representatives (`mgy_clusters.fa.gz` for reference) | 157 GB compressed |
+
+Per sample only a small slice is read, so none needs to sit in RAM.
+
+**Controlling misassignment.** Restricting the reference to detected units forces reads from absent or undetected homologues onto present targets, where they look like variants. Decoys are the main guard.
+
+- *Neighbour decoys:* the other units in each detected unit's component; a read whose best hit is a decoy is dropped.
+- *Null decoys (target-decoy FDR):* reversed targets, as in proteomics; score thresholds from the decoy hit rate, not by hand.
+- *Collinearity:* any k-mer stage (the dense second round) requires ≥ *m* hits on a consistent diagonal and frame; scattered single hits are where Kraken-style false positives come from.
+- *Low complexity:* SEG or tantan on reads and references.
+- *Shared domains:* reads only in a promiscuous domain (ABC transporter ATP-binding, HTH and similar) are reported ambiguous, not forced to a family; the index's Pfam coordinates support this.
+- *Abundance priors with care:* π\_t · L(read | t) helps ambiguous reads but pushes a rare paralogue's reads onto the abundant target, where they read as low-frequency variants. For variant work, assign by likelihood alone, or flag reads whose assignment changes with the prior.
+
+**Variant confidence.** With *w\_r* the read's assignment posterior, *b\_r* its residue and *q\_r* its quality, the per-read-weighted likelihood of alt frequency *f* at a column is
+
+```latex
+L(f) = \prod_r \left[ w_r \, P(b_r \mid f, q_r) + (1 - w_r) \, P(b_r \mid \text{background}) \right]
+```
+
+with confidence from the likelihood ratio or posterior for *f* > 0, as bcftools and GATK do with mapping quality. Stopping there has two problems:
+
+1. *Circularity.* A read carrying a true variant matches the target less well, gets a lower *w\_r*, and true variants are down-weighted, more so for divergent strains. Fix: each read's assignment likelihood leaves out the column being tested (total log-likelihood minus that column's term).
+2. *Structured contamination.* A misassigned read comes from a specific sibling and carries that sibling's residue. A uniform background gives confident false variants exactly where the sibling differs. The background is the competing targets' residues at the aligned column.
+
+So confidence comes from a *joint model per component* (the components the profiler's EM uses). Unknowns: each read's source among candidates and decoys; each target's allele frequencies and abundance. EM loop: assign reads given current target sequences; update allele frequencies from weighted reads; where a variant becomes the majority allele, update that target's consensus and re-align. Output: per-variant frequency, confidence, and each read's contribution.
+
+*Pileup diagnostics* (for what the model cannot see, mainly a source missing from the candidate set): linkage (co-occurring variants form a haplotype; if it aligns better to another target or a decoy, it is contamination); location (variants clustered in a region shared with another detected unit, such as a common Pfam domain); coverage excess against the unit's fitted λ\_g; frequency × λ\_g matching a detected sibling's abundance; standard filters (many-mismatch reads, strand and position bias).
+
+*Calibration:* reads simulated from MGnify neighbours at known identities, with spiked variants and one sibling withheld from the candidate set; reported confidences against the empirical false discovery rate.
+
+**Testing `aai` with the alignments.** The assigned reads give each detected unit an alignment identity measured from the sample itself: the mean identity of its reads to the representative and to the nearest member, and the consensus's identity after the EM. Compared with `aai` / `aai_interval` (and `aai_naive`), unit by unit, this checks the k-mer estimator on real metagenomes, where until now truth came only from simulation (phase 7, steps 7, 9, 22–34). It is reported by alignment-identity bin, unit depth, tier, cluster diversity (`len_cv`, mean *p\_in*), protein length, and whether the pileup shows a strain mixture (two or more alleles at ≥ 0.2 over several columns; the case known bias 5 predicts runs high). It also measures Sequence similarity's decision rule for option C (abundance in units at `aai` ≥ 0.97 with diverse members). Both measures carry DIAMOND's own sensitivity floor and the reference bias below, so the check is read as agreement between two estimators, not as truth.
+
+**Limitations.**
+
+- *Recall follows pass 1.* Units below detection are never recruited; their reads go to a decoy or nowhere. Safe, but it caps completeness for rare targets.
+- *A source absent from the index* is caught only by decoys and the diagnostics.
+- *Amino-acid variants only.* Translated pileups hide synonymous changes. Nucleotide variants need a nucleotide reference: phase 14's nucleotide targets, or one assembled locally from the recruited reads.
+- *Reference bias.* A 90% cluster's representative attracts reads from strains up to ~10% divergent; allele frequencies near divergent sites are skewed and several strains collapse into one pileup. Several diverse members per unit reduce it.
+- *Depth.* Confidence stays weak below a few reads at a column.
+- *Sequencing errors.* The crude tool reports raw residue frequencies; a sequence error model to separate errors from variants is a later step.
+
+**Open questions.** The real hits-per-pair distribution at full scale for the standard tier (only a mean is known); the release sidecar's size for N = 1, 3, 5; DIAMOND's wall time against pass 1 at 10 M and 100 M pairs on the per-sample reference; how many members per unit keep reference bias acceptable.
+
+### Implementation plan (phase 13)
+
+**A crude tool first.** The pileup tool is built only far enough to evaluate how useful kfp's profile is as a front end (recruitment, `aai`, what the reads say about detected targets), not as a complete variant caller. Steps 0–1 are kfp's; steps 2–6 are the crude pileup tool; steps 7–10 come later, if the crude tool shows the follow-up is worth it.
+
+*kfp (part of its scope):*
+
+0. **Now (phase 6 tooling, lands before the phase):** a hits-per-pair histogram in `query --stats`: after collapsing holders, a `bincount` of hit k-mer occurrences per read (read ids never span batches). Run on `full-build` and the standard tier at 10 M pairs; it replaces the estimates above.
+1. **Sequence store and target-sequence output.** Keep MERGE's bucketed members tables as a build output, sorted by `cluster_rep` with small row groups; `fetch` returns the sequences of a list of units (representative + up to N diverse members), and `query` can write them for the detected units. It is an enhanced output of target sequences, and it also serves a dense second round if one is ever built. Build the release sidecar (reps + N members) and record its size for N = 1, 3, 5. For FASTA-built indexes (phase 14) the store is the targets' own sequences.
+
+*The pileup tool, crude:*
+
+2. **Per-sample reference.** From a profile and kfp's `fetch`: detected units, component neighbours, reversed decoys; write FASTA and run `diamond makedb`.
+3. **Alignment.** `diamond blastx` with several hits per read and SAM output. *Rule:* if DIAMOND takes more than ~5× pass 1 on 10 M pairs, add the in-memory dense pre-filter; otherwise none. If it is still above ~5× with the pre-filter, weigh the dense second round as the classifier for outputs that need no pileup.
+4. **Read posteriors.** Bit-score likelihoods over candidates and decoys, decoy-hit drop, leave-one-column-out weights.
+5. **Crude pileups.** Per unit and column: posterior-weighted residue counts, depth, consensus and alt frequencies, with minimum-depth and decoy filters, and a flag where a competing target in the component carries the alt residue (the structured-contamination case). Frequencies and flags only; no calibrated confidence.
+6. **`aai` check.** Per-unit alignment identity against `aai` on the fmh benchmark and the ablation metagenomes (phase 7's tiers, `step34q` attached), with the breakdowns above. *Rule:* a median gap above 0.01 AAI in any identity bin with ≥ 100 units, or interval coverage below 0.8, is recorded as a phase-7 `aai` finding and becomes an ablation arm (no silent fix).
+
+Steps 2–4's alignments and read posteriors also feed phase 12's read cross-reference pipeline (joined with sylph + bowtie2 genome assignments on read id).
+
+*Later (on the crude tool's evidence, not planned in detail):*
+
+7. **Joint per-component EM** over read sources and allele frequencies, with consensus updates and re-alignment.
+8. **Pileup diagnostics:** linkage, shared-domain location, coverage excess, frequency–abundance match, standard filters.
+9. **Sequence error model** to clean variants: substitution error rates learned from the sample's reads and qualities (as DADA2's error model is), carried through translation, so that residues explained by sequencing error are separated from true variants before frequencies are reported.
+10. **Calibration.** Simulated reads from MGnify neighbours with spiked variants and a withheld sibling. *Rule:* ship confidences only if the empirical FDR is within ~2× of reported across identity bins.
+
+The pileup tool lives in this repository as its own package and Nextflow pipeline (the user's decision, 2026-10-15). Each step runs as a Nextflow recipe around the tools (DIAMOND, SEG/tantan); its own code covers only the reference builder and the statistics, and it gets target sequences from kfp's `fetch`. Branch: `dev-pileups` from `main`, one feature branch per step, off `main` until phase 7's ablations are done.
+
+**Gate (the crude tool):**
+
+- read assignment: ≥ 95% precision on reads simulated from MGnify neighbours with one sibling withheld, with decoys catching ≥ 80% of that sibling's reads;
+- cost: the whole follow-up ≤ 5× pass 1 at 10 M pairs;
+- the `aai` check run and recorded (a report, not a pass/fail);
+- a recorded verdict on usefulness: what the pileups add over the profile, and whether steps 7–10 are worth building.
+
+*Later gate (steps 7–10):* variant confidences with empirical FDR within ~2× of reported across identity bins.
+
+## Generic targets: nucleotide and amino-acid indexes (phase 14)
+
+Added 2026-10-15, the user's request; this is kfp's core scope (Tools and scope). Make the tool a general estimator of the abundance of short targets in a metagenome: genes, proteins, marker or resistance genes, short loci, from any target set a user supplies, not only MGnify Proteins. An index declares its molecule, nucleotide or amino acid, and the query uses the matching method. The nucleotide case is the simpler one and is kept simpler: no translation, no frames, no reduced alphabets.
+
+**What already generalises.** `index` takes a members table (`protein_id`, `cluster_rep`, sequence) and phase 10's study recipe builds one from any protein FASTA (pyrodigal → linclust 90% → `index --like`). Everything after the lookup works on units, k-mers and hits, whatever the molecule: *t\_g* floors, components, the zero-inflated EM, `presence`, intervals, ambiguity groups, decoy roles, joint queries, and phase 13's follow-up. So the work is at the two ends: the input to `index`, and hashing in the query.
+
+**Amino-acid targets** (today's path, opened to any target set):
+
+- *Input:* a protein FASTA, with an optional `target → group` table. Without one, each target is its own unit; with `--cluster` it runs linclust (MMseqs2) at a chosen identity first, as phase 10's recipe does. Pfam labels are optional.
+- *Query:* unchanged (six-frame translation, `edges:30`, reduced alphabets, `aai`).
+- *Follow-up (the phase-13 pileup tool, not kfp):* DIAMOND `blastx` against the target sequences, which the user's FASTA already holds; no sequence store needed.
+
+**Nucleotide targets:**
+
+- *Input:* a nucleotide FASTA, with the same optional groups (`--cluster` via MMseqs2 nucleotide or vsearch).
+- *Hashing:* canonical nucleotide k-mers (2-bit packed, k ≤ 32 in a u64; default to be measured, ~21–31), through the same FracMinHash threshold and hash. Strand is handled by canonical k-mers, so there are no frames, no stop filter and no gene-end loss. This is a new `hash_dna` mode (`frames="none"`, molecule nucleotide) and a nucleotide branch in `distinct_kmers`; the packed table, lookup and model are reused.
+- *Similarity column:* `ani` = *c*^(1/k), the same estimator as `aai` (sylph's), with the survival model refitted per molecule and k (or the plain *c*^(1/k) until it is).
+- *Error model:* a sequencing error hits ~k nucleotide k-mers against ~k/3 codons' worth in protein space, so per-k-mer survival differs; `n_min`, *t\_base* and the floor are re-tuned on the nucleotide benchmark rather than carried over.
+- *Follow-up (the phase-13 pileup tool, not kfp):* minimap2 (or bowtie2) on the per-sample reference, then a standard caller (bcftools, or freebayes for pooled frequencies) with the same decoys and per-component read posteriors. Nucleotide pileups show synonymous changes, and existing tools cover much more of the work than in the protein case. Pseudo-aligners (kallisto, salmon, Themisto, Fulgor) also become usable for classification without pileups.
+
+**What is not generalised.** Long targets (whole genomes) belong to sylph and to phase 11–12's genome tools; this phase is about targets of gene length or shorter. Long reads stay out of scope.
+
+**Rules carried over:**
+
+- The MGnify release stays the main amino-acid product; generic targets must not change its outputs (golden tests).
+- Molecule is a property of the index (`meta.json`), checked when indexes are queried jointly: amino-acid and nucleotide indexes are not queried together in one EM. A sample can be queried against one of each in two passes.
+- The model and outputs keep their column names; `aai` becomes `ani` for nucleotide indexes, named after what it measures (as reduced alphabets are).
+
+### Implementation plan (phase 14)
+
+1. **Target input.** `index --targets FASTA [--groups TSV] [--cluster ID]` for amino-acid targets, writing today's members table. Tests: a FASTA of MGnify members with their `cluster_rep` as groups gives an index identical to the members-table build; with no groups each target is a unit.
+2. **Nucleotide hashing.** Canonical 2-bit k-mers in the Rust kernels (`hash_dna` with no translation, `distinct_kmers` for nucleotides), pure-Python twins, `molecule` in `IndexParams` and `meta.json`. Tests: reverse-complement invariance; threshold nesting; Rust matches Python; ≥ 1 M reads/min/thread.
+3. **Nucleotide index and query.** `index --molecule nucleotide`, the query choosing its hashing from the index, `ani`, and the joint-query molecule check. Tests: a read simulated from a target hits it on either strand; a mixed-molecule joint query is refused.
+4. **Nucleotide follow-up (in the pileup tool).** Phase 13's recipe with minimap2/bowtie2 and a standard caller in place of DIAMOND and the custom variant model, keeping the decoys and per-component read posteriors.
+5. **Benchmarks.**
+   - *Nucleotide:* a resistance-gene set (CARD or ResFinder) and a marker-gene set spiked into the fmh benchmark's and CAMI II's metagenomes at known depths and identities (100, 98, 95, 90%). Arms: kfp nucleotide, kfp amino acid on the translated targets, KMA, and bowtie2 with coverage filtering. Metrics: detection F1, abundance L1 and Spearman, `ani` bias, cost.
+   - *Amino acid:* the same protein targets through `index --targets`, against DIAMOND `blastx` and the MGnify path on the same targets.
+   - *Tuning:* k, *t\_base*, *n\_min* and the floor for nucleotides, on cost against accuracy.
+
+Branch: `dev-targets` from `main`, one feature branch per step, off `main` until phase 7's ablations are done.
+
+**Gate:**
+
+- the MGnify outputs unchanged (golden tests);
+- nucleotide mode: detection F1 and abundance L1 within 0.05 of KMA's on the spike-in benchmark, at ≤ KMA's CPU time;
+- amino-acid targets: a FASTA build equal to the members-table build on the same proteins;
+- `ani` |median bias| ≤ 0.01 over 0.9–1.0 after calibration.
 
 ## Sequence similarity (containment AAI)
 
@@ -2661,7 +2946,7 @@ So the useful band is ~85–100% on the floor index and ~75–100% with the dens
 | A. Per-unit AAI (`aai`) | Novelty per detected function: "present, as a variant ~93% to its cluster". Aggregated per Pfam (coverage-weighted), it gives how novel that function's carriers in the sample are. | A column; one more EM fit when the shipped estimator is not ZI | Build (step 1) |
 | B. Neighbour AAIs | For each detected unit, the other hit units in its component with `aai_naive` ≥ threshold: the references that bracket the sample variant (e.g. 96% to A, 91% to B). This is complementary to ambiguity groups, which report split uncertainty, not similarity. | A `component` column, so users group the profile by it; no new table | Build (step 2) |
 | C. Member placement | The nearest MGYP member within a unit and its AAI, with the runner-up. Member ids link to biomes and assemblies (`mgy_biomes`, `mgy_clusters`); the protein release has no taxonomy. | The index keeps only *p\_in* per k-mer, so this needs a member sidecar: per kept dense-tier k-mer, a bitset over at most *M* members per unit (16–64, chosen to span the cluster's diversity), unit-major and read by `pread` for detected units, like the dense tier. Disk ~*M* bits per posting. | Only if step 3's data show it matters (see below) |
-| D. Alignment refinement | Exact per-read identity and best member: reads of detected units aligned (DIAMOND) to those units' member sequences | Needs a unit-ordered member sequence store; members are scattered over the 1 TB sequence file | External recipe at most (phase 9's hybrid pipeline); not in the tool |
+| D. Alignment refinement | Exact per-read identity and best member: reads of detected units aligned (DIAMOND) to those units' member sequences | Needs a unit-ordered member sequence store; members are scattered over the 1 TB sequence file | Superseded (2026-10-15): built as phase 13, with DIAMOND on a per-sample reference and a sequence store from MERGE's output; its alignments also check `aai` |
 | E. Finer units (95% or member-level) | Finer EM units | More than 10⁹ units and many more shared k-mers; already rejected (see Database: 95% vs 90%) | No |
 
 Within-unit placement (C) helps only when a cluster is diverse and the sample variant sits close to one member. The decision rule: build C if, on the real fmh-benchmark and MGnify-subset queries, at least ~20% of detected abundance is in units with `aai` ≥ 0.97 whose members are diverse (mean *p\_in* of kept k-mers ≤ 0.5). Otherwise *â* to the cluster says nearly as much.
@@ -2703,8 +2988,13 @@ The biggest risk is that the gain over fmh-funprofiler with a lower scaled value
   * *Sibling clusters.* A strain carrying the function as a < 90% variant makes the expected unit look absent; read function-level presence, not unit-level.
   * *Misspecification.* Model checks are reported per species; corrections become ablation arms, not silent fixes.
 * **Containment AAI.** Clustered variation and the union-of-members k-mer set both push *â* above the true identity, and gene-end loss pulls it below. At the floor (~8 kept k-mers) its precision is ±2 AAI points, so it is only informative with the dense tier. Read it as similarity to a cluster, not to a member.
+* **Read recruitment and variant pileups** (phase 13; details in its section).
+  * *Recall follows pass 1:* undetected units are never recruited, so rare targets' variants are missed.
+  * *Reference bias:* a 90% cluster's representative pulls in strains up to ~10% divergent and merges them into one pileup; several diverse members per unit reduce it.
+  * *Cost:* DIAMOND on all reads may dominate; the dense pre-filter (or a dense second round) is the fallback.
+* **Generic targets** (phase 14). Nucleotide k-mers lose more to sequencing errors and divergence than protein ones, so floors and k must be re-tuned, not copied; target sets far shorter than a read leave few k-mers per unit.
 * **Future work:** 30% families by mapping MGnify90 representatives onto the 128.7 M MGnify30-C2 representatives, as a coarser level for floors, EM partitions and annotation.
-* **Open:** whether KO/eggNOG labels are worth the annotation run for users, or Pfam suffices. Benchmarking uses Pfam (see Benchmark labels), with KO only for the fmh-funprofiler comparison.
+* **Open:** whether KO/eggNOG labels are worth shipping in the release for users, or Pfam suffices. Benchmarking is at three levels (see Benchmark labels): MGnify90 unit (the function), Pfam and KOfam; KofamScan labels for benchmark indexes and panels are made either way.
 
 ## Sources
 
