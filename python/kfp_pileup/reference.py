@@ -7,6 +7,9 @@ Three roles, one FASTA:
   that catch reads from a sibling the profile did not call;
 - ``decoy``: the targets' sequences reversed, a null for the score threshold.
 
+``withhold`` units (``cluster_rep`` names) are left out of every role, as if the profile had
+never seen them: the benchmark's withheld sibling, whose reads the decoys must catch.
+
 Sequence ids are ``s0``, ``s1``, …, safe as DIAMOND subject and SAM reference names;
 ``refs.tsv`` maps them to role, unit, ``cluster_rep``, member and component.
 """
@@ -34,13 +37,22 @@ def build_reference(
     min_present: float = MIN_PRESENT,
     members: int = MEMBERS,
     store: Sequence[str | Path] = (),
+    withhold: Sequence[str] = (),
 ) -> dict[str, int]:
     """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    hit = pl.read_csv(
-        profile, separator="\t", columns=["unit", "present_prob", "component"]
-    ).with_columns(pl.col("unit").cast(pl.UInt32))
+    hit = (
+        pl.read_csv(
+            profile,
+            separator="\t",
+            columns=["unit", "cluster_rep", "present_prob", "component"],
+            schema_overrides={"cluster_rep": pl.String},
+        )
+        .filter(~pl.col("cluster_rep").is_in(list(withhold)))
+        .drop("cluster_rep")
+        .with_columns(pl.col("unit").cast(pl.UInt32))
+    )
     targets = hit.filter(pl.col("present_prob") >= min_present)
     if targets.height == 0:
         raise ValueError(f"no units with present_prob >= {min_present} in {profile}")

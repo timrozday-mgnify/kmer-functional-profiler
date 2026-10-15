@@ -10,12 +10,13 @@ process INDEX {
 
     input:
     path targets
+    val opts  // options as inputs, not params in the script: Nextflow does not hash params
 
     output:
     path 'index', emit: index
 
     script:
-    "${params.kfp} index ${targets} index --targets ${params.index_args}"
+    "${params.kfp} index ${targets} index --targets ${opts}"
 
     stub:
     "mkdir index"
@@ -29,12 +30,14 @@ process QUERY {
     input:
     tuple val(sample), path(r1), path(r2)
     path index
+    val opts  // e.g. '--stats stats.json' (query_stats) and query_args
 
     output:
     tuple val(sample), path('profile.tsv'), emit: profile
+    path 'stats.json', optional: true  // with --query_stats: stage times, hits per pair
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --aai ${params.query_args}"
+    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --aai ${opts}"
 
     stub:
     "touch profile.tsv"
@@ -49,15 +52,17 @@ process REFERENCE {
     tuple val(sample), path(profile)
     path index
     path store
+    path withhold  // units left out of the reference (spike-benchmark), or NO_WITHHOLD
+    val opts
 
     output:
     tuple val(sample), path('ref'), env('MOLECULE'), emit: ref
 
     script:
     def stores = store.collect { "--store ${it}" }.join(' ')
+    def held = withhold.name == 'NO_WITHHOLD' ? '' : "--withhold ${withhold}"
     """
-    ${params.kfp_pileup} reference ${profile} ${index} ref --min-present ${params.min_present} \\
-        --members ${params.members} ${stores}
+    ${params.kfp_pileup} reference ${profile} ${index} ref ${opts} ${stores} ${held}
     MOLECULE=\$(cat ref/molecule.txt)
     """
 
@@ -72,6 +77,7 @@ process DIAMOND {
 
     input:
     tuple val(sample), path(ref), path(r1), path(r2)
+    val opts
 
     output:
     tuple val(sample), val('diamond'), path('r1.tsv'), path('r2.tsv'), emit: alignments
@@ -83,7 +89,7 @@ process DIAMOND {
     for m in 1 2; do
         reads=\$([ \$m = 1 ] && echo ${r1} || echo ${r2})
         diamond blastx --db ref.dmnd --query \$reads --out r\$m.tsv --threads ${task.cpus} \\
-            --outfmt 6 ${params.diamond_fields} --top ${params.diamond_top} ${params.diamond_args}
+            ${opts}
     done
     """
 
@@ -98,6 +104,7 @@ process BWAMEM2 {
 
     input:
     tuple val(sample), path(ref), path(r1), path(r2)
+    val opts
 
     output:
     tuple val(sample), val('bwa'), path('aln.sam'), emit: alignments
@@ -106,7 +113,7 @@ process BWAMEM2 {
     // -a: every alignment, secondaries included, for the posteriors
     """
     bwa-mem2 index -p ref ${ref}/ref.fa
-    bwa-mem2 mem -a -t ${task.cpus} ${params.bwa_args} ref ${r1} ${r2} > aln.sam
+    bwa-mem2 mem -a -t ${task.cpus} ${opts} ref ${r1} ${r2} > aln.sam
     """
 
     stub:
@@ -120,6 +127,7 @@ process CALL {
 
     input:
     tuple val(sample), val(aligner), path(alignments), path(ref), path(profile)
+    val opts
 
     output:
     tuple val(sample), path('pileup'), emit: pileup
@@ -127,35 +135,41 @@ process CALL {
     script:
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} --min-depth ${params.min_depth} --min-freq ${params.min_freq}
+        --profile ${profile} ${opts}
     """
 
     stub:
     "mkdir pileup"
 }
 
-// Reusable by other pipelines (workflows/read-xref): reads (sample, r1, r2), the index and
-// the store's members tables (a list, possibly empty).
+// Reusable by other pipelines (workflows/read-xref, spike-benchmark): reads (sample, r1, r2),
+// the index, the store's members tables (a list, possibly empty) and a file of units to
+// withhold from the reference (NO_WITHHOLD for none).
 workflow PILEUP {
     take:
     reads
     index
     store
+    withhold
 
     main:
-    def profiles = QUERY(reads, index).profile
-    def refs = REFERENCE(profiles, index, store).ref
+    def profiles = QUERY(reads, index,
+        "${params.query_stats ? '--stats stats.json ' : ''}${params.query_args}").profile
+    def refs = REFERENCE(profiles, index, store, withhold,
+        "--min-present ${params.min_present} --members ${params.members}").ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'
             return tuple(sample, ref, r1, r2)
         protein: true
             return tuple(sample, ref, r1, r2)
     }
-    def alignments = DIAMOND(to_align.protein).alignments
+    def diamond = "--outfmt 6 ${params.diamond_fields} --top ${params.diamond_top} ${params.diamond_args}"
+    def alignments = DIAMOND(to_align.protein, diamond).alignments
         .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
-        .mix(BWAMEM2(to_align.nucleotide).alignments)
+        .mix(BWAMEM2(to_align.nucleotide, params.bwa_args).alignments)
     def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
-    def pileups = CALL(alignments.join(ref_dirs).join(profiles)).pileup
+    def pileups = CALL(alignments.join(ref_dirs).join(profiles),
+        "--min-depth ${params.min_depth} --min-freq ${params.min_freq}").pileup
 
     emit:
     profile = profiles
@@ -179,8 +193,8 @@ workflow {
                 file(sheet.parent.resolve(row.r2), checkIfExists: true))
         }
     def index = params.index ? channel.value(file(params.index, checkIfExists: true))
-        : INDEX(file(params.targets, checkIfExists: true)).index
+        : INDEX(file(params.targets, checkIfExists: true), params.index_args).index
     def store = params.store ? channel.fromPath(params.store, checkIfExists: true).collect()
         : channel.value([])
-    PILEUP(reads, index, store)
+    PILEUP(reads, index, store, file("${projectDir}/assets/NO_WITHHOLD"))
 }

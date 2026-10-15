@@ -543,7 +543,8 @@ def _units(
         wanted = [
             c
             for c in prof.columns
-            if c in ("present_prob", "coverage_zi") or c.startswith(("aai", "ani"))
+            if c in ("present_prob", "coverage_zi", "len_mean", "n_members")
+            or c.startswith(("aai", "ani"))
         ]
         units = units.join(
             prof.select(pl.col("unit").cast(pl.UInt32), *wanted), on="unit", how="left"

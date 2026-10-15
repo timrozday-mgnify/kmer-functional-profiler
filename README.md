@@ -22,6 +22,7 @@ uv run kmer-functional-profiler import-sourmash KOs_sketched_scaled_1000.sig.zip
 nextflow run workflows/mgnify-subset -profile test   # MGnify subset + index; see its README
 nextflow run workflows/fmh-benchmark -profile test   # benchmark vs fmh-funprofiler; see its README
 nextflow run workflows/read-xref -profile test,docker  # function x genome by read id; see its README
+nextflow run workflows/spike-benchmark -profile local,docker  # pileups, aai, nucleotide mode; see its README
 ```
 
 `tests/python/test_compat.py` also checks parity with `sourmash prefetch` on

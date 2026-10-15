@@ -13,12 +13,13 @@ process SKETCH {
 
     input:
     path fastas
+    val opts  // options as inputs, not params in the script: Nextflow does not hash params
 
     output:
     path 'genomes.syldb', emit: db
 
     script:
-    "sylph sketch -g ${fastas} -o genomes -t ${task.cpus} ${params.sketch_args}"
+    "sylph sketch -g ${fastas} -o genomes -t ${task.cpus} ${opts}"
 
     stub:
     "touch genomes.syldb"
@@ -33,12 +34,13 @@ process SYLPH {
     input:
     tuple val(sample), path(r1), path(r2)
     path db
+    val opts
 
     output:
     tuple val(sample), path('sylph.tsv'), emit: profile
 
     script:
-    "sylph profile ${db} -1 ${r1} -2 ${r2} -t ${task.cpus} ${params.sylph_args} > sylph.tsv"
+    "sylph profile ${db} -1 ${r1} -2 ${r2} -t ${task.cpus} ${opts} > sylph.tsv"
 
     stub:
     "touch sylph.tsv"
@@ -55,6 +57,8 @@ process BOWTIE2 {
     tuple val(sample), path(r1), path(r2), path(sylph)
     path fastas
     path names  // file name -> genome
+    val use_sylph
+    val opts  // bowtie2 options, -k included
 
     output:
     tuple val(sample), path('hits.tsv'), path('contigs.tsv'), emit: hits
@@ -62,7 +66,7 @@ process BOWTIE2 {
     script:
     // The genomes sylph reports (or every genome with --sylph false), concatenated with
     // contigs renamed genome|n; then hits as TSV (kfp_genomes.xref.HITS_COLUMNS).
-    def pick = params.sylph
+    def pick = use_sylph
         ? "tail -n +2 ${sylph} | cut -f2 | xargs -r -n1 basename"
         : "cut -f1 ${names}"
     """
@@ -78,8 +82,7 @@ process BOWTIE2 {
     touch hits.tsv
     if [ -s ref_genomes.fa ]; then
         bowtie2-build --threads ${task.cpus} ref_genomes.fa ref_genomes > /dev/null
-        bowtie2 -x ref_genomes -1 ${r1} -2 ${r2} -k ${params.bowtie2_k} --no-unal \\
-            -p ${task.cpus} ${params.bowtie2_args} |
+        bowtie2 -x ref_genomes -1 ${r1} -2 ${r2} --no-unal -p ${task.cpus} ${opts} |
         awk 'BEGIN { OFS = "\\t" } /^@/ { next } {
             a = 0; c = \$6
             while (match(c, /^[0-9]+[MIDNSHP=X]/)) {
@@ -109,6 +112,7 @@ process XREF {
     input:
     tuple val(sample), path(pileup), path(ref), path(hits), path(contigs)
     path genomes
+    val opts
 
     output:
     tuple val(sample), path('xref'), emit: xref
@@ -116,7 +120,7 @@ process XREF {
     script:
     """
     ${params.venv}/bin/python -m kfp_genomes.xref ${pileup} ${ref} ${hits} ${contigs} xref \\
-        --genomes ${genomes} --min-identity ${params.min_identity} --min-mapq ${params.min_mapq}
+        --genomes ${genomes} ${opts}
     """
 
     stub:
@@ -146,15 +150,17 @@ workflow {
     def names = genomes.map { genome, fasta -> "${fasta.name}\t${genome}" }
         .collectFile(name: 'genome_names.tsv', newLine: true)
     def index = params.index ? channel.value(file(params.index, checkIfExists: true))
-        : INDEX(file(params.targets, checkIfExists: true)).index
+        : INDEX(file(params.targets, checkIfExists: true), params.index_args).index
     def store = params.store ? channel.fromPath(params.store, checkIfExists: true).collect()
         : channel.value([])
 
-    def pileup = PILEUP(reads, index, store)
+    def pileup = PILEUP(reads, index, store, file("${projectDir}/../pileup/assets/NO_WITHHOLD"))
     def selected = params.sylph
         ? SYLPH(reads, params.sylph_db ? file(params.sylph_db, checkIfExists: true)
-            : SKETCH(fastas).db).profile
+            : SKETCH(fastas, params.sketch_args).db, params.sylph_args).profile
         : reads.map { sample, r1, r2 -> tuple(sample, genome_sheet) }  // a placeholder, unused
-    def hits = BOWTIE2(reads.join(selected), fastas, names).hits
-    XREF(pileup.pileup.join(pileup.ref).join(hits), genome_sheet)
+    def hits = BOWTIE2(reads.join(selected), fastas, names, params.sylph,
+        "-k ${params.bowtie2_k} ${params.bowtie2_args}").hits
+    XREF(pileup.pileup.join(pileup.ref).join(hits), genome_sheet,
+        "--min-identity ${params.min_identity} --min-mapq ${params.min_mapq}")
 }

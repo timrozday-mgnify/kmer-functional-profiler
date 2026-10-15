@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
+from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
 from kfp_pileup.reference import MIN_PRESENT, build_reference
 from kmer_functional_profiler.store import MEMBERS
@@ -26,10 +28,15 @@ def reference(
         list[Path] | None,
         typer.Option(help="Members tables (default the index's targets.parquet); repeatable"),
     ] = None,
+    withhold: Annotated[
+        Path | None,
+        typer.Option(help="Units (cluster_rep, one per line) left out of the reference"),
+    ] = None,
 ) -> None:
     """Write ref.fa (targets, component neighbours, reversed decoys), refs.tsv and
     molecule.txt; print the sequences per role."""
-    counts = build_reference(profile, index_dir, out_dir, min_present, members, store or ())
+    held = withhold.read_text().split() if withhold else ()
+    counts = build_reference(profile, index_dir, out_dir, min_present, members, store or (), held)
     typer.echo(json.dumps(counts))
 
 
@@ -59,3 +66,19 @@ def call_command(
         batch_reads,
     )  # fmt: skip
     typer.echo(json.dumps(counts))
+
+
+@app.command(name="aai-check")
+def aai_check_command(
+    units: Annotated[Path, typer.Argument(help="units.tsv of `call`")],
+    out: Annotated[Path, typer.Option(help="TSV to write")] = Path("aai_check.tsv"),
+    min_reads: Annotated[
+        float, typer.Option(help="Units with fewer reads are left out")
+    ] = MIN_READS,
+) -> None:
+    """Step 6's aai check: the profile's aai against the reads' alignment identity, by
+    identity, depth, length and cluster size; prints the table (flagged: step 6's rule)."""
+    table = aai_check(units, min_reads)
+    table.write_csv(out, separator="\t")
+    with pl.Config(tbl_rows=-1, tbl_width_chars=150):
+        typer.echo(table)
