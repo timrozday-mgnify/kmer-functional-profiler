@@ -78,6 +78,22 @@ AAI_MODEL: Final = "aai_model.json"  # the k-mer survival model aai inverts
 PROMISCUOUS: Final = "promiscuous.npy"
 
 
+# ponytail: a nucleotide k between sylph's 31 and KMA's 16, to be tuned (plan, phase 14, step 5)
+DNA_K: Final = 21
+
+
+def molecule(alphabet: str) -> str:
+    """What an alphabet's k-mers are made of: ``nucleotide`` for ``dna`` (targets and reads
+    hashed untranslated, as canonical k-mers), ``protein`` for the amino-acid alphabets
+    (reads translated). Recorded in ``meta.json``; the query hashes reads to match."""
+    return "nucleotide" if alphabet == "dna" else "protein"
+
+
+def span_nt(k: int, alphabet: str) -> int:
+    """Nucleotides of a read one k-mer spans."""
+    return k if molecule(alphabet) == "nucleotide" else 3 * k
+
+
 @dataclass(frozen=True)
 class IndexParams:
     """Build parameters, recorded in ``meta.json``."""
@@ -696,7 +712,9 @@ def _prepare(
     members = load_members(members_path)
     n_residues = int(members["sequence"].str.len_bytes().cast(pl.UInt64).sum())
     n_masked = 0
-    if params.mask_adapters:
+    # ponytail: adapters are masked as peptides only; mask their nucleotide k-mers too if
+    # nucleotide targets from read-based assemblies show adapter hits
+    if params.mask_adapters and molecule(params.alphabet) == "protein":
         masked = members.select(mask_adapters(pl.col("sequence")))["sequence"]
         n_masked = int((masked != members["sequence"]).sum())
         members = members.with_columns(sequence=masked)
@@ -1019,6 +1037,7 @@ def write_meta(
     meta = {
         "format": 2,
         "hash": hash_scheme,
+        "molecule": molecule(params.alphabet),
         # Every unit's k-mers with hash <= base_rate are kept (the query's census relies on it).
         "base_stratum_complete": True,
         "params": asdict(params),

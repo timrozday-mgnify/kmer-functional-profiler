@@ -27,7 +27,7 @@ import numpy as np
 import polars as pl
 
 from kmer_functional_profiler import _core
-from kmer_functional_profiler.index import PIN_BITS, Index
+from kmer_functional_profiler.index import PIN_BITS, Index, span_nt
 from kmer_functional_profiler.query import unit_hits
 
 WINDOW: Final = 10_000  # nt per window
@@ -64,9 +64,9 @@ def windows(path: Path, size: int, overlap: int) -> Iterator[bytes]:
         yield bytes(buf)
 
 
-def _batches(path: Path, k: int) -> Iterator[list[bytes]]:
+def _batches(path: Path, k: int, alphabet: str) -> Iterator[list[bytes]]:
     batch: list[bytes] = []
-    for w in windows(path, WINDOW, 3 * k - 1):
+    for w in windows(path, WINDOW, span_nt(k, alphabet) - 1):
         batch.append(w)
         if len(batch) == WINDOWS_PER_BATCH:
             yield batch
@@ -106,7 +106,7 @@ def build_mask(genome: str | Path, index_dir: str | Path, out: str | Path) -> di
     tiers = ["tier2"] + (["dense"] if index.dense is not None else [])
     max_hash = max(int(getattr(index, t).max_hash) for t in tiers)
     found, sampled = [], 0
-    for batch in _batches(genome, params["k"]):
+    for batch in _batches(genome, params["k"], params["alphabet"]):
         raw = _core.hash_dna(
             batch, params["k"], alphabet=params["alphabet"], frames="all", max_hash=max_hash
         )["hash"]

@@ -1,5 +1,6 @@
 //! Pure-Rust kernels for the k-mer functional profiler: FASTX streaming,
-//! translation, amino-acid k-mer packing, hashing and FracMinHash sampling.
+//! translation, amino-acid and canonical nucleotide k-mer packing, hashing and FracMinHash
+//! sampling.
 //! No PyO3 here, so the final CLI reuses them unchanged.
 
 mod alphabet;
@@ -16,7 +17,10 @@ pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use error::Error;
 pub use fastx::{BaseStats, FastxHits};
 pub use gather::{Gathered, gather};
-pub use kmers::{DnaScanner, Hits, KmerParams, distinct_kmers, hash_kmer, max_hash, protein_kmers};
+pub use kmers::{
+    DnaScanner, Hits, KmerParams, distinct_kmers, dna_kmers, hash_kmer, max_hash, protein_kmers,
+    sequence_kmers,
+};
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
