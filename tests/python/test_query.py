@@ -951,6 +951,16 @@ def test_low_memory_rereads_to_the_same_profile(shared: Path) -> None:
     assert "reread" in timer.stages and timer.counts["read_rows"] == 0
 
 
+def test_stats_count_hit_kmers_per_pair(shared: Path) -> None:
+    # Phase 13, step 0: holders collapsed, so the histogram's mean is hit_kmers per pair.
+    index = build(shared, t_base=0.2, n_min=0)
+    timer = Timer()
+    profile(index, *READS, batch_reads=7, timer=timer)
+    hist = np.array(timer.counts["hits_per_pair"])
+    assert hist.sum() == timer.counts["reads"] and hist[1:].sum() > 0
+    assert (hist * np.arange(len(hist))).sum() == timer.counts["hit_kmers"]
+
+
 def test_read_weights_are_poisson_and_keyed_by_read() -> None:
     reads = np.arange(200_000, dtype=np.uint64)
     w = query._poisson1(3, 7, reads)

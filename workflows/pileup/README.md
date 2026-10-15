@@ -32,6 +32,11 @@ Outputs under `<outdir>/<sample>/`:
 | `pileup/variants.tsv` | columns with depth >= `--min_depth` and an alternative residue at >= `--min_freq`, with `sibling_share` |
 | `pileup/units.tsv` | per target unit: reads, alignment identity (all sequences, representative), the representative's consensus identity, and the profile's `aai` (`ani`) columns, for the `aai` check |
 
+`--query_stats true` publishes `<sample>/stats.json` (the query's stage times and
+`hits_per_pair`, step 0's histogram). `kfp-pileup aai-check <sample>/pileup/units.tsv` is
+step 6's check on a real sample: `aai` against the reads' alignment identity by identity,
+depth, length and cluster size, flagging step 6's rule.
+
 `trace.tsv` records each task's time: the aligner's against `QUERY`'s is step 3's rule (add
 a dense pre-filter if the aligner takes more than ~5x).
 
@@ -41,8 +46,10 @@ nextflow run workflows/pileup -profile test,docker              # fixture protei
 nextflow run workflows/pileup -profile test_nucleotide,docker   # fixture CDS, bwa-mem2
 ```
 
-The steps are the subworkflow `PILEUP` (reads, index, store), which `workflows/read-xref`
-reuses.
+The steps are the subworkflow `PILEUP` (reads, index, store, units to withhold from the
+reference), which `workflows/read-xref` and `spike-benchmark` reuse. Options reach the
+processes as inputs, not as `params` in their scripts, because Nextflow does not hash
+`params`: `-resume` reruns a task when its options change.
 
 `samples.csv` has columns `sample,r1,r2`; relative paths are read from the CSV's directory.
 DIAMOND and bwa-mem2 run in biocontainers (`-profile docker` locally, `singularity` on HPC);

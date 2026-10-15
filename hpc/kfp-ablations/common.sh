@@ -17,3 +17,29 @@ fmh() {
     [[ -n $which ]] && cfg=(-c "$WF/fmh-benchmark/ablations/$which.config")
     nextflow run "$WF/fmh-benchmark" -c ../site.config ${cfg[@]+"${cfg[@]}"} --outdir results -resume "$@"
 }
+
+# fetch_reads RUN: an ENA run's two FASTQ files into ../reads/ (md5-checked, once, shared by
+# every run directory); prints nothing. fetch_pairs OUT PAIRS RUN...: the first PAIRS read
+# pairs of those runs, in order, as OUT_1.fastq.gz and OUT_2.fastq.gz (once).
+fetch_reads() {
+    local run=$1 urls md5s
+    [[ -f ../reads/$run.ok ]] && return
+    mkdir -p ../reads
+    read -r _ urls md5s < <(curl -fsS --retry 5 \
+        "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=$run&result=read_run&fields=fastq_ftp,fastq_md5&format=tsv" | tail -n 1)
+    (cd ../reads && for url in ${urls//;/ }; do curl -fsSL --retry 5 -C - -O "https://$url"; done &&
+        paste -d ' ' <(tr ';' '\n' <<< "$md5s") <(tr ';' '\n' <<< "$urls" | xargs -n 1 basename | sed 's/^/ /') | md5sum -c -)
+    touch ../reads/$run.ok
+}
+fetch_pairs() {
+    local out=$1 pairs=$2 run m
+    shift 2
+    [[ -s ${out}_1.fastq.gz && -s ${out}_2.fastq.gz ]] && return
+    for run in "$@"; do fetch_reads "$run"; done
+    for m in 1 2; do
+        # head stops reading early, so the pipe's earlier stages die of SIGPIPE: no pipefail
+        (set +o pipefail; for run in "$@"; do gzip -dc "../reads/${run}_$m.fastq.gz"; done |
+            head -n $((4 * pairs)) | gzip -1 > "${out}_$m.fastq.gz.tmp")
+        mv "${out}_$m.fastq.gz.tmp" "${out}_$m.fastq.gz"
+    done
+}

@@ -59,7 +59,16 @@ cd kfp-ablations/promiscuity-novaseq && sbatch run.sh
 cd kfp-ablations/promiscuity-query-cost && sbatch run.sh
 # step 41: the two controls again with whole fits (no block-wise), alongside promiscuity-query-cost:
 cd kfp-ablations/whole-fit-query-cost && sbatch run.sh
+# phases 13-14 (workflows/spike-benchmark, workflows/pileup), independent of the runs above,
+# all at once: the pileups and aai with truth on the three tiers' sampling, the nucleotide
+# mode against KMA with k and t_base tuning (CARD), then, once release-tiers has finished,
+# the follow-up's cost and the aai check on real reads against the full standard tier:
+for r in spike-protein spike-nucleotide; do (cd kfp-ablations/$r && sbatch run.sh); done
+cd kfp-ablations/pileup-cost && sbatch run.sh
 ```
+
+`../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs
+downloaded by `common.sh`'s `fetch_reads`, shared by the runs that need them.
 
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for

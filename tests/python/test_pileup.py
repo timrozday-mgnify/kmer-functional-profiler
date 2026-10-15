@@ -5,6 +5,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from kfp_pileup.check import aai_check
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
 from kmer_functional_profiler.index import (
@@ -141,3 +142,28 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     decoy = refs.filter(pl.col("role") == "decoy", pl.col("unit") == target["unit"])
     assert fasta[decoy["seq_id"][0]] == fasta[target["seq_id"]][::-1]
     assert (tmp_path / "ref" / "molecule.txt").read_text() == "protein\n"
+    # a withheld unit is in no role
+    held = str(target["cluster_rep"])
+    build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "held", withhold=[held])
+    kept = pl.read_csv(tmp_path / "held" / "refs.tsv", separator="\t", infer_schema=False)
+    assert held not in kept["cluster_rep"].to_list()
+    assert kept.height == refs.filter(pl.col("unit") != target["unit"]).height
+
+
+def test_aai_check_bins_and_flags(tmp_path: Path) -> None:
+    # 120 units at alignment identity 0.96 whose aai runs 0.03 high: that bin is flagged;
+    # 5 at 0.995 with no gap are too few to flag; units with few reads are left out.
+    rows = [(0.96, 0.99, 0.98, 1.0, 50.0, 300.0, 3)] * 120
+    rows += [(0.995, 0.995, 0.99, 1.0, 50.0, 300.0, 3)] * 5 + [(0.5, 0.99, 0.9, 1.0, 2.0, 300.0, 3)]
+    pl.DataFrame(
+        rows,
+        schema=["identity", "aai", "aai_lo", "aai_hi", "reads", "len_mean", "n_members"],
+        orient="row",
+    ).with_columns(coverage_zi=pl.col("reads")).write_csv(tmp_path / "u.tsv", separator="\t")
+    table = aai_check(tmp_path / "u.tsv")
+    by = {(r["breakdown"], r["bin"]): r for r in table.iter_rows(named=True)}
+    assert by[("all", "all")]["units"] == 125
+    assert by[("identity", "[0.95, 0.97)")]["flagged"]
+    assert by[("identity", "[0.95, 0.97)")]["median_gap"] == pytest.approx(0.03)
+    assert not by[("identity", "[0.99, inf)")]["flagged"]
+    assert by[("identity", "[0.95, 0.97)")]["cover"] == 0.0

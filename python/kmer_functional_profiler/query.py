@@ -120,7 +120,7 @@ class Timer:
 
     def __init__(self, path: Path | None = None, *, log: bool = False) -> None:
         self.stages: dict[str, dict[str, float]] = {}
-        self.counts: dict[str, float] = {}
+        self.counts: dict[str, Any] = {}  # numbers, and the hits_per_pair histogram
         self.path, self.log, self.running = path, log, ""
         self.start = time.perf_counter()
         self.peak_anon = anon_rss()
@@ -2217,6 +2217,7 @@ def profile(
     # them or ``low_memory`` re-reads the reads for the detected k-mers only.
     keep_reads = draws > 0 and not joint.dense and not low_memory
     sampled = hit_kmers = hit_rows = 0
+    per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
     reads = iter(stream(joint.max_hash("tier2")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
     while b is not None:
@@ -2241,6 +2242,12 @@ def profile(
         subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier2") // DISTINCT_SAMPLE])
         hit_rows += hits.height
         hit_kmers += round((1 / hits["holders"]).sum()) if hits.height else 0  # rows per hit
+        if record and hits.height:  # occurrences per pair, holders collapsed
+            per_pair = hits.group_by("read").agg((1 / pl.col("holders")).sum().round())
+            pair_counts = np.bincount(per_pair[:, 1].cast(pl.Int64).to_numpy())
+            grow = max(0, len(pair_counts) - len(per_pair_hist))
+            per_pair_hist = np.pad(per_pair_hist, (0, grow))
+            per_pair_hist[: len(pair_counts)] += pair_counts
         with timer("hash"):
             b = next(reads, None)
     with timer("aggregate"):
@@ -2256,6 +2263,9 @@ def profile(
         "unit_kmer_pairs": kmer_hits.height,
         "hit_units": kmer_hits["unit"].n_unique(),
     }
+    if record:  # index i: pairs with i hit k-mer occurrences; 0 = pairs with no hit
+        per_pair_hist[0] = n_reads - per_pair_hist[1:].sum()
+        counts["hits_per_pair"] = per_pair_hist.tolist()
     with timer("hit_units"):  # rows gathered from the unit columns, never the whole table
         hit_info = joint.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
         if mask is not None:
