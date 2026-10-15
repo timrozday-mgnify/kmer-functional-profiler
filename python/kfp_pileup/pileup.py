@@ -28,8 +28,8 @@ position q it uses.
   ``aai`` (``ani``) columns.
 
 The crude pass by design: mates are scored independently, insertions count in scores but
-not in pileups, and there is no sequencing-error model. :mod:`kfp_pileup.refine` (steps 7-9)
-runs after it on the alignments kept here.
+not in pileups, and there is no sequencing-error model. :mod:`kfp_pileup.refine` (steps
+8-9) runs after it on the alignments kept here.
 """
 
 import math
@@ -439,16 +439,15 @@ def call(
     min_freq: float = MIN_FREQ,
     score_nats: float = SCORE_NATS,
     batch_reads: int = BATCH_READS,
-    reads: Sequence[str | Path] = (),
     novel: float = NOVEL,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
     ``ref_dir``. Writes ``assignments.parquet``, ``pileup.parquet``, ``variants.tsv`` and
     ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
-    outputs (steps 7-9; ``reads``: the FASTQ mates, for qualities); returns counts.
+    outputs (steps 8-9); returns counts.
 
-    ponytail: steps 7-9 hold every alignment and its target columns in memory; spill them
+    ponytail: steps 8-9 hold every alignment and its target columns in memory; spill them
     per component to Parquet if ``pileup-cost``'s 100 M pairs do not fit."""
     ref_dir, out = Path(ref_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -496,7 +495,7 @@ def call(
     if hits is not None and hits.height:
         refined, em_units = refine(
             hits, pl.concat(col_parts), refs, sequences, out, aligner == "diamond", profile,
-            reads, min_depth, min_freq, novel,
+            min_depth, min_freq, novel,
         )  # fmt: skip
         hits = hits.join(refined, on="hit", how="left")
     (

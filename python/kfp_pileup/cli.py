@@ -59,21 +59,17 @@ def call_command(
         float, typer.Option(help="bwa: nats per alignment score point")
     ] = SCORE_NATS,
     batch_reads: int = BATCH_READS,
-    reads: Annotated[
-        list[Path] | None,
-        typer.Option(help="FASTQ of each mate (in mate order), for base qualities; repeatable"),
-    ] = None,
     novel: Annotated[
         float, typer.Option(help="Least divergence of a novel relative from the reference")
     ] = NOVEL,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
-    per-unit identity (units.tsv) from alignments to the reference; then the error model,
-    the joint EM, consensus updates and haplotypes (error_model.tsv, sources.tsv,
-    haplotypes.tsv, calls.tsv); print counts."""
+    per-unit identity (units.tsv) from alignments to the reference; then the joint EM over
+    read sources, consensus updates and haplotypes (sources.tsv, haplotypes.tsv); print
+    counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads, reads or (), novel,
+        batch_reads, novel,
     )  # fmt: skip
     typer.echo(json.dumps(counts))
 
