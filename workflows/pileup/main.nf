@@ -122,7 +122,7 @@ process CALL {
     tuple val(sample), val(aligner), path(alignments), path(ref), path(profile)
 
     output:
-    path 'pileup', emit: pileup
+    tuple val(sample), path('pileup'), emit: pileup
 
     script:
     """
@@ -132,6 +132,35 @@ process CALL {
 
     stub:
     "mkdir pileup"
+}
+
+// Reusable by other pipelines (workflows/read-xref): reads (sample, r1, r2), the index and
+// the store's members tables (a list, possibly empty).
+workflow PILEUP {
+    take:
+    reads
+    index
+    store
+
+    main:
+    def profiles = QUERY(reads, index).profile
+    def refs = REFERENCE(profiles, index, store).ref
+    def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
+        nucleotide: molecule == 'nucleotide'
+            return tuple(sample, ref, r1, r2)
+        protein: true
+            return tuple(sample, ref, r1, r2)
+    }
+    def alignments = DIAMOND(to_align.protein).alignments
+        .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
+        .mix(BWAMEM2(to_align.nucleotide).alignments)
+    def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
+    def pileups = CALL(alignments.join(ref_dirs).join(profiles)).pileup
+
+    emit:
+    profile = profiles
+    ref = ref_dirs
+    pileup = pileups
 }
 
 workflow {
@@ -153,21 +182,5 @@ workflow {
         : INDEX(file(params.targets, checkIfExists: true)).index
     def store = params.store ? channel.fromPath(params.store, checkIfExists: true).collect()
         : channel.value([])
-
-    def profiles = QUERY(reads, index).profile
-    def refs = REFERENCE(profiles, index, store).ref
-    def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
-        nucleotide: molecule == 'nucleotide'
-            return tuple(sample, ref, r1, r2)
-        protein: true
-            return tuple(sample, ref, r1, r2)
-    }
-    def alignments = DIAMOND(to_align.protein).alignments
-        .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
-        .mix(BWAMEM2(to_align.nucleotide).alignments)
-    CALL(
-        alignments
-            .join(refs.map { sample, ref, molecule -> tuple(sample, ref) })
-            .join(profiles)
-    )
+    PILEUP(reads, index, store)
 }
