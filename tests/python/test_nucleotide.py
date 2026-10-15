@@ -42,11 +42,10 @@ def write_reads(path: Path, gene: str, n: int, strand: str = "both", length: int
 
 @pytest.fixture
 def dna_index(tmp_path: Path) -> Path:
-    members = write_members(tmp_path / "genes.parquet", GENES)
-    runner = CliRunner()
-    result = runner.invoke(
-        app, ["index", str(members), str(tmp_path / "idx"), "--alphabet", "dna", "--t-base", "1"]
-    )
+    fasta = tmp_path / "genes.fna"
+    fasta.write_text("".join(f">gene{i}\n{g}\n" for i, g in enumerate(GENES)))
+    args = ["index", str(fasta), str(tmp_path / "idx"), "--targets", "--alphabet", "dna"]
+    result = CliRunner().invoke(app, [*args, "--t-base", "1"])
     assert result.exit_code == 0, result.output
     return tmp_path / "idx"
 
@@ -56,6 +55,11 @@ def test_dna_index_records_its_molecule(dna_index: Path) -> None:
     assert meta["molecule"] == "nucleotide"
     assert meta["params"]["alphabet"] == "dna"
     assert meta["params"]["k"] == DNA_K
+    assert Index.load(dna_index).units.frame()["cluster_rep"].to_list() == [
+        "gene0",
+        "gene1",
+        "gene2",
+    ]
 
 
 def test_reads_from_either_strand_hit_their_target(dna_index: Path, tmp_path: Path) -> None:

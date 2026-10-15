@@ -13,9 +13,11 @@ from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
     AAI_MODEL,
     DNA_K,
+    TARGETS,
     Index,
     IndexParams,
     build_index,
+    members_from_fasta,
     write_unit_columns,
 )
 from kmer_functional_profiler.mask import Mask, build_mask
@@ -34,8 +36,32 @@ def version() -> None:
 
 @app.command()
 def index(
-    members: Annotated[Path, typer.Argument(help="Parquet: protein_id, cluster_rep, ...")],
+    members: Annotated[
+        Path,
+        typer.Argument(
+            help="Parquet: protein_id, cluster_rep, ...; with --targets, a FASTA of targets"
+        ),
+    ],
     out_dir: Path,
+    targets: Annotated[
+        bool,
+        typer.Option(
+            help="MEMBERS is a FASTA of targets (proteins, or nucleotides with --alphabet dna), "
+            "kept in the index as targets.parquet; one unit per target unless --groups or "
+            "--cluster"
+        ),
+    ] = False,
+    groups: Annotated[
+        Path | None,
+        typer.Option(help="With --targets: headerless TSV of (target id, group); a unit per group"),
+    ] = None,
+    cluster: Annotated[
+        float | None,
+        typer.Option(
+            help="With --targets: cluster the targets with MMseqs2 linclust at this identity "
+            "(e.g. 0.9), a unit per cluster"
+        ),
+    ] = None,
     pfam: Annotated[Path | None, typer.Option(help="Parquet: protein_id, pfam_accession")] = None,
     k: Annotated[
         int | None, typer.Option(help=f"k-mer length (default {DEFAULTS.k}; {DNA_K} for dna)")
@@ -61,7 +87,15 @@ def index(
     batch_residues: int = DEFAULTS.batch_residues,
     postings: Annotated[bool, typer.Option(help="Also write postings.parquet")] = False,
 ) -> None:
-    """Build an index from a members table; print its stats as JSON."""
+    """Build an index from a members table or a FASTA of targets; print its stats as JSON."""
+    if not targets and (groups is not None or cluster is not None):
+        raise typer.BadParameter("--groups and --cluster need --targets")
+    if groups is not None and cluster is not None:
+        raise typer.BadParameter("--groups and --cluster are alternatives")
+    if targets:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        members_from_fasta(members, groups, cluster).write_parquet(out_dir / TARGETS)
+        members = out_dir / TARGETS
     params = IndexParams(
         k=k if k is not None else DNA_K if alphabet == "dna" else DEFAULTS.k,
         alphabet=alphabet,

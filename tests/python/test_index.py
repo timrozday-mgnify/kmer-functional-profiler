@@ -273,3 +273,73 @@ def test_madvise_random_reaches_memory_mapped_arrays(tmp_path: Path) -> None:
     mapped = np.load(tmp_path / "a.npy", mmap_mode="r")
     assert isinstance(mapped.base, index.mmap.mmap)
     assert index._madvise_random(mapped) is mapped
+
+
+def write_fasta(path: Path, rows: list[tuple[int, int, bool, str]]) -> Path:
+    path.write_text(
+        "".join(f">{pid} member of {rep}\n{seq[:25]}\n{seq[25:]}\n" for pid, rep, _, seq in rows)
+    )
+    return path
+
+
+def test_targets_fasta_with_groups_equals_the_members_table_build(tmp_path: Path) -> None:
+    # HAND's members are all full length but one; a FASTA has no such flag, so compare
+    # against the members table with every member full length.
+    rows = [(pid, rep, True, seq) for pid, rep, _, seq in HAND]
+    params = IndexParams(k=K, t_base=1.0, n_min=1)
+    build_index(
+        write_members(tmp_path / "m.parquet", rows), tmp_path / "a", params, postings_parquet=True
+    )
+    fasta = write_fasta(tmp_path / "t.faa", rows)
+    groups = tmp_path / "groups.tsv"
+    groups.write_text("".join(f"{pid}\t{rep}\n" for pid, rep, _, _ in rows))
+    index.members_from_fasta(fasta, groups).write_parquet(tmp_path / "t.parquet")
+    build_index(tmp_path / "t.parquet", tmp_path / "b", params, postings_parquet=True)
+    a, b = (Index.load(tmp_path / d) for d in "ab")
+    assert b.units.frame().drop("cluster_rep").equals(a.units.frame().drop("cluster_rep"))
+    assert b.units.frame()["cluster_rep"].to_list() == [
+        str(r) for r in a.units.frame()["cluster_rep"]
+    ]
+    assert pl.read_parquet(tmp_path / "b" / "postings.parquet").equals(
+        pl.read_parquet(tmp_path / "a" / "postings.parquet")
+    )
+    for field in index.PACKED_FIELDS:
+        assert np.array_equal(getattr(a.tier2, field), getattr(b.tier2, field))
+
+
+def test_targets_fasta_without_groups_makes_a_unit_per_target(tmp_path: Path) -> None:
+    fasta = write_fasta(tmp_path / "t.faa", HAND)
+    result = CliRunner().invoke(
+        app,
+        [
+            "index",
+            str(fasta),
+            str(tmp_path / "idx"),
+            "--targets",
+            "--k",
+            str(K),
+            "--t-base",
+            "1",
+            "--n-min",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    targets = pl.read_parquet(tmp_path / "idx" / index.TARGETS)
+    assert targets["cluster_rep"].to_list() == targets["protein_id"].to_list()
+    assert Index.load(tmp_path / "idx").units.frame().height == len(HAND)  # each has k-mers
+
+
+def test_targets_fasta_rejects_bad_ids(tmp_path: Path) -> None:
+    fasta = write_fasta(tmp_path / "t.faa", HAND)
+    groups = tmp_path / "g.tsv"
+    groups.write_text("1\tA\n99\tA\n")
+    with pytest.raises(ValueError, match="not in"):
+        index.members_from_fasta(fasta, groups)
+    dup = write_fasta(tmp_path / "d.faa", [HAND[0], HAND[0]])
+    with pytest.raises(ValueError, match="unique"):
+        index.members_from_fasta(dup)
+    result = CliRunner().invoke(
+        app, ["index", str(fasta), str(tmp_path / "x"), "--groups", str(groups)]
+    )
+    assert result.exit_code != 0
