@@ -35,6 +35,9 @@ process {
     withName: 'PILEUP:QUERY' { cpus = 8; memory = { 32.GB * task.attempt } }
     withName: 'PILEUP:DIAMOND' { cpus = 16; memory = { 64.GB * task.attempt }; time = { 48.h * task.attempt } }
     withName: 'PILEUP:CALL' { memory = { 64.GB * task.attempt } }
+    withName: 'PILEUP:MAP_CONSENSUS' { cpus = 16; memory = { 32.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:(HANDOFF|BAM|FREEBAYES|CONSEQUENCES)' { memory = { 16.GB * task.attempt }; time = { 48.h * task.attempt } }
+    withName: 'PILEUP:(FLORIA|INSTRAIN|CLIQUESNV)' { cpus = 16; memory = { 64.GB * task.attempt }; time = { 48.h * task.attempt } }
 }
 CFG
 # one after another in this directory, so -resume reuses the families, siblings and samples

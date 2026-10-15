@@ -62,7 +62,9 @@ cd kfp-ablations/whole-fit-query-cost && sbatch run.sh
 # phases 13-14 (workflows/spike-benchmark, workflows/pileup), independent of the runs above,
 # all at once: the pileups and aai with truth on the three tiers' sampling, the nucleotide
 # mode against KMA with k and t_base tuning (CARD), then, once release-tiers has finished,
-# the follow-up's cost and the aai check on real reads against the full standard tier:
+# the follow-up's cost and the aai check on real reads against the full standard tier (with
+# steps 6b-6c: frameshift-aware DIAMOND, the consensus, variants by freebayes, bcftools csq,
+# Floria and inStrain, and DIAMOND's time without -F on the 10 M sample):
 for r in spike-protein spike-nucleotide; do (cd kfp-ablations/$r && sbatch run.sh); done
 cd kfp-ablations/pileup-cost && sbatch run.sh
 ```

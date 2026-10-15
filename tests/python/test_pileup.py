@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 
 from kfp_pileup.check import aai_check
+from kfp_pileup.handoff import handoff
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
 from kmer_functional_profiler.index import (
@@ -205,3 +206,85 @@ def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> No
     assert all(novel[f"rel{i}"] > 0.9 for i in range(6))
     haps = pl.read_csv(out / "haplotypes.tsv", separator="\t")
     assert haps.filter("novel")["divergence"].to_list() == [pytest.approx(6 / 30)]
+
+
+def test_frameshift_btop_to_nucleotides(tmp_path: Path) -> None:
+    # Real DIAMOND 2.2.8 -F 15 alignments (tests/data/frameshift) of 150-nt reads from
+    # cds.fna[300:450] with planted indels near read position 75 (cds 375), both strands.
+    fs = DATA / "frameshift"
+    cds = dict(read_fasta(fs / "cds.fna"))["p"]
+    prot = dict(read_fasta(fs / "ref.faa"))["p"]
+    refs = write_refs(tmp_path / "ref", [("p", "target", 0, prot), ("d", "decoy", 0, prot[::-1])])
+    (tmp_path / "r2.tsv").write_text("")
+    counts = call(
+        [fs / "diamond.tsv", tmp_path / "r2.tsv"], refs, tmp_path / "out", "diamond",
+        min_depth=1, min_freq=0.1, reads=[fs / "r.fq", fs / "r.fq"],
+    )  # fmt: skip
+    assert counts["codon_mismatch"] == 0  # every read codon translates to its residue
+    assert counts["frameshift_alignments"] == 7  # all but none and codon_del
+    assigned = pl.read_parquet(tmp_path / "out" / "assignments.parquet")
+    assert assigned.filter(pl.col("read_name") == "codon_del")["posterior"][0] > 0.99
+    pile = pl.read_parquet(tmp_path / "out" / "pileup_nt.parquet")
+    indels = {
+        (r["col"], r["allele"]): r["weight"]
+        for r in pile.filter(~pl.col("allele").is_in(list("ACGT"))).iter_rows(named=True)
+    }
+    # a base missing from the read: the next column's first base (DIAMOND puts the shift
+    # after the codon it garbles); an extra base: inserted before the next codon column
+    assert indels[(378, "-")] == pytest.approx(3, abs=0.01)  # del1, del1_rev, off1_del1
+    assert indels[(375, "+G")] == pytest.approx(1, abs=0.01)  # ins1 (its planted G)
+    assert indels[(375, f"+{cds[375]}")] == pytest.approx(1, abs=0.01)  # ins1_rev
+    # codon_del; and del2 (2 nt): a codon out, and the base DIAMOND skipped back in
+    assert indels[(375, "-")] == pytest.approx(2, abs=0.01)
+    assert indels[(378, f"+{cds[377]}")] == pytest.approx(1, abs=0.01)
+    assert indels[(435, "-")] == pytest.approx(1, abs=0.01)  # del1_end: exactly cds 435
+    # the consensus is the CDS wherever reads cover it, away from the garbled codons
+    cons = dict(read_fasta(tmp_path / "out" / "consensus.fna"))["p"]
+    assert len(cons) == 3 * len(prot)
+    assert set(cons[:300]) == {"N"}
+    covered = [i for i in range(300, 450) if not 372 <= i < 381 and not 435 <= i < 439]
+    assert all(cons[i] == cds[i] for i in covered)
+    assert "CDS\t1\t900" in (tmp_path / "out" / "consensus.gff").read_text()
+    recruited = (tmp_path / "out" / "recruited_1.fq.gz").read_bytes()
+    assert recruited  # every read pair has a target alignment
+
+
+def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
+    refs = write_refs(
+        tmp_path / "ref",
+        [("s0", "target", 0, "A" * 30), ("s1", "target", 1, "C" * 30), ("s2", "decoy", 0, "A")],
+    )
+    pile = tmp_path / "pileup"
+    pile.mkdir()
+    pl.DataFrame(
+        {
+            "read_name": ["p1", "p1", "p1", "p2", "p3"],
+            "mate": [0, 1, 0, 0, 0],
+            "unit": [0, 0, 1, 0, 0],
+            "role": ["target"] * 4 + ["decoy"],
+            "em_posterior": [0.9, 0.9, 0.1, 0.4, 0.9],
+        }
+    ).write_parquet(pile / "assignments.parquet")
+    seq, qual = "ACGTA", "IIIII"
+    sam = tmp_path / "in.sam"
+    sam.write_text(
+        "@SQ\tSN:s0\tLN:30\n@SQ\tSN:s1\tLN:30\n"
+        f"p1\t97\ts1\t1\t60\t5M\ts0\t11\t0\t{seq}\t{qual}\tAS:i:5\n"  # unit 1: not assigned
+        f"p1\t353\ts0\t2\t0\t5M\ts0\t11\t0\t*\t*\tAS:i:4\n"  # secondary on unit 0: kept
+        f"p1\t145\ts0\t11\t60\t5M\ts1\t1\t0\t{seq}\t{qual}\tAS:i:5\n"
+        f"p2\t65\ts0\t1\t60\t5M\t=\t1\t0\t{seq}\t{qual}\tAS:i:5\n"  # 0.4 < 0.5: dropped
+    )
+    counts = handoff(pile, refs, sam, tmp_path / "out.sam")
+    assert counts == {"pairs": 2, "kept_mates": 2}
+    rows = [
+        line.split("\t")
+        for line in (tmp_path / "out.sam").read_text().splitlines()
+        if not line.startswith("@")
+    ]
+    first, second = rows
+    assert (first[2], first[3], first[9], first[10]) == ("s0", "2", seq, qual)  # borrowed
+    assert int(first[1]) & 0x900 == 0 and int(first[1]) & 0x2  # primary, proper pair
+    assert int(first[1]) & 0x20  # its mate is reverse
+    assert first[6:9] == ["=", "11", "14"]
+    assert second[4] == first[4] == "10"  # Phred of 1 - 0.9
+    assert second[6:9] == ["=", "2", "-14"]
