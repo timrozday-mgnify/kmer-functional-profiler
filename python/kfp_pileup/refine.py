@@ -81,7 +81,8 @@ def substitution_shares(protein: bool) -> np.ndarray:
             for b in "ACGT".replace(a, ""):
                 m[ord(a), ord(b)] = 1
     total = m.sum(1, keepdims=True)
-    return np.divide(m, total, out=np.zeros_like(m), where=total > 0)
+    out: np.ndarray = np.divide(m, total, out=np.zeros_like(m), where=total > 0)
+    return out
 
 
 def read_qualities(paths: Sequence[str | Path], names: set[str]) -> dict[tuple[str, int], bytes]:
@@ -776,10 +777,12 @@ def _calls(
     for seq, col in cols.select("seq", "col").iter_rows():
         g = groups[(seq, col)]
         alt, other = g.filter("is_alt"), g.filter(~pl.col("is_alt"))
-        table = [
-            [round(part.filter(pl.col("reverse") == r)["weight"].sum()) for r in (False, True)]
-            for part in (alt, other)
-        ]
+        table = np.array(
+            [
+                [round(part.filter(pl.col("reverse") == r)["weight"].sum()) for r in (False, True)]
+                for part in (alt, other)
+            ]
+        )
         strand_p.append(float(stats.fisher_exact(table).pvalue))
         pos_p.append(
             float(
