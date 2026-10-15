@@ -1,9 +1,12 @@
-"""Amino-acid profiles match the golden outputs of the pre-phase-14 build (tests/golden)."""
+"""Amino-acid profiles match the golden outputs of the pre-phase-14 build (tests/golden): exact
+for counts and ids, to a relative 1e-6 for floats (EM and fits differ in the last digits
+between platforms; the plan's rule for golden tests)."""
 
 from pathlib import Path
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
 from kmer_functional_profiler.cli import app
@@ -45,4 +48,4 @@ def test_profiles_match_golden(members: Path, tmp_path: Path, index: str) -> Non
         assert ran.exit_code == 0, ran.output
         got = pl.read_csv(out, separator="\t", infer_schema_length=None)
         want = pl.read_csv(GOLDEN / out.name, separator="\t", infer_schema_length=None)
-        assert got.equals(want), out.name
+        assert_frame_equal(got, want, check_exact=False, rel_tol=1e-6, abs_tol=1e-9)
