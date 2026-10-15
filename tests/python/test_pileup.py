@@ -1,13 +1,15 @@
-"""kfp-pileup (plan, phase 13, steps 2-6) on hand-made alignments and the fixture index."""
+"""kfp-pileup (plan, phase 13, steps 2-9) on hand-made alignments and the fixture index."""
 
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
 from kfp_pileup.check import aai_check
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
+from kfp_pileup.refine import _decreasing, substitution_shares
 from kmer_functional_profiler.index import (
     TARGETS,
     Index,
@@ -167,3 +169,55 @@ def test_aai_check_bins_and_flags(tmp_path: Path) -> None:
     assert by[("identity", "[0.95, 0.97)")]["median_gap"] == pytest.approx(0.03)
     assert not by[("identity", "[0.99, inf)")]["flagged"]
     assert by[("identity", "[0.95, 0.97)")]["cover"] == 0.0
+
+
+def test_error_shares_and_monotone_fit() -> None:
+    shares = substitution_shares(protein=True)
+    for a in "ACDEFGHIKLMNPQRSTVWY":
+        assert shares[ord(a)].sum() == pytest.approx(1.0)
+    # one base change of TGG (W) gives C, G, L, R, S or a stop, never W again
+    assert shares[ord("W"), ord("W")] == 0 and shares[ord("W"), ord("C")] > 0
+    assert substitution_shares(protein=False)[ord("A"), ord("G")] == pytest.approx(1 / 3)
+    fit = _decreasing(np.array([0.05, 0.01, 0.03, 0.001]), np.ones(4))
+    assert fit.tolist() == pytest.approx([0.05, 0.02, 0.02, 0.001])
+
+
+def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> None:
+    # Target A (30 aa); a strain of it with one fixed difference (column 2) and a relative
+    # missing from the reference that differs at five more columns, linked (6/30).
+    ref = "MKVLAAGIVLWQERTYIPASDFGHKLCVNM"
+    refs = write_refs(tmp_path / "ref", [("s0", "target", 0, ref), ("s1", "decoy", 0, ref[::-1])])
+    relative = {2: "W", 5: "S", 10: "D", 15: "N", 20: "Q", 25: "E"}
+
+    def btop(diffs: dict[int, str]) -> str:
+        out, run = "", 0
+        for i, s in enumerate(ref):
+            if i in diffs:
+                out += f"{run or ''}{diffs[i]}{s}"
+                run = 0
+            else:
+                run += 1
+        return out + str(run)
+
+    strain = [diamond_line(f"st{i}", "s0", 60, btop({2: "W"})) for i in range(12)]
+    rel = [diamond_line(f"rel{i}", "s0", 40, btop(relative)) for i in range(6)]
+
+    def run(lines: list[str], name: str) -> tuple[dict[str, float], Path]:
+        hits, out = tmp_path / f"{name}.tsv", tmp_path / name
+        hits.write_text("".join(lines))
+        call([hits], refs, out, "diamond", min_depth=3, min_freq=0.2)
+        a = pl.read_parquet(out / "assignments.parquet").filter(pl.col("role") == "target")
+        return dict(zip(a["read_name"], a["em_novel"], strict=True)), out
+
+    # beside the strain, the EM's novel class takes the relative's reads
+    novel, out = run(strain + rel, "mixed")
+    assert all(novel[f"rel{i}"] > 0.9 for i in range(6))
+    assert all(novel[f"st{i}"] < 0.1 for i in range(12))
+    calls = pl.read_csv(out / "calls.tsv", separator="\t")
+    fixed = calls.filter(pl.col("pos") == 3).row(0, named=True)
+    assert (fixed["consensus"], fixed["alt"], fixed["passed"]) == ("W", "W", True)
+    # alone, the consensus moves to the relative and its haplotype is reported as novel
+    novel, out = run(rel, "alone")
+    assert all(novel[f"rel{i}"] > 0.9 for i in range(6))
+    haps = pl.read_csv(out / "haplotypes.tsv", separator="\t")
+    assert haps.filter("novel")["divergence"].to_list() == [pytest.approx(6 / 30)]
