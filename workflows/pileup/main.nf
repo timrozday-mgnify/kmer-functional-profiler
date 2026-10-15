@@ -1,8 +1,11 @@
 // Read recruitment and crude pileups downstream of a kfp profile (plan, phase 13; the
 // nucleotide follow-up of phase 14, step 4). Per sample: kfp query -> per-sample reference
-// (kfp-pileup reference) -> DIAMOND blastx (amino-acid index) or bwa-mem2 mem (nucleotide
-// index), chosen by the index's molecule -> read posteriors, pileups and per-unit identity
-// (kfp-pileup call). See README.md.
+// (kfp-pileup reference) -> DIAMOND blastx (amino-acid index, frameshift-aware) or bwa-mem2
+// mem (nucleotide index), chosen by the index's molecule -> read posteriors, pileups,
+// per-unit identity, read assignment and, for DIAMOND, the nucleotide pileup and consensus
+// (kfp-pileup call) -> the hand-off BAM (reads re-mapped to the consensus, or the bwa-mem2
+// alignments, kept where step 8 assigns them) -> variants, consequences, haplotypes and
+// microdiversity by existing tools (plan, phase 13, steps 6b-6c). See README.md.
 
 process INDEX {
     label 'process_medium'
@@ -126,20 +129,266 @@ process CALL {
     publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/${it}" }
 
     input:
-    tuple val(sample), val(aligner), path(alignments), path(ref), path(profile)
+    tuple val(sample), val(aligner), path(alignments), path(ref), path(profile), path(r1), path(r2)
     val opts
 
     output:
     tuple val(sample), path('pileup'), emit: pileup
+    tuple val(sample), val(aligner), path('pileup'), emit: called
 
     script:
+    // DIAMOND: the reads too, for the nucleotide pileup and consensus (step 6b)
+    def reads = aligner == 'diamond' ? "--reads ${r1} --reads ${r2}" : ''
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} ${opts}
+        --profile ${profile} ${reads} ${opts}
     """
 
     stub:
     "mkdir pileup"
+}
+
+process MAP_CONSENSUS {
+    tag "${sample}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/bwa-mem2:2.2.1--he70b90d_8'
+
+    input:
+    tuple val(sample), path(pileup)
+    val opts
+
+    output:
+    tuple val(sample), path('consensus.sam'), path('consensus.fna'), emit: sam
+
+    script:
+    // the recruited pairs re-mapped to the protein arm's consensus coding sequences (6b)
+    """
+    cp ${pileup}/consensus.fna .
+    bwa-mem2 index consensus.fna
+    bwa-mem2 mem -t ${task.cpus} ${opts} consensus.fna ${pileup}/recruited_1.fq.gz \\
+        ${pileup}/recruited_2.fq.gz > consensus.sam
+    """
+
+    stub:
+    "touch consensus.sam consensus.fna"
+}
+
+process HANDOFF {
+    tag "${sample}"
+    label 'process_single'
+
+    input:
+    tuple val(sample), path(sam), path(fasta), path(pileup), path(ref)
+    val opts
+
+    output:
+    tuple val(sample), path('handoff.sam'), path(fasta), emit: sam
+
+    script:
+    "${params.kfp_pileup} handoff ${pileup} ${ref} ${sam} --out handoff.sam ${opts}"
+
+    stub:
+    "touch handoff.sam"
+}
+
+process BAM {
+    tag "${sample}"
+    label 'process_single'
+    container 'quay.io/biocontainers/samtools:1.24--h9dcdb79_1'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(sam), path(fasta)
+
+    output:
+    tuple val(sample), path('handoff.bam'), path('handoff.bam.bai'), path(fasta), path("${fasta}.fai"), emit: bam
+
+    script:
+    """
+    samtools sort -o handoff.bam ${sam}
+    samtools index handoff.bam
+    samtools faidx ${fasta}
+    """
+
+    stub:
+    "touch handoff.bam handoff.bam.bai ${fasta}.fai"
+}
+
+process FREEBAYES {
+    tag "${sample}"
+    label 'process_single'
+    container 'quay.io/biocontainers/freebayes:1.3.10--h3752d28_1'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(bam), path(bai), path(fasta), path(fai)
+    val opts
+
+    output:
+    tuple val(sample), path('freebayes.vcf.gz'), path('freebayes.vcf.gz.tbi'), emit: vcf
+
+    script:
+    // allele frequencies without a ploidy; SNVs, indels and MNPs in one haplotype-based pass
+    """
+    freebayes -f ${fasta} --pooled-continuous ${opts} ${bam} | bgzip > freebayes.vcf.gz
+    tabix -p vcf freebayes.vcf.gz
+    """
+
+    stub:
+    "touch freebayes.vcf.gz freebayes.vcf.gz.tbi"
+}
+
+process LOFREQ {
+    tag "${sample}"
+    label 'process_single'
+    container 'quay.io/biocontainers/lofreq:2.1.5--py311h6385618_16'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(bam), path(bai), path(fasta), path(fai)
+    val opts
+
+    output:
+    tuple val(sample), path('lofreq.vcf.gz'), emit: vcf
+
+    script:
+    // low-frequency SNVs and indels: indel qualities (Dindel), then its Poisson-binomial calls
+    """
+    lofreq indelqual --dindel -f ${fasta} -o indelqual.bam ${bam}
+    samtools index indelqual.bam
+    lofreq call --call-indels -f ${fasta} -o lofreq.vcf ${opts} indelqual.bam
+    bgzip lofreq.vcf
+    """
+
+    stub:
+    "touch lofreq.vcf.gz"
+}
+
+process CONSEQUENCES {
+    tag "${sample}"
+    label 'process_single'
+    container 'quay.io/biocontainers/bcftools:1.24--h118bc1c_4'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(vcf), path(tbi), path(fasta), path(fai), path(gff)
+
+    output:
+    tuple val(sample), path('consequences.vcf.gz'), path('consequences.tsv'), emit: csq
+
+    script:
+    // each consensus sequence is one CDS in the protein's frame; local consequences per
+    // record (pooled calls have no meaningful genotypes); BCSQ's amino-acid positions are
+    // the reference protein's columns (1-based), as the consensus keeps its frame
+    """
+    bcftools csq -f ${fasta} -g ${gff} --samples - --local-csq -Oz -o consequences.vcf.gz ${vcf}
+    printf 'seq_id\\tpos\\tref\\talt\\tqual\\tdepth\\talt_depth\\tconsequence\\n' > consequences.tsv
+    bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%QUAL\\t%INFO/DP\\t%INFO/AO\\t%INFO/BCSQ\\n' \\
+        consequences.vcf.gz >> consequences.tsv
+    """
+
+    stub:
+    "touch consequences.vcf.gz consequences.tsv"
+}
+
+process FLORIA {
+    tag "${sample}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/floria:0.0.2--ha6fb395_0'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(bam), path(bai), path(fasta), path(fai), path(vcf), path(tbi)
+    val opts
+
+    output:
+    tuple val(sample), path('floria'), emit: haplotypes
+
+    script:
+    // Floria 0.0.2 panics on a VCF without records: nothing to phase
+    """
+    if zcat ${vcf} | grep -qv '^#'; then
+        floria -b ${bam} -v ${vcf} -r ${fasta} -o floria -t ${task.cpus} ${opts}
+    else
+        mkdir floria
+    fi
+    """
+
+    stub:
+    "mkdir floria"
+}
+
+process CLIQUESNV {
+    tag "${sample}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/cliquesnv:2.0.3--hdfd78af_0'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(sam), path(fasta)
+    val min_reads
+    val opts
+
+    output:
+    tuple val(sample), path('cliquesnv'), emit: haplotypes
+
+    script:
+    // CliqueSNV phases one reference per input: the hand-off split per sequence (records
+    // sorted by reference, each file with its own @SQ line), run where it has at least
+    // min_reads records; haplotypes.tsv gathers every sequence's haplotypes and frequencies
+    """
+    mkdir -p cliquesnv split
+    grep -v '^@' ${sam} | sort -t "\$(printf '\\t')" -k3,3 -s | awk -F '\\t' -v OFS='\\t' -v min=${min_reads} '
+        function flush() {
+            if (n < min) return
+            f = "split/" c ".sam"
+            print sq[c] > f
+            for (i = 1; i <= n; i++) print r[i] > f
+            close(f)
+        }
+        FNR == NR { if (\$1 == "@SQ") { split(\$2, a, ":"); sq[a[2]] = \$0 }; next }
+        \$3 != c { flush(); c = \$3; n = 0 }
+        # a mate on another sequence: mate unmapped here (each file has one @SQ)
+        \$7 != "=" && \$7 != c { \$7 = "*"; \$8 = 0; \$9 = 0; \$2 = or(\$2, 8) }
+        { r[++n] = \$0 }
+        END { flush() }' ${sam} -
+    printf 'seq_id\\thaplotype\\tfrequency\\n' > cliquesnv/haplotypes.tsv
+    for f in split/*.sam; do
+        [ -e "\$f" ] || continue
+        c=\$(basename "\$f" .sam)
+        cliquesnv -m snv-illumina -in "\$f" -outDir "cliquesnv/\$c" -threads ${task.cpus} ${opts} \\
+            > "cliquesnv/\$c.log" 2>&1 || echo "CliqueSNV failed on \$c: see cliquesnv/\$c.log" >&2
+        # no FASTA when it finds no haplotype (too low coverage)
+        [ -e "cliquesnv/\$c/\$c.fasta" ] || continue
+        grep '>' "cliquesnv/\$c/\$c.fasta" | sed 's/^>//; s/_fr_/\\t/' \\
+            | awk -v c="\$c" '{ print c "\\t" \$0 }' >> cliquesnv/haplotypes.tsv
+    done
+    """
+
+    stub:
+    "mkdir cliquesnv"
+}
+
+process INSTRAIN {
+    tag "${sample}"
+    label 'process_medium'
+    container 'quay.io/biocontainers/instrain:1.10.0--pyhdfd78af_0'
+    publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/variants/${it}" }
+
+    input:
+    tuple val(sample), path(bam), path(bai), path(fasta), path(fai), path(genes)
+    val opts
+
+    output:
+    tuple val(sample), path('instrain'), emit: profile
+
+    script:
+    // per-gene microdiversity (nucleotide diversity, linkage) on the protein arm's consensus
+    def g = genes.name == 'NO_GENES' ? '' : "-g ${genes}"
+    "inStrain profile ${bam} ${fasta} -o instrain -p ${task.cpus} ${g} --skip_plot_generation ${opts}"
+
+    stub:
+    "mkdir instrain"
 }
 
 // Reusable by other pipelines (workflows/read-xref, spike-benchmark): reads (sample, r1, r2),
@@ -163,13 +412,43 @@ workflow PILEUP {
         protein: true
             return tuple(sample, ref, r1, r2)
     }
-    def diamond = "--outfmt 6 ${params.diamond_fields} --top ${params.diamond_top} ${params.diamond_args}"
+    def frameshift = params.frameshift ? "-F ${params.frameshift} " : ''
+    def diamond = "--outfmt 6 ${params.diamond_fields} --top ${params.diamond_top} ${frameshift}${params.diamond_args}"
     def alignments = DIAMOND(to_align.protein, diamond).alignments
         .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
         .mix(BWAMEM2(to_align.nucleotide, params.bwa_args).alignments)
     def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
-    def pileups = CALL(alignments.join(ref_dirs).join(profiles),
-        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}").pileup
+    def called = CALL(alignments.join(ref_dirs).join(profiles).join(reads),
+        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}")
+    def pileups = called.pileup
+
+    // steps 6b-6c: the hand-off BAM, then existing callers on it
+    def protein = called.called.filter { it[1] == 'diamond' }.map { s, a, p -> tuple(s, p) }
+    def nucleotide_sams = alignments.filter { it[1] == 'bwa' }.join(ref_dirs)
+        .map { s, a, sam, ref -> tuple(s, sam, ref.resolve('ref.fa')) }
+    def to_handoff = MAP_CONSENSUS(protein, params.bwa_args).sam.mix(nucleotide_sams)
+        .join(pileups).join(ref_dirs)
+    def handoff = HANDOFF(to_handoff, "--min-posterior ${params.min_assign}").sam
+    def bams = BAM(handoff).bam
+    if (params.cliquesnv) {
+        CLIQUESNV(handoff, params.cliquesnv_min_reads, params.cliquesnv_args)
+    }
+    def vcfs = FREEBAYES(bams, params.freebayes_args).vcf
+    if (params.lofreq) {
+        LOFREQ(bams, params.lofreq_args)
+    }
+    // consequences on the protein arm's consensus (a CDS by construction)
+    CONSEQUENCES(vcfs.join(bams).join(protein)
+        .map { s, vcf, tbi, bam, bai, fasta, fai, p -> tuple(s, vcf, tbi, fasta, fai, p.resolve('consensus.gff')) })
+    if (params.floria) {
+        FLORIA(bams.join(vcfs), params.floria_args)
+    }
+    if (params.instrain) {
+        def no_genes = file("${projectDir}/assets/NO_GENES")
+        def genes = called.called.map { s, a, p ->
+            tuple(s, a == 'diamond' ? p.resolve('consensus.genes.fna') : no_genes) }
+        INSTRAIN(bams.join(genes), params.instrain_args)
+    }
 
     emit:
     profile = profiles

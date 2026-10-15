@@ -17,6 +17,9 @@
 #   <sample>/stats.json hits_per_pair: step 0's histogram (replaces the plan's estimates)
 #   <sample>/aai_check.tsv  step 6 on real data: aai against the reads' alignment identity
 #                       (flagged rows are phase-7 aai findings)
+#   <sample>/variants/  step 6c on real data: freebayes calls, csq consequences, Floria and
+#                       CliqueSNV haplotypes, inStrain microdiversity against the consensus (6b)
+#   results-noF/trace.tsv  PILEUP:DIAMOND without -F (step 6b's cost: against trace.tsv)
 # Buckets written before phase 13, step 1 (10,000-row groups) make fetch read far more.
 source ../common.sh
 STD=../release-tiers/results-standard
@@ -30,10 +33,19 @@ process {
     withName: 'PILEUP:REFERENCE' { memory = { 64.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:DIAMOND' { cpus = 32; memory = { 128.GB * task.attempt }; time = { 72.h * task.attempt } }
     withName: 'PILEUP:CALL' { memory = { 128.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:MAP_CONSENSUS' { cpus = 16; memory = { 32.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:(HANDOFF|BAM|FREEBAYES|CONSEQUENCES)' { memory = { 16.GB * task.attempt }; time = { 48.h * task.attempt } }
+    withName: 'PILEUP:(FLORIA|INSTRAIN|CLIQUESNV)' { cpus = 16; memory = { 64.GB * task.attempt }; time = { 48.h * task.attempt } }
 }
 CFG
 nextflow run "$WF/pileup" -c ../site.config -c cost.config -resume --samples samples.csv \
     --index "$STD/index" --store "$STD/members.bucket*.parquet" --query_stats true --outdir results
+# step 6b's cost of frameshift-aware alignment: the 10 M sample again with -F off
+printf 'sample,r1,r2\nhadza10M,hadza10M_1.fastq.gz,hadza10M_2.fastq.gz\n' > samples-noF.csv
+nextflow run "$WF/pileup" -c ../site.config -c cost.config -resume --samples samples-noF.csv \
+    --index "$STD/index" --store "$STD/members.bucket*.parquet" --frameshift 0 \
+    --lofreq false --floria false --instrain false --cliquesnv false \
+    --outdir results-noF
 for s in hadza10M pooled100M; do
     "$REPO/.venv/bin/kfp-pileup" aai-check "results/$s/pileup/units.tsv" --out "results/$s/aai_check.tsv"
 done

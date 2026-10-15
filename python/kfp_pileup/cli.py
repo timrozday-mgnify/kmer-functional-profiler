@@ -8,6 +8,7 @@ import polars as pl
 import typer
 
 from kfp_pileup.check import MIN_READS, aai_check
+from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
 from kfp_pileup.reference import MIN_PRESENT, build_reference
 from kfp_pileup.refine import NOVEL
@@ -62,16 +63,36 @@ def call_command(
     novel: Annotated[
         float, typer.Option(help="Least divergence of a novel relative from the reference")
     ] = NOVEL,
+    reads: Annotated[
+        list[Path] | None,
+        typer.Option(help="diamond: the FASTQs (mate order), for the nucleotide pileup"),
+    ] = None,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
     per-unit identity (units.tsv) from alignments to the reference; then the joint EM over
-    read sources, consensus updates and haplotypes (sources.tsv, haplotypes.tsv); print
-    counts."""
+    read sources, consensus updates and haplotypes (sources.tsv, haplotypes.tsv); with
+    DIAMOND alignments and --reads, the nucleotide pileup and consensus (pileup_nt.parquet,
+    consensus.*, recruited_*.fq.gz); print counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads, novel,
+        batch_reads, novel, reads or (),
     )  # fmt: skip
     typer.echo(json.dumps(counts))
+
+
+@app.command(name="handoff")
+def handoff_command(
+    pileup_dir: Annotated[Path, typer.Argument(help="Output of `call`")],
+    ref_dir: Annotated[Path, typer.Argument(help="Output of `reference`")],
+    sam: Annotated[Path, typer.Argument(help="bwa-mem2 SAM (consensus.fna or ref.fa)")],
+    out: Annotated[Path, typer.Option(help="SAM to write")] = Path("handoff.sam"),
+    min_posterior: Annotated[
+        float, typer.Option(help="Least responsibility of the pair's unit")
+    ] = MIN_POSTERIOR,
+) -> None:
+    """Keep each mate's best alignment to its pair's assigned unit (step 8), MAPQ from the
+    posterior: the BAM for step 6c's callers; print counts."""
+    typer.echo(json.dumps(handoff(pileup_dir, ref_dir, sam, out, min_posterior)))
 
 
 @app.command(name="aai-check")

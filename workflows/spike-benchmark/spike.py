@@ -54,6 +54,9 @@ over the aligned part):
   identity minus truth) and ``aln_cover`` (share of alignment identities inside the ``aai``
   interval). Step 6's rule flags a gap above 0.01 in a bin with >= 100 units, or a cover
   below 0.8.
+- ``kfp`` only, step 6b (amino-acid indexes): ``consensus_identity_<bin>``, the median
+  identity of a unit's consensus coding sequence to its strain's CDS over covered columns
+  (``consensus_n_<bin>`` strains).
 """
 
 import argparse
@@ -252,8 +255,9 @@ def simulate(args: argparse.Namespace) -> None:
                 identity(seq, targets[m]) for m in units[unit] if len(targets[m]) == len(seq)
             )
             rows.append(
-                (k, kind, unit, parent, member, ident, nearest, depth, len(cds), cds_bases, n_pairs)
-            )
+                (k, kind, unit, parent, member, ident, nearest, depth, len(cds), cds_bases,
+                 n_pairs, cds)
+            )  # fmt: skip
         n_bg = 0
         if args.background:
             for n_bg, (a, _, b, _) in enumerate(_fastq_pairs(*args.background), 1):
@@ -276,6 +280,7 @@ def simulate(args: argparse.Namespace) -> None:
             "cds_len",
             "cds_bases",
             "pairs",
+            "cds",
         ],  # fmt: skip
         orient="row",
     ).with_columns(depth=pl.col("cds_bases") / pl.col("cds_len"))
@@ -489,6 +494,35 @@ def _em_scores(
     return out
 
 
+def _consensus_scores(
+    truth: pl.DataFrame, pileup: Path, bins: list[float]
+) -> dict[str, float | None]:
+    """Step 6b: the consensus coding sequence's identity to its unit's strain over covered
+    (non-N) columns, median by identity bin (``consensus_identity_<bin>``, ``_n_<bin>``);
+    strains whose consensus is from a member of another length are left out."""
+    cons = dict(read_fasta(pileup / "consensus.fna"))
+    info = pl.read_csv(pileup / "consensus.tsv", separator="\t", infer_schema=False)
+    seq_of = dict(zip(info["cluster_rep"], info["seq_id"], strict=True))
+    rows = []
+    for unit, b, cds in (
+        truth.filter(pl.col("kind") == "strain").select("unit", "identity_bin", "cds").iter_rows()
+    ):
+        c = cons.get(seq_of.get(str(unit), ""), "")
+        # the strain's CDS carries a stop codon past the protein's columns
+        cols = [i for i in range(len(c)) if c[i] != "N"] if len(cds) - len(c) in (0, 3) else []
+        if cols:
+            rows.append((b, sum(c[i] == cds[i] for i in cols) / len(cols)))
+    t = pl.DataFrame(rows, schema=["bin", "identity"], orient="row")
+    out: dict[str, float | None] = {}
+    for b in bins:
+        at = t.filter(pl.col("bin") == b)
+        out[f"consensus_n_{b}"] = at.height
+        out[f"consensus_identity_{b}"] = (
+            at.select(pl.col("identity").median()).item() if at.height else None
+        )
+    return out
+
+
 def score(args: argparse.Namespace) -> None:
     truth_all = pl.read_csv(args.truth, separator="\t")
     truth = truth_all.select("unit", "depth", "identity", "identity_bin")
@@ -524,6 +558,8 @@ def score(args: argparse.Namespace) -> None:
             sim,
             bins,
         )
+        if (args.pileup / "consensus.fna").exists():
+            row |= _consensus_scores(truth_all, args.pileup, bins)
     rows.append(row)
     per_unit.append(called.rename(lambda c: c if c == "unit" else f"kfp_{c}"))
     if args.aa_profile:

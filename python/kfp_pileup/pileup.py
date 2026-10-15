@@ -41,6 +41,7 @@ from typing import Final
 import numpy as np
 import polars as pl
 
+from kfp_pileup.nucleotide import nucleotide_pileup
 from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.refine import NOVEL, refine
 from kmer_functional_profiler.index import read_fasta
@@ -131,11 +132,19 @@ class _Batch:
         self.end: list[int] = []  # past the last reference column
         self.reverse: list[bool] = []
         self.ins: list[int] = []  # read residues inserted (no reference column)
+        self.shifts: list[int] = []  # frameshifts (DIAMOND -F): one difference each
         self.hit: list[int] = []
         self.col: list[int] = []
         self.qpos: list[int] = []
         self.rres = bytearray()
         self.sres = bytearray()
+        # events without a reference column, for the nucleotide pileup: (hit, the column
+        # they precede, kind, read position key): b"I" an inserted residue (its codon),
+        # b"\\" an inserted base, b"/" a deleted base (the column's first base)
+        self.ev_hit: list[int] = []
+        self.ev_col: list[int] = []
+        self.ev_kind = bytearray()
+        self.ev_key: list[int] = []
 
     def start_read(self, name: str) -> int:
         self.names.append(name)
@@ -152,6 +161,7 @@ class _Batch:
         self.end.append(start)
         self.reverse.append(reverse)
         self.ins.append(0)
+        self.shifts.append(0)
         return len(self.read) - 1
 
     def columns(self, hit: int, cols: range, qpos: Sequence[int], rres: bytes, sres: bytes) -> None:
@@ -161,39 +171,60 @@ class _Batch:
         self.rres += rres
         self.sres += sres
 
+    def event(self, hit: int, col: int, kind: bytes, key: int) -> None:
+        self.ev_hit.append(hit)
+        self.ev_col.append(col)
+        self.ev_kind += kind
+        self.ev_key.append(key)
+
 
 _BTOP: Final = re.compile(r"(\d+)|(.)(.)")
 
 
 def _diamond_hit(batch: _Batch, hit: int, fields: list[str], ref: bytes) -> None:
-    """Columns of one DIAMOND alignment from its BTOP (query letter, then subject letter)."""
+    """Columns of one DIAMOND alignment from its BTOP (query letter, then subject letter).
+
+    Read positions are tracked in nucleotides along the frame: a residue (matched, mismatched
+    or inserted) takes 3 bases, a deletion none, and DIAMOND's frameshifts (``-F``) move the
+    next codon's start: ``/`` (a base missing from the read) 1 back, ``\\`` (an extra base)
+    1 on. Neither takes a reference column (observed on DIAMOND 2.2.8)."""
     qstart, sstart, frame, btop = int(fields[3]), int(fields[5]), int(fields[7]), fields[8]
-    # Read position key of the codon of query residue i: twice its first base on the forward
-    # strand, plus 1 on the reverse strand (DIAMOND's qstart is then the higher coordinate).
-    step = 6 if frame > 0 else -6
-    key0 = 2 * (qstart - 1) + (frame < 0)
-    col, qi = sstart - 1, 0
+    # Read position key of a base: twice its position on the original read, plus 1 on the
+    # reverse strand (DIAMOND's qstart is then the higher coordinate, and a codon's key is
+    # that of its first base in the frame's direction).
+    rev = frame < 0
+    sign = -1 if rev else 1
+
+    def key(nt: int) -> int:
+        return 2 * (qstart - 1 + sign * nt) + rev
+
+    col, nt = sstart - 1, 0
     for num, q, s in _BTOP.findall(btop):
         if num:
             n = int(num)
             run = ref[col : col + n]
             batch.columns(
-                hit,
-                range(col, col + n),
-                range(key0 + step * qi, key0 + step * (qi + n), step),
-                run,
-                run,
+                hit, range(col, col + n), range(key(nt), key(nt + 3 * n), 6 * sign), run, run
             )
-            col, qi = col + n, qi + n
+            col, nt = col + n, nt + 3 * n
+        elif q == "/":  # a base missing from the read: the next codon re-reads one
+            batch.event(hit, col, b"/", -1)
+            batch.shifts[hit] += 1
+            nt -= 1
+        elif q == "\\":  # an extra base in the read
+            batch.event(hit, col, b"\\", key(nt))
+            batch.shifts[hit] += 1
+            nt += 1
         elif s == "-":  # an insertion in the read: no reference column
-            qi += 1
+            batch.event(hit, col, b"I", key(nt))
             batch.ins[hit] += 1
+            nt += 3
         elif q == "-":  # a deletion: a reference column without a read residue
             batch.columns(hit, range(col, col + 1), [-1], b"-", s.encode())
             col += 1
         else:
-            batch.columns(hit, range(col, col + 1), [key0 + step * qi], q.encode(), s.encode())
-            col, qi = col + 1, qi + 1
+            batch.columns(hit, range(col, col + 1), [key(nt)], q.encode(), s.encode())
+            col, nt = col + 1, nt + 3
     batch.end[hit] = col
 
 
@@ -305,11 +336,13 @@ def _chars(data: bytearray) -> np.ndarray:
 
 def score_batch(
     batch: _Batch, refs: pl.DataFrame, matrix: np.ndarray, term_bits: float
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """(assignments, pileup part, per-sequence read stats, target columns) of one batch.
-    Assignments keep each alignment's ``hit`` id, reference span, strand, read residues
-    (``qlen``) and differences (``mism``) for :mod:`kfp_pileup.refine`; target columns are
-    (hit, col, qpos, residue byte) of alignments to targets."""
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """(assignments, pileup part, per-sequence read stats, target columns, target events)
+    of one batch. Assignments keep each alignment's ``hit`` id, reference span, strand,
+    read residues (``qlen``) and differences (``mism``, a frameshift one) for
+    :mod:`kfp_pileup.refine`; target columns are (hit, col, qpos, residue byte) of
+    alignments to targets, and target events (hit, col, kind byte, qpos) their insertions
+    and frameshifts."""
     hits = (
         pl.DataFrame(
             {
@@ -321,6 +354,7 @@ def score_batch(
                 "end": batch.end,
                 "reverse": batch.reverse,
                 "ins": batch.ins,
+                "shifts": batch.shifts,
             },
             schema={
                 "read": pl.UInt32,
@@ -331,6 +365,7 @@ def score_batch(
                 "end": pl.Int32,
                 "reverse": pl.Boolean,
                 "ins": pl.Int32,
+                "shifts": pl.Int32,
             },
         )
         .with_row_index("hit")
@@ -421,12 +456,20 @@ def score_batch(
         end="end",
         reverse="reverse",
         qlen=pl.col("qlen").fill_null(0) + pl.col("ins"),
-        mism=pl.col("mism").fill_null(0) + pl.col("ins"),
+        mism=pl.col("mism").fill_null(0) + pl.col("ins") + pl.col("shifts"),
     )
     target_cols = rows.filter(pl.col("role") == TARGET).select(
         "hit", "col", "qpos", residue="rbyte"
     )
-    return assignments, part, stats, target_cols
+    events = pl.DataFrame(
+        {
+            "hit": np.asarray(batch.ev_hit, np.uint32),
+            "col": np.asarray(batch.ev_col, np.int32),
+            "kind": np.frombuffer(bytes(batch.ev_kind), np.uint8),
+            "qpos": np.asarray(batch.ev_key, np.int64),
+        }
+    ).join(hits.filter(pl.col("role") == TARGET).select("hit"), on="hit")
+    return assignments, part, stats, target_cols, events
 
 
 def call(
@@ -440,12 +483,14 @@ def call(
     score_nats: float = SCORE_NATS,
     batch_reads: int = BATCH_READS,
     novel: float = NOVEL,
+    reads: Sequence[str | Path] = (),
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
     ``ref_dir``. Writes ``assignments.parquet``, ``pileup.parquet``, ``variants.tsv`` and
     ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
-    outputs (steps 8-9); returns counts.
+    outputs (steps 8-9); with DIAMOND alignments and the ``reads`` (FASTQ, in mate order),
+    :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). Returns counts.
 
     ponytail: steps 8-9 hold every alignment and its target columns in memory; spill them
     per component to Parquet if ``pileup-cost``'s 100 M pairs do not fit."""
@@ -479,12 +524,13 @@ def call(
     else:
         raise ValueError(f"aligner must be diamond or bwa, not {aligner}")
     parts, stats, n_assigned = [], [], 0
-    assigned_parts, col_parts = [], []
+    assigned_parts, col_parts, event_parts = [], [], []
     for batch in batches:
-        assignments, part, stat, cols = score_batch(batch, refs, matrix, term_bits)
+        assignments, part, stat, cols, events = score_batch(batch, refs, matrix, term_bits)
         offset = pl.lit(n_assigned, pl.UInt32)
         assigned_parts.append(assignments.with_columns(pl.col("hit") + offset))
         col_parts.append(cols.with_columns(pl.col("hit") + offset))
+        event_parts.append(events.with_columns(pl.col("hit") + offset))
         n_assigned += assignments.height
         parts.append(part)
         stats.append(stat)
@@ -498,6 +544,11 @@ def call(
             min_depth, min_freq, novel,
         )  # fmt: skip
         hits = hits.join(refined, on="hit", how="left")
+    nt_counts = {}
+    if reads and aligner == "diamond" and hits is not None and hits.height:
+        nt_counts = nucleotide_pileup(
+            hits, pl.concat(col_parts), pl.concat(event_parts), refs, reads, out
+        )
     (
         hits.join(refs.select("seq", "seq_id"), on="seq").drop(
             "seq", "hit", "start", "end", "reverse", "qlen", "mism"
@@ -532,6 +583,7 @@ def call(
         "columns": columns.height,
         "variants": variants.height,
         "units": units.height,
+        **nt_counts,
     }
 
 
