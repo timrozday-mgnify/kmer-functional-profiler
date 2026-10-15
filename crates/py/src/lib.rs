@@ -90,7 +90,8 @@ fn hash_dna<'py>(
     hits_dict(py, hits)
 }
 
-/// Sampled k-mer hashes of protein sequences: columns `seq` (index into `seqs`) and `hash`.
+/// Sampled k-mer hashes of target sequences (proteins; DNA, untranslated, with the `dna`
+/// alphabet): columns `seq` (index into `seqs`) and `hash`.
 #[pyfunction]
 #[pyo3(signature = (seqs, k, *, alphabet = "protein", max_hash = u64::MAX))]
 fn hash_proteins<'py>(
@@ -104,7 +105,7 @@ fn hash_proteins<'py>(
     let (seq_ids, hashes) = py.detach(|| {
         let (mut seq_ids, mut hashes) = (Vec::new(), Vec::new());
         for (i, seq) in (0u64..).zip(&seqs) {
-            kfp::protein_kmers(seq, &params, |h| {
+            kfp::sequence_kmers(seq, &params, |h| {
                 seq_ids.push(i);
                 hashes.push(h);
             });

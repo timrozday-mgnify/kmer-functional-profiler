@@ -44,7 +44,15 @@ from scipy.stats import chi2, norm
 
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.compat import sourmash_hits
-from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, base_rate
+from kmer_functional_profiler.index import (
+    PIN_BITS,
+    Index,
+    IndexParams,
+    PackedTable,
+    base_rate,
+    molecule,
+    span_nt,
+)
 from kmer_functional_profiler.survival import SurvivalModel
 
 if TYPE_CHECKING:
@@ -675,7 +683,10 @@ class _Joint:
 
     def __init__(self, indexes: Sequence[Index]) -> None:
         base = indexes[0]
+        kind = molecule(base.meta["params"]["alphabet"])
         for other in indexes[1:]:
+            if molecule(other.meta["params"]["alphabet"]) != kind:
+                raise ValueError("nucleotide and protein indexes cannot be queried jointly")
             for key in ("k", "alphabet"):
                 if other.meta["params"][key] != base.meta["params"][key]:
                     raise ValueError(f"indexes differ in {key}: cannot be queried jointly")
@@ -1960,14 +1971,17 @@ def sample_summary(
     base_stats: dict[str, float] | None,
     census: tuple[int, int] | None,
     t_max: float,
+    alphabet: str = "protein",
 ) -> dict[str, float | int | None]:
     """How much of the sample the index knows (Phase 7, step 14), as sylph's
-    ``--estimate-unknown`` does for genomes. ``error_thinning`` r = (1 - d)^(3k), with d the
-    per-base chance of losing a k-mer window: bases masked or not A/C/G/T, plus
-    ``SENSE_CHANGE`` x the mean Phred error probability. Errors clustered in read tails make
-    r too low, and the containment too high. (A model-based ``explained_fraction``, summed
-    over detected units, was dropped in step 40: a gene hit by several units counted once
-    per unit, up to 0.59 of read bases against 0.41 truth on the fmh benchmark.)
+    ``--estimate-unknown`` does for genomes. ``error_thinning`` r = (1 - d)^s, with s the
+    nucleotides a k-mer spans (3k translated, k for a nucleotide index) and d the per-base
+    chance of losing a k-mer window: bases masked or not A/C/G/T, plus the mean Phred error
+    probability, times ``SENSE_CHANGE`` when reads are translated. Errors clustered in read
+    tails make r too low, and the containment too high. (A model-based
+    ``explained_fraction``, summed over detected units, was dropped in step 40: a gene hit by
+    several units counted once per unit, up to 0.59 of read bases against 0.41 truth on the
+    fmh benchmark.)
 
     ``census_containment`` (model-free): the fraction of census k-mers (:func:`census_counts`)
     found in the index, over r and capped at 1: includes units below detection, but exact
@@ -1991,9 +2005,12 @@ def sample_summary(
     if base_stats is not None and base_stats["bases"] > 0 and reads > 0:
         bases = base_stats["bases"]
         mate_nt = bases / (reads * mates)
-        lost = (base_stats["lost"] + SENSE_CHANGE * base_stats["expected_errors"]) / bases
-        r = (1 - min(lost, 1.0)) ** (3 * k)
-        windows = (mate_nt - 2) / 3 - k + 1  # k-mer windows per frame
+        nucleotide = molecule(alphabet) == "nucleotide"
+        sense = 1.0 if nucleotide else SENSE_CHANGE
+        lost = (base_stats["lost"] + sense * base_stats["expected_errors"]) / bases
+        r = (1 - min(lost, 1.0)) ** span_nt(k, alphabet)
+        # k-mer windows per frame; a nucleotide read is one frame, so no frame is missed
+        windows = float("inf") if nucleotide else (mate_nt - 2) / 3 - k + 1
         out |= {
             "bases": int(bases),
             "lost_bases": int(base_stats["lost"]),
@@ -2096,6 +2113,11 @@ def profile(
     known-k-mer census. The census needs every index to have a complete
     base stratum (``base_stratum_complete`` in ``meta.json``) and the kfp hash; an index
     built without ``promiscuous.npy`` counts its promiscuous k-mers as unknown.
+
+    The index's ``alphabet`` sets how reads are hashed: amino-acid alphabets translate them
+    (``frames`` and ``genetic_code`` apply), ``dna`` hashes them untranslated as canonical
+    k-mers (``frames`` and ``genetic_code`` are ignored), and the ``aai`` columns are named
+    ``ani`` (``min_aai`` then filters on ``ani_naive``).
 
     ``em_start`` > 0 seeds random starting points for the EM fits (:func:`em`,
     :func:`em_pin`; not the posterior's): profiles from several starts agree where the fits
@@ -2514,5 +2536,10 @@ def profile(
             sources[0].base_stats if sources else None,
             None if census_max is None else (census[0], census[1]),
             joint.max_hash("tier2") / 2**64,
+            params.alphabet,
         )
-    return result.filter(pl.col("aai_naive") >= min_aai) if min_aai > 0 else result
+    if min_aai > 0:
+        result = result.filter(pl.col("aai_naive") >= min_aai)
+    if molecule(params.alphabet) == "nucleotide":  # identity of nucleotides: ANI, as sylph's
+        result = result.rename({c: "ani" + c[3:] for c in result.columns if c.startswith("aai")})
+    return result

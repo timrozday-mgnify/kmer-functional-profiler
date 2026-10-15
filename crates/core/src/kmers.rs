@@ -123,6 +123,48 @@ pub fn protein_kmers(protein: &[u8], params: &KmerParams, mut emit: impl FnMut(u
     }
 }
 
+/// Calls `emit` with the hash of every canonical k-mer of `dna` that passes the threshold, in
+/// order: the smaller of the packed k-mer and its reverse complement, so both strands of a
+/// target give the same hashes.
+///
+/// K-mers never span a base other than A, C, G, T or U (`N`, ambiguity codes).
+#[inline]
+pub fn dna_kmers(dna: &[u8], params: &KmerParams, mut emit: impl FnMut(u64)) {
+    let width = 2 * params.k as u32;
+    let mask = if width == u64::BITS {
+        u64::MAX
+    } else {
+        (1 << width) - 1
+    };
+    let (mut fwd, mut rev, mut run) = (0u64, 0u64, 0usize);
+    for &base in dna {
+        let Some(code) = Alphabet::Dna.encode(base) else {
+            run = 0;
+            continue;
+        };
+        fwd = ((fwd << 2) | u64::from(code)) & mask;
+        rev = (rev >> 2) | (u64::from(3 - code) << (width - 2));
+        run += 1;
+        if run >= params.k {
+            let hash = hash_kmer(fwd.min(rev));
+            if hash <= params.max_hash {
+                emit(hash);
+            }
+        }
+    }
+}
+
+/// K-mers of a target sequence in the alphabet of `params`: canonical nucleotide k-mers
+/// ([`dna_kmers`]) for [`Alphabet::Dna`], amino-acid k-mers ([`protein_kmers`]) otherwise.
+#[inline]
+pub fn sequence_kmers(seq: &[u8], params: &KmerParams, emit: impl FnMut(u64)) {
+    if params.alphabet.is_nucleotide() {
+        dna_kmers(seq, params, emit);
+    } else {
+        protein_kmers(seq, params, emit);
+    }
+}
+
 /// Distinct k-mers (hash <= `max_hash`) of each run of proteins sharing a group id.
 ///
 /// `groups` holds one id per protein and must be non-decreasing, so each group is one run.
@@ -162,7 +204,7 @@ pub fn distinct_kmers<S: AsRef<[u8]> + Sync>(
         runs.map(|r| {
             buf.clear();
             for p in &proteins[starts[r]..starts[r + 1]] {
-                protein_kmers(p.as_ref(), params, |h| buf.push(h));
+                sequence_kmers(p.as_ref(), params, |h| buf.push(h));
             }
             buf.sort_unstable();
             buf.dedup();
@@ -197,7 +239,7 @@ pub struct Hits {
     pub read: Vec<u64>,
     /// 0 for the first mate or a single-end read, 1 for the second mate.
     pub mate: Vec<u8>,
-    /// Reading frame, 0–2 forward and 3–5 reverse complement.
+    /// Reading frame, 0–2 forward and 3–5 reverse complement; 0 for nucleotide k-mers.
     pub frame: Vec<u8>,
     pub hash: Vec<u64>,
 }
@@ -221,6 +263,8 @@ impl Hits {
 }
 
 /// Translates reads and collects their sampled k-mer hashes, reusing buffers across reads.
+/// With [`Alphabet::Dna`] reads are hashed untranslated, as canonical k-mers ([`dna_kmers`]),
+/// and the frame mode and genetic code do not apply.
 #[derive(Debug, Clone)]
 pub struct DnaScanner {
     params: KmerParams,
@@ -243,6 +287,15 @@ impl DnaScanner {
 
     /// Appends the hits of one read's kept frames to `hits`.
     pub fn scan(&mut self, dna: &[u8], read: u64, mate: u8, hits: &mut Hits) {
+        if self.params.alphabet.is_nucleotide() {
+            dna_kmers(dna, &self.params, |hash| {
+                hits.read.push(read);
+                hits.mate.push(mate);
+                hits.frame.push(0);
+                hits.hash.push(hash);
+            });
+            return;
+        }
         six_frames_into(dna, self.params.code, &mut self.rc, &mut self.frames);
         for (frame, aa) in (0u8..).zip(&self.frames) {
             let mut emit = |segment: &[u8]| {
@@ -307,6 +360,28 @@ mod tests {
             distinct_kmers(&empty, &[], &params).unwrap(),
             (vec![], vec![])
         );
+    }
+
+    #[test]
+    fn dna_kmers_are_canonical_and_split_at_n() {
+        let params = KmerParams::new(4, Alphabet::Dna).unwrap();
+        let hashes = |seq: &[u8]| {
+            let mut out = Vec::new();
+            dna_kmers(seq, &params, |h| out.push(h));
+            out
+        };
+        // ACGT is its own reverse complement; AAAA and TTTT are one canonical k-mer.
+        assert_eq!(hashes(b"AAAA"), hashes(b"TTTT"));
+        assert_eq!(hashes(b"ACGTNACGT").len(), 2);
+        let scanned = scan(b"AAAAC", params.with_frames(FrameMode::All));
+        assert_eq!(scanned.frame, vec![0, 0]);
+        assert_eq!(scanned.hash, hashes(b"AAAAC"));
+        // k = 32 fills the u64.
+        let full = KmerParams::new(32, Alphabet::Dna).unwrap();
+        let mut n = 0;
+        dna_kmers(&[b'G'; 40], &full, |_| n += 1);
+        assert_eq!(n, 9);
+        assert!(KmerParams::new(33, Alphabet::Dna).is_err());
     }
 
     #[test]
@@ -411,6 +486,18 @@ mod tests {
             let b = frame0(scan(&back_translate(&protein, &picks2), params));
             prop_assert_eq!(a.len(), protein.len().saturating_sub(k - 1));
             prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn dna_kmers_match_on_the_reverse_complement(dna in "[ACGTN]{0,200}", k in 1usize..=32) {
+            let params = KmerParams::new(k, Alphabet::Dna).unwrap();
+            let mut rc = Vec::new();
+            crate::reverse_complement(dna.as_bytes(), &mut rc);
+            let (mut fwd, mut rev) = (Vec::new(), Vec::new());
+            dna_kmers(dna.as_bytes(), &params, |h| fwd.push(h));
+            dna_kmers(&rc, &params, |h| rev.push(h));
+            rev.reverse();
+            prop_assert_eq!(fwd, rev);
         }
 
         #[test]

@@ -15,8 +15,9 @@ ALPHABETS: Final = {
     "protein": list("ACDEFGHIKLMNPQRSTVWY"),
     "murphy10": ["LVIM", "C", "A", "G", "ST", "P", "FYW", "EDNQ", "KR", "H"],
     "dayhoff": ["AGPST", "C", "DENQ", "HKR", "ILMV", "FWY"],
+    "dna": ["A", "C", "G", "TU"],
 }
-BITS: Final = {"protein": 5, "murphy10": 4, "dayhoff": 3}
+BITS: Final = {"protein": 5, "murphy10": 4, "dayhoff": 3, "dna": 2}
 MAX_HASH: Final = 2**64 - 1
 
 _COMPLEMENT: Final = dict(zip("ACGTU", "TGCAA", strict=True))
@@ -89,6 +90,34 @@ def protein_kmers(
     return hashes
 
 
+def dna_kmers(dna: bytes, k: int, threshold: int = MAX_HASH) -> list[int]:
+    """Hashes of the canonical k-mers (the smaller packing of the k-mer and its reverse
+    complement) within runs of A/C/G/T/U, in order, that pass the threshold."""
+    code = {b: i for i, b in enumerate("ACGT")}
+    seq = dna.decode().upper().replace("U", "T")
+    hashes = []
+    for start in range(len(seq) - k + 1):
+        window = seq[start : start + k]
+        if all(b in code for b in window):
+            rc = reverse_complement(window.encode()).decode()
+            packed = min(
+                sum(code[b] << (2 * (k - 1 - i)) for i, b in enumerate(w)) for w in (window, rc)
+            )
+            h = hash_kmer(packed)
+            if h <= threshold:
+                hashes.append(h)
+    return hashes
+
+
+def sequence_kmers(
+    seq: bytes, k: int, alphabet: str = "protein", threshold: int = MAX_HASH
+) -> list[int]:
+    """Canonical nucleotide k-mers for ``dna``, amino-acid k-mers otherwise."""
+    if alphabet == "dna":
+        return dna_kmers(seq, k, threshold)
+    return protein_kmers(seq, k, alphabet, threshold)
+
+
 def _segments(aa: bytes, frames: str) -> list[bytes]:
     """The parts of one translated frame that a frame mode hashes."""
     if frames == "all" or b"*" not in aa:
@@ -116,9 +145,17 @@ def hash_dna(
     mates: Sequence[int] | None = None,
     reads: Sequence[int] | None = None,
 ) -> dict[str, list[int]]:
-    """Twin of ``_core.hash_dna``; ``reads``/``mates`` override the per-sequence labels."""
+    """Twin of ``_core.hash_dna``; ``reads``/``mates`` override the per-sequence labels.
+    With ``alphabet="dna"`` sequences are hashed untranslated, all in frame 0."""
     out: dict[str, list[int]] = {"read": [], "mate": [], "frame": [], "hash": []}
     for i, seq in enumerate(seqs):
+        if alphabet == "dna":
+            for h in dna_kmers(seq, k, max_hash):
+                out["read"].append(reads[i] if reads else i)
+                out["mate"].append(mates[i] if mates else 0)
+                out["frame"].append(0)
+                out["hash"].append(h)
+            continue
         for frame, aa in enumerate(six_frames(seq, genetic_code)):
             for seg in _segments(aa, frames):
                 for h in protein_kmers(seg, k, alphabet, max_hash):
@@ -139,7 +176,7 @@ def hash_proteins(
     """Twin of ``_core.hash_proteins``."""
     out: dict[str, list[int]] = {"seq": [], "hash": []}
     for i, seq in enumerate(seqs):
-        hashes = protein_kmers(seq, k, alphabet, max_hash)
+        hashes = sequence_kmers(seq, k, alphabet, max_hash)
         out["seq"] += [i] * len(hashes)
         out["hash"] += hashes
     return out

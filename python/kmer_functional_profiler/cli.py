@@ -12,6 +12,7 @@ from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import (
     AAI_CALIBRATION,
     AAI_MODEL,
+    DNA_K,
     Index,
     IndexParams,
     build_index,
@@ -36,8 +37,16 @@ def index(
     members: Annotated[Path, typer.Argument(help="Parquet: protein_id, cluster_rep, ...")],
     out_dir: Path,
     pfam: Annotated[Path | None, typer.Option(help="Parquet: protein_id, pfam_accession")] = None,
-    k: int = DEFAULTS.k,
-    alphabet: str = DEFAULTS.alphabet,
+    k: Annotated[
+        int | None, typer.Option(help=f"k-mer length (default {DEFAULTS.k}; {DNA_K} for dna)")
+    ] = None,
+    alphabet: Annotated[
+        str,
+        typer.Option(
+            help="protein, murphy10 or dayhoff (amino-acid targets; reads are translated), "
+            "or dna (nucleotide targets; reads hashed untranslated). Queries follow the index"
+        ),
+    ] = DEFAULTS.alphabet,
     t_base: float = DEFAULTS.t_base,
     t_base_singleton: Annotated[
         float | None, typer.Option(help="t_base for singleton clusters (default: t_base)")
@@ -54,7 +63,7 @@ def index(
 ) -> None:
     """Build an index from a members table; print its stats as JSON."""
     params = IndexParams(
-        k=k,
+        k=k if k is not None else DNA_K if alphabet == "dna" else DEFAULTS.k,
         alphabet=alphabet,
         t_base=t_base,
         t_base_singleton=t_base_singleton,
@@ -153,13 +162,13 @@ def query(
         str,
         typer.Option(
             help="Frames hashed: stopfree; edges (also the terminal segments, >= 30 aa, of "
-            "frames with stops; edges:M sets the length); all"
+            "frames with stops; edges:M sets the length); all. Amino-acid indexes only"
         ),
     ] = "edges:30",
     min_qual: Annotated[
         int, typer.Option(help="Mask bases below this Phred quality as N (0 = off)")
     ] = 0,
-    genetic_code: int = 11,
+    genetic_code: Annotated[int, typer.Option(help="Amino-acid indexes only")] = 11,
     draws: Annotated[
         int, typer.Option(help="Posterior draws for 95% intervals and ambiguity groups")
     ] = 0,
@@ -193,7 +202,7 @@ def query(
         typer.Option(
             help="Containment AAI of the detected units (aai, with a closed-form 95% interval "
             "aai_lo/aai_hi; no --draws needed); fits the zero-inflated EM. aai_naive is "
-            "reported for every hit unit regardless"
+            "reported for every hit unit regardless. Named ani for a dna index"
         ),
     ] = False,
     min_aai: Annotated[

@@ -5,7 +5,8 @@ use crate::Error;
 /// Marks bytes that are not amino acids of the alphabet (stops, `X`, ambiguity codes).
 const INVALID: u8 = u8::MAX;
 
-/// Amino-acid alphabet used to encode k-mers; reduced alphabets merge residues into classes.
+/// Alphabet used to encode k-mers: amino acids (reduced alphabets merge residues into
+/// classes), or nucleotides for indexes of DNA targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Alphabet {
@@ -16,6 +17,9 @@ pub enum Alphabet {
     Murphy10,
     /// Dayhoff 6-letter alphabet, 3 bits per residue.
     Dayhoff,
+    /// Nucleotides A, C, G, T (U read as T), 2 bits per base. Sequences are hashed as
+    /// canonical k-mers without translation (see [`crate::dna_kmers`]).
+    Dna,
 }
 
 const PROTEIN: [u8; 256] = classes(&[
@@ -24,6 +28,8 @@ const PROTEIN: [u8; 256] = classes(&[
 ]);
 const MURPHY10: [u8; 256] = classes(&["LVIM", "C", "A", "G", "ST", "P", "FYW", "EDNQ", "KR", "H"]);
 const DAYHOFF: [u8; 256] = classes(&["AGPST", "C", "DENQ", "HKR", "ILMV", "FWY"]);
+// Complement is 3 - code (A <-> T, C <-> G), which canonical k-mers rely on.
+const DNA: [u8; 256] = classes(&["A", "C", "G", "TU"]);
 
 /// Builds an ASCII lookup table mapping each residue (either case) to its class index.
 const fn classes(groups: &[&str]) -> [u8; 256] {
@@ -49,6 +55,7 @@ impl Alphabet {
             Self::Protein => 5,
             Self::Murphy10 => 4,
             Self::Dayhoff => 3,
+            Self::Dna => 2,
         }
     }
 
@@ -57,13 +64,19 @@ impl Alphabet {
         (u64::BITS / self.bits()) as usize
     }
 
-    /// Class index of an amino-acid byte, or `None` for stops, `X` and ambiguity codes.
+    /// Whether sequences are nucleotides, hashed untranslated, rather than amino acids.
+    pub fn is_nucleotide(self) -> bool {
+        self == Self::Dna
+    }
+
+    /// Class index of a residue byte, or `None` for stops, `X`, `N` and ambiguity codes.
     #[inline]
     pub fn encode(self, aa: u8) -> Option<u8> {
         let table = match self {
             Self::Protein => &PROTEIN,
             Self::Murphy10 => &MURPHY10,
             Self::Dayhoff => &DAYHOFF,
+            Self::Dna => &DNA,
         };
         let code = table[aa as usize];
         (code != INVALID).then_some(code)
@@ -78,6 +91,7 @@ impl FromStr for Alphabet {
             "protein" => Ok(Self::Protein),
             "murphy10" => Ok(Self::Murphy10),
             "dayhoff" => Ok(Self::Dayhoff),
+            "dna" => Ok(Self::Dna),
             _ => Err(Error::UnknownAlphabet(s.to_owned())),
         }
     }
@@ -101,6 +115,17 @@ mod tests {
                 assert_eq!(alphabet.encode(aa), None);
             }
         }
+    }
+
+    #[test]
+    fn dna_codes_complement_to_three() {
+        let code = |b| Alphabet::Dna.encode(b).unwrap();
+        assert_eq!(code(b'A') + code(b'T'), 3);
+        assert_eq!(code(b'c') + code(b'G'), 3);
+        assert_eq!(code(b'U'), code(b'T'));
+        assert_eq!(Alphabet::Dna.encode(b'N'), None);
+        assert_eq!(Alphabet::Dna.max_k(), 32);
+        assert!("dna".parse::<Alphabet>().unwrap().is_nucleotide());
     }
 
     #[test]
