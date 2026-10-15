@@ -41,6 +41,9 @@ nextflow run workflows/pileup -profile test,docker              # fixture protei
 nextflow run workflows/pileup -profile test_nucleotide,docker   # fixture CDS, bwa-mem2
 ```
 
+The steps are the subworkflow `PILEUP` (reads, index, store), which `workflows/read-xref`
+reuses.
+
 `samples.csv` has columns `sample,r1,r2`; relative paths are read from the CSV's directory.
 DIAMOND and bwa-mem2 run in biocontainers (`-profile docker` locally, `singularity` on HPC);
 kfp and kfp-pileup run on the host, in the venv `workflows/setup.sh` makes.

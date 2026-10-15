@@ -39,7 +39,10 @@ build-backend = "maturin"
 manifest-path = "crates/py/Cargo.toml"
 python-source = "python"
 module-name = "kmer_functional_profiler._core"
-python-packages = ["kfp_pileup"]               # the pileup tool (plan: Tools and scope)
+python-packages = [
+  "kfp_pileup",  # the pileup tool (plan: Tools and scope)
+  "kfp_genomes", # the taxonomic tool: read-xref's join on main
+]
 features = ["pyo3/extension-module"]
 profile = "release"
 
