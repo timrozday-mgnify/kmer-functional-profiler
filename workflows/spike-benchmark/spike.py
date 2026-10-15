@@ -431,6 +431,61 @@ def _pileup_scores(
         if with_interval.height
         else None
     )
+    if "em_posterior" in a.columns:
+        out |= _em_scores(truth, a, sib, units)
+    return out
+
+
+def _em_scores(
+    truth: pl.DataFrame, a: pl.DataFrame, sib: pl.DataFrame, units: pl.DataFrame
+) -> dict[str, float | None]:
+    """Steps 7-9 (the joint EM, consensus updates, haplotypes): the crude pileup scores again
+    with ``em_posterior`` (no ``kept`` filter: the EM drops reads itself), the share of
+    strain mates given to the novel class, and abundance from ``em_abundance``."""
+    on_target = a.filter(pl.col("role") == "target")
+    strains = on_target.filter(pl.col("kind") == "strain")
+    w = strains["em_posterior"].sum()
+    out: dict[str, float | None] = {
+        "read_precision_em": strains.filter(pl.col("cluster_rep") == pl.col("source"))[
+            "em_posterior"
+        ].sum()
+        / w
+        if w
+        else None,
+    }
+    mates = a.group_by("read_name", "mate").agg(
+        pl.col("kind").first(), novel=pl.col("em_novel").first()
+    )
+    out["strain_novel_em"] = mates.filter(pl.col("kind") == "strain")["novel"].mean()
+    taken = (
+        on_target.filter(pl.col("kind") == "sibling")
+        .group_by("strain")
+        .agg(taken_em=pl.col("em_posterior").sum())
+    )
+    sib = sib.join(taken, on="strain", how="left").with_columns(pl.col("taken_em").fill_null(0.0))
+    for name, part in (
+        ("", sib),
+        *(
+            (f"_parent_{r}", sib.filter(pl.col("parent_role") == r))
+            for r in ("target", "neighbour", "none")
+        ),
+    ):
+        n = part["mates"].sum()
+        out[f"sibling_caught_em{name}"] = 1 - part["taken_em"].sum() / n if n else None
+    # abundance over the reference's targets and the strains (withheld siblings have no
+    # source here): the EM's against the profile's coverage_zi on the same units
+    t = truth.filter(pl.col("kind") == "strain").select("unit", "depth")
+    for name, col in (("em", "em_abundance"), ("profile", "coverage_zi")):
+        called = units.filter(pl.col("em_pairs").is_not_null()).select(
+            unit="cluster_rep", estimate=pl.col(col).fill_null(0.0)
+        )
+        tp = t.join(called, on="unit")
+        out[f"l1_targets_{name}"] = _l1(t, called)
+        out[f"spearman_targets_{name}"] = (
+            tp.select(pl.corr("depth", "estimate", method="spearman")).item()
+            if tp.height > 2
+            else None
+        )
     return out
 
 

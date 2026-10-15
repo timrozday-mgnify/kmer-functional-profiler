@@ -126,16 +126,17 @@ process CALL {
     publishDir params.outdir, mode: 'copy', saveAs: { "${sample}/${it}" }
 
     input:
-    tuple val(sample), val(aligner), path(alignments), path(ref), path(profile)
+    tuple val(sample), val(aligner), path(alignments), path(ref), path(profile), path(r1), path(r2)
     val opts
 
     output:
     tuple val(sample), path('pileup'), emit: pileup
 
     script:
+    // the FASTQs give base qualities to the error model (phase 13, step 7)
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} ${opts}
+        --profile ${profile} --reads ${r1} --reads ${r2} ${opts}
     """
 
     stub:
@@ -168,8 +169,8 @@ workflow PILEUP {
         .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
         .mix(BWAMEM2(to_align.nucleotide, params.bwa_args).alignments)
     def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
-    def pileups = CALL(alignments.join(ref_dirs).join(profiles),
-        "--min-depth ${params.min_depth} --min-freq ${params.min_freq}").pileup
+    def pileups = CALL(alignments.join(ref_dirs).join(profiles).join(reads),
+        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}").pileup
 
     emit:
     profile = profiles

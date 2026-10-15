@@ -27,8 +27,9 @@ position q it uses.
   representative's consensus identity over its covered columns, beside the profile's
   ``aai`` (``ani``) columns.
 
-Crude by design (plan, phase 13: steps 7-10 come later): mates are scored independently,
-insertions count in scores but not in pileups, and there is no sequencing-error model.
+The crude pass by design: mates are scored independently, insertions count in scores but
+not in pileups, and there is no sequencing-error model. :mod:`kfp_pileup.refine` (steps 7-9)
+runs after it on the alignments kept here.
 """
 
 import math
@@ -41,6 +42,7 @@ import numpy as np
 import polars as pl
 
 from kfp_pileup.reference import REF_FASTA, REFS
+from kfp_pileup.refine import NOVEL, refine
 from kmer_functional_profiler.index import read_fasta
 
 LN2: Final = math.log(2)
@@ -125,6 +127,10 @@ class _Batch:
         self.mate: list[int] = []
         self.seq: list[int] = []
         self.score: list[float] = []
+        self.start: list[int] = []  # first reference column
+        self.end: list[int] = []  # past the last reference column
+        self.reverse: list[bool] = []
+        self.ins: list[int] = []  # read residues inserted (no reference column)
         self.hit: list[int] = []
         self.col: list[int] = []
         self.qpos: list[int] = []
@@ -135,11 +141,17 @@ class _Batch:
         self.names.append(name)
         return len(self.names) - 1
 
-    def start_hit(self, read: int, mate: int, seq: int, score: float) -> int:
+    def start_hit(
+        self, read: int, mate: int, seq: int, score: float, start: int, reverse: bool
+    ) -> int:
         self.read.append(read)
         self.mate.append(mate)
         self.seq.append(seq)
         self.score.append(score)
+        self.start.append(start)
+        self.end.append(start)
+        self.reverse.append(reverse)
+        self.ins.append(0)
         return len(self.read) - 1
 
     def columns(self, hit: int, cols: range, qpos: Sequence[int], rres: bytes, sres: bytes) -> None:
@@ -175,12 +187,14 @@ def _diamond_hit(batch: _Batch, hit: int, fields: list[str], ref: bytes) -> None
             col, qi = col + n, qi + n
         elif s == "-":  # an insertion in the read: no reference column
             qi += 1
+            batch.ins[hit] += 1
         elif q == "-":  # a deletion: a reference column without a read residue
             batch.columns(hit, range(col, col + 1), [-1], b"-", s.encode())
             col += 1
         else:
             batch.columns(hit, range(col, col + 1), [key0 + step * qi], q.encode(), s.encode())
             col, qi = col + 1, qi + 1
+    batch.end[hit] = col
 
 
 def read_diamond(
@@ -199,7 +213,9 @@ def read_diamond(
                         batch, reads = _Batch(), 0
                     last, read, reads = fields[0], batch.start_read(fields[0]), reads + 1
                 seq = seq_index[fields[1]]
-                hit = batch.start_hit(read, mate, seq, float(fields[2]))
+                hit = batch.start_hit(
+                    read, mate, seq, float(fields[2]), int(fields[5]) - 1, int(fields[7]) < 0
+                )
                 _diamond_hit(batch, hit, fields, refs[seq])
     if reads:
         yield batch
@@ -230,9 +246,11 @@ def _sam_hit(
             col, i = col + n, i + n
         elif op in "IS" or (op == "H" and borrowed):
             i += n
+            batch.ins[hit] += n if op == "I" else 0
         elif op in "DN":
             batch.columns(hit, range(col, col + n), [-1] * n, b"-" * n, ref[col : col + n])
             col += n
+    batch.end[hit] = col
 
 
 def read_sam(
@@ -273,7 +291,9 @@ def read_sam(
                 primary[mate] = (seq, reverse)
             score = next((int(t[5:]) for t in fields[11:] if t.startswith("AS:i:")), 0)
             ref_seq = seq_index[fields[2]]
-            hit = batch.start_hit(read, mate, ref_seq, score * score_bits)
+            hit = batch.start_hit(
+                read, mate, ref_seq, score * score_bits, int(fields[3]) - 1, reverse
+            )
             _sam_hit(batch, hit, int(fields[3]), fields[5], seq, reverse, borrowed, refs[ref_seq])
     if reads:
         yield batch
@@ -285,12 +305,33 @@ def _chars(data: bytearray) -> np.ndarray:
 
 def score_batch(
     batch: _Batch, refs: pl.DataFrame, matrix: np.ndarray, term_bits: float
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """(assignments, pileup part, per-sequence read stats) of one batch."""
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """(assignments, pileup part, per-sequence read stats, target columns) of one batch.
+    Assignments keep each alignment's ``hit`` id, reference span, strand, read residues
+    (``qlen``) and differences (``mism``) for :mod:`kfp_pileup.refine`; target columns are
+    (hit, col, qpos, residue byte) of alignments to targets."""
     hits = (
         pl.DataFrame(
-            {"read": batch.read, "mate": batch.mate, "seq": batch.seq, "score": batch.score},
-            schema={"read": pl.UInt32, "mate": pl.UInt8, "seq": pl.UInt32, "score": pl.Float64},
+            {
+                "read": batch.read,
+                "mate": batch.mate,
+                "seq": batch.seq,
+                "score": batch.score,
+                "start": batch.start,
+                "end": batch.end,
+                "reverse": batch.reverse,
+                "ins": batch.ins,
+            },
+            schema={
+                "read": pl.UInt32,
+                "mate": pl.UInt8,
+                "seq": pl.UInt32,
+                "score": pl.Float64,
+                "start": pl.Int32,
+                "end": pl.Int32,
+                "reverse": pl.Boolean,
+                "ins": pl.Int32,
+            },
         )
         .with_row_index("hit")
         .join(refs.select("seq", "role", "unit"), on="seq")
@@ -311,6 +352,7 @@ def score_batch(
             "col": np.asarray(batch.col, np.int32),
             "qpos": np.asarray(batch.qpos, np.int64),
             "residue": _chars(batch.rres),
+            "rbyte": rres,
             "ref": _chars(batch.sres),
             "term": matrix[rres, sres] * term_bits,
         }
@@ -360,7 +402,13 @@ def score_batch(
         )
     )
     names = pl.Series("read_name", batch.names)
-    assignments = hits.select(
+    # read residues and differences of each alignment (insertions count as both)
+    counts = rows.group_by("hit").agg(
+        qlen=(pl.col("qpos") >= 0).sum().cast(pl.Int32),
+        mism=(pl.col("residue") != pl.col("ref")).sum().cast(pl.Int32),
+    )
+    assignments = hits.join(counts, on="hit", how="left").select(
+        "hit",
         read_name=names.gather(hits["read"]),
         mate="mate",
         seq="seq",
@@ -369,8 +417,16 @@ def score_batch(
         score="score",
         posterior="posterior",
         kept="kept",
+        start="start",
+        end="end",
+        reverse="reverse",
+        qlen=pl.col("qlen").fill_null(0) + pl.col("ins"),
+        mism=pl.col("mism").fill_null(0) + pl.col("ins"),
     )
-    return assignments, part, stats
+    target_cols = rows.filter(pl.col("role") == TARGET).select(
+        "hit", "col", "qpos", residue="rbyte"
+    )
+    return assignments, part, stats, target_cols
 
 
 def call(
@@ -383,11 +439,17 @@ def call(
     min_freq: float = MIN_FREQ,
     score_nats: float = SCORE_NATS,
     batch_reads: int = BATCH_READS,
+    reads: Sequence[str | Path] = (),
+    novel: float = NOVEL,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
     ``ref_dir``. Writes ``assignments.parquet``, ``pileup.parquet``, ``variants.tsv`` and
-    ``units.tsv`` to ``out_dir``; returns counts."""
+    ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
+    outputs (steps 7-9; ``reads``: the FASTQ mates, for qualities); returns counts.
+
+    ponytail: steps 7-9 hold every alignment and its target columns in memory; spill them
+    per component to Parquet if ``pileup-cost``'s 100 M pairs do not fit."""
     ref_dir, out = Path(ref_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     refs = (
@@ -418,19 +480,32 @@ def call(
     else:
         raise ValueError(f"aligner must be diamond or bwa, not {aligner}")
     parts, stats, n_assigned = [], [], 0
-    with_names = refs.select("seq", "seq_id")
-    assigned_parts = []
+    assigned_parts, col_parts = [], []
     for batch in batches:
-        assignments, part, stat = score_batch(batch, refs, matrix, term_bits)
-        assigned_parts.append(assignments.join(with_names, on="seq").drop("seq"))
+        assignments, part, stat, cols = score_batch(batch, refs, matrix, term_bits)
+        offset = pl.lit(n_assigned, pl.UInt32)
+        assigned_parts.append(assignments.with_columns(pl.col("hit") + offset))
+        col_parts.append(cols.with_columns(pl.col("hit") + offset))
         n_assigned += assignments.height
         parts.append(part)
         stats.append(stat)
         if len(parts) > 32:  # keep the summed pileup small
             parts = [_sum(parts)]
-    pl.concat(assigned_parts or [pl.DataFrame()], how="diagonal").write_parquet(
-        out / "assignments.parquet"
-    )
+    hits = pl.concat(assigned_parts) if assigned_parts else None
+    refined, em_units = None, None
+    if hits is not None and hits.height:
+        refined, em_units = refine(
+            hits, pl.concat(col_parts), refs, sequences, out, aligner == "diamond", profile,
+            reads, min_depth, min_freq, novel,
+        )  # fmt: skip
+        hits = hits.join(refined, on="hit", how="left")
+    (
+        hits.join(refs.select("seq", "seq_id"), on="seq").drop(
+            "seq", "hit", "start", "end", "reverse", "qlen", "mism"
+        )
+        if hits is not None
+        else pl.DataFrame()
+    ).write_parquet(out / "assignments.parquet")
     pile = (
         _sum(parts)
         if parts
@@ -450,6 +525,8 @@ def call(
     variants = columns.filter(pl.col("depth") >= min_depth, pl.col("alt_freq") >= min_freq)
     variants.write_csv(out / "variants.tsv", separator="\t")
     units = _units(pl.concat(stats) if stats else None, columns, refs, profile)
+    if em_units is not None:
+        units = units.join(em_units, on="unit", how="left")
     units.write_csv(out / "units.tsv", separator="\t")
     return {
         "alignments": n_assigned,

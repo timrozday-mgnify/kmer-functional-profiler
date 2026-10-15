@@ -10,6 +10,7 @@ import typer
 from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
 from kfp_pileup.reference import MIN_PRESENT, build_reference
+from kfp_pileup.refine import NOVEL
 from kmer_functional_profiler.store import MEMBERS
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -58,12 +59,21 @@ def call_command(
         float, typer.Option(help="bwa: nats per alignment score point")
     ] = SCORE_NATS,
     batch_reads: int = BATCH_READS,
+    reads: Annotated[
+        list[Path] | None,
+        typer.Option(help="FASTQ of each mate (in mate order), for base qualities; repeatable"),
+    ] = None,
+    novel: Annotated[
+        float, typer.Option(help="Least divergence of a novel relative from the reference")
+    ] = NOVEL,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
-    per-unit identity (units.tsv) from alignments to the reference; print counts."""
+    per-unit identity (units.tsv) from alignments to the reference; then the error model,
+    the joint EM, consensus updates and haplotypes (error_model.tsv, sources.tsv,
+    haplotypes.tsv, calls.tsv); print counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads,
+        batch_reads, reads or (), novel,
     )  # fmt: skip
     typer.echo(json.dumps(counts))
 

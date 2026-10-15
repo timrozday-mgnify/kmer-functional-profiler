@@ -27,10 +27,14 @@ Outputs under `<outdir>/<sample>/`:
 | --- | --- |
 | `profile.tsv` | kfp's profile |
 | `ref/ref.fa`, `ref/refs.tsv` | the per-sample reference and its roles |
-| `pileup/assignments.parquet` | every alignment: read, mate, reference sequence, unit, role, score (bits), posterior, `kept` (best hit a target) |
+| `pileup/assignments.parquet` | every alignment: read, mate, reference sequence, unit, role, score (bits), posterior, `kept` (best hit a target); steps 7-9's `em_posterior`, `em_novel` (the mate's novel-relative share), `em_flag` (best source differs with the prior) |
 | `pileup/pileup.parquet` | summed weights per (sequence, column, residue), with the part from sibling residues |
 | `pileup/variants.tsv` | columns with depth >= `--min_depth` and an alternative residue at >= `--min_freq`, with `sibling_share` |
-| `pileup/units.tsv` | per target unit: reads, alignment identity (all sequences, representative), the representative's consensus identity, and the profile's `aai` (`ani`) columns, for the `aai` check |
+| `pileup/units.tsv` | per target unit: reads, alignment identity (all sequences, representative), the representative's consensus identity, and the profile's `aai` (`ani`) columns, for the `aai` check; with steps 7-9, `em_pairs`, `em_abundance`, `em_divergence` |
+| `pileup/error_model.tsv` | step 7: residue error by read-cycle third and Phred bin, learned at deep unambiguous columns |
+| `pileup/sources.tsv` | step 8: per source (unit, a component's decoys, its novel relative): pairs (likelihood-only and with the prior), divergence, effective length, abundance |
+| `pileup/haplotypes.tsv` | step 9: per target sequence, haplotypes (0: the original sequence), share, reads, divergence from the original and of their reads from the unit's nearest sequence, `novel` |
+| `pileup/calls.tsv` | step 7's tests on the final pileup: alt against the error model (p, BH q), strand and read-position bias, `passed` |
 
 `--query_stats true` publishes `<sample>/stats.json` (the query's stage times and
 `hits_per_pair`, step 0's histogram). `kfp-pileup aai-check <sample>/pileup/units.tsv` is
