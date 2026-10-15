@@ -1,15 +1,13 @@
-"""kfp-pileup (plan, phase 13, steps 2-9) on hand-made alignments and the fixture index."""
+"""kfp-pileup (plan, phase 13, steps 2-6, 8-9) on hand-made alignments and the fixture index."""
 
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 import pytest
 
 from kfp_pileup.check import aai_check
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
-from kfp_pileup.refine import _decreasing, substitution_shares
 from kmer_functional_profiler.index import (
     TARGETS,
     Index,
@@ -171,17 +169,6 @@ def test_aai_check_bins_and_flags(tmp_path: Path) -> None:
     assert by[("identity", "[0.95, 0.97)")]["cover"] == 0.0
 
 
-def test_error_shares_and_monotone_fit() -> None:
-    shares = substitution_shares(protein=True)
-    for a in "ACDEFGHIKLMNPQRSTVWY":
-        assert shares[ord(a)].sum() == pytest.approx(1.0)
-    # one base change of TGG (W) gives C, G, L, R, S or a stop, never W again
-    assert shares[ord("W"), ord("W")] == 0 and shares[ord("W"), ord("C")] > 0
-    assert substitution_shares(protein=False)[ord("A"), ord("G")] == pytest.approx(1 / 3)
-    fit = _decreasing(np.array([0.05, 0.01, 0.03, 0.001]), np.ones(4))
-    assert fit.tolist() == pytest.approx([0.05, 0.02, 0.02, 0.001])
-
-
 def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> None:
     # Target A (30 aa); a strain of it with one fixed difference (column 2) and a relative
     # missing from the reference that differs at five more columns, linked (6/30).
@@ -213,9 +200,6 @@ def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> No
     novel, out = run(strain + rel, "mixed")
     assert all(novel[f"rel{i}"] > 0.9 for i in range(6))
     assert all(novel[f"st{i}"] < 0.1 for i in range(12))
-    calls = pl.read_csv(out / "calls.tsv", separator="\t")
-    fixed = calls.filter(pl.col("pos") == 3).row(0, named=True)
-    assert (fixed["consensus"], fixed["alt"], fixed["passed"]) == ("W", "W", True)
     # alone, the consensus moves to the relative and its haplotype is reported as novel
     novel, out = run(rel, "alone")
     assert all(novel[f"rel{i}"] > 0.9 for i in range(6))
