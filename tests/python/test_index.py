@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from kmer_functional_profiler import _core, index, reference
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
+from kmer_functional_profiler.store import fetch as fetch_sequences
 
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 K = 6
@@ -343,3 +344,31 @@ def test_targets_fasta_rejects_bad_ids(tmp_path: Path) -> None:
         app, ["index", str(fasta), str(tmp_path / "x"), "--groups", str(groups)]
     )
     assert result.exit_code != 0
+
+
+def test_fetch_takes_the_representative_and_spread_members(tmp_path: Path) -> None:
+    # One unit with members of lengths 9 (the representative's id), 7, 7 (a duplicate), 5,
+    # 3 and 1, in a store apart from the index.
+    store = tmp_path / "store.parquet"
+    lengths = {"rep": 9, "b": 7, "c": 7, "d": 5, "e": 3, "f": 1}
+    rows = [(pid, "rep", True, "M" * n if pid != "c" else "M" * 7) for pid, n in lengths.items()]
+    write_members(store, rows)
+    build_index(store, tmp_path / "idx", IndexParams(k=1, t_base=1.0, n_min=1))
+    picked = {
+        n: fetch_sequences(tmp_path / "idx", [0], n, [store])["protein_id"].to_list()
+        for n in (1, 2, 3, 9)
+    }
+    assert picked == {
+        1: ["rep"],
+        2: ["rep", "b"],
+        3: ["rep", "b", "f"],
+        9: ["rep", "b", "d", "e", "f"],
+    }
+    with pytest.raises(ValueError, match="targets.parquet"):
+        fetch_sequences(tmp_path / "idx", [0])  # built from a members table: no own store
+    ids = tmp_path / "units.txt"
+    ids.write_text("0\n")
+    out = tmp_path / "t.fa"
+    args = ["fetch", str(tmp_path / "idx"), str(ids), "--out", str(out), "--store", str(store)]
+    assert CliRunner().invoke(app, args).exit_code == 0
+    assert out.read_text().splitlines()[0] == ">rep unit=0 cluster_rep=rep"

@@ -3,7 +3,9 @@ extend-exclude = ["*.hmm"] # HMMER files: ALPH is a keyword
 
 [default.extend-words]
 flate = "flate"
-Tru = "Tru"     # Illumina TruSeq
+Tru = "Tru"       # Illumina TruSeq
+BLOSUM = "BLOSUM" # substitution matrices
+blosum = "blosum"
 
 [default.extend-identifiers]
 mOTUs = "mOTUs" # marker-gene profiler
