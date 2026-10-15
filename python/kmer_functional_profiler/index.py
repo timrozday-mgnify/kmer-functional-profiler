@@ -1,7 +1,8 @@
 """Index build (phase 2 prototype): MGnify90 clusters as units, sampled member k-mers.
 
 Input is a members table (``protein_id``, ``cluster_rep``, ``full_length``, ``sequence``),
-e.g. from ``workflows/mgnify-subset``. Translated Illumina adapters in member sequences are
+e.g. from ``workflows/mgnify-subset``, or one made from a FASTA of targets
+(:func:`members_from_fasta`). Translated Illumina adapters in member sequences are
 masked first (``mask_adapters``). The build then hashes every member three times with the
 Rust kernel, keeping only small tables in memory:
 
@@ -40,8 +41,11 @@ members: how far one copy's k-mers can stray from ``pin_sum``.
 The query probes it only for the units the sparse tier detects, to fit abundances on more k-mers.
 """
 
+import gzip
 import json
 import mmap
+import subprocess
+import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from functools import cached_property
@@ -566,6 +570,88 @@ def adapter_peptides() -> list[str]:
 def mask_adapters(sequence: pl.Expr) -> pl.Expr:
     """Replace adapter peptides with ``X`` so no k-mer spans them."""
     return sequence.str.replace_all("|".join(adapter_peptides()), "X" * MASK_WIDTH)
+
+
+TARGETS: Final = "targets.parquet"  # an index's members table when built from a FASTA
+
+
+def read_fasta(path: str | Path) -> Iterator[tuple[str, str]]:
+    """(id, sequence) of each record of a FASTA file (gzipped if it ends in ``.gz``); the
+    id is the header's first word."""
+    opener = gzip.open if Path(path).suffix == ".gz" else open
+    name: str | None = None
+    seq: list[str] = []
+    with opener(path, "rt") as f:
+        for line in f:
+            if line.startswith(">"):
+                if name is not None:
+                    yield name, "".join(seq)
+                name, seq = (line[1:].split() or [""])[0], []
+            elif line.strip():
+                seq.append(line.strip())
+    if name is not None:
+        yield name, "".join(seq)
+
+
+def linclust(fasta: str | Path, min_seq_id: float, workdir: str | Path) -> pl.DataFrame:
+    """Clusters of ``fasta`` by MMseqs2 linclust at ``min_seq_id`` (its default coverage,
+    0.8 of both sequences), as (``protein_id``, ``cluster_rep``); MMseqs2 must be on PATH
+    and detects nucleotide or amino-acid input itself."""
+    prefix = Path(workdir) / "clu"
+    command = ["mmseqs", "easy-linclust", str(fasta), str(prefix), str(Path(workdir) / "tmp")]
+    subprocess.run([*command, "--min-seq-id", str(min_seq_id)], check=True, capture_output=True)
+    return pl.read_csv(
+        f"{prefix}_cluster.tsv",
+        separator="\t",
+        has_header=False,
+        new_columns=["cluster_rep", "protein_id"],
+        schema_overrides=[pl.String, pl.String],
+    )
+
+
+def members_from_fasta(
+    fasta: str | Path, groups: str | Path | None = None, min_seq_id: float | None = None
+) -> pl.DataFrame:
+    """A members table from a FASTA of targets (proteins, or nucleotides for a ``dna``
+    index): ``protein_id`` is each record's id and ``cluster_rep`` its unit, every target
+    counting as full length.
+
+    Units are, by priority: clusters from :func:`linclust` at ``min_seq_id``; the groups of
+    ``groups``, a headerless TSV of (target id, group name), where targets it omits are units
+    of their own and ids it names that the FASTA lacks are an error; or one unit per target.
+    """
+    records = list(read_fasta(fasta))
+    if not records:
+        raise ValueError(f"no records in {fasta}")
+    members = pl.DataFrame(records, schema=["protein_id", "sequence"], orient="row")
+    if "" in members["protein_id"] or members["protein_id"].is_duplicated().any():
+        raise ValueError("target ids (first word of each header) must be non-empty and unique")
+    table = None
+    if min_seq_id is not None:
+        with tempfile.TemporaryDirectory() as workdir:
+            table = linclust(fasta, min_seq_id, workdir)
+    elif groups is not None:
+        table = pl.read_csv(
+            groups,
+            separator="\t",
+            has_header=False,
+            new_columns=["protein_id", "cluster_rep"],
+            schema_overrides=[pl.String, pl.String],
+        )
+        unknown = table.join(members, on="protein_id", how="anti")["protein_id"]
+        if len(unknown):
+            raise ValueError(
+                f"{len(unknown)} ids in {groups} are not in {fasta}, e.g. {unknown[0]}"
+            )
+    if table is None:
+        members = members.with_columns(cluster_rep=pl.col("protein_id"))
+    else:
+        members = members.join(table, on="protein_id", how="left").with_columns(
+            pl.col("cluster_rep").fill_null(pl.col("protein_id"))
+        )
+    return members.select(
+        "protein_id", "cluster_rep", full_length=pl.lit(True), sequence="sequence"
+    )
 
 
 def load_members(path: str | Path) -> pl.DataFrame:
