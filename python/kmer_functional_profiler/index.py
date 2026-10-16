@@ -110,7 +110,7 @@ class IndexParams:
     t_cap: float = 0.2
     oversample: float = 4.0
     mask_adapters: bool = True
-    max_groups: int = 64
+    max_groups: int = 16  # phase 7, step 42 (64 before)
     fp_bits: int = 16
     t_dense: float = 0.0  # 0: no dense tier
     batch_residues: int = 20_000_000
