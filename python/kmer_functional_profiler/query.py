@@ -231,7 +231,7 @@ def _unit_components(col: np.ndarray, row: np.ndarray, n: int) -> np.ndarray:
 
 
 LINK_TAUS: Final = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)  # A1's sweep of link-strength cuts
-# a stricter promiscuity cut (build's max_groups, 64) for the largest component (step 40)
+# a stricter promiscuity cut (build's max_groups, 16) for the largest component (step 40)
 HOLDER_CUTS: Final = (2, 4, 8, 16, 32)
 
 
@@ -351,8 +351,11 @@ PairWeight = Callable[[np.ndarray], np.ndarray]
 
 # a component with more pairs is fitted block-wise (query --max-fit-pairs); a whole fit takes
 # ~65 bytes per pair, block-wise ~90 in two blocks (step 41, synthetic): it saves memory only
-# with many blocks
-MAX_FIT_PAIRS = 10_000_000
+# with many blocks, and on real components whole fits ran 25-32x faster at lower peak (step 42)
+MAX_FIT_PAIRS = 100_000_000
+# the zero-inflated EM's step cap (query --zi-max-iter): its largest component stopped at the
+# plain EM's 1,000 in every query of step 42, explained-away units still moving (step 41)
+ZI_MAX_ITER = 10_000
 BLOCK_STEPS: Final = 30  # EM steps per block per round of a block-wise fit
 MAX_BLOCK_ROUNDS: Final = 1000  # rounds over a block-wise component's blocks
 
@@ -815,7 +818,7 @@ def em(
     zero_inflated: bool = False,
     prior: tuple[float, float] | None = None,
     tol: float = 1e-8,
-    max_iter: int = 1000,
+    max_iter: int | None = None,
     report: dict[str, float] | None = None,
     start: np.random.Generator | None = None,
 ) -> pl.DataFrame:
@@ -836,7 +839,7 @@ def em(
     zero-truncated Poisson MLE sylph uses: mean hits per hit k-mer = c / (1 - exp(-c)).
     With no excess zeros ``present`` stays 1 and the result equals plain EM. Units left
     with fewer than ``EXPLAINED_AWAY`` expected hits (their k-mers explained by other units)
-    get coverage 0.
+    get coverage 0. ``max_iter`` defaults to 1,000 steps, ``ZI_MAX_ITER`` when zero-inflated.
 
     ``prior`` (a, b >= 1) puts a Beta prior on ``present`` (see :func:`fit_present_prior`),
     which pulls it towards the prior mean when few k-mers could be hit, i.e. at low coverage
@@ -890,6 +893,8 @@ def em(
 
         return step
 
+    if max_iter is None:
+        max_iter = ZI_MAX_ITER if zero_inflated else 1000
     attributed = _fit_components(
         col,
         row,

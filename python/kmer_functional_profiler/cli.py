@@ -313,13 +313,19 @@ def query(
         int,
         typer.Option(
             help="Components with more (unit, k-mer) pairs are fitted block-wise, to bound "
-            "memory (~70-100 bytes per pair either way); 0 = the default, 10 M"
+            "memory (~70-100 bytes per pair either way); 0 = the default, 100 M"
         ),
+    ] = 0,
+    zi_max_iter: Annotated[
+        int,
+        typer.Option(help="EM step cap of the zero-inflated fit; 0 = the default, 10,000"),
     ] = 0,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     if max_fit_pairs:  # ponytail: a module setting, as the tests set it; a parameter if it ships
         query_module.MAX_FIT_PAIRS = max_fit_pairs
+    if zi_max_iter:  # ponytail: as --max-fit-pairs
+        query_module.ZI_MAX_ITER = zi_max_iter
     timer = Timer(stats, log=stats is not None)
     sample: dict[str, float | int | None] | None = None if summary is None else {}
     with timer("total"):

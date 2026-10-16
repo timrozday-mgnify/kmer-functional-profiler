@@ -813,13 +813,14 @@ def test_cli_query_max_fit_pairs(
 ) -> None:
     # The block-wise threshold (block-wise fits: test_blockwise_em_*) is set for the query.
     monkeypatch.setattr(query, "MAX_FIT_PAIRS", query.MAX_FIT_PAIRS)  # restored afterwards
+    monkeypatch.setattr(query, "ZI_MAX_ITER", query.ZI_MAX_ITER)
     runner = CliRunner()
     idx = tmp_path / "idx"
     assert runner.invoke(app, ["index", str(members), str(idx), "--k", str(K)]).exit_code == 0
     args = ["query", str(idx), *map(str, READS), "--out", str(tmp_path / "p.tsv")]
-    result = runner.invoke(app, [*args, "--max-fit-pairs", "1"])
+    result = runner.invoke(app, [*args, "--max-fit-pairs", "1", "--zi-max-iter", "7"])
     assert result.exit_code == 0, result.output
-    assert query.MAX_FIT_PAIRS == 1
+    assert (query.MAX_FIT_PAIRS, query.ZI_MAX_ITER) == (1, 7)
 
 
 def test_cli_query(members: Path, tmp_path: Path) -> None:
