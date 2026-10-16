@@ -2139,6 +2139,43 @@ Steps 1–5 build what the ablations need before they run (frame modes, quality 
     - `g16-novaseq` (`ablations/g16.config`): `slim` and `tbase02_all16` at `max_groups` 64 (control, pinned) and 16; `tbase05_all_g16` again. The fmh benchmark as `promiscuity`, 10 NovaSeq samples, `aai` under `step34q`. *Read:* step 42's paired table per tier. `tbase05_all_g16` against `promiscuity-novaseq`'s (same build arguments and samples) isolates the 10,000-step cap: abundance (`abund_zi_*`, Pfam L1) and `aai`. *Rule:* 16 stays the default on a tier if its recall loss is no larger than on the large tier (≤ ~0.005 at every identity bin) and `aai` still passes step 23's rule. Otherwise that tier's `release-tiers` build passes `--max-groups 64`. Submit before `release-tiers`.
     - `zi-iter-query-cost`: `promiscuity-novaseq`'s `tbase05_all_g16` on the pooled gut sample at 40 / 100 / 200 M pairs, with `--zi-max-iter` 1,000 / 3,000 / 10,000 (`results-zi<cap>`). *Read:* `zi_em_iterations`, `zi_em_unconverged_units`, `zi_em_max_change`, `fit_zi_wall_s`. Stats only (the query run publishes no profiles). *Rule:* keep 10,000 if the largest component converges by then, or its `zi_em_max_change` falls by orders of magnitude, at an affordable `fit_zi_wall_s`. If 3,000 and 10,000 stop at about the same change, the cap buys nothing; go to step 41's other candidate (coverage 0 where presence × `m_g` < 1).
     - Also outstanding: the `unknown-novaseq` resubmit (step 40) and `release-tiers`.
+* **Phase 7, step 44 — sixth ablation export: `g16-novaseq` and the `unknown-novaseq` resubmit (results; no decision taken).** `~/Downloads/kfp-ablations.tar.gz` (8.9 GB; only summaries, scores, calibration and index `meta.json` extracted, the disk had ~5 GB free). Both runs at main aa516f1 (step 43), all tasks completed (5 `AAI_CALIBRATE` and 1 `MGNIFY_GENES` failures succeeded on retry). `zi-iter-query-cost` is not in the export. Means over 10 samples; differences paired by sample (mean ± sd, and how many of 10 samples fell / rose).
+  - **`g16-novaseq`: `max_groups` 16 against 64 on `slim` and `tbase02_all16`** (metrics as step 42's table; `meta.json` confirms 64 on the controls, 16 on the cuts):
+
+    | metric | control `slim` | `slim_g16` | control `tbase02_all16` | `tbase02_all16_g16` | `tbase05_all_g16` (absolute) |
+    | --- | --- | --- | --- | --- | --- |
+    | MGnify90 recall at 95% | 0.364 | −0.001 ± 0.001 (9 / 0) | 0.691 | −0.004 ± 0.002 (10 / 0) | 0.789 |
+    | recall at 90% | 0.350 | −0.002 ± 0.001 (10 / 0) | 0.611 | −0.005 ± 0.004 (9 / 1) | 0.741 |
+    | recall at 80% | 0.311 | −0.002 ± 0.000 (10 / 0) | 0.514 | −0.005 ± 0.001 (10 / 0) | 0.654 |
+    | recall at 70% | 0.237 | −0.002 ± 0.000 (10 / 0) | 0.370 | −0.005 ± 0.001 (10 / 0) | 0.517 |
+    | `purity_nearest` | 0.145 | +0.005 | 0.104 | +0.008 | 0.103 |
+    | `abund_zi_bias` at 80% | −0.124 | +0.024 ± 0.043 | −0.078 | −0.011 ± 0.014 | −0.075 |
+    | `abund_zi_err` at 70% | 0.707 | −0.005 ± 0.013 | 0.682 | −0.005 ± 0.011 | 0.640 |
+    | Pfam completeness | 0.785 | −0.002 ± 0.001 | 0.838 | −0.002 ± 0.001 | 0.871 |
+    | Pfam `completeness_low25` | 0.445 | −0.005 ± 0.002 | 0.555 | −0.004 ± 0.002 | 0.632 |
+    | Pfam purity | 0.704 | +0.003 | 0.655 | +0.002 | 0.611 |
+    | Pfam L1 | 0.514 | −0.015 ± 0.007 | 0.493 | −0.024 ± 0.006 | 0.457 |
+    | `aai_n_single` | 224 | −3 | 435 | −15 | 1,180 |
+
+    - *Detection:* the pattern of step 42's `tbase05_all_g16`: small losses, consistently signed, flat across identity bins, with small purity gains and a better Pfam L1. `slim` loses 0.001–0.002, under the large tier's 0.003–0.004. `tbase02_all16` loses 0.004–0.005, at the rule's ~0.005 edge (0.0052 at 90%), and relatively more than the large tier (1.3% of recall at 70% against 0.8%).
+    - *`aai` under `step34q`, step 23's rule (`aai_kmers` ≥ 5):* both cuts pass. Bias in the 5–9 / 10+ bins +0.001 / +0.011 (`slim_g16`), +0.002 / +0.005 (`tbase02_all16_g16`); coverage 0.99 / 0.98 and 0.98 / 0.93, the last 0.003 below its control (10 of 10 samples). By identity bin `slim` reads −0.08 / −0.22 at 80 / 70% in the control too (step 38: unbiased `aai` needs the large tier); the cut moves no bin outside the control's seed noise.
+    - *The 10,000-step zero-inflated cap (`tbase05_all_g16` against step 42's, same build and samples):* no measurable change. Recall 0.789 / 0.741 / 0.654 / 0.517 against 0.790 / 0.741 / 0.654 / 0.518, `abund_zi_bias` at 80% −0.075 against −0.075, `abund_zi_err` at 70% 0.640 against 0.640, Pfam L1 0.457 against 0.457 (step 42's per-sample scores were not kept, so means only). The profiles did rerun (not cached). Either the benchmark samples' largest components converge within 1,000 steps or the extra steps move only explained-away units (abundance ≈ 0); the benchmark exports no `zi_em_*`, so `zi-iter-query-cost` decides.
+  - **`unknown-novaseq` (step 40's sampled-genome ladder; indexes at the new default `max_groups` 16): B passes.** `unknown_summary.tsv`:
+
+    | hold-out | `truth_heldout` | `truth_known_0.7` | `truth_known_any` | `census_containment` `slim` | `tbase02_all16` |
+    | --- | --- | --- | --- | --- | --- |
+    | 0 | 0.000 | 0.190 | 0.408 | 0.0959 | 0.0975 |
+    | 10% | 0.065 | 0.093 | 0.390 | 0.0870 | 0.0892 |
+    | 30% | 0.172 | 0.037 | 0.373 | 0.0796 | 0.0824 |
+    | 50% | 0.256 | 0.020 | 0.364 | 0.0784 | 0.0809 |
+
+    - *Rule:* Spearman of the census with hold-out −1 in all 10 samples on both tiers; no step rises in any sample.
+    - *The ladder now holds out the samples' genomes:* `truth_heldout` tracks the coding share × hold-out (0.054 / 0.162 / 0.270 expected). Kept genomes still lose shared units: `truth_known_0.7` halves at 10% (as in step 39, 0.190 → 0.028 there).
+    - *The census saturates:* it falls 0.009 and 0.007 over 0–10% and 10–30%, but only 0.001 over 30–50%, while `truth_heldout` rises 0.084. As in step 39 it is a k-mer containment (~0.1), not a read fraction, and its scale against the true unknown share is not calibrated; it orders samples, not sizes their unknown fraction.
+  - **Open, for the user:** (1) `max_groups` 16 on `slim` (passes) and `tbase02_all16` (at the edge of the rule; keep 16 or build it at 64 in `release-tiers`); (2) the zero-inflated cap waits for `zi-iter-query-cost`; (3) whether the census's saturation past 30% matters for how B is reported. `release-tiers` still outstanding.
+  - **Decided (user, 2026-10-16):** `max_groups` 16 on both `slim` and the standard tier, as on the large tier. `release-tiers/run.sh` now passes `--max-groups 16` on every tier: the default already, but pinned so it reaches CANDIDATES as a hashed input and `-resume` rebuilds anything an earlier attempt built at 64 (the release extraction upstream stays cached). The phase 13–14 runs (`spike-protein`, `spike-nucleotide`, `pileup-cost`) build at the default, 16.
+  - **Checked (HPC readiness, main 93c4150):** Python suite (162 passed); spike benchmark `test` and `test_nucleotide` with Docker and `--query_stats true` end to end (32 and 34 tasks; indexes at `max_groups` 16; nucleotide F1 0.95 against KMA's 1.00 on the toy set). `mgnify-subset`'s query-cost no longer fails on the nested `hits_per_pair` count (PR #135, needed by `zi-iter-query-cost`); nothing else tabulates the stats' counts.
+  - *Open (nucleotide):* `spike-nucleotide` indexes CARD's protein-homolog models with no `--groups`, one unit per allele. Families such as OXA, TEM, CTX-M and SHV hold hundreds of near-identical alleles, so most of their k-mers have more than 16 (or 64) holders and are cut; an allele left with no posting is not in the index. Not measured (no CARD copy locally); to settle before the run: groups by AMR gene family, `--cluster`, or a laxer `--max-groups` for nucleotide targets.
 
 ### Phase 12
 
