@@ -30,6 +30,10 @@ def _ref_span(cigar: str) -> int:
     return sum(int(n) for n, op in _CIGAR.findall(cigar) if op in "MDN=X")
 
 
+def _query_len(cigar: str) -> int:
+    return sum(int(n) for n, op in _CIGAR.findall(cigar) if op in "M=XIS")
+
+
 def _records(path: Path) -> Iterator[list[str] | str]:
     """Header lines as strings, then alignment records as field lists."""
     with open(path) as f:
@@ -118,7 +122,12 @@ def _write_pair(
             seq, qual, strand = primary[m]
             if strand != reverse:
                 seq, qual = seq.translate(_COMPLEMENT)[::-1], qual[::-1]
+            # the primary's whole read: a hard clip (bwa-mem2 on secondary and supplementary
+            # records) becomes a soft one, so the CIGAR spans the borrowed sequence
+            r[5] = r[5].replace("H", "S")
             r[9], r[10] = seq, qual
+        if r[9] != "*" and r[5] != "*" and _query_len(r[5]) != len(r[9]):
+            r[9], r[10] = "*", "*"  # still inconsistent: samtools rejects it, so drop SEQ
         other = chosen.get(m ^ 0xC0) if m else None
         if other is not None:
             same = other[2] == r[2]
