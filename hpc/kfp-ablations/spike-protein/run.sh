@@ -18,16 +18,25 @@
 source ../common.sh
 fetch_pairs bg 10000000 ERR7738575
 [[ -s seeds.faa ]] || "$REPO/.venv/bin/python" - "$SUBSET/members.parquet" seeds.faa <<'PY'
+# the first 2000 full-length representatives of 200-600 aa, in file order; read row group by
+# row group (10,000 rows each) and stopped there: the whole table OOMs the 8 GB head job
+import os
 import sys
 import polars as pl
-reps = (
-    pl.scan_parquet(sys.argv[1])
-    .filter(pl.col("protein_id").cast(pl.String) == pl.col("cluster_rep").cast(pl.String),
+import pyarrow.parquet as pq
+cols = ["protein_id", "cluster_rep", "full_length", "sequence"]
+n = 0
+with open(sys.argv[2] + ".tmp", "w") as f:  # renamed when complete: -s skips a whole file only
+    for b in pq.ParquetFile(sys.argv[1]).iter_batches(batch_size=10_000, columns=cols):
+        reps = pl.from_arrow(b).filter(
+            pl.col("protein_id").cast(pl.String) == pl.col("cluster_rep").cast(pl.String),
             pl.col("full_length"), pl.col("sequence").str.len_bytes().is_between(200, 600))
-    .select("protein_id", "sequence").head(2000).collect()
-)
-with open(sys.argv[2], "w") as f:
-    f.writelines(f">{i}\n{s}\n" for i, s in reps.iter_rows())
+        for i, s in reps.select("protein_id", "sequence").head(2000 - n).iter_rows():
+            f.write(f">{i}\n{s}\n")
+            n += 1
+        if n >= 2000:
+            break
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
 PY
 cat > spike.config <<CFG
 process {
