@@ -59,6 +59,11 @@ cd kfp-ablations/promiscuity-novaseq && sbatch run.sh
 cd kfp-ablations/promiscuity-query-cost && sbatch run.sh
 # step 41: the two controls again with whole fits (no block-wise), alongside promiscuity-query-cost:
 cd kfp-ablations/whole-fit-query-cost && sbatch run.sh
+# step 43: max_groups 16 on slim and standard (and the large tier under the new zero-inflated step
+# cap), after 00-dbs and before release-tiers; the step cap's cost (1,000/3,000/10,000), after
+# promiscuity-novaseq:
+cd kfp-ablations/g16-novaseq && sbatch run.sh
+cd kfp-ablations/zi-iter-query-cost && sbatch run.sh   # three caps, one after another
 # phases 13-14 (workflows/spike-benchmark, workflows/pileup), independent of the runs above,
 # all at once: the pileups and aai with truth on the three tiers' sampling, the nucleotide
 # mode against KMA with k and t_base tuning (CARD), then, once release-tiers has finished,

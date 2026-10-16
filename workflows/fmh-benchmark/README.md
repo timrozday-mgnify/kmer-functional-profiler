@@ -349,6 +349,7 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
 | `aai` | Step 15's sparse/dense ladder (run; superseded by `floor`) | 4 indexes × 2 arms × 10 |
 | `unknown` | Unknown fraction (plan, phase 7, steps 14, 36, 38 and 40): `slim` and `tbase02_all16` built on the subset and with 10/30/50% of the sampled genomes held out (`--holdout`); read `unknown_summary.tsv` | 8 indexes × 10 |
 | `promiscuity` | As `tiers`: `tbase05_all` at `--max-groups` 64 (control), 128, 16, 8, 4 and `tbase10_all` at 64, 8, for the largest component's size and the accuracy cost of a stricter promiscuity cut (plan, phase 7, step 40); published for `promiscuity-query-cost` | 7 indexes × 10 |
+| `g16` | As `promiscuity`: `slim` and `tbase02_all16` at `--max-groups` 64 (control) and 16 (the default since step 43), and `tbase05_all_g16` again under the zero-inflated fit's 10,000-step cap (plan, phase 7, step 43) | 5 indexes × 10 |
 
 **Raised floor against the dense tier** (`floor`, and the floor/dense pairs of `index`,
 `reads`, `host`): *t_base* is a density floor, since every unit keeps all its k-mers with
