@@ -20,6 +20,8 @@
 #   <sample>/variants/  step 6c on real data: freebayes calls, csq consequences, Floria and
 #                       CliqueSNV haplotypes, inStrain microdiversity against the consensus (6b)
 #   results-noF/trace.tsv  PILEUP:DIAMOND without -F (step 6b's cost: against trace.tsv)
+#   (all of trace.tsv, <sample>/ref/ and stats.json check the plan's cost estimates for a
+#   20 M-pair sample: Progress log, phase 13, "cost estimates for a typical metagenome")
 # Buckets written before phase 13, step 1 (10,000-row groups) make fetch read far more.
 source ../common.sh
 STD=../release-tiers/results-standard
