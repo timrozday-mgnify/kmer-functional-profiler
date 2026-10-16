@@ -1,6 +1,7 @@
 """The MGnify subset extraction on the mini release fixture."""
 
 import gzip
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -170,3 +171,13 @@ def test_em_starts_tells_unidentifiable_splits_from_unconverged_fits(tmp_path: P
     # half L1 between the normalised profiles: (3,1,2,4)/10 against (1,3,3,4)/11
     want = 0.5 * sum(abs(a / 10 - b / 11) for a, b in zip([3, 1, 2, 4], [1, 3, 3, 4], strict=True))
     assert unit["l1_max"] == pytest.approx(want, abs=1e-6)
+
+
+def test_query_cost_skips_nested_counts(tmp_path: Path) -> None:
+    # The query's stats carry a hits_per_pair histogram (a list), which CSV cannot hold.
+    stats = {"counts": {"hit_units": 3, "hits_per_pair": [0, 2, 1]}, "stages": {}}
+    (tmp_path / "idx.40.0.json").write_text(json.dumps(stats))
+    run(tmp_path, "query-cost", "idx.40.0.json")
+    table = pl.read_csv(tmp_path / "query_cost.tsv", separator="\t")
+    assert table["hit_units"].to_list() == [3]
+    assert "hits_per_pair" not in table.columns
