@@ -294,7 +294,9 @@ def query_cost(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
         index, pairs, draws, *start = path.name.removesuffix(".json").split(".")
         stats = json.loads(path.read_text())
         row = {"index": index, "pairs": int(pairs), "draws": int(draws)}
-        row |= {"em_start": int(start[0][1:]) if start else 0, **stats["counts"]}
+        row["em_start"] = int(start[0][1:]) if start else 0
+        # scalars only: hits_per_pair (phase 13, step 0) is a histogram, left in the JSON
+        row |= {k: v for k, v in stats["counts"].items() if not isinstance(v, list | dict)}
         for stage, cost in stats["stages"].items():
             row |= {f"{stage}_{k}": v for k, v in cost.items()}
         rows.append(row)
