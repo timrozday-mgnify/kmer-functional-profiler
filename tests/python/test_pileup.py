@@ -270,7 +270,7 @@ def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
     sam.write_text(
         "@SQ\tSN:s0\tLN:30\n@SQ\tSN:s1\tLN:30\n"
         f"p1\t97\ts1\t1\t60\t5M\ts0\t11\t0\t{seq}\t{qual}\tAS:i:5\n"  # unit 1: not assigned
-        f"p1\t353\ts0\t2\t0\t5M\ts0\t11\t0\t*\t*\tAS:i:4\n"  # secondary on unit 0: kept
+        f"p1\t353\ts0\t2\t0\t2H3M\ts0\t11\t0\t*\t*\tAS:i:4\n"  # secondary on unit 0: kept
         f"p1\t145\ts0\t11\t60\t5M\ts1\t1\t0\t{seq}\t{qual}\tAS:i:5\n"
         f"p2\t65\ts0\t1\t60\t5M\t=\t1\t0\t{seq}\t{qual}\tAS:i:5\n"  # 0.4 < 0.5: dropped
     )
@@ -283,6 +283,7 @@ def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
     ]
     first, second = rows
     assert (first[2], first[3], first[9], first[10]) == ("s0", "2", seq, qual)  # borrowed
+    assert first[5] == "2S3M"  # the hard clip soft, to span the borrowed read
     assert int(first[1]) & 0x900 == 0 and int(first[1]) & 0x2  # primary, proper pair
     assert int(first[1]) & 0x20  # its mate is reverse
     assert first[6:9] == ["=", "11", "14"]

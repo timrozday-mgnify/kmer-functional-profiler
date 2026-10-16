@@ -180,6 +180,7 @@ process HANDOFF {
     input:
     tuple val(sample), path(sam), path(fasta), path(pileup), path(ref)
     val opts
+    path code  // unused: staged so that -resume reruns the hand-off when its code changes
 
     output:
     tuple val(sample), path('handoff.sam'), path(fasta), emit: sam
@@ -428,7 +429,8 @@ workflow PILEUP {
         .map { s, a, sam, ref -> tuple(s, sam, ref.resolve('ref.fa')) }
     def to_handoff = MAP_CONSENSUS(protein, params.bwa_args).sam.mix(nucleotide_sams)
         .join(pileups).join(ref_dirs)
-    def handoff = HANDOFF(to_handoff, "--min-posterior ${params.min_assign}").sam
+    def handoff = HANDOFF(to_handoff, "--min-posterior ${params.min_assign}",
+        file("${moduleDir}/../../python/kfp_pileup/handoff.py", checkIfExists: true)).sam
     def bams = BAM(handoff).bam
     if (params.cliquesnv) {
         CLIQUESNV(handoff, params.cliquesnv_min_reads, params.cliquesnv_args)
