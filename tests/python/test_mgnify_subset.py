@@ -181,3 +181,60 @@ def test_query_cost_skips_nested_counts(tmp_path: Path) -> None:
     table = pl.read_csv(tmp_path / "query_cost.tsv", separator="\t")
     assert table["hit_units"].to_list() == [3]
     assert "hits_per_pair" not in table.columns
+
+
+def test_membership_writes_one_file_per_shard(tmp_path: Path) -> None:
+    run(tmp_path, "membership", "--release", str(RELEASE), "--shard-width", "300")
+    out = tmp_path / "membership"
+    assert not list(out.glob("shard=*"))  # the partitioned pieces are compacted away
+    files = sorted(out.glob("shard_*.parquet"))
+    assert len(files) > 1
+    for f in files:  # each holds its own protein_id range, sorted
+        ids = pl.read_parquet(f)["protein_id"]
+        assert ids.is_sorted() and ids.min() // 300 == ids.max() // 300 == int(f.stem[6:])
+    total = pl.read_parquet(RELEASE / "mgy_cluster_seqs.parquet").height
+    assert sum(pl.read_parquet(f).height for f in files) == total
+
+
+def test_extract_refuses_the_old_membership_layout(tmp_path: Path) -> None:
+    (tmp_path / "membership" / "shard=0").mkdir(parents=True)
+    pl.DataFrame({"cluster_rep": [1], "protein_id": [1]}).write_parquet(
+        tmp_path / "membership" / "shard=0" / "data_0.parquet"
+    )
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "extract", *SHARD, "--lo", "0", "--hi", "10", "--prefix", "s"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0 and "old layout" in result.stderr
+
+
+def test_io_errors_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    import duckdb
+
+    spec = importlib.util.spec_from_file_location("mgnify_subset", SCRIPT)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    calls = []
+
+    def flaky(n: int) -> str:
+        calls.append(n)
+        if len(calls) < 3:
+            raise duckdb.IOException("Cannot open file")
+        return "ok"
+
+    assert mod.with_io_retries(flaky, 7) == "ok" and calls == [7, 7, 7]
+
+    def broken() -> None:
+        calls.append(0)
+        raise duckdb.IOException("Cannot open file")
+
+    calls.clear()
+    with pytest.raises(duckdb.IOException):
+        mod.with_io_retries(broken)
+    assert len(calls) == mod.IO_RETRIES

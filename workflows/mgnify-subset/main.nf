@@ -9,6 +9,7 @@ process MEMBERSHIP {
     input:
     val sample
     val width
+    path code  // unused: staged so that -resume reruns MEMBERSHIP when its code (and so the layout EXTRACT reads) changes
 
     output:
     path 'membership', emit: membership
@@ -532,7 +533,7 @@ workflow {
     if ((params.index && !members_table) || params.stats || params.build) {
         // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
         def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
-        MEMBERSHIP(samples[0], width)
+        MEMBERSHIP(samples[0], width, file("${projectDir}/mgnify_subset.py", checkIfExists: true))
         ch_shards = channel.of(0..<(params.shards as int)).map { i -> [i, i * width, (i + 1) * width] }
         EXTRACT(ch_shards, MEMBERSHIP.out.membership)
         MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())

@@ -6,7 +6,8 @@ One subcommand per pipeline step (``main.nf``):
   lineages), keeping 1 in ``--sample`` by ``cluster_rep``, -> ``membership/``
   (``cluster_rep``, ``protein_id``), split into ``--shard-width`` ranges of ``protein_id``
   so each range below reads only its own files; a partitioned write, not a sort, since the
-  whole release has 5.7 B members. Fails if a member lies at or above ``--max-protein-id``.
+  whole release has 5.7 B members, then compacted to one ``shard_NNNNNN.parquet`` per range
+  (sorted by ``protein_id``). Fails if a member lies at or above ``--max-protein-id``.
 - ``extract``: sequences (and Pfam hits, unless ``--no-pfam``) of the members in one
   ``protein_id`` range, with their ``cluster_rep`` and ``bucket`` (a hash of
   ``cluster_rep`` modulo ``--buckets``). Fails if any member has no sequence.
@@ -38,11 +39,14 @@ One subcommand per pipeline step (``main.nf``):
 import argparse
 import itertools
 import json
+import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import fields, replace
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeVar
 
 import duckdb
 import numpy as np
@@ -88,14 +92,47 @@ def membership(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None
         """,
         params,
     )
+    # One file per shard: the partitioned COPY leaves hundreds of pieces per shard (~10^5 at
+    # full scale), and 256 EXTRACT tasks listing them all at once on shared storage were told
+    # existing files did not exist. Compacted here, where they were just written.
+    for part in sorted(Path(args.out).glob("shard=*")):
+        shard = int(part.name.removeprefix("shard="))
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{part}/*.parquet') ORDER BY protein_id) "
+            f"TO '{args.out}/shard_{shard:06d}.parquet' (FORMAT parquet)"
+        )
+        shutil.rmtree(part)
     top = con.sql(f"SELECT max(protein_id) FROM {read_membership(args.out)}").fetchone()
     if top and top[0] is not None and top[0] >= args.max_protein_id:
         sys.exit(f"member {top[0]} is at or above --max-protein-id {args.max_protein_id}")
 
 
 def read_membership(path: str) -> str:
-    """Membership files; each holds one ``protein_id`` range, so range filters skip the rest."""
-    return f"read_parquet('{path}/**/*.parquet', hive_partitioning = false)"
+    """Membership files, one per ``protein_id`` range (so range filters skip the rest), listed
+    once here and passed by name: no recursive glob for DuckDB to repeat."""
+    files = sorted(str(f) for f in Path(path).glob("shard_*.parquet"))
+    if not files:
+        sys.exit(f"no shard_*.parquet in {path}: MEMBERSHIP missing or in the old layout")
+    return f"read_parquet({files}, hive_partitioning = false)"
+
+
+T = TypeVar("T")
+IO_RETRIES: Final = 5  # attempts of a read that fails on I/O, waiting 30, 60, 120, 240 s
+
+
+def with_io_retries(step: Callable[..., T], *args: object) -> T:
+    """Run ``step(*args)``, retrying on DuckDB I/O errors: shared storage that briefly cannot
+    see a file should not fail the task."""
+    for attempt in range(IO_RETRIES):
+        try:
+            return step(*args)
+        except duckdb.IOException as e:
+            if attempt == IO_RETRIES - 1:
+                raise
+            wait = 30 * 2**attempt
+            print(f"I/O error (attempt {attempt + 1}), retrying in {wait} s: {e}", file=sys.stderr)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
 
 
 def extract(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
@@ -105,7 +142,7 @@ def extract(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     release = args.release
     con.execute(
         f"""
-        CREATE TABLE seqs AS
+        CREATE OR REPLACE TABLE seqs AS
         SELECT m.protein_id, m.cluster_rep, s.full_length, s.sequence,
             hash(m.cluster_rep) % {args.buckets} AS bucket
         FROM ({ids}) m LEFT JOIN (
@@ -550,7 +587,11 @@ def main() -> None:
         "query-cost": query_cost,
         "em-starts": em_starts,
     }
-    steps[args.step](connect(args), args)
+    step = steps[args.step]
+    if args.step in ("extract", "merge"):  # 256 tasks reading shared files; outputs rewritten whole
+        with_io_retries(step, connect(args), args)
+    else:
+        step(connect(args), args)
 
 
 if __name__ == "__main__":
