@@ -12,15 +12,20 @@ with the member id as the first header word, which DIAMOND (``makedb``, with
 reference name.
 """
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from kmer_functional_profiler.index import TARGETS
 
 MEMBERS: Final = 3  # sequences per unit: the representative and two others
+READ_GROUPS: Final = 64  # row groups read at once: bounds memory (10,000 rows each in MERGE's)
 
 
 def store_paths(index_dir: str | Path, store: Sequence[str | Path] = ()) -> list[Path]:
@@ -59,12 +64,7 @@ def fetch(
     if wanted.height < len(set(units)):
         raise ValueError("unit ids not in the index")
     reps = wanted["cluster_rep"]
-    found = (
-        pl.scan_parquet([str(p) for p in store_paths(index_dir, store)])
-        .select("protein_id", "cluster_rep", "sequence")
-        .filter(pl.col("cluster_rep").is_in(reps.implode()))
-        .collect()
-    )
+    found = read_units(store_paths(index_dir, store), reps.to_list())
     k = members - 1
     ranked = (
         found.with_columns(
@@ -90,6 +90,39 @@ def fetch(
         .select("unit", "cluster_rep", "protein_id", "rep", "sequence")
         .sort("unit", "rep", "protein_id", descending=[False, True, False])
     )
+
+
+def read_units(paths: Sequence[Path], reps: Sequence[int | str]) -> pl.DataFrame:
+    """``protein_id``, ``cluster_rep`` and ``sequence`` of the members of ``reps``.
+
+    File by file, only the row groups whose ``cluster_rep`` statistics bracket a wanted
+    unit, ``READ_GROUPS`` at a time, filtered by pyarrow. (A Polars scan of every MGnify
+    bucket with millions of units in one ``is_in`` died with a segfault: pileup-cost, the
+    full standard tier.)
+    """
+    cols = ["protein_id", "cluster_rep", "sequence"]
+    wanted = sorted(set(reps))
+    parts = []
+    for path in paths:
+        pf = pq.ParquetFile(path)
+        field = pf.schema_arrow.get_field_index("cluster_rep")
+        values = pa.array(wanted, type=pf.schema_arrow.field(field).type)
+        groups = []
+        for g in range(pf.num_row_groups):
+            stats = pf.metadata.row_group(g).column(field).statistics
+            if stats is None or not stats.has_min_max:
+                groups.append(g)
+                continue
+            i = bisect_left(wanted, stats.min)
+            if i < len(wanted) and wanted[i] <= stats.max:
+                groups.append(g)
+        parts.append(pf.schema_arrow.empty_table().select(cols))
+        for start in range(0, len(groups), READ_GROUPS):
+            table = pf.read_row_groups(groups[start : start + READ_GROUPS], columns=cols)
+            parts.append(table.filter(pc.is_in(table["cluster_rep"], value_set=values)))
+    found = pl.from_arrow(pa.concat_tables(parts, promote_options="default"))
+    assert isinstance(found, pl.DataFrame)
+    return found
 
 
 def write_fasta(sequences: pl.DataFrame, path: str | Path, ids: str = "protein_id") -> None:

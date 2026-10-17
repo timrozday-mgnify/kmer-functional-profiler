@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner
 
-from kmer_functional_profiler import _core, index, reference
+from kmer_functional_profiler import _core, index, reference, store
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import PIN_BITS, Index, IndexParams, PackedTable, build_index
 from kmer_functional_profiler.store import fetch as fetch_sequences
@@ -372,3 +372,25 @@ def test_fetch_takes_the_representative_and_spread_members(tmp_path: Path) -> No
     args = ["fetch", str(tmp_path / "idx"), str(ids), "--out", str(out), "--store", str(store)]
     assert CliRunner().invoke(app, args).exit_code == 0
     assert out.read_text().splitlines()[0] == ">rep unit=0 cluster_rep=rep"
+
+
+@pytest.mark.parametrize("ids", [int, str])
+def test_read_units_prunes_row_groups_and_matches_a_plain_filter(tmp_path: Path, ids) -> None:
+    # two store files sorted by cluster_rep in row groups of 3 (MERGE's layout, scaled down)
+    paths = []
+    for f in range(2):
+        reps = sorted(ids(r) for r in range(f, 60, 2) for _ in range(2))
+        table = pl.DataFrame(
+            {
+                "protein_id": [f"{f}_{i}" for i in range(len(reps))],
+                "cluster_rep": reps,
+                "sequence": ["M" * (i % 7 + 1) for i in range(len(reps))],
+            }
+        )
+        paths.append(tmp_path / f"members.bucket{f}.parquet")
+        table.write_parquet(paths[-1], row_group_size=3, statistics=True)
+    wanted = [ids(r) for r in (0, 1, 7, 31, 58, 59, 999)]  # 999 is in no file
+    plain = pl.read_parquet(paths).filter(pl.col("cluster_rep").is_in(wanted)).sort("protein_id")
+    got = store.read_units(paths, wanted).sort("protein_id")
+    assert got.equals(plain) and got.height == 12
+    assert store.read_units(paths, []).height == 0
