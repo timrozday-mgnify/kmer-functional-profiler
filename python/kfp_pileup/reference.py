@@ -5,7 +5,7 @@ Three roles, one FASTA:
 - ``target``: units the profile calls present (``present_prob`` >= ``min_present``);
 - ``neighbour``: the other hit units in the targets' components (``component``), decoys
   that catch reads from a sibling the profile did not call; at most ``neighbours`` per
-  target in a component, those with the most tier-2 hits (a real sample's giant component
+  target in a component, those with the most tier-1 hits (a real sample's giant component
   holds most hit units: millions of sequences and a REFERENCE killed at 256 GB);
 - ``decoy``: the targets' sequences reversed, a null for the score threshold.
 

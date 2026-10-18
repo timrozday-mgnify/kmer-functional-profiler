@@ -100,12 +100,31 @@ def test_promiscuous_kmers_are_dropped(tmp_path: Path) -> None:
     assert units["m_g"].to_list() == [len(a), len(kmers(D + Y) - kmers(D)), len(kmers(S))]
 
 
-def test_tier2_lookup_returns_postings(hand: tuple[Index, pl.DataFrame]) -> None:
+def test_tier1_lookup_returns_postings(hand: tuple[Index, pl.DataFrame]) -> None:
     index, postings = hand
-    set_ids = index.tier2.lookup(postings["hash"].to_numpy())
+    set_ids = index.tier1.lookup(postings["hash"].to_numpy())
     assert (set_ids >= 0).all()
     for set_id, unit, pin_q in zip(set_ids, postings["unit"], postings["pin_q"], strict=True):
-        assert (unit << PIN_BITS | pin_q) in index.tier2.values(int(set_id))
+        assert (unit << PIN_BITS | pin_q) in index.tier1.values(int(set_id))
+
+
+def test_format_2_index_loads_its_tier2_files(
+    hand: tuple[Index, pl.DataFrame], tmp_path: Path
+) -> None:
+    # an index built before format 3 names the postings table tier2 (files and meta key)
+    index, postings = hand
+    old = tmp_path / "idx"
+    meta = json.loads((old / "meta.json").read_text())
+    assert meta["format"] == 3 and "tier1" in meta
+    meta["format"], meta["tier2"] = 2, meta.pop("tier1")
+    (old / "meta.json").write_text(json.dumps(meta))
+    for f in old.glob("tier1.*.npy"):
+        f.rename(f.with_name("tier2" + f.name.removeprefix("tier1")))
+    loaded = Index.load(old)
+    assert np.array_equal(
+        loaded.tier1.lookup(postings["hash"].to_numpy()),
+        index.tier1.lookup(postings["hash"].to_numpy()),
+    )
 
 
 def test_candidates_match_analytical_expectation(tmp_path: Path) -> None:
@@ -305,7 +324,7 @@ def test_targets_fasta_with_groups_equals_the_members_table_build(tmp_path: Path
         pl.read_parquet(tmp_path / "a" / "postings.parquet")
     )
     for field in index.PACKED_FIELDS:
-        assert np.array_equal(getattr(a.tier2, field), getattr(b.tier2, field))
+        assert np.array_equal(getattr(a.tier1, field), getattr(b.tier1, field))
 
 
 def test_targets_fasta_without_groups_makes_a_unit_per_target(tmp_path: Path) -> None:

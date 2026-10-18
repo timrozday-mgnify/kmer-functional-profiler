@@ -88,7 +88,7 @@ def predict_cost(
     k-mers are kept among the ``n_min`` more often than at random. Table bytes assume one key
     per posting (an upper bound: shared k-mers share keys) and ``sets`` distinct one-value
     sets per key; the build stores each (unit, ``p_in`` level) set once, so ``sets`` < 1 is
-    measured on built subsets (``tier2_sets / postings``).
+    measured on built subsets (``tier1_sets / postings``).
     """
     candidates = pl.col("t_g") * pl.col("n_kmers") * keep
     best = pl.min_horizontal(candidates, params.n_min)
@@ -119,7 +119,7 @@ def predict_cost(
     )
     max_value = (int(row["with_postings"]) << PIN_BITS) | (2**PIN_BITS - 1)
     n2, n_dense = row["postings"], row["dense"]
-    tier2 = packed_bytes(n2, sets * n2, sets * n2, max_value, params.fp_bits)
+    tier1 = packed_bytes(n2, sets * n2, sets * n2, max_value, params.fp_bits)
     dense = (
         packed_bytes(n_dense, sets * n_dense, sets * n_dense, max_value, params.fp_bits)
         if params.t_dense > 0
@@ -127,7 +127,7 @@ def predict_cost(
     )
     return {
         **row,
-        "tier2_bytes": tier2,
+        "tier1_bytes": tier1,
         "dense_bytes": dense,
-        "tier2_bytes_per_posting": tier2 / max(row["postings"], 1),
+        "tier1_bytes_per_posting": tier1 / max(row["postings"], 1),
     }

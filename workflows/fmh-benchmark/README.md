@@ -56,7 +56,7 @@ SCORE, SUMMARY   purity, completeness, completeness of the 25% least-covered tru
                  kmers_wta, kmers_ufirst after winner-take-all, uniqueness-first)
                  and --min_hits value; abundance of the detected KOs against truth depth
                  (spearman_tp, l1) -> summary.tsv (mean, sd),
-                 scores.tsv; profiles/, kmers/ (tier-2 hits per KO and k-mer) and truth/ keep
+                 scores.tsv; profiles/, kmers/ (tier-1 hits per KO and k-mer) and truth/ keep
                  the per-sample tables
 ```
 
@@ -213,7 +213,7 @@ the share of groups whose interval holds the members' true total. Also for `abun
 `flag_tp` / `flag_fp` the share of each below 0.5.
 
 `detected.tsv` has one row per KO gather keeps per sample and index: `tp`, its counts,
-`present_prob`, `own_evidence`, `ambiguity_group`, and over its tier-2 hit k-mers the
+`present_prob`, `own_evidence`, `ambiguity_group`, and over its tier-1 hit k-mers the
 median `holders` (index KOs holding the k-mer), `hits_max` (most hits on one k-mer) and
 `in_genome` (share present in the six-frame translation of the sample genomes; null for
 `fmh_compat`, which hashes with sourmash). A false positive's k-mers that are in the
@@ -339,7 +339,7 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
 
 | Run | Arms | Profiles (10 seeds) |
 | --- | --- | --- |
-| `floor` | MGnify90 level, one 1-in-100 subset, one DIAMOND truth: `sparse` (k 11, *t_base* 1/1000, *n_min* 8); `dense02` (+ *t_dense* 0.02); `tbase01`/`02`/`05` (raised density floor *t_base* 0.01/0.02/0.05); `tbase02_all` (*t_base* 0.02 and every candidate up to the current *t_g*: `dense02`'s k-mers in tier 2). Plain and edges20. Once per read model and depth: NovaSeq, MiSeq, error-free, 1.65 M and 26.4 M reads | 6 indexes × 2 arms × 10, × 5 runs |
+| `floor` | MGnify90 level, one 1-in-100 subset, one DIAMOND truth: `sparse` (k 11, *t_base* 1/1000, *n_min* 8); `dense02` (+ *t_dense* 0.02); `tbase01`/`02`/`05` (raised density floor *t_base* 0.01/0.02/0.05); `tbase02_all` (*t_base* 0.02 and every candidate up to the current *t_g*: `dense02`'s k-mers in tier 1). Plain and edges20. Once per read model and depth: NovaSeq, MiSeq, error-free, 1.65 M and 26.4 M reads | 6 indexes × 2 arms × 10, × 5 runs |
 | `tiers` | As `floor`, NovaSeq only, plain frames, `min_hits` 1–3: release-tier candidates `sparse`, `tbase01`, `slim` (*t_base* 0.01, 0.001 for singletons: `--t-base-singleton`), `tbase02_all`, `tbase02_n16` (*t_base* 0.02, the best 16 of the same candidates), `tbase05_all`, `tbase10_all` (plan, phase 7, step 21) | 7 indexes × 10 |
 | `standard` | As `tiers`, `min_hits` 1–4: standard-tier candidates at ~120 GB compact: `tbase02_n16`, `tbase015_all` (*t_base* 0.015, every candidate up to `tbase02_all`'s *t_g*), `tbase02_all16` (*t_base* 0.02, every candidate up to half that *t_g*), against `sparse` and `tbase02_all` (plan, phase 7, step 28) | 5 indexes × 10 |
 | `frames` | As `floor`, `min_hits` 1–4, on `slim`, `tbase02_all`, `tbase05_all`: frames stop-free, edges *m* = 20/30, all; scored also by gene length (`completeness_90_len*`, `abund_err_len*`). Once per read model | 3 indexes × 4 arms × 10 |
@@ -353,7 +353,7 @@ nextflow run workflows/mgnify-subset -profile slurm --query true --index false \
 
 **Raised floor against the dense tier** (`floor`, and the floor/dense pairs of `index`,
 `reads`, `host`): *t_base* is a density floor, since every unit keeps all its k-mers with
-hash ≤ *t_base*. `tbase02_all` holds `dense02`'s k-mers in tier 2, so it measures where they
+hash ≤ *t_base*. `tbase02_all` holds `dense02`'s k-mers in tier 1, so it measures where they
 sit (pass 1, so detection too, against pass 2 for detected units only); `tbase02` measures
 whether the plain floor is enough. Read `aai_summary.tsv` and `calibration/*_scores.tsv`
 (`aai_bias_<lo>`, `aai_cover_<lo>`, `aai_spearman`, `aai_n`, `completeness_90`,

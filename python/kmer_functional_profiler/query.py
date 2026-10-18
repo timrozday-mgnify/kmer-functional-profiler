@@ -1,7 +1,7 @@
 """Query (phase 3 prototype): naive hit counts and containment per unit.
 
 Reads are streamed through the Rust kernel at the index's ``t_max``; every sampled hash
-is looked up in tier 2 and counts for each unit in its set whose own threshold it passes
+is looked up in tier 1 and counts for each unit in its set whose own threshold it passes
 (``hash <= max_hash_g``), which also discards most fingerprint false hits. No query
 sketch is stored: only per-(unit, hash) counts are kept. Indexes imported from sourmash
 signatures (``meta["hash"] == "sourmash"``) hash reads with sourmash instead; ``frames``
@@ -101,6 +101,92 @@ def anon_rss() -> int | None:
 
 
 ANON_SAMPLE_S: Final = 0.05  # anonymous RSS sampling interval while a stage runs
+CGROUP_ROOT: Final = Path("/sys/fs/cgroup")
+# cgroup memory.stat keys (v2, then v1) for the charge's parts: anonymous, file pages (page
+# cache, including mapped index files), mapped file pages, shmem (tmpfs, e.g. a RAM $TMPDIR)
+CGROUP_STAT: Final = {
+    "anon": ("anon", "total_rss"),
+    "file": ("file", "total_cache"),
+    "mapped": ("file_mapped", "total_mapped_file"),
+    "shmem": ("shmem", "total_shmem"),
+}
+
+
+def memory_cgroup(proc: Path = Path("/proc/self/cgroup"), root: Path = CGROUP_ROOT) -> Path | None:
+    """The memory cgroup whose limit applies to this process (Linux, v2 or v1): the nearest
+    of its own cgroup and their parents with a limit set (Slurm's job or step cgroup), else
+    its own. None without cgroup memory accounting (macOS, containers without it)."""
+    try:
+        lines = proc.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        _, controllers, rel = line.split(":", 2)
+        v2 = controllers == ""
+        if not v2 and "memory" not in controllers.split(","):
+            continue
+        base = root if v2 else root / "memory"
+        own = base / rel.lstrip("/")
+        limit, usage = (
+            ("memory.max", "memory.current")
+            if v2
+            else ("memory.limit_in_bytes", "memory.usage_in_bytes")
+        )
+        if not (own / usage).exists():
+            continue
+        for d in (own, *own.parents):
+            if not d.is_relative_to(base):
+                break
+            try:
+                text = (d / limit).read_text().strip()
+            except OSError:
+                continue
+            if text != "max" and int(text) < 2**60:  # v1 writes "no limit" as ~2**63
+                return d
+        return own
+    return None
+
+
+def cgroup_memory(cgroup: Path) -> dict[str, int]:
+    """The cgroup's memory charge now (what Slurm's limit is checked against), its kernel
+    high-water mark where the kernel keeps one, its limit, its OOM kills and
+    :data:`CGROUP_STAT`'s parts, in bytes; empty if unreadable."""
+    v2 = (cgroup / "memory.current").exists()
+    files = (
+        {"cgroup": "memory.current", "cgroup_peak": "memory.peak", "cgroup_limit": "memory.max"}
+        if v2
+        else {
+            "cgroup": "memory.usage_in_bytes",
+            "cgroup_peak": "memory.max_usage_in_bytes",
+            "cgroup_limit": "memory.limit_in_bytes",
+        }
+    )
+    out = {}
+    for key, name in files.items():
+        try:
+            text = (cgroup / name).read_text().split()[0]
+        except (OSError, IndexError):
+            continue
+        if text != "max" and int(text) < 2**60:  # v1 writes "no limit" as ~2**63
+            out[key] = int(text)
+    # processes the kernel's OOM killer killed in the cgroup (v2 memory.events; v1
+    # memory.oom_control from Linux 4.13)
+    try:
+        events = (cgroup / ("memory.events" if v2 else "memory.oom_control")).read_text()
+        kills = dict(line.split() for line in events.splitlines())
+        if "oom_kill" in kills:
+            out["cgroup_oom_kill"] = int(kills["oom_kill"])
+    except (OSError, ValueError):
+        pass
+    try:
+        stat = dict(line.split() for line in (cgroup / "memory.stat").read_text().splitlines())
+    except (OSError, ValueError):
+        return out
+    for part, keys in CGROUP_STAT.items():
+        key = keys[0] if v2 else keys[1]
+        if key in stat:
+            out[f"cgroup_{part}"] = int(stat[key])
+    return out
 
 
 class Timer:
@@ -111,6 +197,14 @@ class Timer:
     It counts resident pages of memory-mapped files too, so where the OS reports it (Linux,
     macOS) ``peak_anon`` is the same high-water mark for anonymous memory only, sampled every
     ``ANON_SAMPLE_S`` while a stage runs (the kernel keeps no anonymous peak).
+
+    Under a memory cgroup (Linux; :func:`memory_cgroup`, e.g. a Slurm job), each stage also
+    keeps ``peak_cgroup``, the sampled high-water mark of the cgroup's charge, which is what
+    Slurm's memory limit kills on: anonymous memory plus page cache, mapped index pages
+    included, plus shmem (a ``$TMPDIR`` in RAM). ``peak_cgroup_{anon,file,mapped,shmem}``
+    are its parts' own sampled peaks, ``cgroup_peak`` the kernel's high-water mark at the
+    stage's end where it keeps one (v1, v2 from Linux 5.19; it counts the whole cgroup's
+    life, other processes of the job included) and ``cgroup_limit`` the limit.
 
     With ``path``, the stats are rewritten there after every stage, with ``running`` set to
     the stage in progress, so a process killed mid-query (out of memory) leaves the stages
@@ -124,15 +218,28 @@ class Timer:
         self.path, self.log, self.running = path, log, ""
         self.start = time.perf_counter()
         self.peak_anon = anon_rss()
+        self.cgroup = memory_cgroup()
+        self.peak_cgroup: dict[str, int] = {}
+        self._update_cgroup()
 
     def _sample_anon(self, stop: threading.Event) -> None:
         while not stop.wait(ANON_SAMPLE_S):
             self._update_anon()
+            self._update_cgroup()
 
     def _update_anon(self) -> None:
         now = anon_rss()
         if now is not None and self.peak_anon is not None:
             self.peak_anon = max(self.peak_anon, now)
+
+    def _update_cgroup(self) -> None:
+        if self.cgroup is None:
+            return
+        for key, value in cgroup_memory(self.cgroup).items():
+            if key in ("cgroup_peak", "cgroup_limit", "cgroup_oom_kill"):  # read at the end
+                continue
+            name = "peak_" + key
+            self.peak_cgroup[name] = max(self.peak_cgroup.get(name, 0), value)
 
     def _log(self, event: str, stage: str) -> None:
         if self.log:
@@ -157,7 +264,8 @@ class Timer:
         self._log("start", stage)
         self.write()
         stop = threading.Event()
-        if self.peak_anon is not None and not outer:  # one sampler, for the outermost stage
+        sampled = self.peak_anon is not None or self.cgroup is not None
+        if sampled and not outer:  # one sampler, for the outermost stage
             threading.Thread(target=self._sample_anon, args=(stop,), daemon=True).start()
         wall, cpu = time.perf_counter(), time.process_time()
         try:
@@ -165,12 +273,17 @@ class Timer:
         finally:
             stop.set()
             self._update_anon()
+            self._update_cgroup()
             s = self.stages.setdefault(stage, {"wall_s": 0.0, "cpu_s": 0.0})
             s["wall_s"] += time.perf_counter() - wall
             s["cpu_s"] += time.process_time() - cpu
             s["peak_rss"] = peak_rss()
             if self.peak_anon is not None:
                 s["peak_anon"] = self.peak_anon
+            s |= self.peak_cgroup
+            if self.cgroup is not None:
+                now = cgroup_memory(self.cgroup)
+                s |= {k: now[k] for k in ("cgroup_peak", "cgroup_limit") if k in now}
             self.running = outer
             self._log("end", stage)
             self.write()
@@ -707,9 +820,9 @@ class _Joint:
         return max(int(getattr(i, tier).max_hash) for i in self.indexes)
 
     def hits(self, tier: str, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
-        """:func:`unit_hits` in every index's ``tier`` ("tier2" or "dense"), units offset;
+        """:func:`unit_hits` in every index's ``tier`` ("tier1" or "dense"), units offset;
         ``holders`` counts the units holding the k-mer over all indexes."""
-        column = "max_hash_g" if tier == "tier2" else "max_hash_dense"
+        column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
         if len(self.indexes) == 1:
             index = self.indexes[0]
             return unit_hits(getattr(index, tier), index.units[column], hashes, reads)
@@ -2083,7 +2196,7 @@ def profile(
     gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
-    present rather than hit by background, from the tier-2 k-mers gather gave it; units
+    present rather than hit by background, from the tier-1 k-mers gather gave it; units
     gather drops get 0.
 
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
@@ -2091,10 +2204,10 @@ def profile(
     are kept from the first pass over the reads, or with ``low_memory`` rebuilt by a second
     pass for the detected units' k-mers only (same result; a read pass more, the rows of
     all hit units never held). ``kmers_out`` writes
-    the tier-2 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
+    the tier-1 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
 
     Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
-    unit from its own tier-2 hits (:func:`aai_naive`), and ``aai`` on the units gather keeps
+    unit from its own tier-1 hits (:func:`aai_naive`), and ``aai`` on the units gather keeps
     whenever ``_zi`` is fitted (``with_aai`` fits it), from the hit k-mers after the EM split
     (``aai_kmers``), with a closed-form 95% interval ``aai_lo``/``_hi`` (:func:`aai_fit`; no
     draws needed). Both invert the survival model of the index's ``aai_model.json``
@@ -2143,7 +2256,7 @@ def profile(
     sources: list[_core.FastxHits] = []  # the read streams, for their base counts
     census_max = (
         min(
-            min(_core.max_hash(base_rate(_index_params(i.meta))), int(i.tier2.max_hash))
+            min(_core.max_hash(base_rate(_index_params(i.meta))), int(i.tier1.max_hash))
             for i in joint.indexes
         )
         if summary is not None
@@ -2199,7 +2312,7 @@ def profile(
         also a hit's rows over its holders, so these are the first pass's rows for them."""
         wanted = np.sort(kmers).astype(np.uint64)
         parts = [pl.DataFrame(schema={"hash": pl.UInt64, "read": pl.UInt64, "n": pl.UInt32})]
-        for b in stream(joint.max_hash("tier2")):
+        for b in stream(joint.max_hash("tier1")):
             at = np.minimum(np.searchsorted(wanted, b["hash"]), max(len(wanted) - 1, 0))
             keep = wanted[at] == b["hash"] if len(wanted) else np.zeros(len(at), dtype=bool)
             found = pl.DataFrame({"hash": b["hash"][keep], "read": b["read"][keep]})
@@ -2223,11 +2336,11 @@ def profile(
     keep_reads = draws > 0 and not joint.dense and not low_memory
     sampled = hit_kmers = hit_rows = 0
     per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
-    reads = iter(stream(joint.max_hash("tier2")))
+    reads = iter(stream(joint.max_hash("tier1")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
     while b is not None:
         with timer("lookup"):
-            hits = joint.hits("tier2", b["hash"], b["read"])
+            hits = joint.hits("tier1", b["hash"], b["read"])
         with timer("aggregate"):
             pairs.add(hits.group_by("unit", "hash").agg(hits=pl.len(), **first))
             reads_summed.add(
@@ -2244,7 +2357,7 @@ def profile(
                 got = census_counts(b, hits["hash"].unique().to_numpy(), census_max, promiscuous)
                 census = [census[0] + got[0], census[1] + got[1]]
         sampled += len(b["hash"])
-        subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier2") // DISTINCT_SAMPLE])
+        subsample.append(b["hash"][b["hash"] <= joint.max_hash("tier1") // DISTINCT_SAMPLE])
         hit_rows += hits.height
         hit_kmers += round((1 / hits["holders"]).sum()) if hits.height else 0  # rows per hit
         if record and hits.height:  # occurrences per pair, holders collapsed
@@ -2360,7 +2473,7 @@ def profile(
         plain = plain.with_columns(hits_em=plain["coverage_em"] * m_g[plain["unit"].to_numpy()])
     fits = [plain]
     # Clumping: a read covering a unit hits ~ Poisson(mu) of its kept k-mers, which inflates
-    # the variance of hit counts by 1 + mu. mu from tier-2 hits per hitting read (a
+    # the variance of hit counts by 1 + mu. mu from tier-1 hits per hitting read (a
     # zero-truncated mean).
     ratio = (
         kmer_hits.group_by("unit")
@@ -2368,8 +2481,8 @@ def profile(
         .join(unit_reads, on="unit")
         .select("unit", per_read=pl.col("hits") / pl.col("reads"))
     )
-    mu_tier2 = np.zeros(len(m_g))
-    mu_tier2[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
+    mu_tier1 = np.zeros(len(m_g))
+    mu_tier1[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
     if True:  # coverage_zi is the shipped coverage (step 35): the zero-inflated fit always runs
         with timer("fit_zi"):
             zi_report: dict[str, float] = {}  # its em_* (step 40: 9,059 s block-wise, unreported)
@@ -2394,7 +2507,7 @@ def profile(
             on="unit",
         )
         # scaled to the fitted tier's k-mers
-        mu = mu_tier2 * _div(m_g.astype(np.float64), hit_info["m_g"].to_numpy().astype(np.float64))
+        mu = mu_tier1 * _div(m_g.astype(np.float64), hit_info["m_g"].to_numpy().astype(np.float64))
         estimate = aai_columns(
             zi["coverage"].to_numpy(),
             zi["present"].to_numpy(),
@@ -2452,18 +2565,18 @@ def profile(
             kmer_hits.group_by("unit").agg(hits=pl.col("hits").sum(), kmers=pl.len()).sort("unit")
         )
         at = per_unit["unit"].to_numpy()
-        tier2 = hit_info["m_g"].to_numpy().astype(np.float64)
+        tier1 = hit_info["m_g"].to_numpy().astype(np.float64)
         naive = aai_naive(
             per_unit["hits"].to_numpy(),
             per_unit["kmers"].to_numpy(),
             hit_info["pin_sum"].to_numpy()[at],
-            np.clip(_div(tier2, hit_info["n_kmers"].to_numpy().astype(np.float64)), 0, 1)[at]
+            np.clip(_div(tier1, hit_info["n_kmers"].to_numpy().astype(np.float64)), 0, 1)[at]
             if "n_kmers" in hit_info.columns
             else np.ones(len(at)),
             unit_windows(hit_info, params.k)[at],
             model,
             min_aai_kmers,
-            1 + mu_tier2[at],
+            1 + mu_tier1[at],
             unit_members(hit_info)[at],
         ).with_columns(unit=per_unit["unit"])
     unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
@@ -2550,7 +2663,7 @@ def profile(
             2 if r2 is not None else 1,
             sources[0].base_stats if sources else None,
             None if census_max is None else (census[0], census[1]),
-            joint.max_hash("tier2") / 2**64,
+            joint.max_hash("tier1") / 2**64,
             params.alphabet,
         )
     if min_aai > 0:

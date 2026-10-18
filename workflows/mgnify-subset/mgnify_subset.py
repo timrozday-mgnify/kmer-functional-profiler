@@ -327,17 +327,27 @@ def ladder(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
 
 def query_cost(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
     rows = []
-    for path in map(Path, args.paths):
-        index, pairs, draws, *start = path.name.removesuffix(".json").split(".")
-        stats = json.loads(path.read_text())
+    paths = [Path(p) for p in args.paths]
+    ends = {p.name.removesuffix(".end.json"): p for p in paths if p.name.endswith(".end.json")}
+    for path in (p for p in paths if not p.name.endswith(".end.json")):
+        index, pairs, draws, *rest = path.name.removesuffix(".json").split(".")
+        stats = json.loads(path.read_text()) if path.stat().st_size else {}
+        tags = {t[0]: int(t[1:]) for t in rest}  # s<seed>, m<GB> (a memory ladder's limit)
         row = {"index": index, "pairs": int(pairs), "draws": int(draws)}
-        row["em_start"] = int(start[0][1:]) if start else 0
+        row |= {"em_start": tags.get("s", 0), "memory_gb": tags.get("m")}
         # scalars only: hits_per_pair (phase 13, step 0) is a histogram, left in the JSON
-        row |= {k: v for k, v in stats["counts"].items() if not isinstance(v, list | dict)}
-        for stage, cost in stats["stages"].items():
+        row["running"] = stats.get("running", "")  # the stage a killed query died in
+        end = ends.get(path.name.removesuffix(".json"))
+        if end is not None and end.stat().st_size:  # exit status, the cgroup at the end
+            row |= {f"end_{k}": v for k, v in json.loads(end.read_text()).items()}
+        counts = stats.get("counts", {})
+        row |= {k: v for k, v in counts.items() if not isinstance(v, list | dict)}
+        for stage, cost in stats.get("stages", {}).items():
             row |= {f"{stage}_{k}": v for k, v in cost.items()}
         rows.append(row)
-    table = pl.DataFrame(rows, infer_schema_length=None).sort("index", "pairs", "draws", "em_start")
+    table = pl.DataFrame(rows, infer_schema_length=None).sort(
+        "index", "pairs", "draws", "em_start", "memory_gb", nulls_last=True
+    )
     for c in {"em_max_change", "zi_em_max_change"} & set(table.columns):  # tol 1e-8: not 0.000
         table = table.with_columns(
             pl.col(c).map_elements(lambda x: f"{x:.2e}", return_dtype=pl.String)

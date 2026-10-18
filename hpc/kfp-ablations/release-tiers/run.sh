@@ -24,7 +24,7 @@ for tier in "slim:--t-base 0.01 --t-base-singleton 0.001 --n-min 8 --max-groups 
             "large:--t-base 0.05 --n-min 32 --oversample 1 --max-groups 16:256"; do
     IFS=: read -r name args concat_gb <<< "$tier"
     # a config file, not --index_args: Nextflow reads a value starting with '--' as an option.
-    # CONCAT holds tier 2 (sparse at 77 GB: ~31 GB) and BLOOM the candidate filter (~14 GB
+    # CONCAT holds tier 1 (sparse at 77 GB: ~31 GB) and BLOOM the candidate filter (~14 GB
     # sparse), both larger at higher floors: give them memory up front, not through retries.
     # PRESENCE, GROUPS, PACK_RANGE (32 GB) and UNITS (128 GB) retried on the large tier.
     cat > "$name.config" <<CFG
