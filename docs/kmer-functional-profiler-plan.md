@@ -2367,7 +2367,24 @@ Planned 2026-10-15. To be developed on `dev-pileups` (from `main`), one feature 
   - *"unit ids not in the index":* the profile came from an earlier build of `results-standard/index` (most unit ids mapped to another `cluster_rep`; 591,721 past the index's 1.2 × 10⁹ rows). Nextflow's cache key for a directory is its path, size and mtime, which an in-place rebuild keeps, so `-resume` reused the old `QUERY`. `QUERY` and `REFERENCE` now take the index's `meta.json` as an input of its own (a rebuild rewrites it); `fetch` names the missing ids.
   - *Out of memory (exit 137):* `REFERENCE` took every other hit unit of the targets' components as a neighbour, and a real sample's giant component holds most of its ~19.5 M hit units. `--neighbours` (default 5) now caps them per target in a component, the most-hit first (`hits`; ranking by k-mers shared with a target would need the hit table's links). `pileup-cost` asks `QUERY` and `CALL` for 256 GB per attempt, capped at 512 GB; `QUERY`'s memory is phase 6, step 40.
   - *Decoys kept:* `pileup.py` drops reads whose best alignment is a reversed decoy and `refine.py`'s EM has a decoy source per component; one reversed copy per target is cheap next to the neighbours.
-  - *Next for `CALL`:* it reads the whole profile twice (`refine.py`, `pileup.py`'s `_units`; ~100 columns over every hit unit) for a handful of columns, and holds every alignment's aligned columns for steps 8–9 (spill per component if `pileup-cost` does not fit).
+  - *Next for `CALL`:* see the plan amendment below.
+
+* **Phase 13, plan amendment (2026-10-18, the user's request): `CALL`'s memory.** After phase 6, step 40 (query memory) is sorted and `pileup-cost` has been re-run with the neighbour cap; not before. In `pileup-cost`, `CALL` (hadza10M) was killed at 128 GB. From reading the code (not measured), it holds, all at once:
+  - the whole profile, read twice (`refine.py`'s `refine`, `pileup.py`'s `_units`): every hit unit (19.5 M+ rows), ~100 columns with types inferred over the whole file, for ~6 columns used;
+  - the target columns from `score_batch`, every batch kept to the end: one row per (target alignment, aligned column), ~17 B (hit, col, `qpos` as i64, residue byte), 40–50 per mate, then copied again in `refine` (`sites`, `target_cols` with an i64 position, numpy arrays). This term grows with read depth;
+  - the alignments table, one row per DIAMOND alignment with the read name as a string (many per mate under `--top 10` and 3 members per unit);
+  - step 6b's recruited reads' bases (both mates of every pair with a target alignment) and three rows per aligned residue, each a one-character string;
+  - the summed pileup, bounded by the reference (not a problem).
+
+  Options, cheapest first:
+  1. *Measure:* wrap `call`'s stages (read, batches, `refine`, nucleotide, write) in the query's `Timer`, so `CALL` writes per-stage time, RSS, anonymous and cgroup memory (phase 6, step 40) to a `stats.json`. A few lines; says which of the rest matters.
+  2. *Profile columns only:* read `unit`, `present_prob`, `coverage_zi`, `len_mean`, `n_members` and `aai*`/`ani*`. Output unchanged; plausibly 10–20 GB at pooled100M.
+  3. *Compact types:* `qpos` as i32 (strand bit included), read names mapped to integer pair ids at parse time (names kept for `assignments.parquet` only), step 6b's alleles as bytes. Output unchanged; ~30–50% off the alignment, column and step-6b rows.
+  4. *Fewer alignments:* one sequence per neighbour unit (neighbours attract reads, they carry no pileup), a tighter DIAMOND `--top` or `--max-target-seqs`. Memory falls with the alignments dropped, but sibling capture may too: measured in step 3b's sensitivity ablation on `spike-protein`, not switched on alone.
+  5. *Spill and stream the target columns:* each batch's rows written to Parquet; what steps 8–9 need from them per round (the weighted pileup, the mismatch deltas) are sums, so `refine` keeps only the alignments table and the reference arrays and reads the columns in chunks; step 6b the same. Memory: one chunk plus the alignments, at any depth. Output unchanged; a refactor of `refine` and `nucleotide`.
+  6. *EM by alignment component:* the read pairs linked by the sources they align to form components much smaller than kfp's (whose giant component still holds most targets after the neighbour cap, so the code comment's "per component" saves little); `refine` fits them a batch at a time. Results unchanged; overlaps 5, which is the more general fix.
+
+  *Recommendation:* 1 and 2 first (small, safe; they show whether `CALL` still needs 256 GB on the next `pileup-cost`), then 3 if it is still large, and 5 only if the target columns still dominate. 4 waits for step 3b, since it trades accuracy.
 
 ### Phase 14
 
