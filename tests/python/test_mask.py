@@ -39,7 +39,7 @@ def test_windows_cover_every_stretch(tmp_path: Path) -> None:
     assert not any(seqs[0][-3:] + seqs[1] in w for w in got)  # records are never joined
 
 
-@pytest.fixture(scope="module", params=[0.0, 1.0], ids=["tier2", "dense"])
+@pytest.fixture(scope="module", params=[0.0, 1.0], ids=["tier1", "dense"])
 def masked(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> tuple[Path, Path]:

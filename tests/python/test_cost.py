@@ -38,7 +38,7 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
 
     # Random k-mers are rarely shared, so keep = 1 and one key per posting hold; value sets
     # repeat within a unit, which the build measures.
-    sets = stats["tier2_sets"] / stats["postings"]  # type: ignore[operator]
+    sets = stats["tier1_sets"] / stats["postings"]  # type: ignore[operator]
     cost = predict_cost(clusters.lazy(), params, sets=sets)
     assert cost["units"] == stats["n_clusters"] and cost["floored"] == stats["n_floored"]
     assert cost["t_max"] == stats["t_max"]
@@ -51,7 +51,7 @@ def test_prediction_matches_build(tmp_path: Path) -> None:
     # hashes), so postings, and the bytes they set, are bounded above.
     for predicted, actual in (
         (cost["postings"], stats["postings"]),
-        (cost["tier2_bytes"], stats["tier2_bytes"]),
+        (cost["tier1_bytes"], stats["tier1_bytes"]),
     ):
         assert 1 <= predicted / actual < 1.1, (predicted, actual)  # type: ignore[operator]
     # Dense sets repeat at a different rate, so its bytes are only bounded.

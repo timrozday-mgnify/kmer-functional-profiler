@@ -84,7 +84,7 @@ def test_partitioned_build_equals_single(tmp_path: Path, t_dense: float) -> None
     )
     assert single["promiscuous_dropped"] > 0  # type: ignore[operator]
     assert single["promiscuous_base"] > 0  # type: ignore[operator]
-    if t_dense:  # the dense tier holds more than tier 2, and the reduce must count them
+    if t_dense:  # the dense tier holds more than tier 1, and the reduce must count them
         assert single["dense_postings"] > 2 * single["postings"]  # type: ignore[operator]
 
     d = tmp_path / "parts"
@@ -128,6 +128,6 @@ def test_partitioned_build_equals_single(tmp_path: Path, t_dense: float) -> None
     for npy in (tmp_path / "single").glob("*.npy"):
         assert np.array_equal(np.load(npy), np.load(tmp_path / "parted" / npy.name)), npy.name
     meta = [json.loads((tmp_path / x / "meta.json").read_text()) for x in ("single", "parted")]
-    for table in ("tier2", "dense"):
+    for table in ("tier1", "dense"):
         assert meta[0].get(table) == meta[1].get(table), table
     assert ("dense" in meta[1]) == (t_dense > 0)

@@ -233,7 +233,7 @@ def query(
         int, typer.Option(help="Posterior draws for 95% intervals and ambiguity groups")
     ] = 0,
     kmers: Annotated[
-        Path | None, typer.Option(help="Parquet of tier-2 hits per unit and k-mer (diagnostics)")
+        Path | None, typer.Option(help="Parquet of tier-1 hits per unit and k-mer (diagnostics)")
     ] = None,
     stats: Annotated[
         Path | None,

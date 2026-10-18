@@ -1,11 +1,11 @@
 """Mask sidecar (Additional references, step 2): an index's k-mers found in a host genome.
 
 ``build_mask`` six-frame translates a genome (FASTA, plain or gzip) in overlapping windows
-through the read kernel, keeps the hashes the index holds (tier 2 or dense), and writes
+through the read kernel, keeps the hashes the index holds (tier 1 or dense), and writes
 
 - ``mask.npy``: those hashes, sorted; the query drops sampled hashes in it before lookup;
 - ``mask_units.parquet`` (and ``mask_units_dense.parquet``): per unit of the index with
-  masked postings in tier 2 (dense), their count, per-``p_in``-level counts and ``p_in`` sum,
+  masked postings in tier 1 (dense), their count, per-``p_in``-level counts and ``p_in`` sum,
   which the query subtracts from ``m_g``, ``pin_hist``, ``pin_sum`` (``m_dense``, ...) so
   expected counts match the k-mers that can still be hit;
 - ``mask.json``: the genome's path and SHA-256, the index's ``meta.json`` SHA-256, counts.
@@ -32,7 +32,7 @@ from kmer_functional_profiler.query import unit_hits
 
 WINDOW: Final = 10_000  # nt per window
 WINDOWS_PER_BATCH: Final = 2_000  # windows hashed per kernel call (~20 Mbp)
-HOST_LIKE: Final = 0.5  # masked fraction of a unit's tier-2 k-mers above which it is host_like
+HOST_LIKE: Final = 0.5  # masked fraction of a unit's tier-1 k-mers above which it is host_like
 LEVELS: Final = 2**PIN_BITS
 
 
@@ -78,7 +78,7 @@ def _batches(path: Path, k: int, alphabet: str) -> Iterator[list[bytes]]:
 def _decrements(index: Index, tier: str, hashes: np.ndarray) -> pl.DataFrame:
     """Per unit: masked postings of ``tier``, per p_in level and their p_in sum."""
     table = getattr(index, tier)
-    column = "max_hash_g" if tier == "tier2" else "max_hash_dense"
+    column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
     hashes = hashes[hashes <= np.uint64(table.max_hash)]
     hits = unit_hits(table, index.units[column], hashes, np.zeros(len(hashes), np.uint64))
     unit = hits["unit"].to_numpy().astype(np.int64)
@@ -103,7 +103,7 @@ def build_mask(genome: str | Path, index_dir: str | Path, out: str | Path) -> di
     params = index.meta["params"]
     if index.meta.get("hash") == "sourmash":
         raise ValueError("masks need the index's own hash (not a sourmash import)")
-    tiers = ["tier2"] + (["dense"] if index.dense is not None else [])
+    tiers = ["tier1"] + (["dense"] if index.dense is not None else [])
     max_hash = max(int(getattr(index, t).max_hash) for t in tiers)
     found, sampled = [], 0
     for batch in _batches(genome, params["k"], params["alphabet"]):
@@ -121,7 +121,7 @@ def build_mask(genome: str | Path, index_dir: str | Path, out: str | Path) -> di
     mask = np.unique(np.concatenate([np.empty(0, np.uint64), *found]))
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "mask.npy", mask)
-    units = _decrements(index, "tier2", mask)
+    units = _decrements(index, "tier1", mask)
     units.write_parquet(out / "mask_units.parquet")
     if index.dense is not None:
         _decrements(index, "dense", mask).write_parquet(out / "mask_units_dense.parquet")
@@ -165,7 +165,7 @@ class Mask:
 
     def adjust(self, rows: pl.DataFrame) -> pl.DataFrame:
         """``rows`` of the unit table (``unit``: the index's ids, sorted) less their masked
-        postings, with ``masked_fraction`` (of tier-2 k-mers) and ``host_like`` (above
+        postings, with ``masked_fraction`` (of tier-1 k-mers) and ``host_like`` (above
         ``HOST_LIKE``). Counts stay >= 1: a unit masked whole is hit only by fingerprint
         false hits."""
         unit = rows["unit"].to_numpy().astype(np.int64)

@@ -22,7 +22,7 @@ the query's census of known k-mers counts on; ``meta.json`` marks it with
 ``base_stratum_complete``). Promiscuous k-mers in the base stratum are known but posted
 nowhere, so their hashes are kept apart, sorted, in ``promiscuous.npy`` for the census to
 count as known. The query stays consistent because any subset of k-mers with hash <= ``t_g``
-may be kept. Tier 2 maps each posting hash to its set of (unit, quantised ``p_in``), stored
+may be kept. Tier 1 maps each posting hash to its set of (unit, quantised ``p_in``), stored
 as bucketed fingerprints (``PackedTable``) in ``.npy`` files. Only units with a posting can
 be hit, so only they get a row in ``units.parquet``, renumbered from 0 in ``cluster_rep``
 order, and each numeric column is also written as ``units.<column>.npy`` for the query to
@@ -30,7 +30,7 @@ memory-map; ``postings.parquet`` (every posting with its score) is written only 
 inspection.
 
 With ``t_dense`` > 0 a fourth pass keeps every unit's k-mers with hash <= max(``t_dense``,
-``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-2 set), minus
+``t_g``) (``max_hash_dense``, so each unit's dense set contains its tier-1 set), minus
 promiscuous ones, in a ``dense`` table of the same layout; ``m_dense`` counts them per unit.
 ``pin_hist`` (``pin_hist_dense``) counts each unit's kept (dense) k-mers per ``p_in`` level,
 and ``pin_sum`` (``pin_sum_dense``) sums their ``p_in``: how many of them an average member
@@ -60,7 +60,8 @@ from numpy.typing import NDArray
 from kmer_functional_profiler import _core
 
 U64_MAX: Final = 2**64 - 1
-PIN_BITS: Final = 4  # tier-2 values are unit << PIN_BITS | quantised p_in
+FORMAT: Final = 3  # index format: 3 names the postings table tier1 (format 2: tier2)
+PIN_BITS: Final = 4  # tier-1 values are unit << PIN_BITS | quantised p_in
 PACKED_FIELDS: Final = ("offsets", "fingerprints", "set_ids", "set_offsets", "set_values")
 KEYS_PER_BUCKET_BITS: Final = 2  # ~4 keys per offsets bucket
 SET_SEEDS: Final = (0x243F6A8885A308D3, 0x13198A2E03707344)  # two 64-bit set-content hashes
@@ -375,7 +376,7 @@ class PackedTable:
         """Memory-map a table written by ``save``, or read it into memory (``mmap=False``)."""
 
         def _load(f: str) -> np.ndarray:
-            # No MADV_RANDOM here (unlike unit columns): on a preloaded tier 2 it turned off
+            # No MADV_RANDOM here (unlike unit columns): on a preloaded tier 1 it turned off
             # fault-around, and lookup at 40 M pairs took 74 s, not 40 s (plan, phase 6, step 36).
             arr: np.ndarray = np.load(
                 directory / f"{name}.{f}.npy", mmap_mode="r" if mmap else None
@@ -515,7 +516,7 @@ class Index:
 
     meta: dict[str, Any]
     units: UnitTable
-    tier2: PackedTable
+    tier1: PackedTable
     dense: PackedTable | None = None
     aai_calibration: dict[str, Any] | None = None
     aai_model: dict[str, Any] | None = None
@@ -540,13 +541,20 @@ class Index:
             aai_model=json.loads(model.read_text()) if model.exists() else None,
             meta=meta,
             units=UnitTable(directory, mmap=mmap),
-            tier2=PackedTable.load(directory, "tier2", meta["tier2"], mmap=mmap),
+            tier1=PackedTable.load(directory, *tier1_name(meta), mmap=mmap),
             dense=(
                 PackedTable.load(directory, "dense", meta["dense"], mmap=mmap)
                 if "dense" in meta
                 else None
             ),
         )
+
+
+def tier1_name(meta: dict[str, Any]) -> tuple[str, dict[str, int]]:
+    """The postings table's file name and layout in ``meta.json``: ``tier1`` from format 3,
+    ``tier2`` before (format 2 called it tier 2, after the format-1 tier 1 it dropped)."""
+    name = "tier1" if meta.get("format", 1) >= FORMAT else "tier2"
+    return name, meta[name]
 
 
 def _smallest(max_value: int) -> np.dtype[np.unsignedinteger]:
@@ -940,7 +948,7 @@ def build_index(
     dense = None
     if params.t_dense > 0:
         # Pass 4: every unit's k-mers at max(t_dense, t_g), so the dense set of each unit
-        # contains its tier-2 set, with p_in, minus promiscuous ones.
+        # contains its tier-1 set, with p_in, minus promiscuous ones.
         units = units.with_columns(max_hash_dense=_max_hash_dense(params))
         dense_hash = int(units["max_hash_dense"].max())  # type: ignore[arg-type]
         dense = dense_rows(
@@ -1111,17 +1119,17 @@ def write_meta(
     stats: dict[str, object],
     hash_scheme: str = "kfp",
 ) -> dict[str, object]:
-    """Save the tables and ``meta.json``; ``stats`` gains the tier-2 sizes. Returns it."""
-    tier2 = tables["tier2"]
+    """Save the tables and ``meta.json``; ``stats`` gains the tier-1 sizes. Returns it."""
+    tier1 = tables["tier1"]
     stats = {
         **stats,
-        "tier2_keys": len(tier2.fingerprints),
-        "tier2_sets": len(tier2.set_offsets) - 1,
-        "tier2_bytes": tier2.nbytes(),
-        "tier2_bytes_per_hash": tier2.nbytes() / max(stats["distinct_hashes"], 1),  # type: ignore[call-overload]
+        "tier1_keys": len(tier1.fingerprints),
+        "tier1_sets": len(tier1.set_offsets) - 1,
+        "tier1_bytes": tier1.nbytes(),
+        "tier1_bytes_per_hash": tier1.nbytes() / max(stats["distinct_hashes"], 1),  # type: ignore[call-overload]
     }
     meta = {
-        "format": 2,
+        "format": FORMAT,
         "hash": hash_scheme,
         "molecule": molecule(params.alphabet),
         # Every unit's k-mers with hash <= base_rate are kept (the query's census relies on it).
@@ -1157,14 +1165,14 @@ def write_index(
     n_units = units.height
     units = unit_columns(units, postings)
 
-    tier2 = PackedTable.build(
+    tier1 = PackedTable.build(
         postings["hash"].to_numpy(),
         (postings["unit"].cast(pl.UInt64).to_numpy() << np.uint64(PIN_BITS))
         | postings["pin_q"].to_numpy(),
         t_max_hash,
         params.fp_bits,
     )
-    tables = {"tier2": tier2}
+    tables = {"tier1": tier1}
     if dense is not None:
         tables["dense"] = PackedTable.build(
             dense["hash"].to_numpy(),

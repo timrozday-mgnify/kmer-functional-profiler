@@ -10,7 +10,8 @@ Per sample:
 1. `QUERY`: `kmer-functional-profiler query --aai` against the index (built from
    `--targets` by `INDEX` if no `--index` is given).
 2. `REFERENCE`: `kfp-pileup reference`: units with `present_prob >= --min_present` as
-   targets, the other hit units of their components as neighbour decoys, the targets
+   targets, the other hit units of their components as neighbour decoys (at most
+   `--neighbours` per target in a component, the most-hit first), the targets
    reversed as null decoys; up to `--members` sequences per unit, from kfp's `fetch` (the
    index's `targets.parquet`, or `--store` members tables, e.g. the partitioned build's MERGE
    output).

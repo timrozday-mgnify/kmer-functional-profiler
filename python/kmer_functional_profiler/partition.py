@@ -7,9 +7,9 @@ exactly by a hash-partitioned reduce, with a Bloom filter of all candidate hashe
 the rows each bucket emits small. Units are keyed by ``cluster_rep`` until ``units``.
 
 With a dense tier (``t_dense`` > 0) a unit's candidates are its k-mers with hash <= its
-``max_hash_dense``, which contain its tier-2 candidates, so one reduce gives ``n_groups``
-for both tiers; ``postings`` keeps the tier-2 ones as before, and the dense rows go through
-``pack_range``, ``dedup`` and ``concat`` alongside tier 2 (files with a ``.dense`` infix).
+``max_hash_dense``, which contain its tier-1 candidates, so one reduce gives ``n_groups``
+for both tiers; ``postings`` keeps the tier-1 ones as before, and the dense rows go through
+``pack_range``, ``dedup`` and ``concat`` alongside tier 1 (files with a ``.dense`` infix).
 
 1. ``candidates`` (per bucket): pass 1, the unit table and the bucket's candidate hashes.
 2. ``bloom`` (once): a blocked Bloom filter (``_core.bloom_insert``) of every bucket's
@@ -21,11 +21,11 @@ for both tiers; ``postings`` keeps the tier-2 ones as before, and the dense rows
    drops the filter's false positives) and splits them by bucket.
 5. ``postings`` (per bucket): score, promiscuity cut and floor, as ``build_index``;
    the per-unit columns (``len_cv``, ``pin_hist``, ...) and Pfam labels.
-6. ``units`` (once): the unit table, numbered in ``cluster_rep`` order, and the tier-2
+6. ``units`` (once): the unit table, numbered in ``cluster_rep`` order, and the tier-1
    layout, with pack ranges cut at key boundaries.
 7. ``pack_range`` (per pack range): that range's postings -> keys and value sets.
 8. ``dedup`` (per set-hash range): every part's value sets in that range, deduplicated.
-9. ``concat`` (once): the parts and deduplicated sets -> tier 2 and ``meta.json``.
+9. ``concat`` (once): the parts and deduplicated sets -> tier 1 and ``meta.json``.
 
 The result equals ``build_index`` on the concatenated members.
 """
@@ -334,7 +334,7 @@ def units(
 ) -> None:
     """Stage 6: ``units.parquet``, ``unit_pfam.parquet`` (with ``pfam``),
     ``promiscuous.npy`` (the buckets' merged) and ``pack.json``
-    (tier-2 layout, pack range bounds, stats, and with a dense tier its layout and bounds
+    (tier-1 layout, pack range bounds, stats, and with a dense tier its layout and bounds
     under ``dense``) in ``out_dir``.
 
     Pack ranges are cut at the candidate-hash quantiles, rounded down to key boundaries so
@@ -448,7 +448,7 @@ def concat(
     out_dir: str | Path,
     params: IndexParams,
 ) -> dict[str, object]:
-    """Stage 9: pack range parts and set slices (each in range order) -> tier 2, the unit
+    """Stage 9: pack range parts and set slices (each in range order) -> tier 1, the unit
     tables and ``meta.json`` in ``out_dir``; returns the stats."""
     units_dir, out = Path(units_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -457,7 +457,7 @@ def concat(
     if sum(c["postings"] for c in counts) != meta["stats"]["postings"]:
         raise ValueError("pack ranges do not hold every posting")
     tables = {
-        "tier2": PackedTable.concat(
+        "tier1": PackedTable.concat(
             meta["layout"],
             [PackedPart.load(p) for p in part_prefixes],
             [SetSlice.load(p) for p in set_prefixes],

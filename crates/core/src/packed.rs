@@ -1,4 +1,4 @@
-//! Lookup in a packed tier-2 table (`PackedTable` in the Python index), read in place.
+//! Lookup in a packed tier-1 table (`PackedTable` in the Python index), read in place.
 //!
 //! A hash's key is `hash >> shift`: its top `bucket_bits` address `offsets` directly and
 //! its low `fp_bits` are the stored fingerprint. Bucket `b` holds the sorted fingerprints

@@ -46,7 +46,7 @@
   KOs against ``depth``: Spearman over true positives and L1 between relative abundances,
   and the calibration of posterior intervals where the profile has them.
 - ``detected``: one row per KO gather keeps (``kmers_unique`` >= 1), true or false, with
-  its evidence (``present_prob``, ``own_evidence``, ...) and its tier-2 hit k-mers summarised:
+  its evidence (``present_prob``, ``own_evidence``, ...) and its tier-1 hit k-mers summarised:
   median holders, most hits on one k-mer, and the share found in the sample genomes' six
   frames (``in_genome``; null for sourmash-hashed indexes). A false positive's k-mers that
   are in the genomes come from real sequence (another gene or KO); the rest from read errors.
@@ -905,7 +905,7 @@ def reestimate_aai(
     zero-inflated fit as the query would report them with survival model ``model`` and
     ``--min-aai-kmers`` ``min_kmers``, without rerunning it (offline reruns of archived
     profiles, plan, phase 7, step 23). ``pin_sum`` is present x m / ``copies_zi``; the
-    clumping is the query's, from tier-2 hits per read; m is ``m_dense`` with a dense tier.
+    clumping is the query's, from tier-1 hits per read; m is ``m_dense`` with a dense tier.
     Units without a fit (``copies_zi`` 0) get a null ``aai`` and ``aai_kmers`` 0."""
     m = profile["m_dense" if "m_dense" in profile.columns else "m_g"].to_numpy().astype(np.float64)
     present = profile["present_zi"].to_numpy()

@@ -126,7 +126,7 @@ def test_sampled_index_hits_respect_unit_thresholds(members: Path) -> None:
 
 
 def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
-    # A sparse tier 2 with a fully dense tier fits EM on the same k-mers as a dense index.
+    # A sparse tier 1 with a fully dense tier fits EM on the same k-mers as a dense index.
     both = build(members, t_base=0.2, n_min=0, t_dense=1.0, fp_bits=64)
     dense = build(members, t_base=1.0, fp_bits=64)
     assert both.dense is not None and dense.dense is None
@@ -1202,6 +1202,52 @@ def test_timer_keeps_the_sampled_anonymous_peak(monkeypatch: pytest.MonkeyPatch)
     with timer("stage"):
         pass
     assert "peak_anon" not in timer.stages["stage"]
+
+
+def test_cgroup_memory_reads_the_limited_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # v2: the task's cgroup has no limit, the job's above it has (Slurm), so that one is read
+    job = tmp_path / "v2" / "slurm" / "job_1"
+    task = job / "step_0" / "task_0"
+    task.mkdir(parents=True)
+    (job / "memory.max").write_text(f"{64 * 2**30}\n")
+    (task / "memory.max").write_text("max\n")
+    for d, current in ((job, 50), (task, 40)):
+        (d / "memory.current").write_text(f"{current}\n")
+    (job / "memory.peak").write_text("70\n")
+    (job / "memory.stat").write_text("anon 10\nfile 38\nfile_mapped 30\nshmem 2\nslab 1\n")
+    (job / "memory.events").write_text("low 0\nmax 3\noom 1\noom_kill 1\n")
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/slurm/job_1/step_0/task_0\n")
+    found = query.memory_cgroup(proc, tmp_path / "v2")
+    assert found == job
+    want = {"cgroup": 50, "cgroup_peak": 70, "cgroup_limit": 64 * 2**30, "cgroup_oom_kill": 1}
+    want |= {"cgroup_anon": 10}
+    assert query.cgroup_memory(job) == want | {
+        "cgroup_file": 38,
+        "cgroup_mapped": 30,
+        "cgroup_shmem": 2,
+    }
+    # v1: the memory controller's line; no limit anywhere reads its own cgroup
+    own = tmp_path / "v1" / "memory" / "job_2"
+    own.mkdir(parents=True)
+    (own / "memory.usage_in_bytes").write_text("5\n")
+    (own / "memory.limit_in_bytes").write_text(f"{2**63 - 4096}\n")
+    (own / "memory.stat").write_text("rss 1\ntotal_rss 3\ntotal_cache 2\n")
+    proc.write_text("12:cpu,cpuacct:/job_2\n11:memory:/job_2\n")
+    assert query.memory_cgroup(proc, tmp_path / "v1") == own
+    assert query.cgroup_memory(own) == {"cgroup": 5, "cgroup_anon": 3, "cgroup_file": 2}
+    assert query.memory_cgroup(tmp_path / "missing") is None
+    # the timer keeps the sampled peak of the charge and its parts per stage
+    monkeypatch.setattr(query, "memory_cgroup", lambda: job)
+    timer = Timer()
+    (job / "memory.current").write_text("90\n")
+    with timer("stage"):
+        pass
+    got = timer.stages["stage"]
+    assert got["peak_cgroup"] == 90 and got["peak_cgroup_mapped"] == 30
+    assert got["cgroup_peak"] == 70 and got["cgroup_limit"] == 64 * 2**30
 
 
 def _families(n: int, seed: int = 0, chained: bool = False) -> tuple[pl.DataFrame, np.ndarray]:

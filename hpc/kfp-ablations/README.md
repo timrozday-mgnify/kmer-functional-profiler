@@ -33,6 +33,9 @@ for r in standard-novaseq frames-novaseq frames-miseq; do (cd kfp-ablations/$r &
 # then, each when its NovaSeq run has finished:
 cd kfp-ablations/standard-query-cost && sbatch run.sh
 cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one after another
+# query memory as Slurm counts it, release tiers in place, a ladder of limits (plan, phase 6,
+# step 40), when release-tiers has finished:
+cd kfp-ablations/query-memory && sbatch run.sh
 # EM convergence fix (plan, phase 7, step 29), once tiers-novaseq's indexes exist:
 cd kfp-ablations/em-query-cost && sbatch run.sh
 # EM convergence from 5 starts on two deep soil metagenomes (step 30), as em-query-cost:

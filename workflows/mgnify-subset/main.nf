@@ -430,19 +430,21 @@ process LADDER {
 }
 
 process QUERY {
-    tag "${pairs} pairs, ${name}, draws ${draws}${start ? ', EM start ' + start : ''}"
+    tag "${pairs} pairs, ${name}, draws ${draws}${start ? ', EM start ' + start : ''}${limit ? ', ' + mem : ''}"
     publishDir "${params.outdir}/query", mode: 'copy', pattern: '*.json'
+    memory { mem as MemoryUnit }  // a cell over it fails (FAILED in trace.tsv) and is kept
 
     input:
-    tuple val(pairs), path(r1), path(r2), val(name), path(index), val(draws), val(start)
+    tuple val(pairs), path(r1), path(r2), val(name), path(index), val(draws), val(start), val(mem), val(limit)
 
     output:
-    path "${cell}.json", emit: stats
-    tuple val(draws), path("${cell}.profile.tsv"), emit: profile
+    path "${cell}*.json", emit: stats  // with ${cell}.end.json: exit status, cgroup at the end
+    tuple val(draws), path("${cell}.profile.tsv"), emit: profile, optional: true
 
     script:
     // start 0 is the usual EM start; others are seeds of random starts (--em-start)
-    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '')
+    // limit: the cell's memory in GB, in its name when --query_memory is a ladder
+    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '') + (limit ? ".m${limit}" : '')
     def scratch_dir = params.query_scratch.toString() in ['', 'true', 'false'] ? '' : params.query_scratch  // CLI passes strings
     """
     export POLARS_MAX_THREADS=${task.cpus} OMP_NUM_THREADS=${task.cpus} OPENBLAS_NUM_THREADS=${task.cpus}
@@ -452,7 +454,7 @@ process QUERY {
     if [ -n "${scratch_dir}" ] && scratch=\$(mktemp -d "${scratch_dir}/kfp-index.XXXXXX"); then
         trap 'rm -rf "\$scratch"' EXIT
         start=\$SECONDS
-        if (cd -P ${index} && cp meta.json units.parquet tier2.*.npy \$(ls units.*.npy dense.*.npy 2>/dev/null) "\$scratch"); then
+        if (cd -P ${index} && cp meta.json units.parquet tier[12].*.npy \$(ls units.*.npy dense.*.npy 2>/dev/null) "\$scratch"); then
             idx=\$scratch
             echo "index copied to \$scratch: \$(du -sh "\$scratch" | cut -f1) in \$((SECONDS - start)) s" >&2
         else
@@ -461,16 +463,22 @@ process QUERY {
     fi
     if ${params.query_preload}; then  # page cache is per node, so not a task of its own
         start=\$SECONDS
-        cat \$idx/tier2.*.npy > /dev/null
-        echo "preload: \$(du -chL \$idx/tier2.*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
+        cat \$idx/tier[12].*.npy > /dev/null  # tier2.*: indexes before format 3
+        echo "preload: \$(du -chL \$idx/tier[12].*.npy | tail -1 | cut -f1) in \$((SECONDS - start)) s" >&2
     fi
+    # A query the cgroup's OOM killer stops (exit 137) still leaves its stages in ${cell}.json
+    # and the cgroup's peak, limit and OOM kills in ${cell}.end.json, so the cell is a result.
+    status=0
     ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out ${cell}.profile.tsv ${params.query_args} \\
-        --em-start ${start} --stats ${cell}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''}
+        --em-start ${start} --stats ${cell}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''} || status=\$?
+    ${params.python} -c "import json, sys; from kmer_functional_profiler.query import cgroup_memory, memory_cgroup; g = memory_cgroup(); print(json.dumps({'exit': int(sys.argv[1]), **(cgroup_memory(g) if g else {})}))" \$status > ${cell}.end.json
+    [ \$status -eq 0 ] || rm -f ${cell}.profile.tsv
+    [ \$status -eq 0 ] || [ \$status -eq 137 ] || exit \$status
     """
 
     stub:
-    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '')
-    "touch ${cell}.json ${cell}.profile.tsv"
+    cell = "${name}.${pairs}.${draws}" + (start ? ".s${start}" : '') + (limit ? ".m${limit}" : '')
+    "touch ${cell}.json ${cell}.end.json ${cell}.profile.tsv"
 }
 
 process EM_STARTS {
@@ -621,7 +629,11 @@ workflow {
         ch_query = ch_cells.map { c -> c + [0] }.combine(channel.fromList(starts))
             .mix(ch_cells.filter { c -> (params.query_draws as int) > 0 && (!draws_on || c[3] == draws_on) && (!draws_at || c[0] in draws_at) }
                 .map { c -> c + [params.query_draws, 0] })
-        QUERY(ch_query)
+        // --query_memory: one limit, or a ladder of them ('64 GB,128 GB'), each cell run at each
+        // (the limit Slurm's cgroup enforces; plan, phase 6, step 40)
+        def limits = params.query_memory.toString().tokenize(',')*.trim()
+        def ladder = limits.collect { m -> [m, limits.size() > 1 ? ((m as MemoryUnit).toGiga() as String) : ''] }
+        QUERY(ch_query.combine(channel.fromList(ladder)))
         QUERY_COST(QUERY.out.stats.collect())
         if (starts.size() > 1) {
             EM_STARTS(QUERY.out.profile.filter { r -> r[0] == 0 }.map { r -> r[1] }.collect())

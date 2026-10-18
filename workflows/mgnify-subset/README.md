@@ -22,7 +22,7 @@ BLOOM       all candidate hashes -> Bloom filter, t_max, hash quantiles
 PRESENCE    per bucket: (hash, cluster) at t_max passing the filter, by hash range
 GROUPS      per hash range: n_groups; candidate rows by bucket              (--ranges jobs)
 POSTINGS    per bucket: score, promiscuity cut, floor, per-unit columns, Pfam
-UNITS       all units numbered by cluster_rep; tier-2 layout and pack ranges
+UNITS       all units numbered by cluster_rep; tier-1 layout and pack ranges
 PACK_RANGE  per pack range: keys and value sets                            (--ranges jobs)
 DEDUP       per set-hash range: distinct value sets                        (--ranges jobs)
 CONCAT      -> index/
@@ -106,7 +106,7 @@ This reads the whole sequence file once and writes it again as cluster buckets
 
 Predicted sizes assume one key per posting (an upper bound) and `--sets` value sets
 per posting (default 1, also an upper bound); the nested builds give the real ratio
-(`tier2_sets / postings` in `meta.json`) to re-run COMBINE with.
+(`tier1_sets / postings` in `meta.json`) to re-run COMBINE with.
 
 ### Partitioned build (phase 6)
 
@@ -123,9 +123,9 @@ equal numbers of candidates.
 
 With `--t-dense` in `--index_args` the build also writes the dense tier, equal to
 INDEX's. A unit's candidates are then its k-mers up to its dense threshold
-(max(*t_dense*, *t_g*)), which include its tier-2 candidates, so the same reduce gives
+(max(*t_dense*, *t_g*)), which include its tier-1 candidates, so the same reduce gives
 `n_groups` for both tiers. POSTINGS also writes each bucket's dense rows
-(`.dense.parquet`), and PACK_RANGE, DEDUP and CONCAT handle the dense table alongside tier 2
+(`.dense.parquet`), and PACK_RANGE, DEDUP and CONCAT handle the dense table alongside tier 1
 (`.dense` files).
 
 ```bash
@@ -135,7 +135,7 @@ nextflow run workflows/mgnify-subset -profile slurm --biome root --sample 1 \
     --publish_mode link --outdir full-build
 ```
 
-Tier 2 is packed in hash ranges too: UNITS fixes the table layout from the total
+Tier 1 is packed in hash ranges too: UNITS fixes the table layout from the total
 postings and cuts pack ranges at key boundaries, each PACK_RANGE packs its range's
 postings, DEDUP removes duplicate value sets across ranges (split by a hash of the
 sets' content), and CONCAT joins the parts and sets; sets are numbered in hash order, so
@@ -148,7 +148,7 @@ At 1 in 1000 (8 buckets, 8 ranges, run serially on a laptop) the stages took 11 
 ~11.5 bytes per
 row. Scaled to the whole release: a ~14 GB Bloom filter (about a minute to fill;
 memory-mapped by every PRESENCE job, so jobs on one node share it), ~140 GB
-of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 2 (~31 GB).
+of presence files, a ~34 GB unit table in UNITS, and CONCAT holding tier 1 (~31 GB).
 
 A dense tier enlarges the candidate set, and with it the Bloom filter and presence
 files: roughly 3x at `--t-dense 0.1` (~40 GB filter; BLOOM needs its 64 GB retry), less at
@@ -217,8 +217,16 @@ than h units would leave, a stricter promiscuity cut, phase 7, step 40; `zi_em_*
 `zi_em_block_rounds`) for the zero-inflated fit's convergence, as `em_*` for the plain one) and `{stage}_wall_s`, `_cpu_s` and
 `_peak_rss` (bytes, the process's peak at the stage's end, including resident pages of
 the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory only, Linux
-`RssAnon` sampled every 50 ms) per stage. Queries that exceed
-`--query_memory` or 24 h fail without stopping the rest; they are FAILED in `trace.tsv`.
+`RssAnon` sampled every 50 ms) per stage. Under a memory cgroup (a Slurm job), also
+`_peak_cgroup` (the cgroup's charge, what Slurm's memory limit kills on: anonymous memory,
+page cache with the mapped index, shmem), `_peak_cgroup_{anon,file,mapped,shmem}` (its
+parts), `_cgroup_peak` (the kernel's high-water mark) and `_cgroup_limit`, per stage.
+`--query_memory` takes one limit or a comma list (`'64 GB,128 GB'`): with a list every
+cell runs at each limit, `memory_gb` in its row (`.m<GB>` in its file names). A query the
+cgroup's OOM killer stops at its limit is still a row: `end_exit` 137, `running` the stage
+it died in, `end_cgroup_*` the cgroup at the end (`end_cgroup_oom_kill`, its OOM kills).
+Queries that fail otherwise, or run over 24 h, fail without stopping the rest; they are
+FAILED in `trace.tsv`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -235,7 +243,7 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--t_dense` | `''` | Dense-tier rates, e.g. `'0,0.02,0.1'`: one INDEX job per sample and rate, under `1inN_d<rate>/index` (0: `1inN/index`) |
 | `--members`, `--pfam_table` | `''` | Index these members and Pfam tables instead of extracting from the release |
 | `--build` | `false` | Partitioned index build over the buckets, under `index/` (one `--sample`, `--pfam true`) |
-| `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce and tier-2 packing |
+| `--ranges` | `64` | Hash ranges of the partitioned build's `n_groups` reduce and tier-1 packing |
 | `--bloom_bits` | `10` | Bloom filter bits per candidate hash |
 | `--stats` | `false` | Per-cluster statistics and predicted index sizes |
 | `--stats_args` | `''` | `--k`, `--alphabet` for STATS and COMBINE |
@@ -251,13 +259,13 @@ the memory-mapped index) and `_peak_anon` (the same peak for anonymous memory on
 | `--query_draws` | `100` | Posterior draws, on the `--query_draws_on` index only (0 elsewhere) |
 | `--query_draws_on` | `''` | Index (name) that also gets the posterior; `''` = every index |
 | `--query_draws_at` | `40000000,100000000` | Ladder cells (pairs, comma-separated) that get the posterior; `''` = every cell |
-| `--query_memory` | `128 GB` | Memory per query |
+| `--query_memory` | `128 GB` | Memory per query; a comma list runs each cell at each limit (a memory ladder) |
 | `--query_args` | `''` | Extra `query` options for every cell; give it in a `-c` config file (`params.query_args = "--frames all"`), since Nextflow reads a command-line value starting with `--` as an option |
 | `--query_starts` | `0` | EM starts per draws-0 cell (`query --em-start`): 0 is the usual start, other numbers seed random ones. With several, `em_starts.tsv` compares each cell's profiles: per estimate (`coverage_em`, `_zi`, `present_zi`, `abundance_zi`, `aai`), unit and `component` (hit units linked by shared k-mers) level and `kmers_unique` bin, the share of units within 0.1/1/10% across starts (by count and by value), the largest spread and the largest total-variation distance from the usual start (plan, phase 7, step 30) |
 | `--query_scratch` | `${TMPDIR:-/tmp}` | Node-local directory to copy the index's query files to before each query (removed after; `false` queries it in place). If the copy fails, the query uses the index in place |
-| `--query_in_memory` | `false` | Read the tier-2 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |
+| `--query_in_memory` | `false` | Read the tier-1 (and dense) arrays into memory instead of memory-mapping them: no page faults in lookup, but their full size (~31 GB at full scale) adds to peak RSS, so raise `--query_memory` |
 | `--query_low_memory` | `false` | Trade time for memory where results are unchanged: with draws, the reads are hashed a second time for the detected units' k-mers instead of keeping per-read rows of every hit unit (~2 GB at 40 M pairs, one more read pass). For memory-capped runs; on HPC raising `--query_memory` is cheaper |
-| `--query_preload` | `true` | Read tier 2 into the page cache before each query, so lookups are not random reads from a network filesystem (time logged to `.command.err`) |
+| `--query_preload` | `true` | Read tier 1 into the page cache before each query, so lookups are not random reads from a network filesystem (time logged to `.command.err`) |
 | `--venv` | repo `.venv` | Environment created by `setup.sh` |
 
 Resources are set per label in `nextflow.config` (`process_medium` for DuckDB steps and
