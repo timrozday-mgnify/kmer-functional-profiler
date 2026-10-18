@@ -149,6 +149,23 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     kept = pl.read_csv(tmp_path / "held" / "refs.tsv", separator="\t", infer_schema=False)
     assert held not in kept["cluster_rep"].to_list()
     assert kept.height == refs.filter(pl.col("unit") != target["unit"]).height
+    # neighbours: one target in one component of every unit, at most 2 neighbours, the most hit
+    hit = pl.read_csv(tmp_path / "p.tsv", separator="\t").with_columns(component=pl.lit(0))
+    top = hit.sort("present_prob", descending=True)["unit"][0]
+    hit = hit.with_columns(present_prob=(pl.col("unit") == top).cast(pl.Float64))
+    hit.write_csv(tmp_path / "one.tsv", separator="\t")
+    assert hit.height > 3
+    assert "neighbour" not in build_reference(
+        tmp_path / "one.tsv", index_dir, tmp_path / "n0", neighbours=0
+    )
+    build_reference(tmp_path / "one.tsv", index_dir, tmp_path / "n2", neighbours=2)
+    kept = pl.read_csv(tmp_path / "n2" / "refs.tsv", separator="\t")
+    kept = kept.filter(pl.col("role") == "neighbour")["unit"].unique()
+    others = hit.filter(pl.col("unit") != top)
+    assert kept.len() == 2
+    assert others.filter(pl.col("unit").is_in(kept.implode()))["hits"].min() >= (
+        others.filter(~pl.col("unit").is_in(kept.implode()))["hits"].max()
+    )
 
 
 def test_aai_check_bins_and_flags(tmp_path: Path) -> None:

@@ -412,7 +412,7 @@ workflow PILEUP {
     def profiles = QUERY(reads, index, meta,
         "${params.query_stats ? '--stats stats.json ' : ''}${params.query_args}").profile
     def refs = REFERENCE(profiles, index, meta, store, withhold,
-        "--min-present ${params.min_present} --members ${params.members}").ref
+        "--min-present ${params.min_present} --neighbours ${params.neighbours} --members ${params.members}").ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'
             return tuple(sample, ref, r1, r2)

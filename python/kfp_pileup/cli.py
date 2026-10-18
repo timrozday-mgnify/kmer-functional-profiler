@@ -10,7 +10,7 @@ import typer
 from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
-from kfp_pileup.reference import MIN_PRESENT, build_reference
+from kfp_pileup.reference import MIN_PRESENT, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
 from kmer_functional_profiler.store import MEMBERS
 
@@ -34,11 +34,16 @@ def reference(
         Path | None,
         typer.Option(help="Units (cluster_rep, one per line) left out of the reference"),
     ] = None,
+    neighbours: Annotated[
+        int, typer.Option(help="Neighbours per target in a component, the most-hit first")
+    ] = NEIGHBOURS,
 ) -> None:
     """Write ref.fa (targets, component neighbours, reversed decoys), refs.tsv and
     molecule.txt; print the sequences per role."""
     held = withhold.read_text().split() if withhold else ()
-    counts = build_reference(profile, index_dir, out_dir, min_present, members, store or (), held)
+    counts = build_reference(
+        profile, index_dir, out_dir, min_present, members, store or (), held, neighbours
+    )
     typer.echo(json.dumps(counts))
 
 

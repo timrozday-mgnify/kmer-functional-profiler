@@ -4,7 +4,9 @@ Three roles, one FASTA:
 
 - ``target``: units the profile calls present (``present_prob`` >= ``min_present``);
 - ``neighbour``: the other hit units in the targets' components (``component``), decoys
-  that catch reads from a sibling the profile did not call;
+  that catch reads from a sibling the profile did not call; at most ``neighbours`` per
+  target in a component, those with the most tier-2 hits (a real sample's giant component
+  holds most hit units: millions of sequences and a REFERENCE killed at 256 GB);
 - ``decoy``: the targets' sequences reversed, a null for the score threshold.
 
 ``withhold`` units (``cluster_rep`` names) are left out of every role, as if the profile had
@@ -25,6 +27,7 @@ from kmer_functional_profiler.index import molecule
 from kmer_functional_profiler.store import MEMBERS, fetch, write_fasta
 
 MIN_PRESENT: Final = 0.5
+NEIGHBOURS: Final = 5  # per target in a component
 REF_FASTA: Final = "ref.fa"
 REFS: Final = "refs.tsv"
 MOLECULE: Final = "molecule.txt"  # nucleotide or protein: which aligner the pipeline runs
@@ -38,6 +41,7 @@ def build_reference(
     members: int = MEMBERS,
     store: Sequence[str | Path] = (),
     withhold: Sequence[str] = (),
+    neighbours: int = NEIGHBOURS,
 ) -> dict[str, int]:
     """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts."""
     out = Path(out_dir)
@@ -46,7 +50,7 @@ def build_reference(
         pl.read_csv(
             profile,
             separator="\t",
-            columns=["unit", "cluster_rep", "present_prob", "component"],
+            columns=["unit", "cluster_rep", "present_prob", "component", "hits"],
             schema_overrides={"cluster_rep": pl.String},
         )
         .filter(~pl.col("cluster_rep").is_in(list(withhold)))
@@ -56,14 +60,19 @@ def build_reference(
     targets = hit.filter(pl.col("present_prob") >= min_present)
     if targets.height == 0:
         raise ValueError(f"no units with present_prob >= {min_present} in {profile}")
-    neighbours = hit.filter(
-        pl.col("component").is_in(targets["component"].implode()),
-        ~pl.col("unit").is_in(targets["unit"].implode()),
+    # ponytail: ranked by hits, a proxy for the reads a sibling could take; rank by k-mers
+    # shared with a target (the hit table's links) if called siblings slip past the cap
+    per_component = targets.group_by("component").agg(cap=pl.len() * neighbours)
+    others = (
+        hit.join(per_component, on="component")
+        .filter(~pl.col("unit").is_in(targets["unit"].implode()))
+        .sort(["hits", "unit"], descending=[True, False])
     )
+    others = others.filter(pl.int_range(pl.len()).over("component") < pl.col("cap"))
     roles = pl.concat(
         [
             targets.select("unit", "component", role=pl.lit("target")),
-            neighbours.select("unit", "component", role=pl.lit("neighbour")),
+            others.select("unit", "component", role=pl.lit("neighbour")),
         ]
     )
     seqs = fetch(index_dir, roles["unit"].to_list(), members, store).join(roles, on="unit")
