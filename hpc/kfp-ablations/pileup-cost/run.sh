@@ -29,10 +29,12 @@ fetch_pairs pooled100M 100000000 ERR7738575 ERR7746321
 printf 'sample,r1,r2\nhadza10M,hadza10M_1.fastq.gz,hadza10M_2.fastq.gz\npooled100M,pooled100M_1.fastq.gz,pooled100M_2.fastq.gz\n' > samples.csv
 cat > cost.config <<CFG
 process {
-    withName: 'PILEUP:QUERY' { cpus = 8; memory = { 64.GB * task.attempt }; time = { 24.h * task.attempt } }
-    withName: 'PILEUP:REFERENCE' { memory = { 64.GB * task.attempt }; time = { 24.h * task.attempt } }
+    // 137s at 64-256 GB (REFERENCE pooled100M died at 256 GB, QUERY needed 256 GB, CALL > 128 GB)
+    resourceLimits = [memory: 512.GB]
+    withName: 'PILEUP:QUERY' { cpus = 8; memory = { 256.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:REFERENCE' { memory = { 384.GB + 128.GB * (task.attempt - 1) }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:DIAMOND' { cpus = 32; memory = { 128.GB * task.attempt }; time = { 72.h * task.attempt } }
-    withName: 'PILEUP:CALL' { memory = { 128.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:CALL' { memory = { 256.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:MAP_CONSENSUS' { cpus = 16; memory = { 32.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:(HANDOFF|BAM|FREEBAYES|CONSEQUENCES)' { memory = { 16.GB * task.attempt }; time = { 48.h * task.attempt } }
     withName: 'PILEUP:(FLORIA|INSTRAIN|CLIQUESNV)' { cpus = 16; memory = { 64.GB * task.attempt }; time = { 48.h * task.attempt } }

@@ -22,7 +22,7 @@ process INDEX {
     "${params.kfp} index ${targets} index --targets ${opts}"
 
     stub:
-    "mkdir index"
+    "mkdir index && echo {} > index/meta.json"
 }
 
 process QUERY {
@@ -33,6 +33,7 @@ process QUERY {
     input:
     tuple val(sample), path(r1), path(r2)
     path index
+    path meta, stageAs: 'index.meta.json'  // see PILEUP
     val opts  // e.g. '--stats stats.json' (query_stats) and query_args
 
     output:
@@ -54,6 +55,7 @@ process REFERENCE {
     input:
     tuple val(sample), path(profile)
     path index
+    path meta, stageAs: 'index.meta.json'  // see PILEUP
     path store
     path withhold  // units left out of the reference (spike-benchmark), or NO_WITHHOLD
     val opts
@@ -403,9 +405,13 @@ workflow PILEUP {
     withhold
 
     main:
-    def profiles = QUERY(reads, index,
+    // The index's meta.json as an input of its own: a directory's cache key is its path, size
+    // and mtime, which an in-place rebuild keeps, so -resume reused a profile of the old
+    // index (pileup-cost REFERENCE: unit ids not in the index). A rebuild rewrites meta.json.
+    def meta = index.map { it.resolve('meta.json') }
+    def profiles = QUERY(reads, index, meta,
         "${params.query_stats ? '--stats stats.json ' : ''}${params.query_args}").profile
-    def refs = REFERENCE(profiles, index, store, withhold,
+    def refs = REFERENCE(profiles, index, meta, store, withhold,
         "--min-present ${params.min_present} --members ${params.members}").ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'

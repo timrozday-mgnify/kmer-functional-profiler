@@ -62,7 +62,8 @@ def fetch(
     wanted = pl.read_parquet(Path(index_dir) / "units.parquet", columns=["unit", "cluster_rep"])
     wanted = wanted.filter(pl.col("unit").is_in(list(units)))
     if wanted.height < len(set(units)):
-        raise ValueError("unit ids not in the index")
+        missing = sorted(set(units) - set(wanted["unit"].to_list()))
+        raise ValueError(f"{len(missing)} unit ids not in the index {index_dir}: {missing[:10]}")
     reps = wanted["cluster_rep"]
     found = read_units(store_paths(index_dir, store), reps.to_list())
     k = members - 1
