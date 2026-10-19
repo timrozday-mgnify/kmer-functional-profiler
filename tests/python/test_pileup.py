@@ -1,5 +1,6 @@
 """kfp-pileup (plan, phase 13, steps 2-6, 8-9) on hand-made alignments and the fixture index."""
 
+import json
 from pathlib import Path
 
 import polars as pl
@@ -72,7 +73,11 @@ def test_posteriors_decoys_and_sibling_residues(protein_refs: Path, tmp_path: Pa
         + diamond_line("r4", "s1", 28, "8VI2")
         + diamond_line("r5", "s2", 40, "11")  # best on a reversed decoy: dropped
     )
-    call([hits], protein_refs, tmp_path / "out", "diamond", min_depth=0.5, min_freq=0.1)
+    profile = tmp_path / "profile.tsv"  # a unit outside the reference and an unused column
+    profile.write_text("unit\tother\taai\tcoverage_zi\n0\tx\t0.97\t2.0\n9\ty\t0.5\t1.0\n")
+    stats = tmp_path / "stats.json"
+    call([hits], protein_refs, tmp_path / "out", "diamond", profile, 0.5, 0.1, stats=stats)
+    assert set(json.loads(stats.read_text())["stages"]) == {"read", "batches", "refine", "write"}
     assigned = pl.read_parquet(tmp_path / "out" / "assignments.parquet")
     kept = assigned.filter("kept").group_by("read_name").len()
     assert sorted(kept["read_name"]) == ["r1", "r3", "r4"]
@@ -85,6 +90,11 @@ def test_posteriors_decoys_and_sibling_residues(protein_refs: Path, tmp_path: Pa
     assert (at[9]["alt"], at[9]["sibling_share"]) == ("L", 0.0)
     units = pl.read_csv(tmp_path / "out" / "units.tsv", separator="\t")
     assert units["unit"].to_list() == [0]
+    assert (units["aai"][0], units["coverage_zi"][0], "other" in units.columns) == (
+        0.97,
+        2.0,
+        False,
+    )
     expected = 1 / (1 + 2**-3) + 1 / (1 + 2**-3) + 1 / (1 + 2**-1)
     assert units["reads"][0] == pytest.approx(expected)
 

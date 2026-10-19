@@ -171,9 +171,7 @@ class _Model:
             eff=(pl.col("length") * nt + self.fragment - 2 * OVERLAP).clip(lower_bound=1.0)
         )
         if prof is not None and "coverage_zi" in prof.columns:
-            meta = meta.join(
-                prof.select(pl.col("unit").cast(pl.UInt32), "coverage_zi"), on="unit", how="left"
-            )
+            meta = meta.join(prof.select("unit", "coverage_zi"), on="unit", how="left")
         else:
             meta = meta.with_columns(coverage_zi=pl.lit(1.0))
         meta = meta.with_columns(
@@ -331,7 +329,7 @@ def refine(
     sequences: dict[str, str],
     out: Path,
     protein: bool,
-    profile: str | Path | None,
+    prof: pl.DataFrame | None,
     min_depth: float,
     min_freq: float,
     novel: float = NOVEL,
@@ -345,7 +343,6 @@ def refine(
     error = ERROR
 
     # step 8: the joint EM; step 9: consensus updates and re-scoring between fits
-    prof = pl.read_csv(profile, separator="\t", infer_schema_length=None) if profile else None
     em = _Model(hits, refs, prof, protein, error, novel)
     offsets = np.cumsum([0, *refs["length"].to_list()])
     original = np.frombuffer("".join(sequences[s] for s in refs["seq_id"]).encode(), np.uint8)
