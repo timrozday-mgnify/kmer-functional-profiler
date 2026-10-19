@@ -310,6 +310,14 @@ def query(
             "coverage_mix; coverage_zi is the default"
         ),
     ] = False,
+    greedy: Annotated[
+        bool,
+        typer.Option(
+            help="No EM: coverage_greedy from gather's assignment (zero-truncated hits per "
+            "k-mer of the k-mers gather gives each unit, as sylph), no _em/_zi columns and no "
+            "aai; for a cheap first pass (e.g. targets for a pileup)"
+        ),
+    ] = False,
     em_start: Annotated[
         int,
         typer.Option(
@@ -361,8 +369,10 @@ def query(
             mask=masked,
             summary=sample,
             em_start=em_start,
+            greedy=greedy,
         )
-        result.write_csv(out, separator="\t")
+        with timer("write"):
+            result.write_csv(out, separator="\t")
         if summary is not None:
             summary.write_text(json.dumps(sample, indent=2) + "\n")
     timer.write()

@@ -849,39 +849,65 @@ class _TierHits(NamedTuple):
         return hits.with_columns(unit=pl.Series(self.units[hits["unit"].to_numpy()]))
 
 
-def tier_hits(table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray) -> _TierHits:
-    """What :func:`unit_hits` would give the sorted, distinct sampled ``hashes``, with
-    ``table`` and ``max_hash_g`` read once in order (plan, phase 6, step 40 (c)).
+def tier_hits(
+    table: PackedTable,
+    max_hash_g: np.ndarray,
+    hashes: np.ndarray | Iterable[np.ndarray],
+) -> _TierHits:
+    """What :func:`unit_hits` would give the sorted, distinct sampled ``hashes`` (or their
+    consecutive hash ranges, each sorted), with ``table`` and ``max_hash_g`` read once in
+    order (plan, phase 6, step 40 (c)): keys by bucket range (:func:`_key_sets`), then
+    :func:`_resolve`."""
+    ranges = [hashes] if isinstance(hashes, np.ndarray) else hashes
+    found = [_key_sets(table, part) for part in ranges]
+    return _resolve(
+        table,
+        max_hash_g,
+        np.concatenate([f for f, _ in found] or [np.empty(0, np.uint64)]),
+        np.concatenate([s for _, s in found] or [np.empty(0, np.int64)]),
+    )
 
-    Keys are read by bucket range (:func:`_key_sets`), the sets hit in set order and the
-    units' ``max_hash_g`` in unit order (``take``), so memory is a block of the tier plus
-    the result, at any index size; ``unit_hits`` on the result gives the rows of ``table``
-    for any of ``hashes``, in the same order.
-    """
-    found, set_ids = _key_sets(table, hashes)
+
+def _resolve(
+    table: PackedTable, max_hash_g: np.ndarray, found: np.ndarray, set_ids: np.ndarray
+) -> _TierHits:
+    """The rows of the sorted hit hashes ``found`` (their ``set_ids`` in ``table``): the sets
+    hit read in set order and the units' ``max_hash_g`` in unit order (``take``), so memory
+    is a block of the tier plus the result, at any index size; ``unit_hits`` on the result
+    gives the rows of ``table`` for any of the hashes walked, in the same order."""
     sets, of_set = np.unique(set_ids, return_inverse=True)
+    del set_ids
     ends = take(table.set_offsets, np.stack([sets, sets + 1], axis=1).ravel()).astype(np.int64)
+    del sets
     starts, lengths = ends[0::2], ends[1::2] - ends[0::2]
     values = take(table.set_values, _ranges(starts, lengths)).astype(np.uint64)
+    del ends, starts
     units, local = np.unique(values >> np.uint64(PIN_BITS), return_inverse=True)
     limit = take(max_hash_g, units).astype(np.uint64)
-    local_values = (local.astype(np.uint64) << np.uint64(PIN_BITS)) | (
+    # unit << PIN_BITS | pin_q, in the smallest width that holds it
+    value_type = np.uint32 if len(units) < 2 ** (32 - PIN_BITS) else np.uint64
+    local_values = (local.astype(value_type) << value_type(PIN_BITS)) | (
         values & np.uint64(2**PIN_BITS - 1)
-    )
+    ).astype(value_type)
+    del values
     first = np.cumsum(lengths) - lengths
-    keys, kept = [np.empty(0, np.uint64)], [np.empty(0, np.uint64)]
-    for a in range(0, len(found), WALK_HASHES):  # each hash's set, in set order
+    # Per chunk of hashes, each's set in set order, kept where it passes the unit's limit:
+    # the hashes with a row kept, their row counts and the rows' values.
+    keys, counts, kept = [np.empty(0, np.uint64)], [np.empty(0, np.int64)], []
+    for a in range(0, len(found), WALK_HASHES):
         s = of_set[a : a + WALK_HASHES]
         at = _ranges(first[s], lengths[s])
-        key = np.repeat(found[a : a + WALK_HASHES], lengths[s])
-        keep = key <= limit[local[at]]
-        keys.append(key[keep])
+        key = np.repeat(np.arange(a, a + len(s)), lengths[s])
+        keep = found[key] <= limit[local[at]]
+        n = np.bincount(key[keep] - a, minlength=len(s))
+        keys.append(found[a : a + len(s)][n > 0])
+        counts.append(n[n > 0])
         kept.append(local_values[at[keep]])
-    del values, local, local_values, of_set
-    key, value = np.concatenate(keys), np.concatenate(kept)
-    new = np.ones(len(key), dtype=bool)
-    new[1:] = key[1:] != key[:-1]
-    distinct = key[new]
+    del local, local_values, of_set, first, lengths
+    distinct, n = np.concatenate(keys), np.concatenate(counts)
+    del keys, counts
+    value = np.concatenate(kept or [np.empty(0, value_type)])
+    del kept
     layout = packed_layout(table.max_hash, 0, len(distinct))
     fp_bits = 64 - layout["lead_bits"] - layout["bucket_bits"]  # the whole key: no false hits
     buckets = np.bincount(
@@ -894,8 +920,8 @@ def tier_hits(table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray) ->
         fp_bits,
         np.concatenate([[0], np.cumsum(buckets)]).astype(np.uint64),
         distinct & np.uint64(2**fp_bits - 1),
-        np.arange(len(distinct), dtype=np.uint64),
-        np.append(np.flatnonzero(new), len(key)).astype(np.uint64),
+        np.arange(len(distinct), dtype=np.uint32 if len(distinct) < 2**32 else np.uint64),
+        np.concatenate([[0], np.cumsum(n)]).astype(np.uint64),
         value,
     )
     return _TierHits(exact, limit, units.astype(np.uint32))
@@ -927,13 +953,21 @@ class _Joint:
         self.dense = base.dense is not None
         self.walked: dict[str, list[_TierHits]] = {}
 
-    def walk(self, tier: str, hashes: np.ndarray) -> None:
-        """Read every index's ``tier`` once for the sorted, distinct sampled ``hashes``
-        (:func:`tier_hits`); :meth:`hits` then looks them up in memory."""
+    def walk(self, tier: str, ranges: Iterable[np.ndarray]) -> None:
+        """Read every index's ``tier`` once for the distinct sampled hashes, given as
+        consecutive hash ranges, each sorted (:func:`tier_hits`, a range in memory at a
+        time); :meth:`hits` then looks them up in memory."""
         column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
-        self.walked[tier] = [
-            tier_hits(getattr(i, tier), i.units[column], hashes) for i in self.indexes
-        ]
+        found: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in self.indexes]
+        for part in ranges:
+            for got, index in zip(found, self.indexes, strict=True):
+                got.append(_key_sets(getattr(index, tier), part))
+        self.walked[tier] = []
+        for got, index in zip(found, self.indexes, strict=True):
+            hit = np.concatenate([np.empty(0, np.uint64), *(f for f, _ in got)])
+            sets = np.concatenate([np.empty(0, np.int64), *(s for _, s in got)])
+            got.clear()
+            self.walked[tier].append(_resolve(getattr(index, tier), index.units[column], hit, sets))
 
     def _hits(self, i: int, tier: str, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
         if tier in self.walked:
@@ -987,22 +1021,25 @@ class _Joint:
         return pl.concat(parts, how="diagonal_relaxed")
 
 
-def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> pl.DataFrame:
+def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> tuple[pl.DataFrame, np.ndarray]:
     """Assign each hit k-mer to one unit, greedily, as ``sourmash gather`` does.
 
     Repeatedly take the unit with the most unassigned hit k-mers, scaled by ``1 / t_g`` so
     units sampled at different rates compare as estimated k-mer counts, and give it those
     k-mers. Units left with none are explained away and get no row. Returns ``unit``,
-    ``kmers_unique`` (k-mers assigned) and ``gather_rank`` (0 = taken first).
+    ``kmers_unique`` (k-mers assigned) and ``gather_rank`` (0 = taken first), and per row of
+    ``kmers`` whether its unit took its k-mer (the k-mer's first holder in gather order).
     """
     got = _core.gather(
         kmers["unit"].cast(pl.UInt32).to_numpy(),
         kmers["hash"].cast(pl.UInt64).to_numpy(),
         np.asarray(t_g, dtype=np.float64),
     )
-    return pl.DataFrame(got).with_columns(
+    owned = got.pop("owned")
+    taken = pl.DataFrame(got).with_columns(
         gather_rank=pl.int_range(len(got["unit"]), dtype=pl.UInt32)
     )
+    return taken, owned
 
 
 def assign_best(kmers: pl.DataFrame, score: pl.Expr) -> pl.DataFrame:
@@ -1687,6 +1724,7 @@ def survival_quantiles(
     selected: float = 1.0,
     seen_range: tuple[np.ndarray, np.ndarray] | None = None,
     n_members: np.ndarray | float = 1.0,
+    bounds: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(point, lower, upper) identity from ``h`` hit k-mers of an average member's
     ``pin_sum`` kept windows (sampled at rate ``keep`` out of ``windows``), each window
@@ -1707,7 +1745,8 @@ def survival_quantiles(
     h >= 1, and ``aai`` is null below ``--min-aai-kmers``), so h's distribution is
     conditioned on that. The point is the median-unbiased estimate (mid-p: the a at which h
     is the conditional median); the bounds are where h is at the ``level`` tails' quantiles
-    (a Neyman interval). seen is estimated (from hits per hit k-mer), so the upper bound is
+    (a Neyman interval; with ``bounds`` False, the point only, three times). seen is
+    estimated (from hits per hit k-mer), so the upper bound is
     taken at the low end of ``seen_range`` and the lower bound at its high end. Each is a
     bisection over the grid's rows (~11 steps). Without the conditioning, estimates read
     high near the detection limit (step 23).
@@ -1745,10 +1784,12 @@ def survival_quantiles(
             lo, hi = np.where(ok, lo, mid + 1), np.where(ok, mid, hi)
         return lo
 
+    point = first(lambda row: np.add(*cdfs(row, seen)) / 2 >= 0.5)
+    if not bounds:  # the point only, as the bounds
+        return tables["a"][point], tables["a"][point], tables["a"][point]
     low_seen, high_seen = (seen, seen) if seen_range is None else seen_range
     tail = (1 - level) / 2
     upper = first(lambda row: cdfs(row, low_seen)[0] >= tail)
-    point = first(lambda row: np.add(*cdfs(row, seen)) / 2 >= 0.5)
     # beyond the model's reach (more hits than identity 1 gives on average, as in large
     # unions, where hits over one member's pin_sum can exceed 1), the data say only "at the
     # top": the lower bound is taken as for h at that mean, not collapsed onto 1 (step 34)
@@ -2081,6 +2122,26 @@ def unit_members(units: pl.DataFrame) -> np.ndarray:
     return np.asarray(np.maximum(units["n_members"].to_numpy().astype(np.float64), 1.0))
 
 
+def greedy_coverage(own: pl.DataFrame, kmers_hit: np.ndarray, m: np.ndarray) -> pl.DataFrame:
+    """Coverage without EM, from gather's assignment (as sylph's, on its reassigned k-mers).
+
+    Per unit, its free k-mers are its ``m`` kept ones but those hit and taken by an earlier
+    unit (``kmers_hit`` - own); of those, ``own`` (``unit``, ``hits``) are hit. The
+    zero-inflated Poisson MLE over them: the zero-truncated rate of hits per own k-mer, so
+    missing k-mers (divergence) do not lower it, unless that rate leaves more k-mers hit than
+    are present, then the Poisson rate with all present (hits over free k-mers), as at low
+    coverage, where hit k-mers are seen once and the truncated rate is 0.
+    """
+    per_unit = own.group_by("unit").agg(hits=pl.col("hits").sum(), kmers=pl.len()).sort("unit")
+    unit = per_unit["unit"].to_numpy()
+    hits, kmers = per_unit["hits"].to_numpy(), per_unit["kmers"].to_numpy()
+    free = np.maximum(m[unit] - (kmers_hit[unit] - kmers), kmers).astype(np.float64)
+    lam = ztp_lambda(hits / kmers)
+    all_present = kmers >= free * -np.expm1(-lam)
+    lam = np.where(all_present, hits / free, lam)
+    return per_unit.select("unit", coverage_greedy=pl.Series(lam))
+
+
 def ztp_lambda(mean: np.ndarray, iterations: int = 50) -> np.ndarray:
     """Zero-truncated Poisson MLE of the rate from the mean count of the non-zero items:
     lambda / (1 - exp(-lambda)) = mean, by Newton from lambda = mean; 0 where mean <= 1."""
@@ -2118,11 +2179,18 @@ def aai_naive(
     lam = ztp_lambda(_div(hits.astype(np.float64), kmers_hit.astype(np.float64)))
     low = lam < MIN_AAI_LAMBDA
     seen = np.where(low, 1.0, -np.expm1(-np.maximum(lam, MIN_AAI_LAMBDA)))
-    point, _, _ = survival_quantiles(
-        kmers_hit.astype(np.float64), pin_sum.astype(np.float64), seen, keep, windows, model,
-        clumping, selected=max(min_kmers, 1.0), n_members=n_members,
+    # Units are independent: only those reported are estimated, point only (step 40).
+    ok = kmers_hit >= min_kmers
+
+    def on(x: Any) -> Any:
+        return x[ok] if np.ndim(x) else x
+
+    point = np.full(len(hits), np.nan)
+    point[ok], _, _ = survival_quantiles(
+        on(kmers_hit.astype(np.float64)), on(pin_sum.astype(np.float64)), on(seen), on(keep),
+        on(windows), model, on(clumping), selected=max(min_kmers, 1.0), n_members=on(n_members),
+        bounds=False,
     )  # fmt: skip
-    point = np.where(kmers_hit >= min_kmers, point, np.nan)
     return pl.DataFrame({"aai_naive": point, "aai_naive_lower_bound": low}).with_columns(
         pl.col("aai_naive").fill_nan(None)
     )
@@ -2141,15 +2209,27 @@ class _Summed:
 
     min_rows = 1_000_000  # rows waiting before the first merge, over all parts
 
-    def __init__(self, keys: list[str], aggs: dict[str, pl.Expr], parts: int = 16) -> None:
-        self.keys, self.aggs, self.parts = keys, aggs, parts
+    def __init__(
+        self,
+        keys: list[str],
+        aggs: dict[str, pl.Expr],
+        parts: int = 16,
+        *,
+        part: pl.Expr | None = None,
+        slack: float = 1.0,
+    ) -> None:
+        """``part`` maps rows to their part (0 to ``parts`` - 1; the first key mod
+        ``parts`` by default); a part is merged once its waiting rows exceed ``slack`` x its
+        total, so memory is ~(1 + ``slack``) x the total's."""
+        self.keys, self.aggs, self.parts, self.slack = keys, aggs, parts, slack
+        self.part = pl.col(keys[0]) % parts if part is None else part
         self.totals: list[pl.DataFrame | None] = [None] * parts
         self.pending: list[list[pl.DataFrame]] = [[] for _ in range(parts)]
         self.rows = [0] * parts
 
     def add(self, df: pl.DataFrame) -> None:
         self.empty = df.clear()
-        split = df.with_columns(_part=pl.col(self.keys[0]) % self.parts).partition_by(
+        split = df.with_columns(_part=self.part).partition_by(
             "_part", as_dict=True, include_key=False
         )
         for key, part in split.items():
@@ -2158,7 +2238,7 @@ class _Summed:
             self.rows[p] += part.height
             total = self.totals[p]
             if self.rows[p] > max(
-                self.min_rows // self.parts, 0 if total is None else total.height
+                self.min_rows // self.parts, 0 if total is None else self.slack * total.height
             ):
                 self.totals[p], self.pending[p], self.rows[p] = self._merged(p), [], 0
 
@@ -2166,6 +2246,14 @@ class _Summed:
         total = self.totals[p]
         parts = [total, *self.pending[p]] if total is not None else self.pending[p]
         return pl.concat([self.empty, *parts]).group_by(self.keys).agg(**self.aggs)
+
+    def each(self) -> Iterator[pl.DataFrame]:
+        """The summed table part by part, in part order, each released once given; so it is
+        called once, at the end (as :meth:`total`)."""
+        for p in range(self.parts):
+            merged = self._merged(p)
+            self.totals[p], self.pending[p] = None, []
+            yield merged
 
     def total(self) -> pl.DataFrame:
         """The summed table. It releases the parts, so it is called once, at the end."""
@@ -2290,6 +2378,7 @@ def profile(
     mask: "Mask | None" = None,
     summary: dict[str, float | int | None] | None = None,
     em_start: int = 0,
+    greedy: bool = False,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -2360,6 +2449,10 @@ def profile(
     k-mers (``frames`` and ``genetic_code`` are ignored), and the ``aai`` columns are named
     ``ani`` (``min_aai`` then filters on ``ani_naive``).
 
+    ``greedy`` replaces the EM fits by gather's assignment (:func:`greedy_coverage`, as
+    sylph; ``coverage_greedy``): no ``_em``/``_zi`` columns and no ``aai``, so it excludes
+    ``draws``, ``with_aai`` and ``all_estimators``; ``aai_naive`` is still reported.
+
     ``em_start`` > 0 seeds random starting points for the EM fits (:func:`em`,
     :func:`em_pin`; not the posterior's): profiles from several starts agree where the fits
     converged, a check that needs no truth (phase 7, step 30).
@@ -2368,6 +2461,8 @@ def profile(
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
     space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
     """
+    if greedy and (draws > 0 or with_aai or all_estimators):
+        raise ValueError("greedy has no zero-inflated fit: no draws, aai or other estimators")
     record = timer is not None
     timer = timer or Timer()
     counts = timer.counts
@@ -2461,13 +2556,15 @@ def profile(
     per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
     # The sample's distinct sampled hashes first, a read pass more, so that tier 1 is read
     # once in hash order and dropped (plan, phase 6, step 40 (c)), not paged in at random.
-    distinct = _Summed(["hash"], {})
+    # In 16 hash ranges, each merged once its waiting hashes pass a quarter of it.
+    below = max(joint.max_hash("tier1").bit_length() - 4, 0)
+    distinct = _Summed(["hash"], {}, part=pl.col("hash") // (1 << below), slack=0.25)
     distinct.add(pl.DataFrame({"hash": empty}))
     with timer("sketch"):
         for batch in stream(joint.max_hash("tier1")):
             distinct.add(pl.DataFrame({"hash": batch["hash"]}).unique())
     with timer("walk"):
-        joint.walk("tier1", distinct.total()["hash"].sort().to_numpy())
+        joint.walk("tier1", (part["hash"].sort().to_numpy() for part in distinct.each()))
     del distinct
     reads = iter(stream(joint.max_hash("tier1")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
@@ -2547,22 +2644,23 @@ def profile(
     hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
     t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
-        assigned = gather(kmer_hits.select("unit", "hash"), t_g)
+        assigned, owned = gather(kmer_hits.select("unit", "hash"), t_g)
+        # Each hit k-mer is gather's: the first unit in gather order holding it.
+        own = kmer_hits.filter(pl.Series(owned)).select("unit", "hash", "holders", "hits")
+        del owned
     counts["detected_units"] = assigned.height
     detected = kmer_hits.join(assigned.select("unit"), on="unit")
     m_g = hit_info["m_g"].to_numpy()
     pin_hist = hit_info["pin_hist"].to_numpy()
     pin_sum = hit_info["pin_sum"]
     len_cv = hit_info["len_cv"].to_numpy()
-    # Each hit k-mer is gather's: the first unit in gather order holding it.
-    own = (
-        kmer_hits.join(assigned.select("unit", "gather_rank"), on="unit")
-        .sort("gather_rank")
-        .unique("hash", keep="first")
-        .select("unit", "hash", "holders")
-    )
     with timer("presence"):
         present_prob = presence(own, t_g, n_reads, joint.height, report=counts)
+    greedy_fit = (
+        greedy_coverage(own, np.bincount(kmer_hits["unit"].to_numpy(), minlength=len(m_g)), m_g)
+        if greedy
+        else None
+    )
     del own
     if joint.dense:
         # Second pass: every k-mer at the dense rate, for the detected units only.
@@ -2588,23 +2686,6 @@ def profile(
     if record:
         with timer("links"):
             counts |= link_cuts(detected)
-    start = np.random.default_rng(em_start) if em_start else None
-    with timer("fit_em"):
-        # Fits stop per component, so batches of components give the same units' results.
-        parts = component_batches(detected)
-        detected = pl.concat(parts, rechunk=False)  # the batches' rows, not a second copy
-
-        def per_batch(fit: Callable[[pl.DataFrame], pl.DataFrame]) -> pl.DataFrame:
-            return pl.concat([fit(part) for part in parts]).sort("unit")
-
-        counts["fit_batches"] = len(parts)
-        counts["fit_largest_batch_pairs"] = max(part.height for part in parts)
-        plain = per_batch(lambda part: em(part, m_g, report=counts, start=start)).select(
-            "unit", coverage_em="coverage"
-        )
-        # Hits after the EM split (what the function x taxon table splits): coverage x m.
-        plain = plain.with_columns(hits_em=plain["coverage_em"] * m_g[plain["unit"].to_numpy()])
-    fits = [plain]
     # Clumping: a read covering a unit hits ~ Poisson(mu) of its kept k-mers, which inflates
     # the variance of hit counts by 1 + mu. mu from tier-1 hits per hitting read (a
     # zero-truncated mean).
@@ -2616,7 +2697,28 @@ def profile(
     )
     mu_tier1 = np.zeros(len(m_g))
     mu_tier1[ratio["unit"].to_numpy()] = ztp_lambda(ratio["per_read"].to_numpy())
-    if True:  # coverage_zi is the shipped coverage (step 35): the zero-inflated fit always runs
+    if greedy:  # gather's assignment instead of the EM fits, as sylph (no fit_em, fit_zi)
+        assert greedy_fit is not None
+        fits = [greedy_fit]
+    else:
+        start = np.random.default_rng(em_start) if em_start else None
+        with timer("fit_em"):
+            # Fits stop per component, so batches of components give the same units' results.
+            parts = component_batches(detected)
+            detected = pl.concat(parts, rechunk=False)  # the batches' rows, not a second copy
+
+            def per_batch(fit: Callable[[pl.DataFrame], pl.DataFrame]) -> pl.DataFrame:
+                return pl.concat([fit(part) for part in parts]).sort("unit")
+
+            counts["fit_batches"] = len(parts)
+            counts["fit_largest_batch_pairs"] = max(part.height for part in parts)
+            plain = per_batch(lambda part: em(part, m_g, report=counts, start=start)).select(
+                "unit", coverage_em="coverage"
+            )
+            # Hits after the EM split (what the function x taxon table splits): coverage x m.
+            plain = plain.with_columns(hits_em=plain["coverage_em"] * m_g[plain["unit"].to_numpy()])
+        fits = [plain]
+        # coverage_zi is the shipped coverage (step 35): the zero-inflated fit always runs
         with timer("fit_zi"):
             zi_report: dict[str, float] = {}  # its em_* (step 40: 9,059 s block-wise, unreported)
             inflated = per_batch(
@@ -2678,21 +2780,23 @@ def profile(
                 coverage_zi_dispersion=zi["dispersion"].fill_null(1.0),
             )
         fits.append(fitted_zi)
-    if all_estimators:
-        with timer("fit_zib"):
-            prior = fit_present_prior(inflated)
-            fitted = (
-                per_batch(lambda part: em(part, m_g, zero_inflated=True, prior=prior, start=start))
-                if prior
-                else inflated
-            )
-            fits.append(fitted.select("unit", coverage_zib="coverage", present_zib="present"))
-        with timer("fit_zip"):
-            fits.append(
-                per_batch(lambda part: em_pin(part, pin_hist, start=start)).select(
-                    "unit", coverage_zip="coverage", present_zip="present"
+        if all_estimators:
+            with timer("fit_zib"):
+                prior = fit_present_prior(inflated)
+                fitted = (
+                    per_batch(
+                        lambda part: em(part, m_g, zero_inflated=True, prior=prior, start=start)
+                    )
+                    if prior
+                    else inflated
                 )
-            )
+                fits.append(fitted.select("unit", coverage_zib="coverage", present_zib="present"))
+            with timer("fit_zip"):
+                fits.append(
+                    per_batch(lambda part: em_pin(part, pin_hist, start=start)).select(
+                        "unit", coverage_zip="coverage", present_zip="present"
+                    )
+                )
     with timer("aai"):
         per_unit = (
             kmer_hits.group_by("unit").agg(hits=pl.col("hits").sum(), kmers=pl.len()).sort("unit")
@@ -2771,10 +2875,31 @@ def profile(
                     (pl.col(f"_{rule}").fill_null(0) / pl.col("m_g")).alias(f"coverage_{rule}"),
                 )
             result = result.drop("_wta", "_ufirst")
+    # The hit tables are done with: freed before the result's last copies (step 40).
+    del kmer_hits, detected, unit_reads, component, hit_info, unit_info, assigned, naive
+    del present_prob, fits
+    with timer("finish"):
+        result = _finish(result, joint, min_aai, params.alphabet)
+    if summary is not None:  # over every unit, before min_aai drops rows
+        # The first stream is the full first pass over the reads.
+        summary |= sample_summary(
+            params.k,
+            n_reads if not sources else sources[0].n_reads,
+            2 if r2 is not None else 1,
+            sources[0].base_stats if sources else None,
+            None if census_max is None else (census[0], census[1]),
+            joint.max_hash("tier1") / 2**64,
+            params.alphabet,
+        )
+    return result
+
+
+def _finish(result: pl.DataFrame, joint: _Joint, min_aai: float, alphabet: str) -> pl.DataFrame:
+    """The profile's last columns, its rows in unit order, aai calibrated and filtered."""
     result = (
         result.with_columns(
             pl.col(
-                "^(coverage|present|copies|abundance|hits)_(em|zi|zib|zip)(_lo|_hi)?$"
+                "^(coverage|present|copies|abundance|hits)_(em|zi|zib|zip|greedy)(_lo|_hi)?$"
             ).fill_null(0.0),
             pl.col("present_prob").fill_null(0.0),
             pl.col("^aai_kmers$").fill_null(0.0),
@@ -2788,19 +2913,8 @@ def profile(
         .sort("unit")
     )
     result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
-    if summary is not None:  # over every unit, before min_aai drops rows
-        # The first stream is the full first pass over the reads.
-        summary |= sample_summary(
-            params.k,
-            n_reads if not sources else sources[0].n_reads,
-            2 if r2 is not None else 1,
-            sources[0].base_stats if sources else None,
-            None if census_max is None else (census[0], census[1]),
-            joint.max_hash("tier1") / 2**64,
-            params.alphabet,
-        )
     if min_aai > 0:
         result = result.filter(pl.col("aai_naive") >= min_aai)
-    if molecule(params.alphabet) == "nucleotide":  # identity of nucleotides: ANI, as sylph's
+    if molecule(alphabet) == "nucleotide":  # identity of nucleotides: ANI, as sylph's
         result = result.rename({c: "ani" + c[3:] for c in result.columns if c.startswith("aai")})
     return result
