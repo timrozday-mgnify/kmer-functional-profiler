@@ -4,14 +4,14 @@ existing tools on its assignments (plan, step 6c); a custom error model (step 7)
 work.
 
 - *Step 8, the joint EM over read sources:* each pair's source among the units it aligns to
-  (targets and neighbours), its component's reversed decoys and its component's novel
-  relative. A mate's likelihood under a source is binomial in the differences of its best
-  alignment there (``mism``, plus read residues the alignment leaves out), at the source's
-  divergence d_s: d^m (1 - d)^(n - m) / (A - 1)^m. Units' d lies in [``ERROR``, ``novel``],
-  the novel relative's in [``novel``, 0.5] on the pair's best alignment (a relative missing
-  from the reference), decoys' in [0.3, 0.95]. A mate with no alignment to a source takes its
-  worst alignment's differences (an optimistic bound, as DIAMOND's ``--top`` cut it). Pairs
-  whose mates sit on one sequence get an insert-size term, flat within 2 sigma. pi is
+  (targets and neighbours) and its component's novel relative. A mate's likelihood under a
+  source is binomial in the differences of its best alignment there (``mism``, plus read
+  residues the alignment leaves out), at the source's divergence d_s:
+  d^m (1 - d)^(n - m) / (A - 1)^m. Units' d lies in [``ERROR``, ``novel``], the novel
+  relative's in [``novel``, 0.5] on the pair's best alignment (a relative missing from the
+  reference). A mate with no alignment to a source takes its worst alignment's differences
+  (an optimistic bound, as DIAMOND's ``--top`` cut it). Pairs whose mates sit on one
+  sequence get an insert-size term, flat within 2 sigma. pi is
   started from ``coverage_zi`` x effective length; the prior fit adds ``PRIOR_PAIRS``
   pseudo-pairs per component spread the same way, the likelihood-only fit none. Pairs whose
   best source differs between the two are flagged; pileups use the likelihood-only fit.
@@ -42,7 +42,6 @@ K_MAX: Final = 3
 MIN_COVERED: Final = 10  # novel relatives: least covered columns
 MIN_ALT_READS: Final = 2.0  # haplotypes: least weight of a variable column's second residue
 EM_ITER, EM_TOL = 2000, 1e-8
-DECOY_D: Final = (0.3, 0.95)
 GAP: Final = ord("-")
 
 
@@ -102,20 +101,14 @@ class _Model:
         h = hits.join(refs.select("seq", "component"), on="seq").with_columns(
             pair=pl.col("read_name").rank("dense").cast(pl.Int64) - 1
         )
-        # sources: units (targets, neighbours), then a decoy and a novel class per component
-        units = (
-            refs.filter(pl.col("role") != 2)
-            .select("unit", "component", "role")
-            .unique("unit", maintain_order=True)
-        )
+        # sources: units (targets, neighbours), then a novel class per component
+        units = refs.select("unit", "component", "role").unique("unit", maintain_order=True)
         comps = refs["component"].unique().sort()
         n_u, n_c = units.height, comps.len()
         src_unit = dict(zip(units["unit"], range(n_u), strict=True))
         comp_i = dict(zip(comps, range(n_c), strict=True))
         h = h.with_columns(
-            src=pl.when(pl.col("role") == "decoy")
-            .then(n_u + pl.col("component").replace_strict(comp_i, return_dtype=pl.Int64))
-            .otherwise(pl.col("unit").replace_strict(src_unit, default=0, return_dtype=pl.Int64))
+            src=pl.col("unit").replace_strict(src_unit, default=0, return_dtype=pl.Int64)
         )
         n_read = pl.col("qlen").max().over("pair", "mate")
         h = h.with_columns(m=pl.col("mism") + n_read - pl.col("qlen"), n=n_read)
@@ -134,15 +127,15 @@ class _Model:
         spans = same["span"].to_numpy().astype(float)
         self.fragment = float(np.median(spans)) if len(spans) else 0.0
         sigma = 1.4826 * float(np.median(np.abs(spans - self.fragment))) if len(spans) else 0.0
-        # novel class: each mate's best non-decoy alignment; the pair's component from its best
-        non_decoy = h.filter(pl.col("role") != "decoy").sort("score", descending=True)
+        # novel class: each mate's best alignment; the pair's component from its best
+        ranked = h.sort("score", descending=True)
         pair_comp = (
-            non_decoy.group_by("pair")
+            ranked.group_by("pair")
             .first()
-            .select("pair", novel=n_u + n_c + pl.col("component").replace_strict(comp_i))
+            .select("pair", novel=n_u + pl.col("component").replace_strict(comp_i))
         )
         novel_rows = (
-            non_decoy.group_by("pair", "mate")
+            ranked.group_by("pair", "mate")
             .first()
             .join(pair_comp, on="pair")
             .select("pair", "mate", src=pl.col("novel").cast(pl.Int64), m="m")
@@ -166,7 +159,7 @@ class _Model:
             cand = cand.with_columns(ins=pl.lit(0.0))
         self.cand = cand.sort("pair", "src")
         # per-source bounds, effective lengths, priors and starting points
-        lengths = refs.filter(pl.col("rep"), pl.col("role") != 2).select("unit", "length")
+        lengths = refs.filter(pl.col("rep")).select("unit", "length")
         meta = units.join(lengths, on="unit", how="left").with_columns(
             eff=(pl.col("length") * nt + self.fragment - 2 * OVERLAP).clip(lower_bound=1.0)
         )
@@ -179,25 +172,23 @@ class _Model:
         ).with_columns(share=pl.col("mass") / pl.col("mass").sum().over("component"))
         share = meta["share"].fill_nan(0.0).fill_null(0.0).to_numpy()
         comp_of = meta["component"].replace_strict(comp_i, return_dtype=pl.Int64).to_numpy()
-        pairs_c = np.bincount(pair_comp["novel"].to_numpy() - n_u - n_c, minlength=n_c).astype(
-            float
-        )
+        pairs_c = np.bincount(pair_comp["novel"].to_numpy() - n_u, minlength=n_c).astype(float)
         unit_init = (share + 1e-3) * pairs_c[comp_of]
         self.units = meta
         self.n_u, self.n_c = n_u, n_c
         self.comps = comps
-        self.init = np.r_[unit_init, 0.05 * pairs_c, 0.05 * pairs_c] + 1e-9
-        self.prior = np.r_[PRIOR_PAIRS * share, np.zeros(2 * n_c)]
+        self.init = np.r_[unit_init, 0.05 * pairs_c] + 1e-9
+        self.prior = np.r_[PRIOR_PAIRS * share, np.zeros(n_c)]
         floor = min(max(error, 1e-4), novel)
-        self.lo = np.r_[np.full(n_u, floor), np.full(n_c, DECOY_D[0]), np.full(n_c, novel)]
-        self.hi = np.r_[np.full(n_u, novel), np.full(n_c, DECOY_D[1]), np.full(n_c, 0.5)]
+        self.lo = np.r_[np.full(n_u, floor), np.full(n_c, novel)]
+        self.hi = np.r_[np.full(n_u, novel), np.full(n_c, 0.5)]
 
     def fit(self, prior: bool, novel: bool = True) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
         """``novel`` False starts the novel classes at zero, which EM keeps them at."""
         c = self.cand
         init = self.init.copy()
         if not novel:
-            init[self.n_u + self.n_c :] = 0.0
+            init[self.n_u :] = 0.0
         r, n, d = _em(
             c["pair"].to_numpy(),
             c["src"].to_numpy(),
@@ -217,12 +208,10 @@ class _Model:
         h = self.hits.drop("mism", "m").join(hits, on="hit")
         self.hits = h.with_columns(m=pl.col("mism") + pl.col("n") - pl.col("qlen"))
         best = self.hits.sort("score", descending=True).group_by("pair", "mate", "src").first()
-        non_decoy = self.hits.filter(pl.col("role") != "decoy").sort("score", descending=True)
-        novel_src = self.cand.filter(pl.col("src") >= self.n_u + self.n_c).select(
-            "pair", novel="src"
-        )
+        ranked = self.hits.sort("score", descending=True)
+        novel_src = self.cand.filter(pl.col("src") >= self.n_u).select("pair", novel="src")
         novel_rows = (
-            non_decoy.group_by("pair", "mate")
+            ranked.group_by("pair", "mate")
             .first()
             .join(novel_src, on="pair")
             .select("pair", "mate", src="novel", m="m")
@@ -254,7 +243,7 @@ class _Model:
             * pl.col("share")
             / pl.col("share").sum().over("pair", "mate", "src")
         )
-        novel = fit.filter(pl.col("src") >= self.n_u + self.n_c).select("pair", novel="r")
+        novel = fit.filter(pl.col("src") >= self.n_u).select("pair", novel="r")
         return h.join(novel, on="pair", how="left").select(
             "hit", "pair", "mate", "seq", "src", "weight", novel=pl.col("novel").fill_null(0.0)
         )
@@ -425,8 +414,7 @@ def refine(
     eps = max(error, 0.01)
     # each mate's divergence from the nearest of the unit's original sequences
     nearest = (
-        hits.filter(pl.col("role") != "decoy")
-        .with_columns(n=pl.col("qlen").max().over("read_name", "mate"))
+        hits.with_columns(n=pl.col("qlen").max().over("read_name", "mate"))
         .with_columns(d=(pl.col("mism") + pl.col("n") - pl.col("qlen")) / pl.col("n"))
         .with_columns(d_unit=pl.col("d").min().over("read_name", "mate", "unit"))
         .select("hit", "d_unit")
@@ -501,10 +489,10 @@ def refine(
     )
 
     # outputs
-    kinds = ["unit"] * em.n_u + ["decoy"] * em.n_c + ["novel"] * em.n_c
-    comps = em.units["component"].to_list() + em.comps.to_list() * 2
-    src_units = em.units["unit"].to_list() + [None] * (2 * em.n_c)
-    eff = np.r_[em.units["eff"].to_numpy(), np.full(2 * em.n_c, np.nan)]
+    kinds = ["unit"] * em.n_u + ["novel"] * em.n_c
+    comps = em.units["component"].to_list() + em.comps.to_list()
+    src_units = em.units["unit"].to_list() + [None] * em.n_c
+    eff = np.r_[em.units["eff"].to_numpy(), np.full(em.n_c, np.nan)]
     sources = pl.DataFrame(
         {
             "kind": kinds,

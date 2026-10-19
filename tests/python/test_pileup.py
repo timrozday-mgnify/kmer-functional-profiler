@@ -56,11 +56,11 @@ def diamond_line(read: str, seq: str, bits: float, btop: str) -> str:
 def protein_refs(tmp_path: Path) -> Path:
     return write_refs(
         tmp_path / "ref",
-        [("s0", "target", 0, A), ("s1", "neighbour", 1, B), ("s2", "decoy", 0, A[::-1])],
+        [("s0", "target", 0, A), ("s1", "neighbour", 1, B)],
     )
 
 
-def test_posteriors_decoys_and_sibling_residues(protein_refs: Path, tmp_path: Path) -> None:
+def test_posteriors_neighbours_and_sibling_residues(protein_refs: Path, tmp_path: Path) -> None:
     hits = tmp_path / "r1.tsv"
     hits.write_text(
         diamond_line("r1", "s0", 30, "11")  # A as is: weight 1 / (1 + 2^-3) on A
@@ -71,7 +71,6 @@ def test_posteriors_decoys_and_sibling_residues(protein_refs: Path, tmp_path: Pa
         + diamond_line("r3", "s1", 25, "4AS3LI2")
         + diamond_line("r4", "s0", 29, "4SA6")  # S at 4, as B has: a sibling's residue
         + diamond_line("r4", "s1", 28, "8VI2")
-        + diamond_line("r5", "s2", 40, "11")  # best on a reversed decoy: dropped
     )
     profile = tmp_path / "profile.tsv"  # a unit outside the reference and an unused column
     profile.write_text("unit\tother\taai\tcoverage_zi\n0\tx\t0.97\t2.0\n9\ty\t0.5\t1.0\n")
@@ -117,7 +116,9 @@ def test_leave_one_column_out_weight(tmp_path: Path) -> None:
 
 def test_sam_strands_and_borrowed_sequences(tmp_path: Path) -> None:
     ref = "ACGTTGCAAGGCTTACGATCGATCGGATCCA"
-    refs = write_refs(tmp_path / "ref", [("s0", "target", 0, ref), ("s1", "decoy", 0, ref[::-1])])
+    refs = write_refs(
+        tmp_path / "ref", [("s0", "target", 0, ref), ("s1", "neighbour", 1, ref[::-1])]
+    )
     read = ref[2:22]
     variant = read[:9] + ("A" if read[9] != "A" else "C") + read[10:]  # alt at column 11
     rc = variant.translate(str.maketrans("ACGT", "TGCA"))[::-1]
@@ -145,13 +146,11 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     build_index(index_dir / TARGETS, index_dir, IndexParams(k=7, t_base=1.0))
     profile(Index.load(index_dir), *READS).write_csv(tmp_path / "p.tsv", separator="\t")
     counts = build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "ref")
-    assert counts["target"] == counts["decoy"] > 0
+    assert counts["target"] > 0 and set(counts) <= {"target", "neighbour"}  # no decoys
     refs = pl.read_csv(tmp_path / "ref" / "refs.tsv", separator="\t")
     fasta = dict(read_fasta(tmp_path / "ref" / "ref.fa"))
     assert list(fasta) == refs["seq_id"].to_list()
     target = refs.filter(pl.col("role") == "target").row(0, named=True)
-    decoy = refs.filter(pl.col("role") == "decoy", pl.col("unit") == target["unit"])
-    assert fasta[decoy["seq_id"][0]] == fasta[target["seq_id"]][::-1]
     assert (tmp_path / "ref" / "molecule.txt").read_text() == "protein\n"
     # a withheld unit is in no role
     held = str(target["cluster_rep"])
@@ -201,7 +200,7 @@ def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> No
     # Target A (30 aa); a strain of it with one fixed difference (column 2) and a relative
     # missing from the reference that differs at five more columns, linked (6/30).
     ref = "MKVLAAGIVLWQERTYIPASDFGHKLCVNM"
-    refs = write_refs(tmp_path / "ref", [("s0", "target", 0, ref), ("s1", "decoy", 0, ref[::-1])])
+    refs = write_refs(tmp_path / "ref", [("s0", "target", 0, ref)])
     relative = {2: "W", 5: "S", 10: "D", 15: "N", 20: "Q", 25: "E"}
 
     def btop(diffs: dict[int, str]) -> str:
@@ -241,7 +240,7 @@ def test_frameshift_btop_to_nucleotides(tmp_path: Path) -> None:
     fs = DATA / "frameshift"
     cds = dict(read_fasta(fs / "cds.fna"))["p"]
     prot = dict(read_fasta(fs / "ref.faa"))["p"]
-    refs = write_refs(tmp_path / "ref", [("p", "target", 0, prot), ("d", "decoy", 0, prot[::-1])])
+    refs = write_refs(tmp_path / "ref", [("p", "target", 0, prot)])
     (tmp_path / "r2.tsv").write_text("")
     counts = call(
         [fs / "diamond.tsv", tmp_path / "r2.tsv"], refs, tmp_path / "out", "diamond",
@@ -279,7 +278,7 @@ def test_frameshift_btop_to_nucleotides(tmp_path: Path) -> None:
 def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
     refs = write_refs(
         tmp_path / "ref",
-        [("s0", "target", 0, "A" * 30), ("s1", "target", 1, "C" * 30), ("s2", "decoy", 0, "A")],
+        [("s0", "target", 0, "A" * 30), ("s1", "target", 1, "C" * 30), ("s2", "neighbour", 2, "A")],
     )
     pile = tmp_path / "pileup"
     pile.mkdir()
@@ -287,8 +286,8 @@ def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
         {
             "read_name": ["p1", "p1", "p1", "p2", "p3"],
             "mate": [0, 1, 0, 0, 0],
-            "unit": [0, 0, 1, 0, 0],
-            "role": ["target"] * 4 + ["decoy"],
+            "unit": [0, 0, 1, 0, 2],
+            "role": ["target"] * 4 + ["neighbour"],
             "em_posterior": [0.9, 0.9, 0.1, 0.4, 0.9],
         }
     ).write_parquet(pile / "assignments.parquet")
