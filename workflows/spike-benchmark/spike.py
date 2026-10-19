@@ -384,11 +384,7 @@ def _pileup_scores(
         .agg(taken=pl.col("posterior").sum())
     )
     # the role the profile gave the sibling's parent unit: target, neighbour or none
-    roles = (
-        refs.filter(pl.col("role") != "decoy")
-        .select(parent="cluster_rep", parent_role="role")
-        .unique()
-    )
+    roles = refs.select(parent="cluster_rep", parent_role="role").unique()
     sib = (
         sib.join(taken, on="strain", how="left")
         .join(roles, on="parent", how="left")

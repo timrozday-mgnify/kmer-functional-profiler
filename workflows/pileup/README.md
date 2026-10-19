@@ -10,9 +10,8 @@ Per sample:
 1. `QUERY`: `kmer-functional-profiler query --aai` against the index (built from
    `--targets` by `INDEX` if no `--index` is given).
 2. `REFERENCE`: `kfp-pileup reference`: units with `present_prob >= --min_present` as
-   targets, the other hit units of their components as neighbour decoys (at most
-   `--neighbours` per target in a component, the most-hit first), the targets
-   reversed as null decoys; up to `--members` sequences per unit, from kfp's `fetch` (the
+   targets, the other hit units of their components as neighbours (at most
+   `--neighbours` per target in a component, the most-hit first); up to `--members` sequences per unit, from kfp's `fetch` (the
    index's `targets.parquet`, or `--store` members tables, e.g. the partitioned build's MERGE
    output).
 3. The aligner the index's molecule calls for:
@@ -20,7 +19,7 @@ Per sample:
      `--diamond_top` % of the read's best, frameshift-aware with `-F --frameshift` (0: off),
      tabular with BTOP);
    - nucleotide index: `BWAMEM2` (`index`, then `mem -a`, SAM).
-4. `CALL`: `kfp-pileup call`: read posteriors (leave one column out), decoy drop, pileups,
+4. `CALL`: `kfp-pileup call`: read posteriors (leave one column out), neighbour-best reads dropped, pileups,
    variants and per-unit identity; read assignment (steps 8-9); with DIAMOND, the reads
    brought back to nucleotides along their alignments, a nucleotide pileup and a consensus
    coding sequence per unit (step 6b).
@@ -46,7 +45,7 @@ Outputs under `<outdir>/<sample>/`:
 | `pileup/pileup.parquet` | summed weights per (sequence, column, residue), with the part from sibling residues |
 | `pileup/variants.tsv` | columns with depth >= `--min_depth` and an alternative residue at >= `--min_freq`, with `sibling_share` |
 | `pileup/units.tsv` | per target unit: reads, alignment identity (all sequences, representative), the representative's consensus identity, and the profile's `aai` (`ani`) columns, for the `aai` check; with steps 8-9, `em_pairs`, `em_abundance`, `em_divergence` |
-| `pileup/sources.tsv` | step 8: per source (unit, a component's decoys, its novel relative): pairs (likelihood-only and with the prior), divergence, effective length, abundance |
+| `pileup/sources.tsv` | step 8: per source (unit, or a component's novel relative): pairs (likelihood-only and with the prior), divergence, effective length, abundance |
 | `pileup/haplotypes.tsv` | step 9: per target sequence, haplotypes (0: the original sequence), share, reads, divergence from the original and of their reads from the unit's nearest sequence, `novel` |
 | `pileup/pileup_nt.parquet` | step 6b (DIAMOND): summed weights per (sequence, nucleotide column, allele): a base, `-` (deleted), or `+` and inserted bases (before the column); a diagnostic |
 | `pileup/consensus.fna`, `.gff`, `.genes.fna`, `.tsv` | step 6b: per unit, the consensus coding sequence of its best-supported sequence (substitutions only, `N` where uncovered; columns 3c..3c+2 are reference column c), as one CDS for `bcftools csq`, as prodigal genes for inStrain, and its coverage |

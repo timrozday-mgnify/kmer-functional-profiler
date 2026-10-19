@@ -1,16 +1,19 @@
 """Per-sample reference from a profile (plan, phase 13, step 2).
 
-Three roles, one FASTA:
+Two roles, one FASTA:
 
 - ``target``: units the profile calls present (``present_prob`` >= ``min_present``);
 - ``neighbour``: the other hit units in the targets' components (``component``), decoys
   that catch reads from a sibling the profile did not call; at most ``neighbours`` per
   target in a component, those with the most tier-1 hits (a real sample's giant component
-  holds most hit units: millions of sequences and a REFERENCE killed at 256 GB);
-- ``decoy``: the targets' sequences reversed, a null for the score threshold.
+  holds most hit units: millions of sequences and a REFERENCE killed at 256 GB).
+
+Reversed decoys were dropped (plan, phase 13, 2026-10-19): on ``spike-protein`` they kept
+0-21 mates per sample off targets, and the EM's novel class takes chance alignments.
 
 ``withhold`` units (``cluster_rep`` names) are left out of every role, as if the profile had
-never seen them: the benchmark's withheld sibling, whose reads the decoys must catch.
+never seen them: the benchmark's withheld sibling, whose reads neighbours and the EM's
+novel class must catch.
 
 Sequence ids are ``s0``, ``s1``, …, safe as DIAMOND subject and SAM reference names;
 ``refs.tsv`` maps them to role, unit, ``cluster_rep``, member and component.
@@ -76,10 +79,7 @@ def build_reference(
         ]
     )
     seqs = fetch(index_dir, roles["unit"].to_list(), members, store).join(roles, on="unit")
-    decoys = seqs.filter(pl.col("role") == "target").with_columns(
-        pl.col("sequence").str.reverse(), role=pl.lit("decoy")
-    )
-    refs = pl.concat([seqs, decoys]).with_columns(
+    refs = seqs.with_columns(
         seq_id=pl.format("s{}", pl.int_range(pl.len())),
         length=pl.col("sequence").str.len_bytes(),
     )

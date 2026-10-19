@@ -38,7 +38,7 @@ def reference(
         int, typer.Option(help="Neighbours per target in a component, the most-hit first")
     ] = NEIGHBOURS,
 ) -> None:
-    """Write ref.fa (targets, component neighbours, reversed decoys), refs.tsv and
+    """Write ref.fa (targets and component neighbours), refs.tsv and
     molecule.txt; print the sequences per role."""
     held = withhold.read_text().split() if withhold else ()
     counts = build_reference(

@@ -59,6 +59,7 @@ process REFERENCE {
     path store
     path withhold  // units left out of the reference (spike-benchmark), or NO_WITHHOLD
     val opts
+    path code  // unused: staged so that -resume rebuilds the reference when its code changes
 
     output:
     tuple val(sample), path('ref'), env('MOLECULE'), emit: ref
@@ -414,7 +415,8 @@ workflow PILEUP {
     def profiles = QUERY(reads, index, meta,
         "${params.query_stats ? '--stats stats.json ' : ''}${params.query_args}").profile
     def refs = REFERENCE(profiles, index, meta, store, withhold,
-        "--min-present ${params.min_present} --neighbours ${params.neighbours} --members ${params.members}").ref
+        "--min-present ${params.min_present} --neighbours ${params.neighbours} --members ${params.members}",
+        file("${moduleDir}/../../python/kfp_pileup/reference.py", checkIfExists: true)).ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'
             return tuple(sample, ref, r1, r2)

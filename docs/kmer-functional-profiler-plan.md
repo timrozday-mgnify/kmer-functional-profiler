@@ -2445,6 +2445,12 @@ Planned 2026-10-15. To be developed on `dev-pileups` (from `main`), one feature 
   - *Order:* after `pileup-cost`'s re-run (its `-resume` cache is the input) and with neither `spike-protein` nor `pileup-cost` running.
   - **Checked:** `compare.py` on the laptop spike outputs (the same results under two arm names: agreement 1, both pass, cost counted once per benchmark); `bash -n run.sh`; ruff.
 
+* **Phase 13, reversed decoys dropped (2026-10-19, branch `pileup-drop-decoys`, the user's question and `decoys.py` on `spike-protein`).** Per sample (3 tiers × 10): 1,747–3,138 of 3.5–4.9 M alignments reach a decoy; 1,165–2,101 mates have a decoy as best alignment, of which 0–21 also align to a target, against 110,689–149,309 pairs the EM puts on units (≤ 0.02%); the EM's decoy classes take 1,109–2,006 pairs against 728,437–880,805 in the novel class (≤ 0.26%). The rule set the same day (< 0.1% of target pairs, decoy pairs small beside novel) passes in every sample, so the decoys go.
+  - *Code:* `kfp-pileup reference` writes targets and neighbours only (`ROLES` = target, neighbour); `refine`'s sources are units then one novel class per component (the decoy class and `DECOY_D` gone; novel at `n_u + c`); `handoff` and the spike scorer needed no change beyond dropping a filter. The neighbours (real units, the "neighbour decoys" of the design) stay.
+  - *Workflow:* `REFERENCE` stages `reference.py` as an input (as `HANDOFF` does `handoff.py`), so `-resume` rebuilds a cached reference that still holds decoys (Nextflow does not hash the installed package); the `pileup-cost` re-run and step 3b's arms therefore all use the decoy-free reference, baseline included.
+  - *Design text superseded:* Controlling misassignment's null decoys (target-decoy FDR, never built) and step 2's "reversed decoys"; the gate's "decoys catching ≥ 80% of a withheld sibling's reads" is now met by neighbours and the novel class (`sibling_caught_em`).
+  - **Checked:** pileup tests (fixtures without decoys; the EM still sends a missing relative's reads to the novel class), ruff, mypy; `workflows/pileup` `test` (`REFERENCE` reran under `-resume`; `sources.tsv` holds unit and novel only); spike benchmark `test`: read precision (EM) 1.0, siblings caught (EM) 0.98, 0.96 where the parent is a target.
+
 ### Phase 14
 
 Planned 2026-10-15. To be developed on `dev-targets` (from `main`), one feature branch per step, kept off `main` until phase 7's ablations are done.

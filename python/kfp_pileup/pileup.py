@@ -10,9 +10,8 @@ Each alignment h of a read has a score S_h in bits (DIAMOND's bit score; bwa's `
 the substitution score of that column (BLOSUM62 or bwa's match/mismatch), keyed by the read
 position q it uses.
 
-- *Read posterior:* w_h = 2^S_h / sum_g 2^S_g over the read's alignments, decoys included.
-  A read whose best alignment is not a target (a neighbour or a reversed decoy) is dropped
-  from the pileups.
+- *Read posterior:* w_h = 2^S_h / sum_g 2^S_g over the read's alignments, neighbours
+  included. A read whose best alignment is a neighbour is dropped from the pileups.
 - *Leave one column out* (the circularity fix): at a target column using read position q
   the weight is 2^(S_h - t_h,q) / sum_g 2^(S_g - t_g,q), every alignment's term at q
   removed, so a read's residue there does not lower its own weight. Deletions (no read
@@ -57,8 +56,8 @@ BWA_MATCH, BWA_MISMATCH, BWA_N, GAP_EXTEND = 1, -4, -1, -1  # bwa-mem2's default
 MIN_DEPTH: Final = 3.0
 MIN_FREQ: Final = 0.2
 BATCH_READS: Final = 20_000
-ROLES: Final = ("target", "neighbour", "decoy")
-TARGET, NEIGHBOUR, DECOY = range(3)
+ROLES: Final = ("target", "neighbour")
+TARGET, NEIGHBOUR = range(2)
 GAP: Final = ord("-")
 MATE: Final = ["read", "mate"]  # one read's alignments: mates are scored independently
 
@@ -411,7 +410,7 @@ def score_batch(
         .otherwise(pl.col("posterior"))
     )
     piled = rows.filter(pl.col("kept"), pl.col("role") == TARGET)
-    others = rows.filter(pl.col("role") != DECOY).select(*MATE, "qpos", residue="ref", other="unit")
+    others = rows.select(*MATE, "qpos", residue="ref", other="unit")
     sibling = (
         piled.filter(pl.col("residue") != pl.col("ref"), pl.col("qpos") >= 0)
         .join(others, on=[*MATE, "qpos", "residue"])
