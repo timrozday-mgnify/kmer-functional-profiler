@@ -36,6 +36,9 @@ cd kfp-ablations/frames-query-cost && sbatch run.sh   # four frame modes, one af
 # query memory as Slurm counts it, release tiers in place, a ladder of limits (plan, phase 6,
 # step 40), when release-tiers has finished:
 cd kfp-ablations/query-memory && sbatch run.sh
+# then the same cells with tier 1 read by hash range and unit columns in unit order (step 40
+# (c)-(d)); KEEP=1 for the arm that leaves the pages read in the page cache:
+cd kfp-ablations/query-walk && sbatch run.sh
 # EM convergence fix (plan, phase 7, step 29), once tiers-novaseq's indexes exist:
 cd kfp-ablations/em-query-cost && sbatch run.sh
 # EM convergence from 5 starts on two deep soil metagenomes (step 30), as em-query-cost:

@@ -42,9 +42,12 @@ The query probes it only for the units the sparse tier detects, to fit abundance
 """
 
 import gzip
+import itertools
 import json
 import mmap
+import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
@@ -402,6 +405,59 @@ def _madvise_random(array: np.ndarray) -> np.ndarray:
     return array
 
 
+# Index arrays read in order (plan, phase 6, step 40): rows per read, and whether the pages
+# read are dropped from the page cache after (the job's cgroup is charged for them).
+READ_ROWS: Final = 2**22
+DROP_CACHE = True
+PAGE: Final = 4096
+
+
+def read_rows(arr: np.ndarray, start: int, stop: int, wanted: int | None = None) -> np.ndarray:
+    """``arr[start:stop]`` of a whole index array, for ``wanted`` of its rows (all if None).
+
+    A memory-mapped array (``np.load(mmap_mode="r")``, not a slice of one) is read with
+    plain reads into memory, then (``DROP_CACHE``) its pages dropped from the page cache, so
+    they are never mapped and never stay charged to the job; with under one wanted row per
+    page, the rows are left in place (a view: only their pages fault in). Other arrays are
+    sliced.
+    """
+    width = arr.itemsize * int(np.prod(arr.shape[1:]))
+    sparse = wanted is not None and int(wanted) * PAGE < (stop - start) * width
+    if not isinstance(arr, np.memmap) or sparse or stop <= start:
+        return arr[start:stop]
+    out = np.empty((stop - start, *arr.shape[1:]), arr.dtype)
+    view, offset = out.data.cast("B"), arr.offset + start * width
+    with Path(str(arr.filename)).open("rb", buffering=0) as f:
+        f.seek(offset)
+        done = 0
+        while done < len(view):  # a read may return less than asked
+            n = f.readinto(view[done:])
+            if not n:
+                raise EOFError(f"{arr.filename}: ends before row {stop}")
+            done += n
+        if DROP_CACHE and sys.platform == "linux":
+            os.posix_fadvise(f.fileno(), offset, len(view), os.POSIX_FADV_DONTNEED)
+    return out
+
+
+def take(arr: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """``arr[rows]`` for sorted ``rows`` of a whole index array, read ``READ_ROWS`` at a time
+    in order (``read_rows``): one pass over the pages, never all of them mapped at once."""
+    rows = np.asarray(rows, dtype=np.int64)
+    if not isinstance(arr, np.memmap):
+        got: np.ndarray = arr[rows]
+        return got
+    out = np.empty((len(rows), *arr.shape[1:]), arr.dtype)
+    block = rows // READ_ROWS
+    cuts = [0, *(np.flatnonzero(np.diff(block)) + 1), len(rows)]
+    for a, b in itertools.pairwise(cuts):
+        if a == b:
+            continue
+        lo = int(block[a]) * READ_ROWS
+        out[a:b] = read_rows(arr, lo, min(lo + READ_ROWS, len(arr)), b - a)[rows[a:b] - lo]
+    return out
+
+
 def _is_numeric(dtype: pl.DataType) -> bool:
     return dtype.is_numeric() or (isinstance(dtype, pl.Array) and dtype.inner.is_numeric())
 
@@ -494,7 +550,7 @@ class UnitTable:
         other = [n for n in self.schema if n != "unit" and n not in numeric]
         frame = pl.DataFrame(
             [pl.Series("unit", units)]
-            + [pl.Series(n, self[n][units], dtype=self.schema[n]) for n in numeric]
+            + [pl.Series(n, take(self[n], units), dtype=self.schema[n]) for n in numeric]
         )
         if other:  # strings: scanned from the parquet, which is in unit order
             frame = frame.hstack(

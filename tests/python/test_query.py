@@ -15,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from kmer_functional_profiler import _core, query, reference
+from kmer_functional_profiler import index as index_module
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import (
     PIN_BITS,
@@ -39,6 +40,7 @@ from kmer_functional_profiler.query import (
     presence,
     profile,
     sample_summary,
+    tier_hits,
     unit_hits,
 )
 from kmer_functional_profiler.survival import SurvivalModel, check_aai_model
@@ -123,6 +125,46 @@ def test_sampled_index_hits_respect_unit_thresholds(members: Path) -> None:
     assert (both["hits"] - both["hits_exact"]).sum() <= 2
     assert (result["kmers_hit"] <= result["m_g"]).all()
     assert result["containment"].is_between(0, 1).all()
+
+
+@pytest.fixture
+def read_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Index arrays read in small blocks with plain reads, never left in place (step 40)."""
+    monkeypatch.setattr(index_module, "PAGE", 2**62)  # every block read whole
+    monkeypatch.setattr(index_module, "READ_ROWS", 64)
+    monkeypatch.setattr(query, "WALK_BUCKETS", 4)
+    monkeypatch.setattr(query, "WALK_HASHES", 16)
+
+
+@pytest.mark.parametrize("fp_bits", [4, 16])  # 4 bits: fingerprints collide, sets pool
+@pytest.mark.usefixtures("read_in_order")
+def test_tier_walk_gives_the_lookups_rows(shared: Path, fp_bits: int) -> None:
+    index = build(shared, t_base=0.2, n_min=4, fp_bits=fp_bits)
+    table, max_hash_g = index.tier1, index.units["max_hash_g"]
+    assert isinstance(table.fingerprints, np.memmap)
+    assert not isinstance(index_module.read_rows(table.fingerprints, 0, 9, 1), np.memmap)
+    batches = list(_core.FastxHits(*READS, k=K, max_hash=table.max_hash))
+    hashes = np.concatenate([b["hash"] for b in batches])
+    reads = np.concatenate([b["read"] for b in batches])
+    noise = np.random.default_rng(1).integers(0, table.max_hash, 5000, dtype=np.uint64)
+    hashes = np.concatenate([hashes, noise])
+    reads = np.concatenate([reads, np.zeros(len(noise), np.uint64)])
+    walked = tier_hits(table, max_hash_g, np.unique(hashes))
+    want = unit_hits(table, max_hash_g, hashes, reads)
+    assert want.height > 0
+    assert walked.hits(hashes, reads).equals(want)
+    # Hashes not in the walk's set may be missing, never wrong: the walk read only theirs.
+    some = np.unique(hashes)[::3].copy()
+    part = tier_hits(table, max_hash_g, some).hits(some, np.zeros(len(some), np.uint64))
+    assert part.equals(unit_hits(table, max_hash_g, some, np.zeros(len(some), np.uint64)))
+
+
+@pytest.mark.usefixtures("read_in_order")
+def test_unit_rows_read_in_order_equal_rows_in_place(shared: Path) -> None:
+    index = build(shared, t_base=0.2, n_min=4)
+    units = np.flatnonzero(np.random.default_rng(2).random(index.units.height) < 0.3)
+    in_memory = UnitTable(index.units.path.parent, mmap=False)
+    assert index.units.rows(units).equals(in_memory.rows(units))
 
 
 def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
