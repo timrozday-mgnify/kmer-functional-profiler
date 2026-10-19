@@ -426,7 +426,7 @@ def read_rows(arr: np.ndarray, start: int, stop: int, wanted: int | None = None)
     if not isinstance(arr, np.memmap) or sparse or stop <= start:
         return arr[start:stop]
     out = np.empty((stop - start, *arr.shape[1:]), arr.dtype)
-    view, offset = memoryview(out).cast("B"), arr.offset + start * width
+    view, offset = out.data.cast("B"), arr.offset + start * width
     with Path(str(arr.filename)).open("rb", buffering=0) as f:
         f.seek(offset)
         done = 0
