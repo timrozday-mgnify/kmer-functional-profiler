@@ -344,12 +344,20 @@ def query(
         int,
         typer.Option(help="EM step cap of the zero-inflated fit; 0 = the default, 10,000"),
     ] = 0,
+    zi_cold_start: Annotated[
+        bool,
+        typer.Option(
+            help="Start the zero-inflated fit from the usual start, not from the plain EM's "
+            "coverages (the warm-start ablation)"
+        ),
+    ] = False,
 ) -> None:
     """Profile reads (FASTA/FASTQ, optionally paired) against an index."""
     if max_fit_pairs:  # ponytail: a module setting, as the tests set it; a parameter if it ships
         query_module.MAX_FIT_PAIRS = max_fit_pairs
     if zi_max_iter:  # ponytail: as --max-fit-pairs
         query_module.ZI_MAX_ITER = zi_max_iter
+    query_module.ZI_WARM_START = not zi_cold_start  # ponytail: as --max-fit-pairs
     index_module.DROP_CACHE = not keep_index_cache  # ponytail: as --max-fit-pairs
     timer = Timer(stats, log=stats is not None)
     sample: dict[str, float | int | None] | None = None if summary is None else {}

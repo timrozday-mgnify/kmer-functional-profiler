@@ -1410,6 +1410,25 @@ def test_random_em_starts_reach_one_fixed_point() -> None:
     assert np.allclose(moved, usual, rtol=0, atol=1e-5)
 
 
+def test_zero_inflated_fit_warm_from_plain_em_reaches_its_fixed_point() -> None:
+    # Started from the plain EM's coverages (0 for units it explains away, floored), the
+    # zero-inflated fit reaches the usual start's coverages, in fewer steps (as in profile:
+    # gather's units only).
+    kmers, m_g = _families(200, 1)
+    kept, _ = query.gather(kmers.select("unit", "hash"), np.ones(len(m_g)))
+    kmers = kmers.join(kept.select("unit"), on="unit", how="semi")
+    plain = em(kmers, m_g)
+    init = np.zeros(len(m_g))
+    init[plain["unit"].to_numpy()] = plain["coverage"].to_numpy()
+    cold: dict[str, float] = {}
+    warm: dict[str, float] = {}
+    want = em(kmers, m_g, zero_inflated=True, report=cold)
+    got = em(kmers, m_g, zero_inflated=True, report=warm, init=init)
+    assert cold["em_unconverged_units"] == warm["em_unconverged_units"] == 0
+    assert warm["em_iterations"] < cold["em_iterations"]
+    assert np.allclose(got["coverage"], want["coverage"], rtol=0, atol=1e-5)
+
+
 def test_blockwise_em_does_not_stop_short(monkeypatch: pytest.MonkeyPatch) -> None:
     # At the default tol, blocks cut by unit id crept along a slow direction and passed the
     # round test with three units ~0.1 short of the fixed point; blocks in graph order, with
