@@ -9,6 +9,8 @@ import pytest
 from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
+from kmer_functional_profiler import index as index_module
+from kmer_functional_profiler import query
 from kmer_functional_profiler.cli import app
 from kmer_functional_profiler.index import read_fasta
 
@@ -35,8 +37,16 @@ def members(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
+@pytest.mark.parametrize("in_order", [False, True])
 @pytest.mark.parametrize("index", INDEXES)
-def test_profiles_match_golden(members: Path, tmp_path: Path, index: str) -> None:
+def test_profiles_match_golden(
+    members: Path, tmp_path: Path, index: str, in_order: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if in_order:  # tier 1 and unit columns read in small blocks, never in place (step 40)
+        monkeypatch.setattr(index_module, "PAGE", 2**62)  # every block read whole
+        monkeypatch.setattr(index_module, "READ_ROWS", 64)
+        monkeypatch.setattr(query, "WALK_BUCKETS", 4)
+        monkeypatch.setattr(query, "WALK_HASHES", 16)
     runner = CliRunner()
     built = runner.invoke(
         app, ["index", str(members), str(tmp_path / "idx"), *INDEXES[index].split()]

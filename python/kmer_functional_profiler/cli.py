@@ -7,6 +7,7 @@ from typing import Annotated
 import typer
 
 from kmer_functional_profiler import __version__
+from kmer_functional_profiler import index as index_module
 from kmer_functional_profiler import query as query_module
 from kmer_functional_profiler.compat import import_signatures
 from kmer_functional_profiler.index import (
@@ -249,6 +250,13 @@ def query(
             "faults during lookup, at the cost of their full size in RSS"
         ),
     ] = False,
+    keep_index_cache: Annotated[
+        bool,
+        typer.Option(
+            help="Leave the index pages read in the page cache (for a next query on the "
+            "node) instead of dropping them; the job's memory limit is charged for them"
+        ),
+    ] = False,
     low_memory: Annotated[
         bool,
         typer.Option(
@@ -326,6 +334,7 @@ def query(
         query_module.MAX_FIT_PAIRS = max_fit_pairs
     if zi_max_iter:  # ponytail: as --max-fit-pairs
         query_module.ZI_MAX_ITER = zi_max_iter
+    index_module.DROP_CACHE = not keep_index_cache  # ponytail: as --max-fit-pairs
     timer = Timer(stats, log=stats is not None)
     sample: dict[str, float | int | None] | None = None if summary is None else {}
     with timer("total"):

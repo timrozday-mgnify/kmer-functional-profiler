@@ -51,7 +51,10 @@ from kmer_functional_profiler.index import (
     PackedTable,
     base_rate,
     molecule,
+    packed_layout,
+    read_rows,
     span_nt,
+    take,
 )
 from kmer_functional_profiler.survival import SurvivalModel
 
@@ -791,6 +794,113 @@ def unit_hits(
     )
 
 
+# Tier-1 buckets per read of its key arrays when walking it in hash order (~16 M keys).
+WALK_BUCKETS: Final = 2**22
+WALK_HASHES: Final = 2**22  # hit hashes expanded to their sets at a time
+
+
+def _key_sets(table: PackedTable, hashes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The sorted ``hashes`` that ``table`` holds and their set ids, as
+    :meth:`PackedTable.lookup` finds them, with its key arrays read ``WALK_BUCKETS``
+    buckets at a time in hash order (``read_rows``)."""
+    hashes = hashes[hashes <= np.uint64(table.max_hash)]
+    below = table.shift + table.fp_bits  # hash bits below the bucket
+    block = (hashes >> np.uint64(below)) // np.uint64(WALK_BUCKETS)
+    cuts = [0, *(np.flatnonzero(np.diff(block)) + 1), len(hashes)]
+    none = np.zeros(1, np.uint8)
+    found, sets = [np.empty(0, np.uint64)], [np.empty(0, np.int64)]
+    for a, b in itertools.pairwise(cuts):
+        if a == b:
+            continue
+        b0 = int(block[a]) * WALK_BUCKETS
+        b1 = min(b0 + WALK_BUCKETS, len(table.offsets) - 1)
+        offsets = read_rows(table.offsets, b0, b1 + 1, 2 * (b - a)).astype(np.uint64)
+        k0, k1 = int(offsets[0]), int(offsets[-1])
+        # The block as a table of its own: its hashes shifted down to bucket 0.
+        part = PackedTable(
+            table.max_hash,
+            table.lead_bits,
+            table.bucket_bits,
+            table.fp_bits,
+            offsets - offsets[0],
+            read_rows(table.fingerprints, k0, k1, b - a),
+            read_rows(table.set_ids, k0, k1, b - a),
+            none,
+            none,
+        )
+        ids = part.lookup(hashes[a:b] - np.uint64(b0 << below))
+        hit = ids >= 0
+        found.append(hashes[a:b][hit])
+        sets.append(ids[hit])
+    return np.concatenate(found), np.concatenate(sets)
+
+
+class _TierHits(NamedTuple):
+    """The part of a tier a sample's hashes hit, in memory: exact keys (no fingerprint
+    bits dropped), the units passing their ``max_hash_g`` only, numbered ``0..`` in
+    ``units`` (index unit ids) order, with their ``max_hash_g``."""
+
+    table: PackedTable
+    max_hash_g: np.ndarray
+    units: np.ndarray
+
+    def hits(self, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
+        hits = unit_hits(self.table, self.max_hash_g, hashes, reads)
+        return hits.with_columns(unit=pl.Series(self.units[hits["unit"].to_numpy()]))
+
+
+def tier_hits(table: PackedTable, max_hash_g: np.ndarray, hashes: np.ndarray) -> _TierHits:
+    """What :func:`unit_hits` would give the sorted, distinct sampled ``hashes``, with
+    ``table`` and ``max_hash_g`` read once in order (plan, phase 6, step 40 (c)).
+
+    Keys are read by bucket range (:func:`_key_sets`), the sets hit in set order and the
+    units' ``max_hash_g`` in unit order (``take``), so memory is a block of the tier plus
+    the result, at any index size; ``unit_hits`` on the result gives the rows of ``table``
+    for any of ``hashes``, in the same order.
+    """
+    found, set_ids = _key_sets(table, hashes)
+    sets, of_set = np.unique(set_ids, return_inverse=True)
+    ends = take(table.set_offsets, np.stack([sets, sets + 1], axis=1).ravel()).astype(np.int64)
+    starts, lengths = ends[0::2], ends[1::2] - ends[0::2]
+    values = take(table.set_values, _ranges(starts, lengths)).astype(np.uint64)
+    units, local = np.unique(values >> np.uint64(PIN_BITS), return_inverse=True)
+    limit = take(max_hash_g, units).astype(np.uint64)
+    local_values = (local.astype(np.uint64) << np.uint64(PIN_BITS)) | (
+        values & np.uint64(2**PIN_BITS - 1)
+    )
+    first = np.cumsum(lengths) - lengths
+    keys, kept = [np.empty(0, np.uint64)], [np.empty(0, np.uint64)]
+    for a in range(0, len(found), WALK_HASHES):  # each hash's set, in set order
+        s = of_set[a : a + WALK_HASHES]
+        at = _ranges(first[s], lengths[s])
+        key = np.repeat(found[a : a + WALK_HASHES], lengths[s])
+        keep = key <= limit[local[at]]
+        keys.append(key[keep])
+        kept.append(local_values[at[keep]])
+    del values, local, local_values, of_set
+    key, value = np.concatenate(keys), np.concatenate(kept)
+    new = np.ones(len(key), dtype=bool)
+    new[1:] = key[1:] != key[:-1]
+    distinct = key[new]
+    layout = packed_layout(table.max_hash, 0, len(distinct))
+    fp_bits = 64 - layout["lead_bits"] - layout["bucket_bits"]  # the whole key: no false hits
+    buckets = np.bincount(
+        (distinct >> np.uint64(fp_bits)).astype(np.int64), minlength=2 ** layout["bucket_bits"]
+    )
+    exact = PackedTable(
+        table.max_hash,
+        layout["lead_bits"],
+        layout["bucket_bits"],
+        fp_bits,
+        np.concatenate([[0], np.cumsum(buckets)]).astype(np.uint64),
+        distinct & np.uint64(2**fp_bits - 1),
+        np.arange(len(distinct), dtype=np.uint64),
+        np.append(np.flatnonzero(new), len(key)).astype(np.uint64),
+        value,
+    )
+    return _TierHits(exact, limit, units.astype(np.uint32))
+
+
 class _Joint:
     """Several indexes with one hash scheme queried as one: unit ids are offset by the units
     of the indexes before, so gather, EM and the posterior see one hit table (Additional
@@ -815,6 +925,22 @@ class _Joint:
         self.offsets = np.cumsum([0, *heights])
         self.height = int(self.offsets[-1])
         self.dense = base.dense is not None
+        self.walked: dict[str, list[_TierHits]] = {}
+
+    def walk(self, tier: str, hashes: np.ndarray) -> None:
+        """Read every index's ``tier`` once for the sorted, distinct sampled ``hashes``
+        (:func:`tier_hits`); :meth:`hits` then looks them up in memory."""
+        column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
+        self.walked[tier] = [
+            tier_hits(getattr(i, tier), i.units[column], hashes) for i in self.indexes
+        ]
+
+    def _hits(self, i: int, tier: str, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
+        if tier in self.walked:
+            return self.walked[tier][i].hits(hashes, reads)
+        index = self.indexes[i]
+        column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
+        return unit_hits(getattr(index, tier), index.units[column], hashes, reads)
 
     def max_hash(self, tier: str) -> int:
         return max(int(getattr(i, tier).max_hash) for i in self.indexes)
@@ -822,15 +948,12 @@ class _Joint:
     def hits(self, tier: str, hashes: np.ndarray, reads: np.ndarray) -> pl.DataFrame:
         """:func:`unit_hits` in every index's ``tier`` ("tier1" or "dense"), units offset;
         ``holders`` counts the units holding the k-mer over all indexes."""
-        column = "max_hash_g" if tier == "tier1" else "max_hash_dense"
         if len(self.indexes) == 1:
-            index = self.indexes[0]
-            return unit_hits(getattr(index, tier), index.units[column], hashes, reads)
+            return self._hits(0, tier, hashes, reads)
         parts = []
-        for index, offset in zip(self.indexes, self.offsets[:-1], strict=True):
-            table = getattr(index, tier)
-            ok = hashes <= np.uint64(table.max_hash)
-            got = unit_hits(table, index.units[column], hashes[ok], reads[ok])
+        for i, (index, offset) in enumerate(zip(self.indexes, self.offsets[:-1], strict=True)):
+            ok = hashes <= np.uint64(getattr(index, tier).max_hash)
+            got = self._hits(i, tier, hashes[ok], reads[ok])
             parts.append(got.with_columns(pl.col("unit").cast(pl.UInt64) + int(offset)))
         hits = pl.concat(parts)
         per_index = hits.group_by("hash", "unit").agg(pl.col("holders").first())
@@ -2336,6 +2459,16 @@ def profile(
     keep_reads = draws > 0 and not joint.dense and not low_memory
     sampled = hit_kmers = hit_rows = 0
     per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
+    # The sample's distinct sampled hashes first, a read pass more, so that tier 1 is read
+    # once in hash order and dropped (plan, phase 6, step 40 (c)), not paged in at random.
+    distinct = _Summed(["hash"], {})
+    distinct.add(pl.DataFrame({"hash": empty}))
+    with timer("sketch"):
+        for batch in stream(joint.max_hash("tier1")):
+            distinct.add(pl.DataFrame({"hash": batch["hash"]}).unique())
+    with timer("walk"):
+        joint.walk("tier1", distinct.total()["hash"].sort().to_numpy())
+    del distinct
     reads = iter(stream(joint.max_hash("tier1")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
     while b is not None:
