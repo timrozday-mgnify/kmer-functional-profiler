@@ -47,7 +47,7 @@ def test_fmh_funprofiler_demo(tmp_path: Path) -> None:
     """Same KOs and overlaps as ``sourmash prefetch`` in fmh-funprofiler's pipeline."""
     sketches, fastq = FMH / "KOs_sketched_scaled_1000.sig.zip", FMH / "metagenome_example.fastq"
     import_signatures(sketches, tmp_path / "idx", 11)
-    ours = profile(Index.load(tmp_path / "idx"), fastq)
+    ours = profile(Index.load(tmp_path / "idx"), fastq, with_aai=True)  # every hit unit
     sm = ["uv", "run", "sourmash", "-q"]
     subprocess.run([*sm, "sketch", "translate", "-p", "scaled=1000,k=11,abund", str(fastq),
                     "-o", str(tmp_path / "mg.sig.zip")], check=True)  # fmt: skip

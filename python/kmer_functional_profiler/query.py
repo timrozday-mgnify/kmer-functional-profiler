@@ -1691,6 +1691,7 @@ def _posterior_batch(
 
 
 MIN_AAI_KMERS: Final = 5  # default hit k-mers below which aai is null (--min-aai-kmers)
+AAI_CHUNK: Final = 2**20  # units per aai_naive estimate
 MIN_AAI_LAMBDA: Final = 0.1  # zero-truncated coverage below which aai_naive is not corrected
 
 
@@ -2179,18 +2180,21 @@ def aai_naive(
     lam = ztp_lambda(_div(hits.astype(np.float64), kmers_hit.astype(np.float64)))
     low = lam < MIN_AAI_LAMBDA
     seen = np.where(low, 1.0, -np.expm1(-np.maximum(lam, MIN_AAI_LAMBDA)))
-    # Units are independent: only those reported are estimated, point only (step 40).
-    ok = kmers_hit >= min_kmers
-
-    def on(x: Any) -> Any:
-        return x[ok] if np.ndim(x) else x
-
+    # Units are independent: only those reported are estimated, point only, AAI_CHUNK at a
+    # time (the bisection's arrays are per unit; step 40).
     point = np.full(len(hits), np.nan)
-    point[ok], _, _ = survival_quantiles(
-        on(kmers_hit.astype(np.float64)), on(pin_sum.astype(np.float64)), on(seen), on(keep),
-        on(windows), model, on(clumping), selected=max(min_kmers, 1.0), n_members=on(n_members),
-        bounds=False,
-    )  # fmt: skip
+    ok = np.flatnonzero(kmers_hit >= min_kmers)
+    for start in range(0, len(ok), AAI_CHUNK):
+        at = ok[start : start + AAI_CHUNK]
+
+        def on(x: Any, at: np.ndarray = at) -> Any:
+            return x[at] if np.ndim(x) else x
+
+        point[at], _, _ = survival_quantiles(
+            on(kmers_hit).astype(np.float64), on(pin_sum).astype(np.float64), on(seen), on(keep),
+            on(windows), model, on(clumping), selected=max(min_kmers, 1.0),
+            n_members=on(n_members), bounds=False,
+        )  # fmt: skip
     return pl.DataFrame({"aai_naive": point, "aai_naive_lower_bound": low}).with_columns(
         pl.col("aai_naive").fill_nan(None)
     )
@@ -2379,6 +2383,7 @@ def profile(
     summary: dict[str, float | int | None] | None = None,
     em_start: int = 0,
     greedy: bool = False,
+    link_stats: bool = False,
 ) -> pl.DataFrame:
     """Per-unit hits, distinct k-mers hit, reads hit, containment and mean coverage.
 
@@ -2418,16 +2423,19 @@ def profile(
     all hit units never held). ``kmers_out`` writes
     the tier-1 hits per (``unit``, ``hash``) with ``hits`` and ``holders`` to Parquet.
 
+    Without ``with_aai`` (or ``all_estimators``, ``min_aai`` > 0) no AAI is estimated and
+    the profile holds the units gather keeps only (step 40); with it, every hit unit.
     Containment AAI (sylph's containment ANI in protein space): ``aai_naive`` on every hit
     unit from its own tier-1 hits (:func:`aai_naive`), and ``aai`` on the units gather keeps
-    whenever ``_zi`` is fitted (``with_aai`` fits it), from the hit k-mers after the EM split
+    (with the zero-inflated fit), from the hit k-mers after the EM split
     (``aai_kmers``), with a closed-form 95% interval ``aai_lo``/``_hi`` (:func:`aai_fit`; no
     draws needed). Both invert the survival model of the index's ``aai_model.json``
     (:func:`survival`; a^k without one) and are null below ``min_aai_kmers`` hit k-mers
     (``aai_kmers``, or ``kmers_hit`` for ``aai_naive``, still reported). An index with an
     ``aai_calibration.json`` maps them to alignment identity (:func:`calibrate_aai`) and
     keeps the raw ones as ``aai_raw``, ``aai_raw_lo``/``_hi``.
-    ``component`` labels the hit units linked by shared k-mers by their smallest unit id, so
+    ``component`` labels the hit units linked by shared k-mers by their smallest unit id in
+    the profile, so
     the units that bracket a sample variant can be read together. ``min_aai`` > 0 drops rows
     with ``aai_naive`` below it or null.
 
@@ -2451,7 +2459,10 @@ def profile(
 
     ``greedy`` replaces the EM fits by gather's assignment (:func:`greedy_coverage`, as
     sylph; ``coverage_greedy``): no ``_em``/``_zi`` columns and no ``aai``, so it excludes
-    ``draws``, ``with_aai`` and ``all_estimators``; ``aai_naive`` is still reported.
+    ``draws`` and ``all_estimators``; with ``with_aai``, ``aai_naive`` is reported.
+
+    ``link_stats`` (with ``timer``) adds the largest component's link and promiscuity cuts to
+    the counts (:func:`link_cuts`, ablations only: GBs at depth).
 
     ``em_start`` > 0 seeds random starting points for the EM fits (:func:`em`,
     :func:`em_pin`; not the posterior's): profiles from several starts agree where the fits
@@ -2461,8 +2472,11 @@ def profile(
     hinges on (sampled k-mers, distinct ones estimated on 1 in ``DISTINCT_SAMPLE`` of hash
     space, hit k-mers, hit rows, (unit, hash) pairs, detected units, component sizes).
     """
-    if greedy and (draws > 0 or with_aai or all_estimators):
-        raise ValueError("greedy has no zero-inflated fit: no draws, aai or other estimators")
+    if greedy and (draws > 0 or all_estimators):
+        raise ValueError("greedy has no zero-inflated fit: no draws or other estimators")
+    # aai (aai_naive, and aai from the zero-inflated fit) only when asked for (step 40);
+    # without it the profile holds the detected units only.
+    aai = with_aai or all_estimators or min_aai > 0
     record = timer is not None
     timer = timer or Timer()
     counts = timer.counts
@@ -2599,6 +2613,7 @@ def profile(
             per_pair_hist[: len(pair_counts)] += pair_counts
         with timer("hash"):
             b = next(reads, None)
+    joint.walked.pop("tier1", None)  # the walk's table: every batch is looked up
     with timer("aggregate"):
         per_read = pl.concat(batches) if batches else None
         kmer_hits, unit_reads = pairs.total(), reads_summed.total()
@@ -2663,6 +2678,24 @@ def profile(
         else None
     )
     del own
+    if not aai:  # the undetected units are dropped here, units renumbered 0.. over the rest
+        keep = assigned.select("unit").sort("unit")
+        new = keep.with_columns(new=pl.int_range(pl.len(), dtype=pl.UInt32))
+
+        def detected_only(df: pl.DataFrame) -> pl.DataFrame:
+            return df.join(new, on="unit").drop("unit").rename({"new": "unit"})
+
+        kmer_hits, unit_reads, component, detected, assigned, present_prob = map(
+            detected_only, (kmer_hits, unit_reads, component, detected, assigned, present_prob)
+        )
+        if greedy_fit is not None:
+            greedy_fit = detected_only(greedy_fit)
+        hit_info = hit_info[keep["unit"].to_numpy()].with_columns(unit=new["new"])
+        ids = ids.join(new.rename({"unit": "index"}), on="index").select("unit", index="new")
+        t_g, m_g = hit_info["t_g"].to_numpy(), hit_info["m_g"].to_numpy()
+        pin_hist, pin_sum = hit_info["pin_hist"].to_numpy(), hit_info["pin_sum"]
+        len_cv = hit_info["len_cv"].to_numpy()
+        del keep, new
     if joint.dense:
         # Second pass: every k-mer at the dense rate, for the detected units only.
         keep = assigned.select("unit")  # detected units are hit units, so renumber keeps all
@@ -2684,7 +2717,7 @@ def profile(
         pin_hist = hit_info["pin_hist_dense"].to_numpy()
         pin_sum = hit_info["pin_sum_dense"]
         len_cv = hit_info["len_cv_dense"].to_numpy()
-    if record:
+    if link_stats:
         with timer("links"):
             counts |= link_cuts(detected)
     # Clumping: a read covering a unit hits ~ Poisson(mu) of its kept k-mers, which inflates
@@ -2763,7 +2796,7 @@ def profile(
             copies_zi=copies,
             abundance_zi=pl.col("coverage") * copies,
         )
-        if all_estimators or draws > 0 or with_aai or summary is not None:  # aai stays opt-in
+        if aai:
             fitted_zi = fitted_zi.hstack(estimate)
         unit_kmers = detected.select("unit", "hash", "hits")
         if all_estimators:  # experimental: rarely splits real units (step 35, HPC results)
@@ -2798,25 +2831,29 @@ def profile(
                         "unit", coverage_zip="coverage", present_zip="present"
                     )
                 )
-    with timer("aai"):
-        per_unit = (
-            kmer_hits.group_by("unit").agg(hits=pl.col("hits").sum(), kmers=pl.len()).sort("unit")
-        )
-        at = per_unit["unit"].to_numpy()
-        tier1 = hit_info["m_g"].to_numpy().astype(np.float64)
-        naive = aai_naive(
-            per_unit["hits"].to_numpy(),
-            per_unit["kmers"].to_numpy(),
-            hit_info["pin_sum"].to_numpy()[at],
-            np.clip(_div(tier1, hit_info["n_kmers"].to_numpy().astype(np.float64)), 0, 1)[at]
-            if "n_kmers" in hit_info.columns
-            else np.ones(len(at)),
-            unit_windows(hit_info, params.k)[at],
-            model,
-            min_aai_kmers,
-            1 + mu_tier1[at],
-            unit_members(hit_info)[at],
-        ).with_columns(unit=per_unit["unit"])
+    naive = None
+    if aai:  # aai_naive of every hit unit
+        with timer("aai"):
+            per_unit = (
+                kmer_hits.group_by("unit")
+                .agg(hits=pl.col("hits").sum(), kmers=pl.len())
+                .sort("unit")
+            )
+            at = per_unit["unit"].to_numpy()
+            tier1 = hit_info["m_g"].to_numpy().astype(np.float64)
+            naive = aai_naive(
+                per_unit["hits"].to_numpy(),
+                per_unit["kmers"].to_numpy(),
+                hit_info["pin_sum"].to_numpy()[at],
+                np.clip(_div(tier1, hit_info["n_kmers"].to_numpy().astype(np.float64)), 0, 1)[at]
+                if "n_kmers" in hit_info.columns
+                else np.ones(len(at)),
+                unit_windows(hit_info, params.k)[at],
+                model,
+                min_aai_kmers,
+                1 + mu_tier1[at],
+                unit_members(hit_info)[at],
+            ).with_columns(unit=per_unit["unit"])
     unit_info = hit_info.select(pl.exclude("^(pin_(hist|sum)|len_cv).*$"))
     if "name" not in unit_info.columns:  # sourmash imports name units, builds by cluster_rep
         unit_info = unit_info.with_columns(name=pl.col("cluster_rep").cast(pl.String))
@@ -2828,9 +2865,10 @@ def profile(
             .join(unit_info, on="unit")
             .join(assigned, on="unit", how="left")
             .join(present_prob, on="unit", how="left")
-            .join(naive, on="unit")
-            .join(component, on="unit")
         )
+        if naive is not None:
+            result = result.join(naive, on="unit")
+        result = result.join(component, on="unit")
         for fit in fits:
             result = result.join(fit, on="unit", how="left")
     if detected.height == 0:  # nothing detected (e.g. host-only reads): no posterior to draw
