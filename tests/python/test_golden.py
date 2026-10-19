@@ -47,6 +47,7 @@ def test_profiles_match_golden(
         monkeypatch.setattr(index_module, "READ_ROWS", 64)
         monkeypatch.setattr(query, "WALK_BUCKETS", 4)
         monkeypatch.setattr(query, "WALK_HASHES", 16)
+        monkeypatch.setattr(query, "AAI_CHUNK", 3)
     runner = CliRunner()
     built = runner.invoke(
         app, ["index", str(members), str(tmp_path / "idx"), *INDEXES[index].split()]
@@ -58,4 +59,10 @@ def test_profiles_match_golden(
         assert ran.exit_code == 0, ran.output
         got = pl.read_csv(out, separator="\t", infer_schema_length=None)
         want = pl.read_csv(GOLDEN / out.name, separator="\t", infer_schema_length=None)
+        if "--aai" not in args:  # no AAI: the detected units only, labelled within them
+            want = (
+                want.filter(pl.col("gather_rank").is_not_null())
+                .drop("aai_naive", "aai_naive_lower_bound")
+                .with_columns(component=pl.col("unit").min().over("component"))
+            )
         assert_frame_equal(got, want, check_exact=False, rel_tol=1e-6, abs_tol=1e-9)

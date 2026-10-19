@@ -268,9 +268,10 @@ def query(
     aai: Annotated[
         bool,
         typer.Option(
-            help="Containment AAI of the detected units (aai, with a closed-form 95% interval "
-            "aai_lo/aai_hi; no --draws needed); fits the zero-inflated EM. aai_naive is "
-            "reported for every hit unit regardless. Named ani for a dna index"
+            help="Containment AAI: aai of the detected units (with a closed-form 95% interval "
+            "aai_lo/aai_hi; no --draws needed) and aai_naive of every hit unit, which then "
+            "stay in the profile (without it, only the detected units are). Implied by "
+            "--min-aai and --all-estimators. Named ani for a dna index"
         ),
     ] = False,
     min_aai: Annotated[
@@ -310,12 +311,19 @@ def query(
             "coverage_mix; coverage_zi is the default"
         ),
     ] = False,
+    link_stats: Annotated[
+        bool,
+        typer.Option(
+            help="With --stats, also the largest component's link and promiscuity cuts "
+            "(link_cuts; ablation statistics, GBs at depth)"
+        ),
+    ] = False,
     greedy: Annotated[
         bool,
         typer.Option(
             help="No EM: coverage_greedy from gather's assignment (zero-truncated hits per "
-            "k-mer of the k-mers gather gives each unit, as sylph), no _em/_zi columns and no "
-            "aai; for a cheap first pass (e.g. targets for a pileup)"
+            "k-mer of the k-mers gather gives each unit, as sylph), no _em/_zi columns (with "
+            "--aai, aai_naive only); for a cheap first pass (e.g. targets for a pileup)"
         ),
     ] = False,
     em_start: Annotated[
@@ -370,6 +378,7 @@ def query(
             summary=sample,
             em_start=em_start,
             greedy=greedy,
+            link_stats=link_stats and stats is not None,
         )
         with timer("write"):
             result.write_csv(out, separator="\t")

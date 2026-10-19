@@ -13,7 +13,8 @@
 # (gate: <= 32 GB for standard at 100 M pairs), the new stages sketch (the extra read pass)
 # and walk (tier 1 read in order), and wall against query-memory's at its passing limit.
 # Then identical.tsv: each passing cell's profile against query-memory's (same tier and
-# pairs, any limit) on the columns both have, equal to 1e-6 relative (as the golden tests).
+# pairs, any limit) on the units and columns both have, equal to 1e-6 relative (as the
+# golden tests). Without --aai a profile holds the detected units only.
 # Cells run --greedy (no EM: coverage_greedy from gather), into results-greedy/: the cost of
 # the query itself (plan, step 40, 2026-10-19). FIT=em sbatch run.sh: the shipped fits, into
 # results/. KEEP=1: the pages read stay in the page cache (--keep-index-cache), the plan's
@@ -65,10 +66,13 @@ for key in sorted(new):
     ok = 0
     for path in new[key]:
         got = pl.read_csv(path, separator="\t", infer_schema_length=None)
-        both = [c for c in got.columns if c in want.columns]
+        # the units and columns both have (without --aai a profile is the detected units;
+        # component labels are the smallest unit in the profile)
+        both = [c for c in got.columns if c in want.columns and c != "component"]
+        same = want.join(got.select("unit"), on="unit", how="semi").select(both)
         try:
             assert_frame_equal(
-                got.select(both), want.select(both), check_exact=False, rel_tol=1e-6, abs_tol=1e-9
+                got.select(both), same, check_exact=False, rel_tol=1e-6, abs_tol=1e-9
             )
             ok += 1
         except AssertionError:

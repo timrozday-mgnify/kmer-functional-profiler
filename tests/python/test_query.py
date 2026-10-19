@@ -167,6 +167,18 @@ def test_unit_rows_read_in_order_equal_rows_in_place(shared: Path) -> None:
     assert index.units.rows(units).equals(in_memory.rows(units))
 
 
+def test_without_aai_the_profile_is_the_detected_units(shared: Path) -> None:
+    index = build(shared, t_base=0.2, n_min=8)
+    plain, with_aai = profile(index, *READS), profile(index, *READS, with_aai=True)
+    assert not any(c.startswith("aai") for c in plain.columns)
+    detected = with_aai.filter(pl.col("gather_rank").is_not_null())
+    assert 0 < detected.height < with_aai.height  # the copies are explained away
+    want = detected.select(plain.columns).with_columns(
+        component=pl.col("unit").min().over("component")
+    )
+    assert plain.equals(want)
+
+
 def test_greedy_matches_the_zero_inflated_fit_without_shared_kmers(shared: Path) -> None:
     index = build(shared, t_base=0.2, n_min=8)
     fitted, greedy = profile(index, *READS), profile(index, *READS, greedy=True)
@@ -888,7 +900,9 @@ def test_cli_query(members: Path, tmp_path: Path) -> None:
     stats = tmp_path / "stats.json"
     args = ["query", str(idx), *map(str, READS), "--out", str(out), "--stats", str(stats)]
     summary = tmp_path / "summary.json"
-    result = runner.invoke(app, [*args, "--draws", "3", "--aai", "--summary", str(summary)])
+    result = runner.invoke(
+        app, [*args, "--draws", "3", "--aai", "--summary", str(summary), "--link-stats"]
+    )
     assert result.exit_code == 0, result.output
     table = pl.read_csv(out, separator="\t")
     assert {"cluster_rep", "hits", "containment", "coverage", "aai_lo", "component"} <= set(
@@ -933,7 +947,7 @@ def test_frame_modes_and_quality_mask_reach_the_profile(members: Path, tmp_path:
         "joint": ["--extra-index", str(idx)],  # itself: every unit twice, each half the hits
     }.items():
         out = tmp_path / f"{name}.tsv"
-        args = ["query", str(idx), *map(str, READS), "--out", str(out), *extra]
+        args = ["query", str(idx), *map(str, READS), "--out", str(out), "--aai", *extra]
         assert runner.invoke(app, args).exit_code == 0
         hits[name] = pl.read_csv(out, separator="\t").select("unit", name=pl.col("hits"))
     # Edges hash a superset of the stop-free k-mers, so no unit loses hits.
@@ -1075,7 +1089,7 @@ def test_component_batches_change_nothing(shared: Path, monkeypatch: pytest.Monk
     # One component per batch: every fit gives what it gives on all units at once.
     indexes = [build(shared, t_base=0.2, n_min=0), build(shared, t_base=0.2, n_min=0, t_dense=1.0)]
     timer = Timer()
-    profile(indexes[0], *READS, timer=timer)
+    profile(indexes[0], *READS, timer=timer, link_stats=True)
     assert timer.counts["components"] < timer.counts["hit_units"]
     assert timer.counts["fit_batches"] == 1 and timer.counts["em_unconverged_units"] == 0
     assert 0 < timer.counts["em_iterations"] <= 1000
