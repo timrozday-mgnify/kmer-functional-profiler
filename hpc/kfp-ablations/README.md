@@ -70,6 +70,9 @@ cd kfp-ablations/whole-fit-query-cost && sbatch run.sh
 # promiscuity-novaseq:
 cd kfp-ablations/g16-novaseq && sbatch run.sh
 cd kfp-ablations/zi-iter-query-cost && sbatch run.sh   # three caps, one after another
+# step 45: the zero-inflated fit warm-started from the plain EM against the old start, on the
+# three release tiers at 10 M and 100 M pairs, when release-tiers has finished:
+cd kfp-ablations/zi-warm-query-cost && sbatch run.sh
 # phases 13-14 (workflows/spike-benchmark, workflows/pileup), independent of the runs above,
 # all at once: the pileups and aai with truth on the three tiers' sampling, the nucleotide
 # mode against KMA with k and t_base tuning (CARD), then, once release-tiers has finished,
