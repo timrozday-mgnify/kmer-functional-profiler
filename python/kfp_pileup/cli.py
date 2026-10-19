@@ -72,6 +72,9 @@ def call_command(
         list[Path] | None,
         typer.Option(help="diamond: the FASTQs (mate order), for the nucleotide pileup"),
     ] = None,
+    stats: Annotated[
+        Path | None, typer.Option(help="JSON of each stage's time and memory (as query's)")
+    ] = None,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
     per-unit identity (units.tsv) from alignments to the reference; then the joint EM over
@@ -80,7 +83,7 @@ def call_command(
     consensus.*, recruited_*.fq.gz); print counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads, novel, reads or (),
+        batch_reads, novel, reads or (), stats,
     )  # fmt: skip
     typer.echo(json.dumps(counts))
 

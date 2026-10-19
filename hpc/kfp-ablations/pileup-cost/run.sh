@@ -7,7 +7,8 @@
 #SBATCH --mem=8G
 #SBATCH --export=ALL
 # The pileup follow-up on real reads against the full standard tier (plan, phase 13: steps
-# 0, 3 and 6; open questions: DIAMOND's wall time against pass 1 at 10 M and 100 M pairs).
+# 0 and 3, and CALL's memory; open questions: DIAMOND's wall time against pass 1 at 10 M and
+# 100 M pairs).
 # Samples: the first 10 M pairs of ERR7738575 (Hadza gut) and the first 100 M of ERR7738575 +
 # ERR7746321 pooled (phase 6's pair). Needs the finished release-tiers run (its
 # results-standard/index, step34q attached, and the MERGE buckets as the sequence store).
@@ -15,8 +16,8 @@
 #   trace.tsv           PILEUP:DIAMOND against PILEUP:QUERY realtime: step 3's rule (> ~5x
 #                       at 10 M pairs: add the in-memory dense pre-filter)
 #   <sample>/stats.json hits_per_pair: step 0's histogram (replaces the plan's estimates)
-#   <sample>/aai_check.tsv  step 6 on real data: aai against the reads' alignment identity
-#                       (flagged rows are phase-7 aai findings)
+#   <sample>/call_stats.json  CALL's time and memory per stage (read, batches, refine,
+#                       nucleotide, write): which of the plan's CALL memory options is next
 #   <sample>/variants/  step 6c on real data: freebayes calls, csq consequences, Floria and
 #                       CliqueSNV haplotypes, inStrain microdiversity against the consensus (6b)
 #   results-noF/trace.tsv  PILEUP:DIAMOND without -F (step 6b's cost: against trace.tsv)
@@ -49,6 +50,3 @@ nextflow run "$WF/pileup" -c ../site.config -c cost.config -resume --samples sam
     --index "$STD/index" --store "$STD/members.bucket*.parquet" --frameshift 0 \
     --lofreq false --floria false --instrain false --cliquesnv false \
     --outdir results-noF
-for s in hadza10M pooled100M; do
-    "$REPO/.venv/bin/kfp-pileup" aai-check "results/$s/pileup/units.tsv" --out "results/$s/aai_check.tsv"
-done

@@ -137,17 +137,19 @@ process CALL {
     output:
     tuple val(sample), path('pileup'), emit: pileup
     tuple val(sample), val(aligner), path('pileup'), emit: called
+    path 'call_stats.json'
 
     script:
-    // DIAMOND: the reads too, for the nucleotide pileup and consensus (step 6b)
+    // DIAMOND: the reads too, for the nucleotide pileup and consensus (step 6b); per-stage
+    // time and memory in call_stats.json (CALL's memory, phase 13)
     def reads = aligner == 'diamond' ? "--reads ${r1} --reads ${r2}" : ''
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} ${reads} ${opts}
+        --profile ${profile} ${reads} --stats call_stats.json ${opts}
     """
 
     stub:
-    "mkdir pileup"
+    "mkdir pileup; touch call_stats.json"
 }
 
 process MAP_CONSENSUS {

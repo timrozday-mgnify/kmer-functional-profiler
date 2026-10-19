@@ -45,6 +45,7 @@ from kfp_pileup.nucleotide import nucleotide_pileup
 from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.refine import NOVEL, refine
 from kmer_functional_profiler.index import read_fasta
+from kmer_functional_profiler.query import Timer
 
 LN2: Final = math.log(2)
 DIAMOND_FIELDS: Final = "qseqid sseqid bitscore qstart qend sstart send qframe btop"
@@ -484,18 +485,57 @@ def call(
     batch_reads: int = BATCH_READS,
     novel: float = NOVEL,
     reads: Sequence[str | Path] = (),
+    stats: str | Path | None = None,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
     ``ref_dir``. Writes ``assignments.parquet``, ``pileup.parquet``, ``variants.tsv`` and
     ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
     outputs (steps 8-9); with DIAMOND alignments and the ``reads`` (FASTQ, in mate order),
-    :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). Returns counts.
+    :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). With ``stats``, each
+    stage's time and memory go there as the query's (``Timer``). Returns counts.
 
     ponytail: steps 8-9 hold every alignment and its target columns in memory; spill them
     per component to Parquet if ``pileup-cost``'s 100 M pairs do not fit."""
     ref_dir, out = Path(ref_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    timer = Timer(Path(stats) if stats else None, log=stats is not None)
+    with timer("read"):
+        refs, sequences, prof = _read_inputs(ref_dir, profile)
+    with timer("batches"):
+        hits, col_parts, event_parts, parts, stat_parts = _score(
+            alignments, refs, sequences, aligner, score_nats, batch_reads
+        )
+    timer.counts["alignments"] = 0 if hits is None else hits.height
+    refined, em_units = None, None
+    if hits is not None and hits.height:
+        with timer("refine"):
+            refined, em_units = refine(
+                hits, pl.concat(col_parts), refs, sequences, out, aligner == "diamond", prof,
+                min_depth, min_freq, novel,
+            )  # fmt: skip
+        hits = hits.join(refined, on="hit", how="left")
+    nt_counts = {}
+    if reads and aligner == "diamond" and hits is not None and hits.height:
+        with timer("nucleotide"):
+            nt_counts = nucleotide_pileup(
+                hits, pl.concat(col_parts), pl.concat(event_parts), refs, reads, out
+            )
+    with timer("write"):
+        counts = _write(
+            hits, parts, stat_parts, refs, sequences, prof, em_units, out, min_depth, min_freq
+        )
+    counts = {**counts, **nt_counts}
+    timer.counts.update(counts)
+    timer.write()
+    return counts
+
+
+def _read_inputs(
+    ref_dir: Path, profile: str | Path | None
+) -> tuple[pl.DataFrame, dict[str, str], pl.DataFrame | None]:
+    """The reference table and sequences, and the profile's columns ``call`` uses on the
+    reference's units only (a real profile holds every hit unit, ~100 columns)."""
     refs = (
         pl.read_csv(
             ref_dir / REFS,
@@ -511,6 +551,42 @@ def call(
         )
     )
     sequences = dict(read_fasta(ref_dir / REF_FASTA))
+    prof = None
+    if profile is not None:
+        with open(profile) as f:
+            header = f.readline().rstrip("\n").split("\t")
+        wanted = [
+            c
+            for c in header
+            if c in ("present_prob", "coverage_zi", "len_mean", "n_members")
+            or c.startswith(("aai", "ani"))
+        ]
+        prof = (
+            pl.read_csv(
+                profile, separator="\t", columns=["unit", *wanted], infer_schema_length=None
+            )
+            .with_columns(pl.col("unit").cast(pl.UInt32))
+            .filter(pl.col("unit").is_in(refs["unit"].unique().implode()))
+        )
+    return refs, sequences, prof
+
+
+def _score(
+    alignments: Sequence[str | Path],
+    refs: pl.DataFrame,
+    sequences: dict[str, str],
+    aligner: str,
+    score_nats: float,
+    batch_reads: int,
+) -> tuple[
+    pl.DataFrame | None,
+    list[pl.DataFrame],
+    list[pl.DataFrame],
+    list[pl.DataFrame],
+    list[pl.DataFrame],
+]:
+    """The crude pass, batch by batch: alignments with hit ids, their target columns and
+    events, the summed pileup's parts and per-sequence read stats."""
     seq_index = {s: i for i, s in enumerate(refs["seq_id"])}
     ref_bytes = [sequences[s].encode() for s in refs["seq_id"]]
     if aligner == "diamond":
@@ -537,18 +613,22 @@ def call(
         if len(parts) > 32:  # keep the summed pileup small
             parts = [_sum(parts)]
     hits = pl.concat(assigned_parts) if assigned_parts else None
-    refined, em_units = None, None
-    if hits is not None and hits.height:
-        refined, em_units = refine(
-            hits, pl.concat(col_parts), refs, sequences, out, aligner == "diamond", profile,
-            min_depth, min_freq, novel,
-        )  # fmt: skip
-        hits = hits.join(refined, on="hit", how="left")
-    nt_counts = {}
-    if reads and aligner == "diamond" and hits is not None and hits.height:
-        nt_counts = nucleotide_pileup(
-            hits, pl.concat(col_parts), pl.concat(event_parts), refs, reads, out
-        )
+    return hits, col_parts, event_parts, parts, stats
+
+
+def _write(
+    hits: pl.DataFrame | None,
+    parts: list[pl.DataFrame],
+    stats: list[pl.DataFrame],
+    refs: pl.DataFrame,
+    sequences: dict[str, str],
+    prof: pl.DataFrame | None,
+    em_units: pl.DataFrame | None,
+    out: Path,
+    min_depth: float,
+    min_freq: float,
+) -> dict[str, int]:
+    """``assignments.parquet``, ``pileup.parquet``, ``variants.tsv`` and ``units.tsv``."""
     (
         hits.join(refs.select("seq", "seq_id"), on="seq").drop(
             "seq", "hit", "start", "end", "reverse", "qlen", "mism"
@@ -574,16 +654,15 @@ def call(
     columns = _columns(pile, refs, sequences)
     variants = columns.filter(pl.col("depth") >= min_depth, pl.col("alt_freq") >= min_freq)
     variants.write_csv(out / "variants.tsv", separator="\t")
-    units = _units(pl.concat(stats) if stats else None, columns, refs, profile)
+    units = _units(pl.concat(stats) if stats else None, columns, refs, prof)
     if em_units is not None:
         units = units.join(em_units, on="unit", how="left")
     units.write_csv(out / "units.tsv", separator="\t")
     return {
-        "alignments": n_assigned,
+        "alignments": 0 if hits is None else hits.height,
         "columns": columns.height,
         "variants": variants.height,
         "units": units.height,
-        **nt_counts,
     }
 
 
@@ -631,7 +710,7 @@ def _units(
     stats: pl.DataFrame | None,
     columns: pl.DataFrame,
     refs: pl.DataFrame,
-    profile: str | Path | None,
+    prof: pl.DataFrame | None,
 ) -> pl.DataFrame:
     """Per target unit: reads, alignment identity (all sequences, representative) and the
     representative's consensus identity; with the profile's columns for the aai check."""
@@ -666,15 +745,6 @@ def _units(
     units = units.join(rep_columns, on="unit", how="left").with_columns(
         pl.col("rep_covered").fill_null(0)
     )
-    if profile is not None:
-        prof = pl.read_csv(profile, separator="\t", infer_schema_length=None)
-        wanted = [
-            c
-            for c in prof.columns
-            if c in ("present_prob", "coverage_zi", "len_mean", "n_members")
-            or c.startswith(("aai", "ani"))
-        ]
-        units = units.join(
-            prof.select(pl.col("unit").cast(pl.UInt32), *wanted), on="unit", how="left"
-        )
+    if prof is not None:
+        units = units.join(prof, on="unit", how="left")
     return units.with_columns(pl.col("identity", "identity_rep").fill_nan(None)).sort("unit")
