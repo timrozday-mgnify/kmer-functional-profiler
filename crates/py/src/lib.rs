@@ -304,6 +304,7 @@ fn gather<'py>(
     let dict = PyDict::new(py);
     dict.set_item("unit", got.unit.into_pyarray(py))?;
     dict.set_item("kmers_unique", got.kmers_unique.into_pyarray(py))?;
+    dict.set_item("owned", got.owned.into_pyarray(py))?;
     Ok(dict)
 }
 
