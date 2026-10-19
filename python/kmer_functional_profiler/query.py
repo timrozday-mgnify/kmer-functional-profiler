@@ -2556,9 +2556,10 @@ def profile(
     per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
     # The sample's distinct sampled hashes first, a read pass more, so that tier 1 is read
     # once in hash order and dropped (plan, phase 6, step 40 (c)), not paged in at random.
-    # In 16 hash ranges, each merged once its waiting hashes pass a quarter of it.
+    # In 16 hash ranges. ponytail: merged at the default slack; a quarter (0.25) doubled
+    # sketch's time at 100 M pairs and left its peak as it was (step 40, query-walk)
     below = max(joint.max_hash("tier1").bit_length() - 4, 0)
-    distinct = _Summed(["hash"], {}, part=pl.col("hash") // (1 << below), slack=0.25)
+    distinct = _Summed(["hash"], {}, part=pl.col("hash") // (1 << below))
     distinct.add(pl.DataFrame({"hash": empty}))
     with timer("sketch"):
         for batch in stream(joint.max_hash("tier1")):
