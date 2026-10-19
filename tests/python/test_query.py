@@ -167,6 +167,21 @@ def test_unit_rows_read_in_order_equal_rows_in_place(shared: Path) -> None:
     assert index.units.rows(units).equals(in_memory.rows(units))
 
 
+def test_greedy_matches_the_zero_inflated_fit_without_shared_kmers(shared: Path) -> None:
+    index = build(shared, t_base=0.2, n_min=8)
+    fitted, greedy = profile(index, *READS), profile(index, *READS, greedy=True)
+    assert "coverage_zi" not in greedy.columns and "coverage_em" not in greedy.columns
+    # Same hits, gather and presence; the copies are explained away, so on gather's units
+    # the k-mers are their own and the constrained zero-inflated MLE is the EM's.
+    same = [c for c in greedy.columns if c != "coverage_greedy"]
+    assert greedy.select(same).equals(fitted.select(same))
+    both = fitted.join(greedy.select("unit", "coverage_greedy"), on="unit")
+    assert both.filter(pl.col("coverage_zi") > 0).height > 10
+    assert np.allclose(both["coverage_greedy"], both["coverage_zi"], rtol=1e-6, atol=1e-9)
+    with pytest.raises(ValueError, match="greedy"):
+        profile(index, *READS, greedy=True, draws=2)
+
+
 def test_dense_tier_fits_em_on_every_kmer(members: Path) -> None:
     # A sparse tier 1 with a fully dense tier fits EM on the same k-mers as a dense index.
     both = build(members, t_base=0.2, n_min=0, t_dense=1.0, fp_bits=64)
@@ -637,11 +652,11 @@ def test_gather_explains_away_shared_kmers() -> None:
         schema={"unit": pl.UInt32, "hash": pl.UInt64},
     )
     t_g = np.array([0.01, 0.01, 0.01, 0.01])
-    got = {u: (n, r) for u, n, r in gather(kmers, t_g).iter_rows()}
+    got = {u: (n, r) for u, n, r in gather(kmers, t_g)[0].iter_rows()}
     # 1 is a subset of 0: explained away. 2 keeps only hash 5; 3 shares nothing.
     assert got == {0: (4, 0), 2: (1, 2), 3: (2, 1)}
     # Sampled 10x more sparsely, unit 1's 2 k-mers stand for more than unit 0's 4.
-    got = {u: n for u, n, _ in gather(kmers, np.array([0.01, 0.001, 0.01, 0.01])).iter_rows()}
+    got = {u: n for u, n, _ in gather(kmers, np.array([0.01, 0.001, 0.01, 0.01]))[0].iter_rows()}
     assert got == {1: 2, 0: 2, 2: 1, 3: 2}
 
 

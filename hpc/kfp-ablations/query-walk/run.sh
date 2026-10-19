@@ -12,14 +12,19 @@
 # Read results/query_cost.tsv as query-memory's: the smallest limit with end_exit 0 per cell
 # (gate: <= 32 GB for standard at 100 M pairs), the new stages sketch (the extra read pass)
 # and walk (tier 1 read in order), and wall against query-memory's at its passing limit.
-# Then results/identical.tsv: each passing cell's profile against query-memory's (same tier
-# and pairs, any limit), equal to 1e-6 relative (as the golden tests).
-# KEEP=1 sbatch run.sh: the pages read stay in the page cache (--keep-index-cache), into
-# results-keep/, the plan's (c2) arm.
+# Then identical.tsv: each passing cell's profile against query-memory's (same tier and
+# pairs, any limit) on the columns both have, equal to 1e-6 relative (as the golden tests).
+# Cells run --greedy (no EM: coverage_greedy from gather), into results-greedy/: the cost of
+# the query itself (plan, step 40, 2026-10-19). FIT=em sbatch run.sh: the shipped fits, into
+# results/. KEEP=1: the pages read stay in the page cache (--keep-index-cache), the plan's
+# (c2) arm, into <out>-keep/. -resume reuses a cell whose script is unchanged, whatever the
+# code: after a code change, RESUME= sbatch run.sh (the profile comparison runs again too).
 source ../common.sh
 TIERS=${TIERS:-slim standard large}
-out=results args=()
-[[ -n ${KEEP:-} ]] && out=results-keep args=(--query_args ' --keep-index-cache')  # the space: not read as a flag
+out=results-greedy args=' --greedy'  # the leading space: not read as a flag by Nextflow
+[[ ${FIT:-greedy} == em ]] && out=results args=''
+[[ -n ${KEEP:-} ]] && out=$out-keep args="$args --keep-index-cache"
+[[ -n $args ]] && args=(--query_args "$args") || args=()
 for t in $TIERS; do
     [[ -f ../release-tiers/results-$t/index/meta.json ]] ||
         { echo "release-tiers has not finished (no results-$t/index)" >&2; exit 1; }
@@ -32,7 +37,7 @@ nextflow run "$WF/mgnify-subset" -c ../site.config --query true --index false \
     --query_run ERR7738575,ERR7746321 --query_ladder 10000000,100000000 \
     --query_draws 0 --query_scratch '' --query_preload false ${args[@]+"${args[@]}"} \
     --query_memory '16 GB,24 GB,32 GB,48 GB,64 GB,128 GB' \
-    --outdir "$out" -resume
+    --outdir "$out" ${RESUME--resume}
 
 # Profiles are not published: find each cell's in its work directory from the traces.
 "$REPO/.venv/bin/python" - "$out/trace.tsv" ../query-memory/results/trace.tsv \
@@ -60,8 +65,11 @@ for key in sorted(new):
     ok = 0
     for path in new[key]:
         got = pl.read_csv(path, separator="\t", infer_schema_length=None)
+        both = [c for c in got.columns if c in want.columns]
         try:
-            assert_frame_equal(got, want, check_exact=False, rel_tol=1e-6, abs_tol=1e-9)
+            assert_frame_equal(
+                got.select(both), want.select(both), check_exact=False, rel_tol=1e-6, abs_tol=1e-9
+            )
             ok += 1
         except AssertionError:
             pass

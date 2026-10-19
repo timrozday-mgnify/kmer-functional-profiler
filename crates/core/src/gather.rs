@@ -11,6 +11,8 @@ pub struct Gathered {
     pub unit: Vec<u32>,
     /// Hit k-mers assigned to the unit: its k-mers no earlier unit took.
     pub kmers_unique: Vec<u32>,
+    /// Per input pair: its unit took its k-mer (the k-mer's first holder in gather order).
+    pub owned: Vec<bool>,
 }
 
 /// Heap entry, popped highest score first, then lowest unit.
@@ -44,7 +46,7 @@ impl Eq for Entry {}
 /// Gather over (unit, hash) pairs: repeatedly take the unit with the most untaken hit
 /// k-mers divided by its sampling rate `t_g[unit]`, and give it those k-mers. Units left
 /// with none are explained away. Scores only fall as k-mers are taken, so a lazy heap
-/// rechecks only a stale top. Repeated pairs count once.
+/// rechecks only a stale top. Repeated pairs count once (and are all marked `owned`).
 pub fn gather(units: &[u32], hashes: &[u64], t_g: &[f64]) -> Result<Gathered, Error> {
     if units.len() != hashes.len() {
         return Err(Error::LengthMismatch);
@@ -62,6 +64,7 @@ pub fn gather(units: &[u32], hashes: &[u64], t_g: &[f64]) -> Result<Gathered, Er
         kmer[pair] = n_kmers;
     }
     drop(by_hash);
+    let mut owner = vec![u32::MAX; n_kmers as usize + 1];
     // Each unit's k-mers, CSR: members[start[u]..end[u]] are its untaken ones.
     let mut start = vec![0usize; n + 1];
     for &u in units {
@@ -80,7 +83,6 @@ pub fn gather(units: &[u32], hashes: &[u64], t_g: &[f64]) -> Result<Gathered, Er
         members[end[u as usize]] = k;
         end[u as usize] += 1;
     }
-    drop(kmer);
     let mut heap = BinaryHeap::new();
     for u in 0..n {
         let mine = &mut members[start[u]..end[u]];
@@ -124,11 +126,17 @@ pub fn gather(units: &[u32], hashes: &[u64], t_g: &[f64]) -> Result<Gathered, Er
         }
         for &k in &members[start[u]..end[u]] {
             taken[k as usize] = true;
+            owner[k as usize] = unit;
         }
         out.unit.push(unit);
         #[allow(clippy::cast_possible_truncation)] // a unit has far fewer than 2^32 k-mers
         out.kmers_unique.push(len as u32);
     }
+    out.owned = units
+        .iter()
+        .zip(&kmer)
+        .map(|(&u, &k)| owner[k as usize] == u)
+        .collect();
     Ok(out)
 }
 
@@ -145,6 +153,11 @@ mod tests {
         let got = gather(&UNITS, &HASHES, &[0.01; 4]).unwrap();
         assert_eq!(got.unit, [0, 3, 2]);
         assert_eq!(got.kmers_unique, [4, 2, 1]);
+        // Unit 0 owns its four k-mers, 2 hash 5 and 3 both of its own; 1 owns none.
+        let owned = [
+            true, true, true, true, false, false, false, true, true, true,
+        ];
+        assert_eq!(got.owned, owned);
         // Sampled 10x more sparsely, unit 1's 2 k-mers stand for more than unit 0's 4.
         let got = gather(&UNITS, &HASHES, &[0.01, 0.001, 0.01, 0.01]).unwrap();
         assert_eq!(got.unit, [1, 0, 3, 2]);
@@ -155,6 +168,7 @@ mod tests {
     fn ties_go_to_the_lowest_unit_and_repeats_count_once() {
         let got = gather(&[2, 1, 1, 2], &[9, 9, 9, 9], &[1.0; 3]).unwrap();
         assert_eq!((got.unit, got.kmers_unique), (vec![1], vec![1]));
+        assert_eq!(got.owned, [false, true, true, false]);
     }
 
     #[test]
