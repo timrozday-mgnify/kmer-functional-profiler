@@ -5,6 +5,8 @@
 
 mod alphabet;
 mod bloom;
+mod components;
+mod distinct;
 mod error;
 mod fastx;
 mod gather;
@@ -14,6 +16,8 @@ mod translate;
 
 pub use alphabet::Alphabet;
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
+pub use components::components;
+pub use distinct::Distinct;
 pub use error::Error;
 pub use fastx::{BaseStats, FastxHits};
 pub use gather::{Gathered, gather};
