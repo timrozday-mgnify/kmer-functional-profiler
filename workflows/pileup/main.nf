@@ -34,14 +34,14 @@ process QUERY {
     tuple val(sample), path(r1), path(r2)
     path index
     path meta, stageAs: 'index.meta.json'  // see PILEUP
-    val opts  // e.g. '--stats stats.json' (query_stats) and query_args
+    val opts  // e.g. '--stats stats.json' (query_stats), --aai, --min-identity and query_args
 
     output:
     tuple val(sample), path('profile.tsv'), emit: profile
     path 'stats.json', optional: true  // with --query_stats: stage times, hits per pair
 
     script:
-    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --aai ${opts}"
+    "${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv ${opts}"
 
     stub:
     "touch profile.tsv"
@@ -413,10 +413,16 @@ workflow PILEUP {
     // and mtime, which an in-place rebuild keeps, so -resume reused a profile of the old
     // index (pileup-cost REFERENCE: unit ids not in the index). A rebuild rewrites meta.json.
     def meta = index.map { it.resolve('meta.json') }
-    def profiles = QUERY(reads, index, meta,
-        "${params.query_stats ? '--stats stats.json ' : ''}${params.query_args}").profile
+    // aai/ani optional (targets need neither): --aai only when asked for, or with theta
+    def query_opts = [
+        params.query_stats ? '--stats stats.json' : '',
+        params.aai ? '--aai' : '',
+        params.min_identity ? "--min-identity ${params.min_identity}" : '',
+        params.query_args,
+    ].findAll { it }.join(' ')
+    def profiles = QUERY(reads, index, meta, query_opts).profile
     def refs = REFERENCE(profiles, index, meta, store, withhold,
-        "--min-present ${params.min_present} --neighbours ${params.neighbours} --members ${params.members}",
+        "--max-fdr ${params.max_fdr} --max-targets ${params.max_targets} --neighbours ${params.neighbours} --members ${params.members}",
         file("${moduleDir}/../../python/kfp_pileup/reference.py", checkIfExists: true)).ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'

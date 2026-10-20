@@ -10,7 +10,7 @@ import typer
 from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
-from kfp_pileup.reference import MIN_PRESENT, NEIGHBOURS, build_reference
+from kfp_pileup.reference import MAX_FDR, MAX_TARGETS, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
 from kmer_functional_profiler.store import MEMBERS
 
@@ -22,9 +22,13 @@ def reference(
     profile: Annotated[Path, typer.Argument(help="kfp profile.tsv")],
     index_dir: Path,
     out_dir: Path,
-    min_present: Annotated[
-        float, typer.Option(help="Targets: units with present_prob at least this")
-    ] = MIN_PRESENT,
+    max_fdr: Annotated[
+        float,
+        typer.Option(
+            help="Targets: the top units by present_prob whose expected false share is at "
+            "most this (present_q <= max_fdr)"
+        ),
+    ] = MAX_FDR,
     members: Annotated[int, typer.Option(help="Sequences per unit")] = MEMBERS,
     store: Annotated[
         list[Path] | None,
@@ -37,12 +41,16 @@ def reference(
     neighbours: Annotated[
         int, typer.Option(help="Neighbours per target in a component, the most-hit first")
     ] = NEIGHBOURS,
+    max_targets: Annotated[
+        int,
+        typer.Option(help="At most this many targets, the most hit first (0 = no cap)"),
+    ] = MAX_TARGETS,
 ) -> None:
     """Write ref.fa (targets and component neighbours), refs.tsv and
     molecule.txt; print the sequences per role."""
     held = withhold.read_text().split() if withhold else ()
     counts = build_reference(
-        profile, index_dir, out_dir, min_present, members, store or (), held, neighbours
+        profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours, max_targets
     )
     typer.echo(json.dumps(counts))
 

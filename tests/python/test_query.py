@@ -34,6 +34,7 @@ from kmer_functional_profiler.query import (
     assign_best,
     em,
     em_pin,
+    fdr_q,
     fit_present_prior,
     gather,
     posterior_zi,
@@ -556,6 +557,28 @@ def test_min_aai_kmers_nulls_aai_but_keeps_its_kmers(members: Path) -> None:
     assert profile(index, *READS, with_aai=True, min_aai_kmers=0)["aai"].null_count() < got.height
 
 
+def test_min_identity_makes_units_below_theta_absent(members: Path) -> None:
+    index = build(members, t_base=1.0, fp_bits=64)
+    plain = profile(index, *READS, with_aai=True)
+    tested = profile(index, *READS, min_identity=0.5)  # implies with_aai
+    assert (
+        tested.select(plain.columns)
+        .drop("present_prob", "present_q")
+        .equals(plain.drop("present_prob", "present_q"))
+    )
+    below = plain["aai_hi"].fill_null(1.0) < 0.5
+    assert tested.filter(below)["present_prob"].to_list() == [0.0] * int(below.sum())
+    assert tested.filter(~below)["present_prob"].equals(plain.filter(~below)["present_prob"])
+    # theta above every upper bound: every unit with an aai is absent; untested ones stay
+    above = profile(index, *READS, min_identity=1.01)
+    tested_any = above["aai_hi"].is_not_null()
+    assert tested_any.any() and (above.filter(tested_any)["present_prob"] == 0).all()
+    assert above.filter(~tested_any)["present_prob"].equals(
+        plain.filter(~tested_any)["present_prob"]
+    )
+    assert above["present_q"].to_numpy() == pytest.approx(fdr_q(above["present_prob"].to_numpy()))
+
+
 MODEL = {"survival": "markov_gamma", "shape": 1.0, "region": 30.0}
 
 
@@ -626,7 +649,7 @@ def test_joint_query_equals_one_index_of_the_union(
     assert joint["source"].to_list() == [int(u >= a.units.height) for u in joint["unit"]]
     assert joint.drop("source").equals(union.select(joint.drop("source").columns))
     # An unrelated extra index leaves the first index's rows as they were, but for
-    # present_prob, whose prior counts every index's units.
+    # present_prob (and its q-value), whose prior counts every index's units.
     unrelated = tmp_path / "unrelated"
     rng = np.random.default_rng(0)
     random_seqs = ["".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), 300)) for _ in range(5)]
@@ -636,7 +659,7 @@ def test_joint_query_equals_one_index_of_the_union(
     assert with_unrelated.filter(pl.col("source") == 1).height == 0
     # Nothing hit in any index: an empty profile, not an error.
     assert profile(Index.load(unrelated), *READS, extra=[Index.load(unrelated)]).height == 0
-    keep = [c for c in alone.columns if c != "present_prob"]
+    keep = [c for c in alone.columns if c not in ("present_prob", "present_q")]
     assert with_unrelated.select(keep).equals(alone.select(keep))
 
 
@@ -1012,7 +1035,41 @@ def test_presence_doubts_few_and_shared_hits() -> None:
     presence(own, t_g, 3_000_000, 2000, report=report)
     assert report["presence_converged"] == 1 and 1 < report["presence_iterations"] < 500
     presence(own, t_g, 3_000_000, 2000, max_iter=1, report=report)
-    assert report == {"presence_iterations": 1, "presence_converged": 0}
+    assert (report["presence_iterations"], report["presence_converged"]) == (1, 0)
+
+
+def test_presence_background_capped_by_share() -> None:
+    # The per-unit rate times every index unit: 10^9 units at t_g 0.05 and 10 M reads predict
+    # ~4 x 10^8 background units against 1,000 seen, so every few-k-mer unit read as
+    # background. Capped at a share of the units seen, the expected background stays under
+    # it, few-k-mer units become credible, and a small index (cap not binding) is unchanged.
+    h = np.array([*[1] * 600, *[2] * 200, *[3] * 100, *[8] * 100])
+    own = pl.DataFrame(
+        {"unit": np.repeat(np.arange(len(h)), h), "hash": np.arange(h.sum()), "holders": 1},
+        schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32},
+    )
+    t_g = np.full(len(h), 0.05)
+    report: dict[str, float] = {}
+    uncapped = presence(own, t_g, 10_000_000, 10**9, share=float("inf"))["present_prob"]
+    capped = presence(own, t_g, 10_000_000, 10**9, share=0.1, report=report)["present_prob"]
+    assert uncapped[:900].max() < 0.01  # one to three own k-mers: background, uncapped
+    assert report["presence_background_scale"] < 1e-5
+    assert report["presence_background_units"] <= 0.1 * len(h) + 1e-6
+    assert capped[0] > uncapped[0] and capped[900] > 0.99
+    small = presence(own, t_g, 10_000, 2000, share=0.1, report=report)["present_prob"]
+    assert report["presence_background_scale"] == 1.0
+    assert small.equals(presence(own, t_g, 10_000, 2000, share=float("inf"))["present_prob"])
+
+
+def test_fdr_q_values() -> None:
+    p = np.array([0.99, 0.5, 0.9, 1.0, 0.0, 0.9])
+    q = fdr_q(p)
+    order = np.argsort(-p, kind="stable")
+    assert np.all(np.diff(q[order]) >= 0)  # q rises down the ranking
+    for x in (0.0, 0.05, 0.2, 1.0):  # the kept set's expected false share is at most x
+        kept = q <= x
+        assert not kept.any() or (1 - p[kept]).mean() <= x + 1e-12
+    assert q[3] == 0.0 and q[4] == pytest.approx((1 - p).mean())
 
 
 def by_hash(hit_reads: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
