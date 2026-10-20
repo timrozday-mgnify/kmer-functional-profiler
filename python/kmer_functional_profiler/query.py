@@ -469,9 +469,9 @@ PairWeight = Callable[[np.ndarray], np.ndarray]
 # ~65 bytes per pair, block-wise ~90 in two blocks (step 41, synthetic): it saves memory only
 # with many blocks, and on real components whole fits ran 25-32x faster at lower peak (step 42)
 MAX_FIT_PAIRS = 100_000_000
-# the zero-inflated EM's step cap (query --zi-max-iter): its largest component stopped at the
-# plain EM's 1,000 in every query of step 42, explained-away units still moving (step 41)
-ZI_MAX_ITER = 10_000
+# the zero-inflated EM's step cap (query --zi-max-iter), the plain EM's: 3,000 and 10,000 left
+# the same units unconverged at 3-10x the fit's time, with no change in accuracy (step 45)
+ZI_MAX_ITER = 1000
 BLOCK_STEPS: Final = 30  # EM steps per block per round of a block-wise fit
 MAX_BLOCK_ROUNDS: Final = 1000  # rounds over a block-wise component's blocks
 

@@ -342,7 +342,7 @@ def query(
     ] = 0,
     zi_max_iter: Annotated[
         int,
-        typer.Option(help="EM step cap of the zero-inflated fit; 0 = the default, 10,000"),
+        typer.Option(help="EM step cap of the zero-inflated fit; 0 = the default, 1,000"),
     ] = 0,
     zi_cold_start: Annotated[
         bool,
