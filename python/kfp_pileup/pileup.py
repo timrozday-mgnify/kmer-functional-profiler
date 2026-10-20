@@ -33,6 +33,7 @@ not in pileups, and there is no sequencing-error model. :mod:`kfp_pileup.refine`
 
 import math
 import re
+import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Final
@@ -43,6 +44,7 @@ import polars as pl
 from kfp_pileup.nucleotide import nucleotide_pileup
 from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.refine import NOVEL, refine
+from kfp_pileup.spill import PARTS, Spill, partitions
 from kmer_functional_profiler.index import read_fasta
 from kmer_functional_profiler.query import Timer
 
@@ -340,9 +342,9 @@ def score_batch(
     """(assignments, pileup part, per-sequence read stats, target columns, target events)
     of one batch. Assignments keep each alignment's ``hit`` id, reference span, strand,
     read residues (``qlen``) and differences (``mism``, a frameshift one) for
-    :mod:`kfp_pileup.refine`; target columns are (hit, col, qpos, residue byte) of
-    alignments to targets, and target events (hit, col, kind byte, qpos) their insertions
-    and frameshifts."""
+    :mod:`kfp_pileup.refine`; target columns are (hit, seq, col, qpos, residue byte) of
+    alignments to targets, and target events (hit, seq, col, kind byte, qpos) their
+    insertions and frameshifts."""
     hits = (
         pl.DataFrame(
             {
@@ -459,7 +461,7 @@ def score_batch(
         mism=pl.col("mism").fill_null(0) + pl.col("ins") + pl.col("shifts"),
     )
     target_cols = rows.filter(pl.col("role") == TARGET).select(
-        "hit", "col", "qpos", residue="rbyte"
+        "hit", "seq", "col", "qpos", residue="rbyte"
     )
     events = pl.DataFrame(
         {
@@ -468,7 +470,7 @@ def score_batch(
             "kind": np.frombuffer(bytes(batch.ev_kind), np.uint8),
             "qpos": np.asarray(batch.ev_key, np.int64),
         }
-    ).join(hits.filter(pl.col("role") == TARGET).select("hit"), on="hit")
+    ).join(hits.filter(pl.col("role") == TARGET).select("hit", "seq"), on="hit")
     return assignments, part, stats, target_cols, events
 
 
@@ -485,6 +487,7 @@ def call(
     novel: float = NOVEL,
     reads: Sequence[str | Path] = (),
     stats: str | Path | None = None,
+    spill_parts: int = PARTS,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
@@ -494,32 +497,40 @@ def call(
     :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). With ``stats``, each
     stage's time and memory go there as the query's (``Timer``). Returns counts.
 
-    ponytail: steps 8-9 hold every alignment and its target columns in memory; spill them
-    per component to Parquet if ``pileup-cost``'s 100 M pairs do not fit."""
+    Target columns and events are spilled to Parquet by reference sequence in a temporary
+    directory under ``out_dir`` (:mod:`kfp_pileup.spill`), so steps 6b and 8-9 hold one
+    partition of them at a time; the alignments table stays in memory."""
     ref_dir, out = Path(ref_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     timer = Timer(Path(stats) if stats else None, log=stats is not None)
     with timer("read"):
         refs, sequences, prof = _read_inputs(ref_dir, profile)
-    with timer("batches"):
-        hits, col_parts, event_parts, parts, stat_parts = _score(
-            alignments, refs, sequences, aligner, score_nats, batch_reads
-        )
-    timer.counts["alignments"] = 0 if hits is None else hits.height
-    refined, em_units = None, None
-    if hits is not None and hits.height:
-        with timer("refine"):
-            refined, em_units = refine(
-                hits, pl.concat(col_parts), refs, sequences, out, aligner == "diamond", prof,
-                min_depth, min_freq, novel,
-            )  # fmt: skip
-        hits = hits.join(refined, on="hit", how="left")
-    nt_counts = {}
-    if reads and aligner == "diamond" and hits is not None and hits.height:
-        with timer("nucleotide"):
-            nt_counts = nucleotide_pileup(
-                hits, pl.concat(col_parts), pl.concat(event_parts), refs, reads, out
+    with tempfile.TemporaryDirectory(prefix=".spill-", dir=out) as tmp:
+        target_len = np.where(refs["role"] == TARGET, refs["length"], 0)
+        spill = Spill(Path(tmp), partitions(target_len, spill_parts))
+        with timer("batches"):
+            hits, parts, stat_parts = _score(
+                alignments, refs, sequences, aligner, score_nats, batch_reads, spill
             )
+            spill.close()
+        timer.counts.update(
+            alignments=0 if hits is None else hits.height,
+            spill_rows=spill.rows,
+            spill_parts=len(spill.files),
+            spill_bytes=sum(f.stat().st_size for f in spill.files),
+        )
+        refined, em_units = None, None
+        if hits is not None and hits.height:
+            with timer("refine"):
+                refined, em_units = refine(
+                    hits, spill, refs, sequences, out, aligner == "diamond", prof,
+                    min_depth, min_freq, novel,
+                )  # fmt: skip
+            hits = hits.join(refined, on="hit", how="left")
+        nt_counts = {}
+        if reads and aligner == "diamond" and hits is not None and hits.height:
+            with timer("nucleotide"):
+                nt_counts = nucleotide_pileup(hits, spill, refs, reads, out)
     with timer("write"):
         counts = _write(
             hits, parts, stat_parts, refs, sequences, prof, em_units, out, min_depth, min_freq
@@ -577,15 +588,10 @@ def _score(
     aligner: str,
     score_nats: float,
     batch_reads: int,
-) -> tuple[
-    pl.DataFrame | None,
-    list[pl.DataFrame],
-    list[pl.DataFrame],
-    list[pl.DataFrame],
-    list[pl.DataFrame],
-]:
-    """The crude pass, batch by batch: alignments with hit ids, their target columns and
-    events, the summed pileup's parts and per-sequence read stats."""
+    spill: Spill,
+) -> tuple[pl.DataFrame | None, list[pl.DataFrame], list[pl.DataFrame]]:
+    """The crude pass, batch by batch: alignments with hit ids, the summed pileup's parts
+    and per-sequence read stats; target columns and events go to ``spill``."""
     seq_index = {s: i for i, s in enumerate(refs["seq_id"])}
     ref_bytes = [sequences[s].encode() for s in refs["seq_id"]]
     if aligner == "diamond":
@@ -599,20 +605,27 @@ def _score(
     else:
         raise ValueError(f"aligner must be diamond or bwa, not {aligner}")
     parts, stats, n_assigned = [], [], 0
-    assigned_parts, col_parts, event_parts = [], [], []
+    assigned_parts = []
     for batch in batches:
         assignments, part, stat, cols, events = score_batch(batch, refs, matrix, term_bits)
         offset = pl.lit(n_assigned, pl.UInt32)
         assigned_parts.append(assignments.with_columns(pl.col("hit") + offset))
-        col_parts.append(cols.with_columns(pl.col("hit") + offset))
-        event_parts.append(events.with_columns(pl.col("hit") + offset))
+        spill.write(
+            pl.concat(
+                [
+                    cols.with_columns(kind=pl.lit(0, pl.UInt8)),
+                    events.with_columns(residue=pl.lit(0, pl.UInt8)),
+                ],
+                how="diagonal_relaxed",
+            ).with_columns(pl.col("hit") + offset)
+        )
         n_assigned += assignments.height
         parts.append(part)
         stats.append(stat)
         if len(parts) > 32:  # keep the summed pileup small
             parts = [_sum(parts)]
     hits = pl.concat(assigned_parts) if assigned_parts else None
-    return hits, col_parts, event_parts, parts, stats
+    return hits, parts, stats
 
 
 def _write(
@@ -681,12 +694,12 @@ def _columns(pile: pl.DataFrame, refs: pl.DataFrame, sequences: dict[str, str]) 
     keys = ["seq_id", "unit", "cluster_rep", "protein_id", "rep", "col", "ref"]
     per_column = pile.group_by(keys).agg(
         depth=pl.col("weight").sum(),
-        consensus=pl.col("residue").sort_by("weight").last(),
+        consensus=pl.col("residue").sort_by("weight", "residue", descending=[True, False]).first(),
         consensus_freq=pl.col("weight").max() / pl.col("weight").sum(),
     )
     alt = (
         pile.filter(pl.col("residue") != pl.col("ref"))
-        .sort("weight", descending=True)
+        .sort("weight", "residue", descending=[True, False])  # ties: the first residue
         .group_by(["seq_id", "col"])
         .agg(
             alt=pl.col("residue").first(),

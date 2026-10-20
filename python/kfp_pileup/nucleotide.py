@@ -36,6 +36,7 @@ from typing import Final
 import numpy as np
 import polars as pl
 
+from kfp_pileup.spill import Spill
 from kmer_functional_profiler.reference import BASES, CODE_11
 
 MIN_WEIGHT: Final = 1e-3
@@ -99,22 +100,97 @@ def _bases(buf: np.ndarray, off: np.ndarray, key: np.ndarray, k: np.ndarray) -> 
 
 def nucleotide_pileup(
     hits: pl.DataFrame,
-    cols: pl.DataFrame,
-    events: pl.DataFrame,
+    spill: Spill,
     refs: pl.DataFrame,
     reads: Sequence[str | Path],
     out: Path,
 ) -> dict[str, int]:
-    """Step 6b from the crude pass's target columns and events and steps 8-9's weights
-    (``hits``: assignments with ``em_posterior``). Writes the module's outputs to ``out``;
-    returns counts, ``codon_mismatch`` the read codons whose translation is not the residue
-    the alignment shows (0 unless coordinates are wrong; codons with N excepted)."""
+    """Step 6b from the crude pass's target columns and events (``spill``, read one
+    partition at a time) and steps 8-9's weights (``hits``: assignments with
+    ``em_posterior``). Writes the module's outputs to ``out``; returns counts,
+    ``codon_mismatch`` the read codons whose translation is not the residue the alignment
+    shows (0 unless coordinates are wrong; codons with N excepted)."""
     w = hits.filter(pl.col("role") == "target", pl.col("em_posterior") > MIN_WEIGHT).select(
         "hit", "read_name", "mate", "seq", weight="em_posterior"
     )
     table, buf = _recruit(reads, set(w["read_name"]), out)
     w = w.join(table, on=["mate", "read_name"]).select("hit", "seq", "weight", "off")
+    piles, codon_mismatch, frameshifts = [], 0, 0
+    for _, cols, events in spill.parts():  # all of a sequence's rows are in one partition
+        pile, mismatched, shifted = _pile_part(cols.drop("seq"), events.drop("seq"), w, buf)
+        piles.append(pile)
+        codon_mismatch += mismatched
+        frameshifts += shifted
+    pile = pl.concat(piles)
+    ids = refs.select("seq", "seq_id", "unit", "cluster_rep", "protein_id", "length")
+    pile.join(ids.select("seq", "seq_id"), on="seq").drop("seq").sort(
+        "seq_id", "col", "allele"
+    ).write_parquet(out / "pileup_nt.parquet")
 
+    # consensus: per unit, its best-supported sequence; bases only (see the module note)
+    bases = pile.filter(pl.col("allele").is_in(list("ACGT")))
+    best = (
+        bases.group_by("seq")
+        .agg(support=pl.col("weight").sum())
+        .join(ids, on="seq")
+        .sort("support", "seq", descending=[True, False])
+        .unique("unit", keep="first")
+        .sort("seq")
+    )
+    top = (
+        bases.sort("weight", "allele", descending=[True, False])  # ties: the first allele
+        .group_by("seq", "col")
+        .agg(allele=pl.col("allele").first(), depth=pl.col("weight").sum())
+    )
+    top_by_seq = top.partition_by("seq", as_dict=True)
+    none = top.clear()
+    fna, gff, genes, info = [], ["##gff-version 3\n"], [], []
+    for row in best.iter_rows(named=True):
+        length = 3 * row["length"]
+        cons = np.full(length, ord("N"), np.uint8)
+        at = top_by_seq.get((row["seq"],), none)
+        cons[at["col"].to_numpy()] = np.frombuffer("".join(at["allele"]).encode(), np.uint8)
+        text, sid = cons.tobytes().decode(), row["seq_id"]
+        fna.append(f">{sid} unit={row['unit']} cluster_rep={row['cluster_rep']}\n{text}\n")
+        genes.append(f">{sid}_1 # 1 # {length} # 1 # ID={sid}_1\n{text}\n")
+        gff.extend(
+            f"{sid}\tkfp\t{kind}\t1\t{length}\t.\t+\t{phase}\t{attrs}\n"
+            for kind, phase, attrs in (
+                ("gene", ".", f"ID=gene:{sid};Name={sid};biotype=protein_coding"),
+                (
+                    "mRNA",
+                    ".",
+                    f"ID=transcript:{sid};Parent=gene:{sid};Name={sid};biotype=protein_coding",
+                ),
+                ("exon", ".", f"Parent=transcript:{sid}"),
+                ("CDS", "0", f"Parent=transcript:{sid}"),
+            )
+        )
+        info.append(
+            (sid, row["unit"], row["cluster_rep"], row["protein_id"], length, at.height,
+             float(at["depth"].sum()) / length)
+        )  # fmt: skip
+    (out / "consensus.fna").write_text("".join(fna))
+    (out / "consensus.genes.fna").write_text("".join(genes))
+    (out / "consensus.gff").write_text("".join(gff))
+    pl.DataFrame(
+        info,
+        schema=["seq_id", "unit", "cluster_rep", "protein_id", "length", "covered", "depth"],
+        orient="row",
+    ).write_csv(out / "consensus.tsv", separator="\t")
+    return {
+        "recruited_mates": table.height,
+        "consensus_sequences": best.height,
+        "frameshift_alignments": frameshifts,
+        "codon_mismatch": codon_mismatch,
+    }
+
+
+def _pile_part(
+    cols: pl.DataFrame, events: pl.DataFrame, w: pl.DataFrame, buf: np.ndarray
+) -> tuple[pl.DataFrame, int, int]:
+    """One partition's nucleotide pileup (seq, col, allele, weight), its codon mismatches
+    and its alignments with a frameshift."""
     # codons of aligned residues, and the translation check
     codons = cols.filter(pl.col("qpos") >= 0).join(w, on="hit")
     off, key = codons["off"].to_numpy(), codons["qpos"].to_numpy()
@@ -132,7 +208,8 @@ def nucleotide_pileup(
             "hit": np.tile(codons["hit"].to_numpy(), 3),
             "col": np.concatenate([3 * c + k for k in range(3)]),
             "allele": np.frombuffer(b.tobytes(), "S1").astype("U1"),
-        }
+        },
+        schema={"hit": pl.UInt32, "col": pl.Int64, "allele": pl.String},
     )
     deleted = cols.filter(pl.col("qpos") < 0).join(w.select("hit"), on="hit")
     del_rows = pl.concat(
@@ -168,63 +245,5 @@ def nucleotide_pileup(
         .group_by("seq", "col", "allele")
         .agg(pl.col("weight").sum())
     )
-    ids = refs.select("seq", "seq_id", "unit", "cluster_rep", "protein_id", "length")
-    pile.join(ids.select("seq", "seq_id"), on="seq").drop("seq").sort(
-        "seq_id", "col", "allele"
-    ).write_parquet(out / "pileup_nt.parquet")
-
-    # consensus: per unit, its best-supported sequence; bases only (see the module note)
-    bases = pile.filter(pl.col("allele").is_in(list("ACGT")))
-    best = (
-        bases.group_by("seq")
-        .agg(support=pl.col("weight").sum())
-        .join(ids, on="seq")
-        .sort("support", "seq", descending=[True, False])
-        .unique("unit", keep="first")
-        .sort("seq")
-    )
-    top = (
-        bases.sort("weight", descending=True)
-        .group_by("seq", "col")
-        .agg(allele=pl.col("allele").first(), depth=pl.col("weight").sum())
-    )
-    fna, gff, genes, info = [], ["##gff-version 3\n"], [], []
-    for row in best.iter_rows(named=True):
-        length = 3 * row["length"]
-        cons = np.full(length, ord("N"), np.uint8)
-        at = top.filter(pl.col("seq") == row["seq"])
-        cons[at["col"].to_numpy()] = np.frombuffer("".join(at["allele"]).encode(), np.uint8)
-        text, sid = cons.tobytes().decode(), row["seq_id"]
-        fna.append(f">{sid} unit={row['unit']} cluster_rep={row['cluster_rep']}\n{text}\n")
-        genes.append(f">{sid}_1 # 1 # {length} # 1 # ID={sid}_1\n{text}\n")
-        gff.extend(
-            f"{sid}\tkfp\t{kind}\t1\t{length}\t.\t+\t{phase}\t{attrs}\n"
-            for kind, phase, attrs in (
-                ("gene", ".", f"ID=gene:{sid};Name={sid};biotype=protein_coding"),
-                (
-                    "mRNA",
-                    ".",
-                    f"ID=transcript:{sid};Parent=gene:{sid};Name={sid};biotype=protein_coding",
-                ),
-                ("exon", ".", f"Parent=transcript:{sid}"),
-                ("CDS", "0", f"Parent=transcript:{sid}"),
-            )
-        )
-        info.append(
-            (sid, row["unit"], row["cluster_rep"], row["protein_id"], length, at.height,
-             float(at["depth"].sum()) / length)
-        )  # fmt: skip
-    (out / "consensus.fna").write_text("".join(fna))
-    (out / "consensus.genes.fna").write_text("".join(genes))
-    (out / "consensus.gff").write_text("".join(gff))
-    pl.DataFrame(
-        info,
-        schema=["seq_id", "unit", "cluster_rep", "protein_id", "length", "covered", "depth"],
-        orient="row",
-    ).write_csv(out / "consensus.tsv", separator="\t")
-    return {
-        "recruited_mates": table.height,
-        "consensus_sequences": best.height,
-        "frameshift_alignments": int(ev.filter(pl.col("kind") != ord("I"))["hit"].n_unique()),
-        "codon_mismatch": codon_mismatch,
-    }
+    frameshifts = int(ev.filter(pl.col("kind") != ord("I"))["hit"].n_unique())
+    return pile, codon_mismatch, frameshifts

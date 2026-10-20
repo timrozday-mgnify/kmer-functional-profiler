@@ -24,6 +24,10 @@ work.
   by BIC; a haplotype diverging from the original sequence by more than ``novel`` over the
   covered columns is a novel relative, and its reads' weight moves to the novel class:
   ``haplotypes.tsv``.
+
+The EM runs on the whole alignments table (one row per pair and candidate source); the
+target columns are read one :mod:`kfp_pileup.spill` partition at a time for the pileups,
+consensus updates and haplotypes, which are per sequence (plan, ``CALL``'s memory, option 5).
 """
 
 from pathlib import Path
@@ -31,6 +35,8 @@ from typing import Final
 
 import numpy as np
 import polars as pl
+
+from kfp_pileup.spill import Spill
 
 NOVEL: Final = 0.1  # least divergence of a novel relative: MGnify90's cluster radius
 PRIOR_PAIRS: Final = 2.0  # weak Dirichlet: pseudo-pairs per component from coverage_zi
@@ -98,8 +104,13 @@ class _Model:
     ) -> None:
         self.alpha = 20 if protein else 4
         nt = 3 if protein else 1
-        h = hits.join(refs.select("seq", "component"), on="seq").with_columns(
-            pair=pl.col("read_name").rank("dense").cast(pl.Int64) - 1
+        h = (
+            hits.select(
+                "hit", "read_name", "mate", "seq", "unit", "score", "start", "end", "qlen", "mism"
+            )
+            .join(refs.select("seq", "component"), on="seq")
+            .with_columns(pair=pl.col("read_name").rank("dense").cast(pl.Int64) - 1)
+            .drop("read_name")
         )
         # sources: units (targets, neighbours), then a novel class per component
         units = refs.select("unit", "component", "role").unique("unit", maintain_order=True)
@@ -313,7 +324,7 @@ def _haplotypes(
 
 def refine(
     hits: pl.DataFrame,
-    cols: pl.DataFrame,
+    spill: Spill,
     refs: pl.DataFrame,
     sequences: dict[str, str],
     out: Path,
@@ -324,8 +335,8 @@ def refine(
     novel: float = NOVEL,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Steps 8-9 on the crude pass's alignments (``hits``: assignments with hit ids, spans,
-    ``qlen`` and ``mism``; ``cols``: target columns). Writes ``sources.tsv`` and
-    ``haplotypes.tsv``; returns per alignment
+    ``qlen`` and ``mism``; ``spill``: their target columns by sequence partition). Writes
+    ``sources.tsv`` and ``haplotypes.tsv``; returns per alignment
     (hit, em_posterior, em_novel, em_flag) and per unit (em_pairs, em_abundance,
     em_divergence)."""
     alpha = 20 if protein else 4
@@ -340,46 +351,55 @@ def refine(
     position = pl.col("col").cast(pl.Int64) + pl.col("seq").replace_strict(
         start_of, return_dtype=pl.Int64
     )
-    target_cols = cols.join(hits.select("hit", "seq"), on="hit").with_columns(g=position)
-    g = target_cols["g"].to_numpy()
-    res = target_cols["residue"].to_numpy()
-    hit_of = target_cols["hit"].to_numpy()
     mism = hits.select("hit", "mism").sort("hit")
-    sites = cols.filter(pl.col("qpos") >= 0).join(hits.select("hit", "seq"), on="hit")
     updated = 0
     for _ in range(ROUNDS):
         # without the novel class: a strain's reads must reach its consensus before the
         # final fit and the haplotypes judge novelty against the original sequence
         fit, _, _ = em.fit(prior=False, novel=False)
         weights = em.hit_weights(fit).filter(pl.col("src") < em.n_u)
-        pile = _pile(sites.filter(pl.col("residue") != GAP), weights).with_columns(g=position)
-        pile = pile.with_columns(orig=pl.Series(original[pile["g"].to_numpy()]))
-        # a new majority, where the original residue has lost its support (not where a
-        # misplaced relative outnumbers the unit's own strain)
-        top = (
-            pile.group_by("seq", "col", "g")
-            .agg(
-                consensus=pl.col("residue").sort_by("weight").last(),
-                freq=pl.col("weight").max() / pl.col("weight").sum(),
-                depth=pl.col("weight").sum(),
-                orig_weight=pl.col("weight").filter(pl.col("residue") == pl.col("orig")).sum(),
-            )
-            .filter(
-                pl.col("depth") >= min_depth,
-                pl.col("freq") > 0.5,
-                pl.col("orig_weight")
-                < pl.max_horizontal(MIN_ALT_READS, min_freq * pl.col("depth")),
-            )
-        )
-        at = top["g"].to_numpy()
-        change = top["consensus"].to_numpy() != current[at]
-        if not change.any():
-            break
         before = current.copy()
-        current[at[change]] = top["consensus"].to_numpy()[change]
-        updated += int(change.sum())
-        delta = (res != current[g]).astype(np.int64) - (res != before[g])
-        moved = np.bincount(hit_of, delta, minlength=hits.height)
+        moved = np.zeros(hits.height, np.int64)
+        changed = 0
+        for _, cols, _ in spill.parts():  # a partition's sequences: its columns are all here
+            pile = _pile(
+                cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP), weights
+            ).with_columns(g=position)
+            pile = pile.with_columns(orig=pl.Series(original[pile["g"].to_numpy()]))
+            # a new majority, where the original residue has lost its support (not where a
+            # misplaced relative outnumbers the unit's own strain)
+            top = (
+                pile.group_by("seq", "col", "g")
+                .agg(
+                    consensus=pl.col("residue")
+                    .sort_by("weight", "residue", descending=[True, False])
+                    .first(),
+                    freq=pl.col("weight").max() / pl.col("weight").sum(),
+                    depth=pl.col("weight").sum(),
+                    orig_weight=pl.col("weight").filter(pl.col("residue") == pl.col("orig")).sum(),
+                )
+                .filter(
+                    pl.col("depth") >= min_depth,
+                    pl.col("freq") > 0.5,
+                    pl.col("orig_weight")
+                    < pl.max_horizontal(MIN_ALT_READS, min_freq * pl.col("depth")),
+                )
+            )
+            at = top["g"].to_numpy()
+            change = top["consensus"].to_numpy() != current[at]
+            if not change.any():
+                continue
+            current[at[change]] = top["consensus"].to_numpy()[change]
+            changed += int(change.sum())
+            g = cols.select(position).to_series().to_numpy()
+            res = cols["residue"].to_numpy()
+            delta = (res != current[g]).astype(np.int64) - (res != before[g])
+            moved += np.bincount(cols["hit"].to_numpy(), delta, minlength=hits.height).astype(
+                np.int64
+            )
+        if not changed:
+            break
+        updated += changed
         mism = mism.with_columns(
             mism=pl.col("mism") + pl.Series(moved[mism["hit"].to_numpy()].astype(np.int32))
         )
@@ -399,18 +419,6 @@ def refine(
         .join(hits.select("hit", "role"), on="hit")
         .filter(pl.col("role") == "target", pl.col("weight") > 1e-3)
     )
-    pile = _pile(sites.filter(pl.col("residue") != GAP), on_targets)
-    columns = pile.group_by("seq", "col").agg(
-        depth=pl.col("weight").sum(),
-        second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
-    )
-    covered = columns.filter(pl.col("depth") >= min_depth).with_columns(g=position)
-    at = covered["g"].to_numpy()
-    covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
-    variable = covered.filter(
-        (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
-        | pl.col("updated")
-    )
     eps = max(error, 0.01)
     # each mate's divergence from the nearest of the unit's original sequences
     nearest = (
@@ -419,43 +427,74 @@ def refine(
         .with_columns(d_unit=pl.col("d").min().over("read_name", "mate", "unit"))
         .select("hit", "d_unit")
     )
+    # reads on each sequence, in on_targets' order (the haplotype seeds depend on it)
+    part = pl.Series(spill.part_of[on_targets["seq"].to_numpy()])
+    reads_by_part = {
+        k: v.drop("part")
+        for k, v in on_targets.with_columns(part=part).partition_by("part", as_dict=True).items()
+    }
+    del part
     hap_rows, novel_hits = [], []
-    site_res = sites.filter(pl.col("residue") != GAP).select("hit", "seq", "col", "residue")
-    for (seq,), cov in covered.group_by("seq"):
-        off = int(offsets[seq])
-        cov_cols = np.sort(cov["col"].to_numpy())
-        var_cols = np.sort(variable.filter(pl.col("seq") == seq)["col"].to_numpy())
-        reads_w = (
-            on_targets.filter(pl.col("seq") == seq)
-            .select("hit", "weight")
-            .join(nearest, on="hit", how="left", maintain_order="left")
+    for p, cols, _ in spill.parts():
+        site_res = cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP).select(
+            "hit", "seq", "col", "residue"
         )
-        x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
-        if len(var_cols):
-            obs = site_res.filter(
-                pl.col("seq") == seq, pl.col("col").is_in(var_cols.tolist())
-            ).join(reads_w.with_row_index("i"), on="hit")
-            x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
-                "residue"
-            ].to_numpy()
-        cons = current[off + var_cols]
-        w = reads_w["weight"].to_numpy()
-        haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
-        is_novel = np.zeros(len(haps), bool)
-        d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
-        for k, hap in enumerate(haps):
-            full = current[off + cov_cols].copy()
-            full[np.searchsorted(cov_cols, var_cols)] = hap
-            div = float((full != original[off + cov_cols]).mean())
-            mass = float(w @ resp[:, k])
-            # its reads, against the nearest of the unit's sequences, sequencing error removed
-            read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
-            is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
-            hap_rows.append(
-                (int(seq), k, float(eta[k]), mass, div, read_div, len(cov_cols), is_novel[k])
+        on_part = reads_by_part.get((p,), on_targets.clear())
+        pile = _pile(site_res, on_part)
+        columns = pile.group_by("seq", "col").agg(
+            depth=pl.col("weight").sum(),
+            second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
+        )
+        covered = columns.filter(pl.col("depth") >= min_depth).with_columns(g=position)
+        at = covered["g"].to_numpy()
+        covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
+        variable = covered.filter(
+            (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
+            | pl.col("updated")
+        )
+        var_by_seq = variable.partition_by("seq", as_dict=True)
+        reads_by_seq = on_part.select("hit", "seq", "weight").partition_by("seq", as_dict=True)
+        sites_by_seq = site_res.partition_by("seq", as_dict=True)
+        for (seq,), cov in covered.group_by("seq"):
+            off = int(offsets[seq])
+            cov_cols = np.sort(cov["col"].to_numpy())
+            var = var_by_seq.get((seq,))
+            var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
+            reads_w = (
+                reads_by_seq[(seq,)]
+                .select("hit", "weight")
+                .join(nearest, on="hit", how="left", maintain_order="left")
             )
-        if is_novel.any():
-            novel_hits.append(reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1))))
+            x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
+            if len(var_cols):
+                obs = (
+                    sites_by_seq[(seq,)]
+                    .filter(pl.col("col").is_in(var_cols.tolist()))
+                    .join(reads_w.with_row_index("i"), on="hit")
+                )
+                x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
+                    "residue"
+                ].to_numpy()
+            cons = current[off + var_cols]
+            w = reads_w["weight"].to_numpy()
+            haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
+            is_novel = np.zeros(len(haps), bool)
+            d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
+            for k, hap in enumerate(haps):
+                full = current[off + cov_cols].copy()
+                full[np.searchsorted(cov_cols, var_cols)] = hap
+                div = float((full != original[off + cov_cols]).mean())
+                mass = float(w @ resp[:, k])
+                # its reads, against the nearest of the unit's sequences, sequencing error removed
+                read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
+                is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
+                hap_rows.append(
+                    (int(seq), k, float(eta[k]), mass, div, read_div, len(cov_cols), is_novel[k])
+                )
+            if is_novel.any():
+                novel_hits.append(
+                    reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1)))
+                )
     haplotypes = pl.DataFrame(
         hap_rows,
         schema={

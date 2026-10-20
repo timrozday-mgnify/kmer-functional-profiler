@@ -234,6 +234,47 @@ def test_em_and_haplotypes_send_a_relatives_reads_to_novel(tmp_path: Path) -> No
     assert haps.filter("novel")["divergence"].to_list() == [pytest.approx(6 / 30)]
 
 
+def test_spill_partitions_do_not_change_results(tmp_path: Path) -> None:
+    # Two targets, each with a strain (a fixed difference: a consensus update) and a novel
+    # relative's reads: the same outputs with every column in one partition or split in two.
+    ref = "MKVLAAGIVLWQERTYIPASDFGHKLCVNM"
+    other = ref[::-1]
+    refs = write_refs(tmp_path / "ref", [("s0", "target", 0, ref), ("s1", "target", 1, other)])
+
+    def btop(seq: str, diffs: dict[int, str]) -> str:
+        out, run = "", 0
+        for i, s in enumerate(seq):
+            if i in diffs:
+                out += f"{run or ''}{diffs[i]}{s}"
+                run = 0
+            else:
+                run += 1
+        return out + str(run)
+
+    rel = {2: "W", 5: "S", 10: "D", 15: "N", 20: "Q", 25: "E"}
+    lines = [diamond_line(f"a{i}", "s0", 60, btop(ref, {2: "W"})) for i in range(8)]
+    lines += [diamond_line(f"b{i}", "s1", 60, btop(other, {7: "K"})) for i in range(8)]
+    lines += [diamond_line(f"r{i}", "s0", 40, btop(ref, rel)) for i in range(4)]
+    hits = tmp_path / "r1.tsv"
+    hits.write_text("".join(lines))
+    outs = {}
+    for parts in (1, 2):
+        out, stats = tmp_path / f"p{parts}", tmp_path / f"p{parts}.json"
+        call(
+            [hits], refs, out, "diamond", min_depth=3, min_freq=0.2, stats=stats, spill_parts=parts
+        )
+        assert json.loads(stats.read_text())["counts"]["spill_parts"] == parts
+        assert not [p for p in out.iterdir() if p.name.startswith(".spill")]  # cleaned up
+        outs[parts] = out
+    for name in ("assignments.parquet", "pileup.parquet"):
+        one, two = (pl.read_parquet(outs[p] / name) for p in (1, 2))
+        assert one.sort(one.columns).equals(two.sort(two.columns))
+    for name in ("sources.tsv", "haplotypes.tsv", "units.tsv", "variants.tsv"):
+        assert (outs[1] / name).read_text() == (outs[2] / name).read_text(), name
+    haps = pl.read_csv(outs[1] / "haplotypes.tsv", separator="\t")
+    assert set(haps["seq_id"]) == {"s0", "s1"}
+
+
 def test_frameshift_btop_to_nucleotides(tmp_path: Path) -> None:
     # Real DIAMOND 2.2.8 -F 15 alignments (tests/data/frameshift) of 150-nt reads from
     # cds.fna[300:450] with planted indels near read position 75 (cds 375), both strands.

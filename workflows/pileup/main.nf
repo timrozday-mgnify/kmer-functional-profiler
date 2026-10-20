@@ -134,6 +134,7 @@ process CALL {
     input:
     tuple val(sample), val(aligner), path(alignments), path(ref), path(profile), path(r1), path(r2)
     val opts
+    path code, stageAs: 'code/*'  // unused: staged so that -resume reruns CALL when its code changes
 
     output:
     tuple val(sample), path('pileup'), emit: pileup
@@ -429,8 +430,12 @@ workflow PILEUP {
         .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
         .mix(BWAMEM2(to_align.nucleotide, params.bwa_args).alignments)
     def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
+    def call_code = ['pileup', 'refine', 'spill', 'nucleotide'].collect {
+        file("${moduleDir}/../../python/kfp_pileup/${it}.py", checkIfExists: true)
+    }
     def called = CALL(alignments.join(ref_dirs).join(profiles).join(reads),
-        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}")
+        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}",
+        call_code)
     def pileups = called.pileup
 
     // steps 6b-6c: the hand-off BAM, then existing callers on it
