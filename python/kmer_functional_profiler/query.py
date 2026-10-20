@@ -2222,27 +2222,15 @@ class _Summed:
 
     min_rows = 1_000_000  # rows waiting before the first merge, over all parts
 
-    def __init__(
-        self,
-        keys: list[str],
-        aggs: dict[str, pl.Expr],
-        parts: int = 16,
-        *,
-        part: pl.Expr | None = None,
-        slack: float = 1.0,
-    ) -> None:
-        """``part`` maps rows to their part (0 to ``parts`` - 1; the first key mod
-        ``parts`` by default); a part is merged once its waiting rows exceed ``slack`` x its
-        total, so memory is ~(1 + ``slack``) x the total's."""
-        self.keys, self.aggs, self.parts, self.slack = keys, aggs, parts, slack
-        self.part = pl.col(keys[0]) % parts if part is None else part
+    def __init__(self, keys: list[str], aggs: dict[str, pl.Expr], parts: int = 16) -> None:
+        self.keys, self.aggs, self.parts = keys, aggs, parts
         self.totals: list[pl.DataFrame | None] = [None] * parts
         self.pending: list[list[pl.DataFrame]] = [[] for _ in range(parts)]
         self.rows = [0] * parts
 
     def add(self, df: pl.DataFrame) -> None:
         self.empty = df.clear()
-        split = df.with_columns(_part=self.part).partition_by(
+        split = df.with_columns(_part=pl.col(self.keys[0]) % self.parts).partition_by(
             "_part", as_dict=True, include_key=False
         )
         for key, part in split.items():
@@ -2251,7 +2239,7 @@ class _Summed:
             self.rows[p] += part.height
             total = self.totals[p]
             if self.rows[p] > max(
-                self.min_rows // self.parts, 0 if total is None else self.slack * total.height
+                self.min_rows // self.parts, 0 if total is None else total.height
             ):
                 self.totals[p], self.pending[p], self.rows[p] = self._merged(p), [], 0
 
@@ -2259,14 +2247,6 @@ class _Summed:
         total = self.totals[p]
         parts = [total, *self.pending[p]] if total is not None else self.pending[p]
         return pl.concat([self.empty, *parts]).group_by(self.keys).agg(**self.aggs)
-
-    def each(self) -> Iterator[pl.DataFrame]:
-        """The summed table part by part, in part order, each released once given; so it is
-        called once, at the end (as :meth:`total`)."""
-        for p in range(self.parts):
-            merged = self._merged(p)
-            self.totals[p], self.pending[p] = None, []
-            yield merged
 
     def total(self) -> pl.DataFrame:
         """The summed table. It releases the parts, so it is called once, at the end."""
@@ -2579,16 +2559,13 @@ def profile(
     per_pair_hist = np.zeros(1, dtype=np.int64)  # pairs by hit k-mers (phase 13, step 0)
     # The sample's distinct sampled hashes first, a read pass more, so that tier 1 is read
     # once in hash order and dropped (plan, phase 6, step 40 (c)), not paged in at random.
-    # In 16 hash ranges. ponytail: merged at the default slack; a quarter (0.25) doubled
-    # sketch's time at 100 M pairs and left its peak as it was (step 40, query-walk)
-    below = max(joint.max_hash("tier1").bit_length() - 4, 0)
-    distinct = _Summed(["hash"], {}, part=pl.col("hash") // (1 << below))
-    distinct.add(pl.DataFrame({"hash": empty}))
+    # Kept sorted in hash ranges in Rust (~1.25x the distinct hashes; step 40).
+    distinct = _core.DistinctHashes(joint.max_hash("tier1"))
     with timer("sketch"):
         for batch in stream(joint.max_hash("tier1")):
-            distinct.add(pl.DataFrame({"hash": batch["hash"]}).unique())
+            distinct.add(np.ascontiguousarray(batch["hash"], dtype=np.uint64))
     with timer("walk"):
-        joint.walk("tier1", (part["hash"].sort().to_numpy() for part in distinct.each()))
+        joint.walk("tier1", (distinct.take(i) for i in range(len(distinct))))
     del distinct
     reads = iter(stream(joint.max_hash("tier1")))
     b: dict[str, np.ndarray] | None = {"hash": empty, "read": empty}
@@ -2643,16 +2620,6 @@ def profile(
         hit_info = joint.rows(np.sort(kmer_hits["unit"].unique().to_numpy()))
         if mask is not None:
             hit_info = mask.adjust(hit_info)
-    with timer("components"):
-        component = component_labels(kmer_hits)
-        if record and kmer_hits.height:  # a sample with no hit has no component
-            per_unit = component.group_by("component").len()
-            counts["components"] = per_unit.height
-            largest = per_unit.sort("len", "component", descending=[True, False]).row(0)
-            counts["largest_component_units"] = largest[1]
-            counts["largest_component_pairs"] = kmer_hits.join(
-                component.filter(pl.col("component") == largest[0]), on="unit"
-            ).height
     if kmers_out is not None:
         kmer_hits.write_parquet(kmers_out)
     # From here units are numbered 0.. in the hit units' order (``index`` keeps the index's
@@ -2665,8 +2632,21 @@ def profile(
     def renumber(df: pl.DataFrame) -> pl.DataFrame:
         return df.join(ids, on="unit").drop("unit").rename({"index": "unit"})
 
-    kmer_hits, unit_reads, component = map(renumber, (kmer_hits, unit_reads, component))
+    kmer_hits, unit_reads = map(renumber, (kmer_hits, unit_reads))
     hit_info = hit_info.with_columns(index=pl.col("unit"), unit=ids["index"])
+    with timer("components"):  # a union-find on the local ids (step 40)
+        pair_unit = kmer_hits["unit"].cast(pl.UInt32).to_numpy()
+        label = _core.components(pair_unit, kmer_hits["hash"].to_numpy(), hit_info.height)
+        component = pl.DataFrame(
+            {"unit": np.arange(len(label), dtype=np.uint32), "component": label}
+        ).with_columns(pl.col("unit").cast(kmer_hits.schema["unit"]))
+        if record and kmer_hits.height:  # a sample with no hit has no component
+            sizes = np.bincount(label)
+            largest = int(np.argmax(sizes))  # the first of the largest
+            counts["components"] = len(sizes)
+            counts["largest_component_units"] = int(sizes[largest])
+            counts["largest_component_pairs"] = int(np.count_nonzero(label[pair_unit] == largest))
+        del pair_unit
     t_g = hit_info["t_g"].to_numpy()
     with timer("gather"):
         assigned, owned = gather(kmer_hits.select("unit", "hash"), t_g)

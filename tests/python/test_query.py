@@ -136,6 +136,26 @@ def read_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(query, "WALK_HASHES", 16)
 
 
+def test_rust_components_equal_the_unit_graphs() -> None:
+    rng = np.random.default_rng(3)
+    for n, pairs in ((1, 1), (50, 30), (400, 600), (2000, 1500)):
+        units = rng.integers(0, n, pairs, dtype=np.uint32)
+        hashes = rng.integers(0, pairs, pairs, dtype=np.uint64)  # repeats link units
+        _, row = query._ids(hashes)
+        want = query._unit_components(units.astype(np.int64), row, n)
+        assert np.array_equal(_core.components(units, hashes, n), want)
+
+
+def test_distinct_hashes_are_taken_sorted_range_by_range() -> None:
+    rng = np.random.default_rng(4)
+    distinct = _core.DistinctHashes(2**40 - 1)
+    batches = [rng.integers(0, 2**40, 50_000, dtype=np.uint64) for _ in range(5)]
+    for b in [*batches, batches[0]]:
+        distinct.add(b)
+    got = np.concatenate([distinct.take(i) for i in range(len(distinct))])
+    assert np.array_equal(got, np.unique(np.concatenate(batches)))
+
+
 @pytest.mark.parametrize("fp_bits", [4, 16])  # 4 bits: fingerprints collide, sets pool
 @pytest.mark.usefixtures("read_in_order")
 def test_tier_walk_gives_the_lookups_rows(shared: Path, fp_bits: int) -> None:

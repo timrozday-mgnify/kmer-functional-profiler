@@ -308,6 +308,72 @@ fn gather<'py>(
     Ok(dict)
 }
 
+/// Component label of each of units `0..n` linked by shared hashes (`units`, `hashes`
+/// pairs), numbered in order of their smallest unit.
+#[pyfunction]
+fn components<'py>(
+    py: Python<'py>,
+    units: PyReadonlyArray1<'py, u32>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    n: usize,
+) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    let (units, hashes) = (units.as_slice()?, hashes.as_slice()?);
+    let label = py
+        .detach(|| kfp::components(units, hashes, n))
+        .map_err(to_py_err)?;
+    Ok(label.into_pyarray(py))
+}
+
+/// Distinct hashes at most `max_hash` from batches, taken back sorted range by range.
+#[pyclass(name = "DistinctHashes")]
+struct PyDistinct {
+    inner: Mutex<kfp::Distinct>,
+}
+
+#[pymethods]
+impl PyDistinct {
+    #[new]
+    fn new(max_hash: u64) -> Self {
+        Self {
+            inner: Mutex::new(kfp::Distinct::new(max_hash)),
+        }
+    }
+
+    /// Add a batch of hashes (any order, repeats allowed).
+    fn add(&self, py: Python<'_>, hashes: PyReadonlyArray1<'_, u64>) -> PyResult<()> {
+        let hashes = hashes.as_slice()?;
+        py.detach(|| {
+            self.inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .add(hashes);
+        });
+        Ok(())
+    }
+
+    /// Number of hash ranges.
+    fn __len__(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Range `i`'s distinct hashes, sorted; the range is emptied.
+    fn take<'py>(&self, py: Python<'py>, i: usize) -> PyResult<Bound<'py, PyArray1<u64>>> {
+        if i >= self.__len__() {
+            return Err(PyValueError::new_err("no such range"));
+        }
+        let got = py.detach(|| {
+            self.inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(i)
+        });
+        Ok(got.into_pyarray(py))
+    }
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -397,6 +463,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(unit_hits, m)?)?;
     m.add_function(wrap_pyfunction!(gather, m)?)?;
+    m.add_function(wrap_pyfunction!(components, m)?)?;
+    m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     Ok(())
 }
