@@ -10,7 +10,7 @@ import typer
 from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
-from kfp_pileup.reference import MAX_FDR, NEIGHBOURS, build_reference
+from kfp_pileup.reference import MAX_FDR, MAX_TARGETS, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
 from kmer_functional_profiler.store import MEMBERS
 
@@ -41,12 +41,16 @@ def reference(
     neighbours: Annotated[
         int, typer.Option(help="Neighbours per target in a component, the most-hit first")
     ] = NEIGHBOURS,
+    max_targets: Annotated[
+        int,
+        typer.Option(help="At most this many targets, the most hit first (0 = no cap)"),
+    ] = MAX_TARGETS,
 ) -> None:
     """Write ref.fa (targets and component neighbours), refs.tsv and
     molecule.txt; print the sequences per role."""
     held = withhold.read_text().split() if withhold else ()
     counts = build_reference(
-        profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours
+        profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours, max_targets
     )
     typer.echo(json.dumps(counts))
 

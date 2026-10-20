@@ -6,7 +6,8 @@ Two roles, one FASTA:
   ``present_prob`` whose expected false share is at most ``max_fdr`` (``present_q`` <=
   ``max_fdr``; q computed from ``present_prob`` for profiles without ``present_q``). No
   aai or ani is needed; a profile queried with ``--min-identity`` carries its identity test
-  in ``present_prob`` (plan, phase 13, 2026-10-20);
+  in ``present_prob`` (plan, phase 13, 2026-10-20); with ``max_targets`` (0 = off), only
+  that many of them, the most hit first (a cap on DIAMOND's and ``call``'s cost);
 - ``neighbour``: the other hit units in the targets' components (``component``), decoys
   that catch reads from a sibling the profile did not call; at most ``neighbours`` per
   target in a component, those with the most tier-1 hits (a real sample's giant component
@@ -36,6 +37,7 @@ from kmer_functional_profiler.store import MEMBERS, fetch, write_fasta
 
 MAX_FDR: Final = 0.05  # targets: expected false share among them (the user's choice)
 NEIGHBOURS: Final = 5  # per target in a component
+MAX_TARGETS: Final = 0  # 0: no cap
 REF_FASTA: Final = "ref.fa"
 REFS: Final = "refs.tsv"
 MOLECULE: Final = "molecule.txt"  # nucleotide or protein: which aligner the pipeline runs
@@ -50,6 +52,7 @@ def build_reference(
     store: Sequence[str | Path] = (),
     withhold: Sequence[str] = (),
     neighbours: int = NEIGHBOURS,
+    max_targets: int = MAX_TARGETS,
 ) -> dict[str, int]:
     """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts."""
     out = Path(out_dir)
@@ -73,6 +76,8 @@ def build_reference(
     targets = hit.filter(pl.col("present_q") <= max_fdr)
     if targets.height == 0:
         raise ValueError(f"no units with present_q <= {max_fdr} in {profile}")
+    if max_targets > 0:  # cost cap: the most hit, as neighbours are ranked
+        targets = targets.sort(["hits", "unit"], descending=[True, False]).head(max_targets)
     # ponytail: ranked by hits, a proxy for the reads a sibling could take; rank by k-mers
     # shared with a target (the hit table's links) if called siblings slip past the cap
     per_component = targets.group_by("component").agg(cap=pl.len() * neighbours)

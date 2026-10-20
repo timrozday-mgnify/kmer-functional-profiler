@@ -151,6 +151,12 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     prof = pl.read_csv(tmp_path / "p.tsv", separator="\t")  # targets: present_q <= 0.05
     want = set(prof.filter(pl.col("present_q") <= 0.05)["unit"])
     assert set(refs.filter(pl.col("role") == "target")["unit"]) == want
+    # --max-targets: the most hit of them; off (0) by default, as above
+    assert len(want) > 2
+    build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "cap", max_targets=2)
+    capped = pl.read_csv(tmp_path / "cap" / "refs.tsv", separator="\t")
+    top2 = prof.filter(pl.col("present_q") <= 0.05).sort(["hits", "unit"], descending=[True, False])
+    assert set(capped.filter(pl.col("role") == "target")["unit"]) == set(top2["unit"][:2])
     fasta = dict(read_fasta(tmp_path / "ref" / "ref.fa"))
     assert list(fasta) == refs["seq_id"].to_list()
     target = refs.filter(pl.col("role") == "target").row(0, named=True)

@@ -12,7 +12,8 @@ Per sample:
    columns, and `--min_identity` (theta, implies `--aai`) makes relatives below theta not
    present. Neither is needed for targets.
 2. `REFERENCE`: `kfp-pileup reference`: the top units by `present_prob` at a false
-   discovery rate of `--max_fdr` (`present_q` <= 0.05 by default) as targets, the other hit units of their components as neighbours (at most
+   discovery rate of `--max_fdr` (`present_q` <= 0.05 by default) as targets (at most
+   `--max_targets`, the most hit first; 0, the default, is no cap), the other hit units of their components as neighbours (at most
    `--neighbours` per target in a component, the most-hit first); up to `--members` sequences per unit, from kfp's `fetch` (the
    index's `targets.parquet`, or `--store` members tables, e.g. the partitioned build's MERGE
    output).
