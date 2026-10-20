@@ -2,7 +2,11 @@
 
 Two roles, one FASTA:
 
-- ``target``: units the profile calls present (``present_prob`` >= ``min_present``);
+- ``target``: units the profile calls present at a false discovery rate: the top units by
+  ``present_prob`` whose expected false share is at most ``max_fdr`` (``present_q`` <=
+  ``max_fdr``; q computed from ``present_prob`` for profiles without ``present_q``). No
+  aai or ani is needed; a profile queried with ``--min-identity`` carries its identity test
+  in ``present_prob`` (plan, phase 13, 2026-10-20);
 - ``neighbour``: the other hit units in the targets' components (``component``), decoys
   that catch reads from a sibling the profile did not call; at most ``neighbours`` per
   target in a component, those with the most tier-1 hits (a real sample's giant component
@@ -27,9 +31,10 @@ from typing import Final
 import polars as pl
 
 from kmer_functional_profiler.index import molecule
+from kmer_functional_profiler.query import fdr_q
 from kmer_functional_profiler.store import MEMBERS, fetch, write_fasta
 
-MIN_PRESENT: Final = 0.5
+MAX_FDR: Final = 0.05  # targets: expected false share among them (the user's choice)
 NEIGHBOURS: Final = 5  # per target in a component
 REF_FASTA: Final = "ref.fa"
 REFS: Final = "refs.tsv"
@@ -40,7 +45,7 @@ def build_reference(
     profile: str | Path,
     index_dir: str | Path,
     out_dir: str | Path,
-    min_present: float = MIN_PRESENT,
+    max_fdr: float = MAX_FDR,
     members: int = MEMBERS,
     store: Sequence[str | Path] = (),
     withhold: Sequence[str] = (),
@@ -49,20 +54,25 @@ def build_reference(
     """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    with open(profile) as f:
+        has_q = "present_q" in f.readline().rstrip("\n").split("\t")
+    hit = pl.read_csv(
+        profile,
+        separator="\t",
+        columns=["unit", "cluster_rep", "present_prob", "component", "hits"]
+        + (["present_q"] if has_q else []),
+        schema_overrides={"cluster_rep": pl.String},
+    )
+    if not has_q:  # a profile from before present_q: the same q over the same rows
+        hit = hit.with_columns(present_q=pl.Series(fdr_q(hit["present_prob"].to_numpy())))
     hit = (
-        pl.read_csv(
-            profile,
-            separator="\t",
-            columns=["unit", "cluster_rep", "present_prob", "component", "hits"],
-            schema_overrides={"cluster_rep": pl.String},
-        )
-        .filter(~pl.col("cluster_rep").is_in(list(withhold)))
+        hit.filter(~pl.col("cluster_rep").is_in(list(withhold)))
         .drop("cluster_rep")
         .with_columns(pl.col("unit").cast(pl.UInt32))
     )
-    targets = hit.filter(pl.col("present_prob") >= min_present)
+    targets = hit.filter(pl.col("present_q") <= max_fdr)
     if targets.height == 0:
-        raise ValueError(f"no units with present_prob >= {min_present} in {profile}")
+        raise ValueError(f"no units with present_q <= {max_fdr} in {profile}")
     # ponytail: ranked by hits, a proxy for the reads a sibling could take; rank by k-mers
     # shared with a target (the hit table's links) if called siblings slip past the cap
     per_component = targets.group_by("component").agg(cap=pl.len() * neighbours)

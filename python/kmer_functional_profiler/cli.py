@@ -22,7 +22,13 @@ from kmer_functional_profiler.index import (
     write_unit_columns,
 )
 from kmer_functional_profiler.mask import Mask, build_mask
-from kmer_functional_profiler.query import MIN_AAI_KMERS, Timer, check_aai_calibration, profile
+from kmer_functional_profiler.query import (
+    BACKGROUND_SHARE,
+    MIN_AAI_KMERS,
+    Timer,
+    check_aai_calibration,
+    profile,
+)
 from kmer_functional_profiler.store import MEMBERS, write_fasta
 from kmer_functional_profiler.store import fetch as fetch_sequences
 from kmer_functional_profiler.survival import check_aai_model
@@ -285,6 +291,20 @@ def query(
             "(aai_kmers, kmers_hit), which are still reported"
         ),
     ] = MIN_AAI_KMERS,
+    background_share: Annotated[
+        float,
+        typer.Option(
+            help="present_prob's background: at most this share of the detected units may "
+            "be background hits, in expectation (inf: the calibrated per-unit rate, uncapped)"
+        ),
+    ] = BACKGROUND_SHARE,
+    min_identity: Annotated[
+        float,
+        typer.Option(
+            help="Presence at identity theta: units whose aai_hi (95% upper bound) is below "
+            "this are relatives, present_prob 0; implies --aai (0 = off)"
+        ),
+    ] = 0.0,
     extra_index: Annotated[
         list[Path] | None,
         typer.Option(
@@ -381,6 +401,8 @@ def query(
             with_aai=aai,
             min_aai=min_aai,
             min_aai_kmers=min_aai_kmers,
+            background_share=background_share,
+            min_identity=min_identity,
             extra=extra,
             mask=masked,
             summary=sample,

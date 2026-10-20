@@ -1305,6 +1305,12 @@ def fit_present_prior(
 # calibrated on the fmh benchmark (step 18): P(true | own k-mers) within 0.05 on all indexes.
 BACKGROUND: Final = 1e-6
 CLUMP: Final = 0.3
+# The most of the units gather keeps that background may claim, in expectation
+# (query --background-share): BACKGROUND x every index unit predicts 2e8-1e9 background
+# detections on the MGnify90 standard tier, against 3.2 M units kept at 10 M pairs (plan,
+# phase 13, 2026-10-20); on KO-level indexes the cap does not bind. 0.1 is the user's
+# choice (2026-10-20), to calibrate against spikes on the full standard tier.
+BACKGROUND_SHARE: Final = 0.1
 H_CAP: Final = 20  # hit counts pooled at and above this in the present-unit distribution
 
 
@@ -1316,6 +1322,7 @@ def presence(
     *,
     background: float = BACKGROUND,
     clump: float = CLUMP,
+    share: float = BACKGROUND_SHARE,
     max_iter: int = 500,
     tol: float = 1e-9,
     report: dict[str, float] | None = None,
@@ -1340,8 +1347,15 @@ def presence(
     t_g rather than m_g matches the fmh benchmark, where false positives are small,
     often floored, KOs.
 
-    ``report`` gets ``presence_iterations`` and ``presence_converged`` (0 when stopped at
-    ``max_iter``).
+    The rate is per index unit, so the background it predicts grows with the index; it is
+    capped at ``share`` of the units seen (``own``'s): the absent term is scaled down until
+    A x mean(1 - exp(-mu)) over the units seen is at most ``share`` x their number (``inf``:
+    no cap). ponytail: the units seen stand in for the index's t_g distribution; store the
+    index's mean of 1 - exp(-mu) per read depth at build if the two differ.
+
+    ``report`` gets ``presence_iterations``, ``presence_converged`` (0 when stopped at
+    ``max_iter``), ``presence_background_scale`` (the cap's factor, 1 when it does not bind)
+    and ``presence_background_units`` (the expected background units, sum of 1 - P).
     """
     per_unit = (
         own.group_by("unit")
@@ -1361,21 +1375,38 @@ def presence(
         * np.exp(per_unit["log_holders"].to_numpy()),
         0.0,
     )
+    detect = float(np.mean(-np.expm1(-mu))) if len(units) else 0.0
     prob = np.ones(len(units))
-    it, done = 0, False
+    it, done, scale = 0, False, 1.0
     while not done and it < max_iter:
         w = np.bincount(capped, weights=prob, minlength=H_CAP + 1)
-        new = w[capped] / (w[capped] + (n_index_units - prob.sum()) * absent)
+        n_absent = n_index_units - prob.sum()
+        predicted = n_absent * detect  # background units the calibrated rate predicts
+        scale = min(1.0, share * len(units) / predicted) if predicted > 0 else 1.0
+        new = w[capped] / (w[capped] + scale * n_absent * absent)
         done = np.abs(new - prob).max(initial=0) <= tol
         prob = new
         it += 1
     if report is not None:
         report["presence_iterations"] = it
         report["presence_converged"] = int(done)
+        report["presence_background_scale"] = scale
+        report["presence_background_units"] = float((1 - prob).sum())
     return pl.DataFrame(
         {"unit": units, "present_prob": prob},
         schema={"unit": pl.UInt32, "present_prob": pl.Float64},
     )
+
+
+def fdr_q(prob: np.ndarray) -> np.ndarray:
+    """Each unit's q-value: the least expected false share, mean(1 - P), among the units
+    ranked by presence probability down to it (ties in input order), over the units given.
+    Keeping units with q <= x keeps the largest top set whose expected false share is <= x."""
+    order = np.argsort(-prob, kind="stable")
+    fdr = np.cumsum(1 - prob[order]) / np.arange(1, len(prob) + 1)
+    q = np.empty(len(prob))
+    q[order] = np.minimum.accumulate(fdr[::-1])[::-1]
+    return q
 
 
 # Floor of the copies error (sd on the log scale), calibrated on the fmh benchmark (step 18):
@@ -2387,6 +2418,8 @@ def profile(
     with_aai: bool = False,
     min_aai: float = 0.0,
     min_aai_kmers: float = MIN_AAI_KMERS,
+    background_share: float = BACKGROUND_SHARE,
+    min_identity: float = 0.0,
     extra: Sequence[Index] = (),
     mask: "Mask | None" = None,
     summary: dict[str, float | int | None] | None = None,
@@ -2422,8 +2455,15 @@ def profile(
     gather keeps, over their ``m_dense`` k-mers; ``kmers_dense`` counts those hit.
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
-    present rather than hit by background, from the tier-1 k-mers gather gave it; units
-    gather drops get 0.
+    present rather than hit by background, from the tier-1 k-mers gather gave it, with
+    background at most ``background_share`` of those units; units gather drops get 0.
+    ``present_q`` is its q-value (:func:`fdr_q`, over every row before ``min_aai`` drops
+    any): keep ``present_q`` <= x for an expected false share of at most x. With
+    ``min_identity`` (theta) > 0, implying ``with_aai``, "present" means a member within
+    theta identity is in the sample: units whose ``aai_hi`` (the 95% upper bound, calibrated
+    where the index is) is below theta are relatives, not the unit, and get
+    ``present_prob`` 0; units without an ``aai`` (fewer than ``min_aai_kmers``) are not
+    tested.
 
     ``draws`` > 0 adds 95% posterior intervals for ``coverage_zi`` and ``abundance_zi`` and
     ambiguity groups from that many Gibbs sweeps (:func:`posterior_zi`). Its per-read rows
@@ -2485,7 +2525,7 @@ def profile(
         raise ValueError("greedy has no zero-inflated fit: no draws or other estimators")
     # aai (aai_naive, and aai from the zero-inflated fit) only when asked for (step 40);
     # without it the profile holds the detected units only.
-    aai = with_aai or all_estimators or min_aai > 0
+    aai = with_aai or all_estimators or min_aai > 0 or min_identity > 0
     record = timer is not None
     timer = timer or Timer()
     counts = timer.counts
@@ -2680,7 +2720,9 @@ def profile(
     pin_sum = hit_info["pin_sum"]
     len_cv = hit_info["len_cv"].to_numpy()
     with timer("presence"):
-        present_prob = presence(own, t_g, n_reads, joint.height, report=counts)
+        present_prob = presence(
+            own, t_g, n_reads, joint.height, share=background_share, report=counts
+        )
     greedy_fit = (
         greedy_coverage(own, np.bincount(kmer_hits["unit"].to_numpy(), minlength=len(m_g)), m_g)
         if greedy
@@ -2933,7 +2975,7 @@ def profile(
     del kmer_hits, detected, unit_reads, component, hit_info, unit_info, assigned, naive
     del present_prob, fits
     with timer("finish"):
-        result = _finish(result, joint, min_aai, params.alphabet)
+        result = _finish(result, joint, min_aai, params.alphabet, min_identity)
     if summary is not None:  # over every unit, before min_aai drops rows
         # The first stream is the full first pass over the reads.
         summary |= sample_summary(
@@ -2948,8 +2990,11 @@ def profile(
     return result
 
 
-def _finish(result: pl.DataFrame, joint: _Joint, min_aai: float, alphabet: str) -> pl.DataFrame:
-    """The profile's last columns, its rows in unit order, aai calibrated and filtered."""
+def _finish(
+    result: pl.DataFrame, joint: _Joint, min_aai: float, alphabet: str, min_identity: float = 0.0
+) -> pl.DataFrame:
+    """The profile's last columns, its rows in unit order, aai calibrated, presence tested
+    against ``min_identity`` and given q-values, rows filtered by ``min_aai``."""
     result = (
         result.with_columns(
             pl.col(
@@ -2967,6 +3012,13 @@ def _finish(result: pl.DataFrame, joint: _Joint, min_aai: float, alphabet: str) 
         .sort("unit")
     )
     result = _calibrated(result, [i.aai_calibration for i in joint.indexes])
+    if min_identity > 0:  # confidently below theta: a relative's sequence, not the unit
+        result = result.with_columns(
+            present_prob=pl.when(pl.col("aai_hi") < min_identity)
+            .then(0.0)
+            .otherwise(pl.col("present_prob"))
+        )
+    result = result.with_columns(present_q=pl.Series(fdr_q(result["present_prob"].to_numpy())))
     if min_aai > 0:
         result = result.filter(pl.col("aai_naive") >= min_aai)
     if molecule(alphabet) == "nucleotide":  # identity of nucleotides: ANI, as sylph's

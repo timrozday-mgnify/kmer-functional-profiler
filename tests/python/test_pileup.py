@@ -148,6 +148,9 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     counts = build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "ref")
     assert counts["target"] > 0 and set(counts) <= {"target", "neighbour"}  # no decoys
     refs = pl.read_csv(tmp_path / "ref" / "refs.tsv", separator="\t")
+    prof = pl.read_csv(tmp_path / "p.tsv", separator="\t")  # targets: present_q <= 0.05
+    want = set(prof.filter(pl.col("present_q") <= 0.05)["unit"])
+    assert set(refs.filter(pl.col("role") == "target")["unit"]) == want
     fasta = dict(read_fasta(tmp_path / "ref" / "ref.fa"))
     assert list(fasta) == refs["seq_id"].to_list()
     target = refs.filter(pl.col("role") == "target").row(0, named=True)
@@ -159,7 +162,9 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     assert held not in kept["cluster_rep"].to_list()
     assert kept.height == refs.filter(pl.col("unit") != target["unit"]).height
     # neighbours: one target in one component of every unit, at most 2 neighbours, the most hit
-    hit = pl.read_csv(tmp_path / "p.tsv", separator="\t").with_columns(component=pl.lit(0))
+    # present_q dropped: the reference computes it from present_prob, as for older profiles
+    hit = pl.read_csv(tmp_path / "p.tsv", separator="\t").drop("present_q")
+    hit = hit.with_columns(component=pl.lit(0))
     top = hit.sort("present_prob", descending=True)["unit"][0]
     hit = hit.with_columns(present_prob=(pl.col("unit") == top).cast(pl.Float64))
     hit.write_csv(tmp_path / "one.tsv", separator="\t")

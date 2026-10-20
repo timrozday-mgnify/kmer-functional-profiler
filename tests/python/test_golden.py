@@ -58,6 +58,10 @@ def test_profiles_match_golden(
         ran = runner.invoke(app, ["query", str(tmp_path / "idx"), *READS, "--out", str(out), *args])
         assert ran.exit_code == 0, ran.output
         got = pl.read_csv(out, separator="\t", infer_schema_length=None)
+        # present_q (2026-10-20) is new beside the frozen outputs: the q-value of present_prob
+        q = query.fdr_q(got["present_prob"].to_numpy())
+        assert got["present_q"].to_numpy() == pytest.approx(q)
+        got = got.drop("present_q")
         want = pl.read_csv(GOLDEN / out.name, separator="\t", infer_schema_length=None)
         if "--aai" not in args:  # no AAI: the detected units only, labelled within them
             want = (
