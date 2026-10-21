@@ -90,7 +90,7 @@ def run(out: Path, k: int, part_kmers: int) -> None:
     with tempfile.TemporaryDirectory(dir=out) as scratch:
         table = kmer_table(seqs, block, k, "protein", Path(scratch), part_kmers)
         lap("table")
-        rows, pairs = pair_hits(table, reads, k, "protein")
+        rows, _, pairs = pair_hits(table, reads, k, "protein")
         lap("hash + lookup")
         del table
     print(f"  {pairs} pairs, {rows['read'].n_unique()} with a hit, {rows.height} rows")

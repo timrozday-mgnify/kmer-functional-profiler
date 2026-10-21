@@ -436,6 +436,8 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     assert counts["routed_pairs"] == len(set(sum(want.values(), [])))
     # routes.parquet: every hit, named; a sequence carries over unchanged
     hits = pl.read_parquet(out / "routes.parquet")
+    assert (hits["total_kmers"] >= hits["kmers"]).all()
+    assert sum(counts["dropped_by_total_kmers"].values()) == counts["dropped_pairs"]
     assert sorted(
         hits.select(pl.col("read_name").str.replace("/1$", ""), "block").rows()
     ) == sorted((n, b) for b, ns in want.items() for n in ns)
@@ -467,7 +469,9 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     )
     first = hash_proteins([A[:7].encode()], 7)["hash"]
     got = _core.route_hits(table, np.array([5, 5], dtype=np.uint64), np.repeat(first, 2))
-    assert pl.DataFrame(got).sort("block").rows() == [(5, 0, 1), (5, 1, 1)]
+    rows = pl.DataFrame({c: got[c] for c in ("read", "block", "kmers")})
+    assert rows.sort("block").rows() == [(5, 0, 1), (5, 1, 1)]
+    assert (list(got["pair"]), list(got["pair_kmers"])) == ([5], [1])  # distinct k-mers in all
     # route.fa (--route-members): extra sequences route pairs to their unit's block; the
     # junk pair (poly-A: poly-K and poly-F frames) hits only an added poly-K member of s0's unit
     extra = tmp_path / "ref_more"

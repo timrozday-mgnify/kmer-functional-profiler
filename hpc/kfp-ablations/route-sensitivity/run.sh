@@ -21,8 +21,9 @@ source ../common.sh
 PY="$REPO/.venv/bin/python"
 K=${K:-7 8 9 10 11}
 MIN=${MIN:-1 2 3 5 8}
-# routing's sequences per unit: 0 = the baseline reference's own (3); e.g. MEMBERS="0 5 10"
-# OUT=out-members K="8 9" MIN="1 2 3 5" sbatch run.sh (the members re-run, 2026-10-21)
+# routing's sequences per unit: 0 = the baseline reference's own (3). The members re-run
+# (2026-10-21: can more members raise recall enough to allow a larger k, fewer false hits?):
+# OUT=out-members MEMBERS="0 5 10 20" K="8 9 10 11 12" MIN="1 2 3 5" sbatch run.sh
 MEMBERS=${MEMBERS:-0}
 OUT=${OUT:-out}
 mkdir -p "$OUT"

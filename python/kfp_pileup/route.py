@@ -21,8 +21,10 @@ as DIAMOND's ``--dbsize`` so that e-values do not change with the split.
 Writes per block ``b<i>.fa`` (its reference sequences) and, where it has pairs,
 ``b<i>_1.fa.gz`` and ``b<i>_2.fa.gz`` (its pairs' mates as FASTA, names cut at the first
 word: DIAMOND reads neither qualities nor comments, which are about half of a FASTQ.gz);
-``letters.txt``; ``route.json`` (counts); and ``routes.parquet``, every (pair, block) hit
-with its distinct k-mers (``read_name``, ``pair`` in input order, ``block``, ``kmers``),
+``letters.txt``; ``route.json`` (counts, with the dropped pairs by their distinct k-mers in
+all, ``dropped_by_total_kmers``); and ``routes.parquet``, every (pair, block) hit
+with its distinct k-mers (``read_name``, ``total_kmers``: the pair's in all, ``pair`` in
+input order, ``block``, ``kmers``),
 routed or not, so that another ``min_kmers`` is a filter, not a rerun.
 """
 
@@ -35,7 +37,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 import polars as pl
@@ -130,10 +132,13 @@ def pair_hits(
     alphabet: str,
     genetic_code: int = 11,
     batch_reads: int = BATCH_READS,
-) -> tuple[pl.DataFrame, int]:
-    """(read, block, kmers) for every pair that hits the table, and the number of pairs.
-    Read ids number pairs in input order and never span batches; the lookup and the
-    distinct-k-mer count per pair and block run in Rust, on every core (``route_hits``)."""
+    single: bool = False,
+) -> tuple[pl.DataFrame, pl.DataFrame, int]:
+    """(read, block, kmers) for every pair that hits the table, (read, total_kmers) for
+    every pair with any k-mer (its distinct k-mers, shared or not), and the number of pairs.
+    Read ids number pairs in input order and never span batches; with ``single``, each mate
+    is a read of its own, numbered 2 x pair + mate (0 or 1). The lookup and the counts run
+    in Rust, on every core (``route_hits``)."""
     hits = _core.FastxHits(
         *map(str, reads),
         k=k,
@@ -143,18 +148,30 @@ def pair_hits(
         batch_reads=batch_reads,
     )
     u64 = np.uint64
-    rows = pl.concat(
-        [pl.DataFrame(schema={"read": pl.UInt64, "block": pl.UInt32, "kmers": pl.UInt32})]
-        + [
-            pl.DataFrame(
-                _core.route_hits(
-                    table, b["read"].astype(u64, copy=False), b["hash"].astype(u64, copy=False)
-                )
-            )
-            for b in hits
-        ]
-    )
-    return rows, hits.n_reads
+    rows = [pl.DataFrame(schema={"read": pl.UInt64, "block": pl.UInt32, "kmers": pl.UInt32})]
+    totals = [pl.DataFrame(schema={"read": pl.UInt64, "total_kmers": pl.UInt32})]
+    for b in hits:
+        ids = b["read"].astype(u64, copy=False)
+        if single:
+            ids = ids * u64(2) + b["mate"].astype(u64)
+        got = _core.route_hits(table, ids, b["hash"].astype(u64, copy=False))
+        rows.append(pl.DataFrame({c: got[c] for c in ("read", "block", "kmers")}))
+        totals.append(pl.DataFrame({"read": got["pair"], "total_kmers": got["pair_kmers"]}))
+    n = hits.n_reads * (2 if single else 1)
+    return pl.concat(rows), pl.concat(totals), n
+
+
+TOTAL_BINS: Final = (1, 50, 150)  # route.json: dropped pairs by their distinct k-mers in all
+
+
+def by_total(total: pl.Series, n_none: int) -> dict[str, int]:
+    """Counts by total distinct k-mers: none, and the bins ``TOTAL_BINS`` open."""
+    edges = [*TOTAL_BINS, None]
+    out = {"0": n_none + int((total == 0).sum())}
+    for lo, hi in itertools.pairwise(edges):
+        part = total >= lo if hi is None else (total >= lo) & (total < hi)
+        out[f"{lo}+" if hi is None else f"{lo}-{hi - 1}"] = int(part.sum())
+    return out
 
 
 def _records(path: Path) -> Iterator[tuple[bytes, bytes]]:
@@ -177,7 +194,7 @@ def route(
     genetic_code: int = 11,
     batch_reads: int = BATCH_READS,
     part_kmers: int = PART_KMERS,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Split the reference in ``ref_dir`` into blocks and the pairs in ``reads`` (two
     FASTQs, mate order) by the blocks they share at least ``min_kmers`` distinct k-mers
     with (``k``: 0 for the index's); write them to ``out_dir``; return counts."""
@@ -200,7 +217,9 @@ def route(
     k = k or params["k"]
     with tempfile.TemporaryDirectory(prefix=".table-", dir=out) as scratch:
         table = kmer_table(seqs, seq_block, k, params["alphabet"], Path(scratch), part_kmers)
-        rows, pairs = pair_hits(table, reads, k, params["alphabet"], genetic_code, batch_reads)
+        rows, totals, pairs = pair_hits(
+            table, reads, k, params["alphabet"], genetic_code, batch_reads
+        )
         n_kmers = len(table.fingerprints)
         del table  # its parts are memory-mapped from the scratch directory
     rows = rows.sort("read", "block")
@@ -234,8 +253,8 @@ def route(
     # every hit, routed or not, so another min_kmers needs no rerun
     names.append(pl.Series(chunk, dtype=pl.String))
     named = pl.DataFrame({"read": hit_ids, "read_name": pl.concat(names)})
-    rows.join(named, on="read").select(
-        "read_name", pair="read", block="block", kmers="kmers"
+    rows.join(named, on="read").join(totals, on="read", how="left").select(
+        "read_name", "total_kmers", pair="read", block="block", kmers="kmers"
     ).write_parquet(out / ROUTES, compression="zstd")
     counts = {
         "k": k,
@@ -249,5 +268,17 @@ def route(
         "kmers": n_kmers,
     }
     counts["dropped_pairs"] = pairs - counts["routed_pairs"]
+    # dropped pairs by their distinct k-mers in all: few (none) is a short, N-rich or, with a
+    # quality mask, low-quality pair; many, a pair the reference lacks or holds distantly
+    dropped_totals = totals.filter(~pl.col("read").is_in(routed["read"].implode()))["total_kmers"]
+    counts["dropped_by_total_kmers"] = by_total(
+        dropped_totals, counts["dropped_pairs"] - dropped_totals.len()
+    )
+    counts["total_kmers_median"] = {
+        "routed": totals.filter(pl.col("read").is_in(routed["read"].implode()))[
+            "total_kmers"
+        ].median(),
+        "dropped": dropped_totals.median(),
+    }
     (out / ROUTE).write_text(json.dumps(counts, indent=1) + "\n")
     return counts

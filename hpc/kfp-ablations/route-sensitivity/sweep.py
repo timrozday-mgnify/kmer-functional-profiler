@@ -153,7 +153,7 @@ def main() -> None:
         route_seqs, route_block = routing(members)
         with tempfile.TemporaryDirectory(prefix=".table-", dir=args.out) as scratch:
             table = kmer_table(route_seqs, route_block, k, alphabet, Path(scratch))
-            hits, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
+            hits, _, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
             del table
         assert n_pairs == pair_names.len(), "pair numbering differs from the FASTQ"
         hits = hits.with_columns(read_name=pair_names.gather(hits["read"].cast(pl.Int64)))

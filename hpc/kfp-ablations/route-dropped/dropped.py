@@ -1,8 +1,15 @@
 """What routing drops, searched against every profile unit (plan, phase 13, routing).
 
-``dropped``: the pairs routing (k = 8, min_kmers = 3 by default) does not send to DIAMOND,
-as FASTA (names cut at the first word), a seeded subsample of ``--pairs`` of them
-(0 = all), and ``dropped.json`` (pairs, dropped, sampled).
+Reads are single-end here (the user's choice, 2026-10-21): each mate is routed on its own
+and dropped when it shares fewer than ``min_kmers`` distinct k-mers with every block.
+
+``dropped``: the dropped reads (k = 8, min_kmers = 3 by default) as one FASTA (``<pair
+name>/<mate>``), a seeded subsample of ``--reads`` of them (0 = all); ``dropped.parquet``
+(each sampled read's ``total_kmers``, its distinct k-mers in all, and ``shared_kmers``, the
+most it shares with one block); ``dropped.json``: reads, routed, dropped (also with the
+partner routed, which the pair-routed pipeline still aligns), and the dropped reads by
+total k-mers (few: a short, N-rich or, with a quality mask, low-quality read; many but few
+shared: a read the reference lacks or holds distantly).
 
 ``fullref``: one FASTA of every unit in the profile, ``--members`` sequences each, and a
 table of each sequence's unit, its role in the per-sample reference (target, neighbour,
@@ -10,18 +17,19 @@ table of each sequence's unit, its role in the per-sample reference (target, nei
 siblings) and its ``present_q``.
 
 ``summarise``: per arm (a full reference; DIAMOND tabular ``qseqid sseqid pident length
-bitscore`` per mate), each dropped pair's best alignment over both mates: pairs aligned, by
-identity bin and by the role of the unit hit; high-identity pairs (>= ``HIGH``) on targets
-or neighbours (routing's misses) and on profile-only units (reads of units the reference
-lacks), and the profile-only units they gather on; with ``--assignments``, how the unrouted
-baseline treated the same pairs. Between two arms, the identity each pair gains with more
-members. With ``--trace``, DIAMOND's CPU-h per arm and that per million dropped pairs.
+bitscore``), each dropped read's best alignment: reads aligned, by identity bin and by the
+role of the unit hit; high-identity reads (>= ``HIGH``) on targets or neighbours (routing's
+misses) and on profile-only units (reads of units the reference lacks), and the units they
+gather on; the same by total k-mers; with ``--assignments``, how the unrouted baseline
+treated the same reads. Between two arms, the identity each read gains with more members.
+With ``--trace``, DIAMOND's CPU-h per arm and that per million dropped reads.
 """
 
 import argparse
 import gzip
+import itertools
 import json
-import random
+import re
 import tempfile
 from pathlib import Path
 
@@ -29,7 +37,16 @@ import numpy as np
 import polars as pl
 
 from kfp_pileup.reference import REF_FASTA, REFS
-from kfp_pileup.route import MIN_KMERS, ROUTE_K, _records, blocks, kmer_table, pair_hits
+from kfp_pileup.route import (
+    MIN_KMERS,
+    ROUTE_K,
+    TOTAL_BINS,
+    _records,
+    blocks,
+    by_total,
+    kmer_table,
+    pair_hits,
+)
 from kmer_functional_profiler.index import read_fasta
 from kmer_functional_profiler.query import fdr_q
 from kmer_functional_profiler.store import fetch
@@ -49,22 +66,48 @@ def dropped(args: argparse.Namespace) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=args.out) as scratch:
         table = kmer_table(seqs, block, args.k, params["alphabet"], Path(scratch))
-        rows, pairs = pair_hits(table, args.reads, args.k, params["alphabet"])
+        rows, totals, n = pair_hits(table, args.reads, args.k, params["alphabet"], single=True)
         del table
-    routed = set(rows.filter(pl.col("kmers") >= args.min_kmers)["read"].unique().to_list())
-    drop = [i for i in range(pairs) if i not in routed]
-    sample = (
-        sorted(random.Random(1).sample(drop, args.pairs)) if 0 < args.pairs < len(drop) else drop
-    )
-    keep = np.zeros(pairs, dtype=bool)
+    total, shared = np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64)
+    total[totals["read"].to_numpy().astype(np.int64)] = totals["total_kmers"].to_numpy()
+    most = rows.group_by("read").agg(pl.col("kmers").max())
+    shared[most["read"].to_numpy().astype(np.int64)] = most["kmers"].to_numpy()
+    routed = shared >= args.min_kmers
+    drop = np.flatnonzero(~routed)
+    sample = drop
+    if 0 < args.reads_n < len(drop):
+        sample = np.sort(np.random.default_rng(1).choice(drop, args.reads_n, replace=False))
+    keep = np.zeros(n, dtype=bool)
     keep[sample] = True
-    for mate, path in enumerate(args.reads, 1):
-        with gzip.open(args.out / f"dropped_{mate}.fa.gz", "wb", compresslevel=1) as f:
+    with gzip.open(args.out / "dropped.fa.gz", "wb", compresslevel=1) as f:
+        for mate, path in enumerate(args.reads):
             for i, (name, seq) in enumerate(_records(path)):
-                if keep[i]:
-                    f.write(b">" + name + b"\n" + seq + b"\n")
-    counts = {"pairs": pairs, "routed": len(routed), "dropped": len(drop), "sampled": len(sample)}
-    counts |= {"k": args.k, "min_kmers": args.min_kmers}
+                if keep[2 * i + mate]:
+                    stem = re.sub(rb"/[12]$", b"", name)
+                    f.write(b">" + stem + b"/%d\n" % (mate + 1) + seq + b"\n")
+    pl.DataFrame(
+        {
+            "read": sample,
+            "mate": (sample % 2 + 1).astype(np.uint8),
+            "total_kmers": total[sample],
+            "shared_kmers": shared[sample],
+        }
+    ).write_parquet(args.out / "dropped.parquet")
+    counts: dict[str, object] = {
+        "reads": n,
+        "routed": int(routed.sum()),
+        "dropped": len(drop),
+        "dropped_partner_routed": int(routed[drop ^ 1].sum()),
+        "pairs_both_dropped": int((~routed[0::2] & ~routed[1::2]).sum()),
+        "sampled": len(sample),
+        "k": args.k,
+        "min_kmers": args.min_kmers,
+        "dropped_by_total_kmers": by_total(pl.Series(total[drop]), 0),
+        "total_kmers_median": {
+            "routed": float(np.median(total[routed])) if routed.any() else None,
+            "dropped": float(np.median(total[drop])) if len(drop) else None,
+        },
+    }
     (args.out / "dropped.json").write_text(json.dumps(counts, indent=1) + "\n")
     print(counts)
 
@@ -106,21 +149,19 @@ def fullref(args: argparse.Namespace) -> None:
     print({"units": prof.height, "sequences": seqs.height, "residues": int(seqs["length"].sum())})
 
 
-def best_per_pair(r1: Path, r2: Path, table: Path) -> pl.DataFrame:
-    """Each dropped pair's best alignment over both mates, with the unit hit and its role."""
+def best_per_read(hits_path: Path, table: Path) -> pl.DataFrame:
+    """Each dropped read's best alignment, with the unit hit and its role."""
     cols = pl.read_csv(table, separator="\t", columns=["sseqid", "unit", "role", "present_q"])
-    hits = pl.concat(
-        pl.read_csv(p, separator="\t", has_header=False, new_columns=FIELDS)
-        for p in (r1, r2)
-        if p.stat().st_size
-    ) if any(p.stat().st_size for p in (r1, r2)) else pl.DataFrame(
-        schema={"qseqid": pl.String, "sseqid": pl.String, "pident": pl.Float64,
-                "length": pl.Int64, "bitscore": pl.Float64}
-    )  # fmt: skip
+    if not hits_path.stat().st_size:
+        return pl.DataFrame(
+            schema={"qseqid": pl.String, "sseqid": pl.String, "pident": pl.Float64,
+                    "length": pl.Int64, "bitscore": pl.Float64, "unit": pl.Int64,
+                    "role": pl.String, "present_q": pl.Float64}
+        )  # fmt: skip
+    hits = pl.read_csv(hits_path, separator="\t", has_header=False, new_columns=FIELDS)
     return (
-        hits.with_columns(read_name=pl.col("qseqid").str.replace(MATE, ""))
-        .sort("bitscore", descending=True)
-        .group_by("read_name")
+        hits.sort("bitscore", descending=True)
+        .group_by("qseqid")
         .first()
         .join(cols, on="sseqid", how="left")
     )
@@ -129,7 +170,7 @@ def best_per_pair(r1: Path, r2: Path, table: Path) -> pl.DataFrame:
 def arm_summary(best: pl.DataFrame, n_dropped: int) -> dict[str, float | int]:
     high = best.filter(pl.col("pident") >= HIGH)
     out: dict[str, float | int] = {
-        "dropped_pairs": n_dropped,
+        "dropped_reads": n_dropped,
         "aligned": best.height / n_dropped if n_dropped else 0.0,
     }
     edges = [0.0, *BINS, 101.0]
@@ -142,10 +183,10 @@ def arm_summary(best: pl.DataFrame, n_dropped: int) -> dict[str, float | int]:
     units = (
         high.filter(pl.col("role") == "profile")
         .group_by("unit")
-        .agg(pairs=pl.len(), present_q=pl.col("present_q").first())
+        .agg(reads=pl.len(), present_q=pl.col("present_q").first())
     )
     out["profile_units_high"] = units.height
-    out["profile_units_high_10"] = units.filter(pl.col("pairs") >= 10).height
+    out["profile_units_high_10"] = units.filter(pl.col("reads") >= 10).height
     out["profile_units_high_median_q"] = (
         float(units["present_q"].median()) if units.height else float("nan")  # type: ignore[arg-type]
     )
@@ -154,30 +195,38 @@ def arm_summary(best: pl.DataFrame, n_dropped: int) -> dict[str, float | int]:
 
 def summarise(args: argparse.Namespace) -> None:
     n = json.loads((args.dropped / "dropped.json").read_text())["sampled"]
-    names = pl.Series(
-        "read_name", [nm.decode() for nm, _ in _records(args.dropped / "dropped_1.fa.gz")]
-    ).str.replace(MATE, "")
+    with gzip.open(args.dropped / "dropped.fa.gz", "rt") as f:  # in dropped.parquet's order
+        names = pl.Series("qseqid", [line[1:].split()[0] for line in f if line.startswith(">")])
+    info = pl.read_parquet(args.dropped / "dropped.parquet").with_columns(qseqid=names)
+    edges = [0, *TOTAL_BINS, None]
     rows, bests = [], {}
     for arm in args.arm:
         name, directory = arm.split("=", 1)
         d = Path(directory)
-        bests[name] = best_per_pair(d / "r1.tsv", d / "r2.tsv", d / "full.tsv")
-        rows.append({"arm": name, **arm_summary(bests[name], n)})
+        best = best_per_read(d / "r.tsv", d / "full.tsv")
+        bests[name] = best
+        rows.append({"arm": name, "total_kmers": "all", **arm_summary(best, n)})
+        for lo, hi in itertools.pairwise(edges):  # the same by the reads' total k-mers
+            t = pl.col("total_kmers")
+            part = info.filter(t >= lo if hi is None else (t >= lo) & (t < hi))
+            label = f"{lo}+" if hi is None else f"{lo}-{hi - 1}"
+            sub = best.join(part.select("qseqid"), on="qseqid", how="semi")
+            rows.append({"arm": name, "total_kmers": label, **arm_summary(sub, part.height)})
     table = pl.DataFrame(rows)
     if args.assignments:
         a = pl.read_parquet(args.assignments).with_columns(
-            pl.col("read_name").str.replace(MATE, "")
+            qseqid=pl.format("{}/{}", pl.col("read_name").str.replace(MATE, ""), pl.col("mate") + 1)
         )
-        dropped_a = a.join(pl.DataFrame(names), on="read_name", how="semi")
+        dropped_a = a.join(pl.DataFrame(names), on="qseqid", how="semi")
         assigned = (
-            dropped_a.group_by("read_name", "mate", "unit")
+            dropped_a.group_by("qseqid", "unit")
             .agg(pl.col("em_posterior").sum())
-            .filter(pl.col("em_posterior") >= 0.5)["read_name"]
+            .filter(pl.col("em_posterior") >= 0.5)["qseqid"]
             .n_unique()
         )
-        novel = dropped_a.group_by("read_name").agg(pl.col("em_novel").max())
+        novel = dropped_a.group_by("qseqid").agg(pl.col("em_novel").max())
         table = table.with_columns(
-            baseline_aligned=pl.lit(dropped_a["read_name"].n_unique() / max(n, 1)),
+            baseline_aligned=pl.lit(dropped_a["qseqid"].n_unique() / max(n, 1)),
             baseline_unit=pl.lit(assigned / max(n, 1)),
             baseline_novel=pl.lit(novel.filter(pl.col("em_novel") >= 0.5).height / max(n, 1)),
         )
@@ -199,25 +248,25 @@ def summarise(args: argparse.Namespace) -> None:
             )
         )
         table = table.join(cost, on="arm", how="left").with_columns(
-            cpu_h_per_m_pairs=pl.col("diamond_cpu_h") / max(n, 1) * 1e6
+            cpu_h_per_m_reads=pl.col("diamond_cpu_h") / max(n, 1) * 1e6
         )
-    if len(bests) == 2:  # identity gained with more members, per pair aligned in either
+    if len(bests) == 2:  # identity gained with more members, per read aligned in either
         (a1, b1), (a2, b2) = bests.items()
         both = (
-            b1.select("read_name", p1="pident")
-            .join(b2.select("read_name", p2="pident"), on="read_name", how="full", coalesce=True)
+            b1.select("qseqid", p1="pident")
+            .join(b2.select("qseqid", p2="pident"), on="qseqid", how="full", coalesce=True)
             .fill_null(0.0)
         )
         gain = both["p2"] - both["p1"]
         print(
-            f"{a2} vs {a1}: pairs aligned {b2.height} vs {b1.height}; identity gain median "
-            f"{gain.median():.2f}, >= 2 points in {(gain >= 2).mean():.3f} of pairs aligned"
+            f"{a2} vs {a1}: reads aligned {b2.height} vs {b1.height}; identity gain median "
+            f"{gain.median():.2f}, >= 2 points in {(gain >= 2).mean():.3f} of reads aligned"
             f" in either; reaching >= {HIGH:g}% only with {a2}: "
-            f"{((both['p2'] >= HIGH) & (both['p1'] < HIGH)).sum()} pairs"
+            f"{((both['p2'] >= HIGH) & (both['p1'] < HIGH)).sum()} reads"
         )
     table.write_csv(args.out, separator="\t")
     with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=250, fmt_float="mixed"):
-        print(table.transpose(include_header=True, column_names="arm"))
+        print(table)
 
 
 def main() -> None:
@@ -229,7 +278,7 @@ def main() -> None:
     d.add_argument("--reads", type=Path, nargs=2, required=True)
     d.add_argument("--k", type=int, default=ROUTE_K)
     d.add_argument("--min-kmers", type=int, default=MIN_KMERS)
-    d.add_argument("--pairs", type=int, default=1_000_000, help="subsample (0 = all)")
+    d.add_argument("--reads-n", type=int, default=2_000_000, help="dropped reads aligned (0 = all)")
     d.add_argument("--out", type=Path, default=Path("."))
     f = sub.add_parser("fullref")
     f.add_argument("--profile", type=Path, required=True)
@@ -242,7 +291,7 @@ def main() -> None:
     f.add_argument("--out-table", type=Path, default=Path("full.tsv"))
     s = sub.add_parser("summarise")
     s.add_argument("--dropped", type=Path, required=True, help="directory of `dropped`")
-    s.add_argument("--arm", action="append", required=True, help="name=dir (r1/r2.tsv, full.tsv)")
+    s.add_argument("--arm", action="append", required=True, help="name=dir (r.tsv, full.tsv)")
     s.add_argument("--assignments", type=Path)
     s.add_argument("--trace", type=Path)
     s.add_argument("--out", type=Path, default=Path("summary.tsv"))
