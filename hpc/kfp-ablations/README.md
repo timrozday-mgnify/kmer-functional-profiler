@@ -85,6 +85,9 @@ cd kfp-ablations/pileup-cost && sbatch run.sh
 # against them:
 cd kfp-ablations/pileup-fdr && sbatch run.sh
 cd kfp-ablations/route-dropped && BASE=../pileup-fdr/results/hadza10M OUT=results-fdr sbatch run.sh
+# query --background-share at full-index scale (spikes of the standard tier's own units in
+# hadza10M, plus unspiked and reversed-null samples; needs pileup-cost's reads):
+cd kfp-ablations/presence-calibration && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs
