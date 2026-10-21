@@ -24,6 +24,9 @@
 #                         sensitive_F15 DIAMOND on all hadza10M pairs (1.79 CPU-h)
 # and the log line "m3 vs m1": identity gained with 3 members.
 source ../common.sh
+# the workflow is $WF/route-dropped: a nextflow.config left here by its first layout would
+# override its params (python = '')
+[[ ! -f nextflow.config ]] || { echo "remove ./nextflow.config (stale; the workflow has its own)" >&2; exit 1; }
 STD=../release-tiers/results-standard
 base=../pileup-cost/results-dmnd-sensitive_F15/hadza10M
 [[ -f $base/pileup/assignments.parquet ]] || { echo "no $base: run diamond-sensitivity first" >&2; exit 1; }

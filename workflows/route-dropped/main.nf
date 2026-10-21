@@ -4,6 +4,12 @@
 // dropped reads against each full reference. dropped.py summarise reads the outputs. See
 // README.md; on HPC, hpc/kfp-ablations/route-dropped/run.sh.
 
+// The venv's python; an empty params.python (a stale config setting it to '') falls back to
+// it rather than running dropped.py as a command
+def python() {
+    params.python ?: "${params.venv}/bin/python"
+}
+
 process DROPPED {
     label 'process_medium'
     publishDir params.outdir, mode: 'copy'
@@ -18,7 +24,7 @@ process DROPPED {
     path 'dropped', emit: dir
 
     script:
-    "${params.python} ${code} dropped --ref ${ref} --index index --reads ${r1} ${r2} --reads-n ${params.reads} --out dropped"
+    "${python()} ${code} dropped --ref ${ref} --index index --reads ${r1} ${r2} --reads-n ${params.reads} --out dropped"
 }
 
 process FULLREF {
@@ -39,7 +45,7 @@ process FULLREF {
     script:
     def store = params.store ? "--store ${params.store}" : ''
     def held = params.withhold ? "--withhold ${params.withhold}" : ''
-    "${params.python} ${code} fullref --profile ${profile} --ref ${ref} --index ${index} --members ${members} ${store} ${held}"
+    "${python()} ${code} fullref --profile ${profile} --ref ${ref} --index ${index} --members ${members} ${store} ${held}"
 }
 
 process DIAMOND {
