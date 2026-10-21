@@ -8,9 +8,9 @@
 #SBATCH --export=ALL
 # What routing (k = 8, min_kmers = 3) drops on hadza10M, searched with DIAMOND (--sensitive
 # -F 15 --top 10) against every unit of the profile, with 1 and with 3 members per unit
-# (plan, phase 13, routing). Inputs: step 3b's unrouted sensitive_F15 arm in ../pileup-cost
-# (its ref/, profile.tsv and pileup/assignments.parquet), hadza10M's reads, the standard
-# tier's index and MERGE buckets. Reads are single-end: each mate routed on its own; 2 M
+# (plan, phase 13, routing), with workflows/route-dropped. Inputs: step 3b's unrouted
+# sensitive_F15 arm in ../pileup-cost (its ref/, profile.tsv and pileup/assignments.parquet),
+# hadza10M's reads, the standard tier's index and MERGE buckets. Reads are single-end: each mate routed on its own; 2 M
 # dropped reads are aligned (READS=0: all). dropped.json: reads routed and dropped, by total
 # k-mers.
 # Read summary.tsv (a row per arm, m1 and m3, and per total-k-mer bin of the reads):
@@ -24,16 +24,14 @@
 #                         sensitive_F15 DIAMOND on all hadza10M pairs (1.79 CPU-h)
 # and the log line "m3 vs m1": identity gained with 3 members.
 source ../common.sh
-# the venv's directory made absolute, not its python: realpath of .venv/bin/python follows the
-# symlink to the base interpreter, which has none of the venv's packages
 STD=../release-tiers/results-standard
 base=../pileup-cost/results-dmnd-sensitive_F15/hadza10M
 [[ -f $base/pileup/assignments.parquet ]] || { echo "no $base: run diamond-sensitivity first" >&2; exit 1; }
-nextflow run main.nf -c ../site.config -resume \
-    --ref "$base/ref" --profile "$base/profile.tsv" --index "$(realpath "$STD/index")" \
-    --store "$(realpath "$STD")/members.bucket*.parquet" \
-    --r1 ../pileup-cost/hadza10M_1.fastq.gz --r2 ../pileup-cost/hadza10M_2.fastq.gz \
-    --reads "${READS:-2000000}" --python "$(realpath "$REPO/.venv")/bin/python"
-"$REPO/.venv/bin/python" dropped.py summarise --dropped results/dropped \
+nextflow run "$WF/route-dropped" -c ../site.config -resume --outdir results \
+    --ref "$(realpath "$base/ref")" --profile "$(realpath "$base/profile.tsv")" \
+    --index "$(realpath "$STD/index")" --store "$(realpath "$STD")/members.bucket*.parquet" \
+    --r1 "$(realpath ../pileup-cost/hadza10M_1.fastq.gz)" \
+    --r2 "$(realpath ../pileup-cost/hadza10M_2.fastq.gz)" --reads "${READS:-2000000}"
+"$REPO/.venv/bin/python" "$WF/route-dropped/dropped.py" summarise --dropped results/dropped \
     --arm m1=results/m1 --arm m3=results/m3 --assignments "$base/pileup/assignments.parquet" \
     --trace results/trace.tsv --out summary.tsv

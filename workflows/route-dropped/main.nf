@@ -1,10 +1,11 @@
 // Routing's dropped reads against every profile unit (plan, phase 13, routing): DROPPED
 // (the reads, single-end, routing does not send to DIAMOND, subsampled), FULLREF (every profile unit,
 // 1 and 3 members), DIAMOND (as workflows/pileup's: --sensitive -F 15 --top 10) of the
-// dropped reads against each full reference. dropped.py summarise reads the outputs.
+// dropped reads against each full reference. dropped.py summarise reads the outputs. See
+// README.md; on HPC, hpc/kfp-ablations/route-dropped/run.sh.
 
 process DROPPED {
-    label 'python'
+    label 'process_medium'
     publishDir params.outdir, mode: 'copy'
 
     input:
@@ -22,7 +23,7 @@ process DROPPED {
 
 process FULLREF {
     tag "m${members}"
-    label 'python'
+    label 'process_medium'
     publishDir params.outdir, mode: 'copy', pattern: '*.tsv', saveAs: { "m${members}/${it}" }
 
     input:
@@ -43,7 +44,7 @@ process FULLREF {
 
 process DIAMOND {
     tag "${arm}"
-    label 'diamond'
+    label 'process_high'
     container 'quay.io/biocontainers/diamond:2.2.8--he361c42_0'
     publishDir params.outdir, mode: 'copy', pattern: '*.tsv', saveAs: { "${arm}/${it}" }
 
