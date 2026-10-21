@@ -50,6 +50,7 @@ Outputs under `<outdir>/<sample>/`:
 | `profile.tsv` | kfp's profile |
 | `ref/ref.fa`, `ref/refs.tsv` | the per-sample reference and its roles |
 | `route.json` | routing: pairs, pairs routed and dropped, blocks, reference residues and k-mers |
+| `routes.parquet` | routing: every (pair, block) hit, routed or not: `read_name`, `pair` (input order), `block`, `kmers` (distinct k-mers shared); another `--route_min_kmers` is a filter on `kmers` |
 | `pileup/assignments.parquet` | every alignment: read, mate, reference sequence, unit, role, score (bits), posterior, `kept` (best hit a target); steps 8-9's `em_posterior`, `em_novel` (the mate's novel-relative share), `em_flag` (best source differs with the prior) |
 | `pileup/pileup.parquet` | summed weights per (sequence, column, residue), with the part from sibling residues |
 | `pileup/variants.tsv` | columns with depth >= `--min_depth` and an alternative residue at >= `--min_freq`, with `sibling_share` |

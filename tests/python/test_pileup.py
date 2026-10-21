@@ -12,7 +12,8 @@ from kfp_pileup.check import aai_check
 from kfp_pileup.handoff import handoff
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
-from kfp_pileup.route import kmer_table, lookup, route
+from kfp_pileup.route import kmer_table, route
+from kmer_functional_profiler import _core
 from kmer_functional_profiler._core import hash_dna, hash_proteins
 from kmer_functional_profiler.index import (
     TARGETS,
@@ -399,9 +400,10 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     by_comp = refs.with_columns(block=pl.col("seq_id").replace_strict(block_of))
     assert by_comp.group_by("component").agg(pl.col("block").n_unique())["block"].max() == 1
 
-    def names(path: Path) -> list[str]:
+    def names(path: Path) -> list[str]:  # FASTQ or FASTA; /1, /2 dropped
         lines = gzip.decompress(path.read_bytes()).decode().splitlines()
-        return [line.split()[0].split("/")[0] for line in lines[::4]]  # /1, /2 dropped
+        step = 2 if lines[0].startswith(">") else 4
+        return [line[1:].split()[0].split("/")[0] for line in lines[::step]]
 
     # each block's mates in step; a pair in every block one of its k-mers hits, no other
     params = json.loads((index_dir / "meta.json").read_text())["params"]
@@ -418,19 +420,35 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
         for b, ks in kmers.items():
             if got & ks:
                 want.setdefault(b, []).append(name)
-    assert "@junk" not in sum(want.values(), [])
+    assert "junk" not in sum(want.values(), [])
     for b in kmers:
         if b not in want:
-            assert not (out / f"b{b}_1.fq.gz").exists()
+            assert not (out / f"b{b}_1.fa.gz").exists()
             continue
-        assert names(out / f"b{b}_1.fq.gz") == names(out / f"b{b}_2.fq.gz") == want[b]
+        assert names(out / f"b{b}_1.fa.gz") == names(out / f"b{b}_2.fa.gz") == want[b]
     assert counts["routed_pairs"] == len(set(sum(want.values(), [])))
+    # routes.parquet: every hit, named; a sequence carries over unchanged
+    hits = pl.read_parquet(out / "routes.parquet")
+    assert sorted(
+        hits.select(pl.col("read_name").str.replace("/1$", ""), "block").rows()
+    ) == sorted((n, b) for b, ns in want.items() for n in ns)
+    first_block = min(want)
+    fa = gzip.decompress((out / f"b{first_block}_1.fa.gz").read_bytes()).decode().splitlines()
+    assert fa[1] in gzip.decompress(reads[0].read_bytes()).decode()
     # --min-kmers: only pairs sharing that many distinct k-mers with a block; --k overrides
     strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, min_kmers=40)
     assert 0 < strict["routed_pairs"] < counts["routed_pairs"]
+    assert hits.filter(pl.col("kmers") >= 40)["pair"].n_unique() == strict["routed_pairs"]
     assert route(tmp_path / "ref", index_dir, reads, tmp_path / "k5", 300, k=5)["k"] == 5
-    # a k-mer held in two blocks sends its read to both
-    table = kmer_table([A.encode(), A.encode(), C.encode()], np.array([0, 1, 1]), 7, "protein")
+    # the table built in several hash ranges routes exactly as in one
+    parts = route(tmp_path / "ref", index_dir, reads, tmp_path / "parts", 300, part_kmers=500)
+    assert parts == counts
+    for f in sorted(out.glob("b*_1.fa.gz")):
+        assert names(f) == names(tmp_path / "parts" / f.name)
+    # a k-mer held in two blocks sends its read to both, counted once per block
+    table = kmer_table(
+        [A.encode(), A.encode(), C.encode()], np.array([0, 1, 1]), 7, "protein", tmp_path
+    )
     first = hash_proteins([A[:7].encode()], 7)["hash"]
-    got = lookup(table, first, np.array([5], dtype=np.uint64))
-    assert sorted(got.rows()) == [(5, 0, 1), (5, 1, 1)]
+    got = _core.route_hits(table, np.array([5, 5], dtype=np.uint64), np.repeat(first, 2))
+    assert pl.DataFrame(got).sort("block").rows() == [(5, 0, 1), (5, 1, 1)]

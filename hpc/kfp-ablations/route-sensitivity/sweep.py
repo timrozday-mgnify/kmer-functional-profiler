@@ -27,6 +27,7 @@ routing on.
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -42,9 +43,9 @@ MATE_SUFFIX = r"/[12]$"
 
 def names(r1: Path) -> pl.Series:
     """Pair names in input order (FastxHits' read ids), the first word, /1 dropped."""
-    return pl.Series(
-        "read_name", [r.split(maxsplit=1)[0][1:].decode() for r in _records(r1)]
-    ).str.replace(MATE_SUFFIX, "")
+    return pl.Series("read_name", [n.decode() for n, _ in _records(r1)]).str.replace(
+        MATE_SUFFIX, ""
+    )
 
 
 def baseline(assignments: Path, seq_block: pl.DataFrame) -> dict[str, pl.DataFrame]:
@@ -91,6 +92,7 @@ def main() -> None:
     parser.add_argument("--min-kmers", type=int, nargs="+", default=[1, 2, 3, 5, 8])
     parser.add_argument("--out", type=Path, default=Path("."))
     args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
 
     alphabet = json.loads((args.index / "meta.json").read_text())["params"]["alphabet"]
     refs = pl.read_csv(args.ref / REFS, separator="\t", infer_schema_length=None)
@@ -121,8 +123,10 @@ def main() -> None:
 
     rows, hist = [], []
     for k in args.k:
-        table = kmer_table(seqs, block, k, alphabet)
-        hits, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
+        with tempfile.TemporaryDirectory(prefix=".table-", dir=args.out) as scratch:
+            table = kmer_table(seqs, block, k, alphabet, Path(scratch))
+            hits, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
+            del table
         assert n_pairs == pair_names.len(), "pair numbering differs from the FASTQ"
         hits = hits.with_columns(read_name=pair_names.gather(hits["read"].cast(pl.Int64)))
         most = hits.group_by("read").agg(pl.col("kmers").max())
@@ -149,7 +153,6 @@ def main() -> None:
             }
             row |= {f"{g}_recall": reach(p, routed) for g, p in groups.items()}
             rows.append(row)
-    args.out.mkdir(parents=True, exist_ok=True)
     tag = f"{args.bench}.{args.sample}"
     pl.DataFrame(rows).write_csv(args.out / f"sweep.{tag}.tsv", separator="\t")
     pl.DataFrame(hist).write_csv(args.out / f"hist.{tag}.tsv", separator="\t")

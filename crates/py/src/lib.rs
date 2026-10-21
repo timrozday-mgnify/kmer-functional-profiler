@@ -91,23 +91,27 @@ fn hash_dna<'py>(
 }
 
 /// Sampled k-mer hashes of target sequences (proteins; DNA, untranslated, with the `dna`
-/// alphabet): columns `seq` (index into `seqs`) and `hash`.
+/// alphabet): columns `seq` (index into `seqs`) and `hash`; with `min_hash`, only hashes in
+/// [`min_hash`, `max_hash`] (one hash range of a table built range by range).
 #[pyfunction]
-#[pyo3(signature = (seqs, k, *, alphabet = "protein", max_hash = u64::MAX))]
+#[pyo3(signature = (seqs, k, *, alphabet = "protein", max_hash = u64::MAX, min_hash = 0))]
 fn hash_proteins<'py>(
     py: Python<'py>,
     seqs: Vec<PyBackedBytes>,
     k: usize,
     alphabet: &str,
     max_hash: u64,
+    min_hash: u64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let params = params(k, alphabet, 11, "all", max_hash)?;
     let (seq_ids, hashes) = py.detach(|| {
         let (mut seq_ids, mut hashes) = (Vec::new(), Vec::new());
         for (i, seq) in (0u64..).zip(&seqs) {
             kfp::sequence_kmers(seq, &params, |h| {
-                seq_ids.push(i);
-                hashes.push(h);
+                if h >= min_hash {
+                    seq_ids.push(i);
+                    hashes.push(h);
+                }
             });
         }
         (seq_ids, hashes)
@@ -289,6 +293,29 @@ fn unit_hits<'py>(
     Ok(dict)
 }
 
+/// Routing rows of a batch's (read, hash) columns through a `PackedTable` whose values are
+/// block ids: columns `read`, `block` and `kmers` (distinct k-mers the pair shares with the
+/// block); `reads` non-decreasing.
+#[pyfunction]
+fn route_hits<'py>(
+    py: Python<'py>,
+    table: &Bound<'py, PyAny>,
+    reads: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let packed = Packed::new(table)?;
+    let table = packed.table()?;
+    let (reads, hashes) = (reads.as_slice()?, hashes.as_slice()?);
+    let got = py
+        .detach(|| kfp::route_hits(&table, reads, hashes))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("read", got.read.into_pyarray(py))?;
+    dict.set_item("block", got.block.into_pyarray(py))?;
+    dict.set_item("kmers", got.kmers.into_pyarray(py))?;
+    Ok(dict)
+}
+
 /// Greedy gather over (unit, hash) pairs: the units taken, in order, and their k-mers.
 #[pyfunction]
 fn gather<'py>(
@@ -462,6 +489,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BLOOM_BLOCK_BYTES", kfp::BLOCK_BYTES)?;
     m.add_function(wrap_pyfunction!(packed_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(unit_hits, m)?)?;
+    m.add_function(wrap_pyfunction!(route_hits, m)?)?;
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_function(wrap_pyfunction!(components, m)?)?;
     m.add_class::<PyDistinct>()?;

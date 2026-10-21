@@ -12,6 +12,7 @@ mod fastx;
 mod gather;
 mod kmers;
 mod packed;
+mod route;
 mod translate;
 
 pub use alphabet::Alphabet;
@@ -26,6 +27,7 @@ pub use kmers::{
     sequence_kmers,
 };
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};
+pub use route::{RouteHits, route_hits};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
 };

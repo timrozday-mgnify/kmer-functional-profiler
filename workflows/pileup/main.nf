@@ -80,7 +80,7 @@ process REFERENCE {
 process ROUTE {
     tag "${sample}"
     label 'process_single'
-    publishDir params.outdir, mode: 'copy', pattern: 'route.json', saveAs: { "${sample}/${it}" }
+    publishDir params.outdir, mode: 'copy', pattern: 'route*.{json,parquet}', saveAs: { "${sample}/${it}" }
 
     input:
     tuple val(sample), path(ref), path(r1), path(r2)
@@ -91,15 +91,16 @@ process ROUTE {
     output:
     tuple val(sample), path('route'), path(r1), path(r2), emit: route
     path 'route.json'  // pairs routed and dropped, blocks
+    path 'routes.parquet'  // every (pair, block) hit and its distinct k-mers
 
     script:
     """
     ${params.kfp_pileup} route ${ref} index ${r1} ${r2} route ${opts}
-    cp route/route.json .
+    cp route/route.json route/routes.parquet .
     """
 
     stub:
-    "mkdir route && echo 1 > route/letters.txt && echo {} > route.json"
+    "mkdir route && echo 1 > route/letters.txt && echo {} > route.json && touch routes.parquet"
 }
 
 process DIAMOND {
@@ -128,10 +129,10 @@ process DIAMOND {
     : > r1.tsv
     : > r2.tsv
     if [ -e ${ref}/letters.txt ]; then
-        for q1 in ${ref}/b*_1.fq.gz; do
+        for q1 in ${ref}/b*_1.fa.gz; do
             [ -e "\$q1" ] || continue
-            b=\${q1%_1.fq.gz}
-            align \$b.fa \$q1 \${b}_2.fq.gz "--dbsize \$(cat ${ref}/letters.txt)"
+            b=\${q1%_1.fa.gz}
+            align \$b.fa \$q1 \${b}_2.fa.gz "--dbsize \$(cat ${ref}/letters.txt)"
         done
         for m in 1 2; do
             LC_ALL=C sort -s -t "\$(printf '\\t')" -k1,1 -o r\$m.tsv r\$m.tsv
