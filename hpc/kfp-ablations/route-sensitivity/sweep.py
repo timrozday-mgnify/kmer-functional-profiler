@@ -19,9 +19,10 @@ it is routed to that sequence's component. Columns:
 
 ``hist.tsv``: pairs by the most distinct k-mers they share with one component, per k (for
 a per-sample threshold fitted like the query's presence model, if a fixed one does not hold).
-``decision.tsv``: the rule (``unit_recall`` >= ``MIN_UNIT_RECALL`` in every sample; proposed,
-to be fixed before the run), the cheapest passing setting by mean ``searched_share``. The
-truth metrics of the chosen setting are read from step 3b's re-run with routing on.
+``decision.tsv``: the rule (``unit_recall`` >= ``MIN_UNIT_RECALL`` in every sample; fixed by
+the user before the run, 2026-10-21), the cheapest passing setting by mean
+``searched_share``. The chosen setting's truth metrics come from step 3b's re-run with
+routing on.
 """
 
 import argparse
@@ -35,7 +36,7 @@ from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.route import _records, blocks, kmer_table, pair_hits
 from kmer_functional_profiler.index import read_fasta
 
-MIN_UNIT_RECALL = 0.99  # proposed rule (plan, phase 13, routing), to fix before the run
+MIN_UNIT_RECALL = 0.99  # the rule, fixed before the run (user, 2026-10-21)
 MATE_SUFFIX = r"/[12]$"
 
 
