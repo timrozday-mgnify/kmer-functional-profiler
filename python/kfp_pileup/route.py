@@ -6,7 +6,8 @@ with, not the whole of it:
 - the reference's components (``refs.tsv``) are packed, in order, into blocks of about
   ``block_letters`` residues; a component is never split, so a block holds whole components;
 - every k-mer of the reference (the index's alphabet; its k unless ``k`` is given;
-  unsampled) gives the blocks that hold it; the reads are hashed in all six frames (a
+  unsampled; ``route.fa``'s sequences when ``reference`` wrote more per unit for routing,
+  ``--route-members``) gives the blocks that hold it; the reads are hashed in all six frames (a
   frameshifted read keeps its k-mers on either side of the shift), and a pair goes to every
   block it shares at least ``min_kmers`` distinct k-mers with. A smaller ``k`` routes more
   distant relatives (more siblings, more homologues); a larger ``min_kmers`` fewer;
@@ -20,8 +21,10 @@ as DIAMOND's ``--dbsize`` so that e-values do not change with the split.
 Writes per block ``b<i>.fa`` (its reference sequences) and, where it has pairs,
 ``b<i>_1.fa.gz`` and ``b<i>_2.fa.gz`` (its pairs' mates as FASTA, names cut at the first
 word: DIAMOND reads neither qualities nor comments, which are about half of a FASTQ.gz);
-``letters.txt``; ``route.json`` (counts); and ``routes.parquet``, every (pair, block) hit
-with its distinct k-mers (``read_name``, ``pair`` in input order, ``block``, ``kmers``),
+``letters.txt``; ``route.json`` (counts, with the dropped pairs by their distinct k-mers in
+all, ``dropped_by_total_kmers``); and ``routes.parquet``, every (pair, block) hit
+with its distinct k-mers (``read_name``, ``total_kmers``: the pair's in all, ``pair`` in
+input order, ``block``, ``kmers``),
 routed or not, so that another ``min_kmers`` is a filter, not a rerun.
 """
 
@@ -34,12 +37,12 @@ from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 import polars as pl
 
-from kfp_pileup.reference import REF_FASTA, REFS
+from kfp_pileup.reference import REF_FASTA, REFS, ROUTE_FASTA, ROUTE_SEQS
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.index import (
     PackedPart,
@@ -54,7 +57,11 @@ BATCH_READS: Final = 100_000
 PART_KMERS: Final = 25_000_000  # reference residues per hash range of the table build
 FP_BITS: Final = 32  # fingerprint bits: false hits ~keys per bucket x 2^-32 per lookup
 HASH_MAX: Final = 2**64 - 1
-MIN_KMERS: Final = 1  # distinct k-mers a pair shares with a block to be sent there
+# route-sensitivity (2026-10-21): the cheapest setting keeping >= 0.99 of the pairs the
+# unrouted EM gives a unit, in every sample (spike-protein x 10, hadza10M). min_kmers applies
+# per block, whose size is fixed, so chance hits per block do not grow with the reference
+ROUTE_K: Final = 8
+MIN_KMERS: Final = 3  # distinct k-mers a pair shares with a block to be sent there
 LETTERS: Final = "letters.txt"
 ROUTE: Final = "route.json"
 ROUTES: Final = "routes.parquet"
@@ -70,6 +77,23 @@ def blocks(refs: pl.DataFrame, block_letters: int) -> np.ndarray:
         block=(start // block_letters).rank("dense").cast(pl.Int64) - 1
     )  # dense: a component above block_letters skips no number
     return refs.join(comp, on="component", how="left", maintain_order="left")["block"].to_numpy()
+
+
+def routing_sequences(
+    ref: Path, refs: pl.DataFrame, sequences: dict[str, str], block: np.ndarray
+) -> tuple[list[bytes], np.ndarray]:
+    """The sequences routing hashes and each one's block: ``route.fa`` (``route_members``
+    per unit, from ``reference``) if there is one, else the reference's own, with blocks
+    by component, as the reference's."""
+    if not (ref / ROUTE_SEQS).exists():
+        return [sequences[s].encode() for s in refs["seq_id"]], block
+    of = dict(zip(refs["component"].to_list(), block.tolist(), strict=False))
+    more = pl.read_csv(ref / ROUTE_SEQS, separator="\t", infer_schema_length=None)
+    found = dict(read_fasta(ref / ROUTE_FASTA))
+    return (
+        [found[s].encode() for s in more["seq_id"]],
+        np.array([of[c] for c in more["component"].to_list()], dtype=np.int64),
+    )
 
 
 def kmer_table(
@@ -108,10 +132,13 @@ def pair_hits(
     alphabet: str,
     genetic_code: int = 11,
     batch_reads: int = BATCH_READS,
-) -> tuple[pl.DataFrame, int]:
-    """(read, block, kmers) for every pair that hits the table, and the number of pairs.
-    Read ids number pairs in input order and never span batches; the lookup and the
-    distinct-k-mer count per pair and block run in Rust, on every core (``route_hits``)."""
+    single: bool = False,
+) -> tuple[pl.DataFrame, pl.DataFrame, int]:
+    """(read, block, kmers) for every pair that hits the table, (read, total_kmers) for
+    every pair with any k-mer (its distinct k-mers, shared or not), and the number of pairs.
+    Read ids number pairs in input order and never span batches; with ``single``, each mate
+    is a read of its own, numbered 2 x pair + mate (0 or 1). The lookup and the counts run
+    in Rust, on every core (``route_hits``)."""
     hits = _core.FastxHits(
         *map(str, reads),
         k=k,
@@ -121,18 +148,30 @@ def pair_hits(
         batch_reads=batch_reads,
     )
     u64 = np.uint64
-    rows = pl.concat(
-        [pl.DataFrame(schema={"read": pl.UInt64, "block": pl.UInt32, "kmers": pl.UInt32})]
-        + [
-            pl.DataFrame(
-                _core.route_hits(
-                    table, b["read"].astype(u64, copy=False), b["hash"].astype(u64, copy=False)
-                )
-            )
-            for b in hits
-        ]
-    )
-    return rows, hits.n_reads
+    rows = [pl.DataFrame(schema={"read": pl.UInt64, "block": pl.UInt32, "kmers": pl.UInt32})]
+    totals = [pl.DataFrame(schema={"read": pl.UInt64, "total_kmers": pl.UInt32})]
+    for b in hits:
+        ids = b["read"].astype(u64, copy=False)
+        if single:
+            ids = ids * u64(2) + b["mate"].astype(u64)
+        got = _core.route_hits(table, ids, b["hash"].astype(u64, copy=False))
+        rows.append(pl.DataFrame({c: got[c] for c in ("read", "block", "kmers")}))
+        totals.append(pl.DataFrame({"read": got["pair"], "total_kmers": got["pair_kmers"]}))
+    n = hits.n_reads * (2 if single else 1)
+    return pl.concat(rows), pl.concat(totals), n
+
+
+TOTAL_BINS: Final = (1, 50, 150)  # route.json: dropped pairs by their distinct k-mers in all
+
+
+def by_total(total: pl.Series, n_none: int) -> dict[str, int]:
+    """Counts by total distinct k-mers: none, and the bins ``TOTAL_BINS`` open."""
+    edges = [*TOTAL_BINS, None]
+    out = {"0": n_none + int((total == 0).sum())}
+    for lo, hi in itertools.pairwise(edges):
+        part = total >= lo if hi is None else (total >= lo) & (total < hi)
+        out[f"{lo}+" if hi is None else f"{lo}-{hi - 1}"] = int(part.sum())
+    return out
 
 
 def _records(path: Path) -> Iterator[tuple[bytes, bytes]]:
@@ -150,12 +189,12 @@ def route(
     reads: Sequence[str | Path],
     out_dir: str | Path,
     block_letters: int = BLOCK_LETTERS,
-    k: int = 0,
+    k: int = ROUTE_K,
     min_kmers: int = MIN_KMERS,
     genetic_code: int = 11,
     batch_reads: int = BATCH_READS,
     part_kmers: int = PART_KMERS,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Split the reference in ``ref_dir`` into blocks and the pairs in ``reads`` (two
     FASTQs, mate order) by the blocks they share at least ``min_kmers`` distinct k-mers
     with (``k``: 0 for the index's); write them to ``out_dir``; return counts."""
@@ -166,8 +205,8 @@ def route(
         raise ValueError("routing is for amino-acid references (DIAMOND); bwa-mem2 is not routed")
     refs = pl.read_csv(ref / REFS, separator="\t", infer_schema_length=None)
     sequences = dict(read_fasta(ref / REF_FASTA))
-    seqs = [sequences[s].encode() for s in refs["seq_id"]]
     block = blocks(refs, block_letters)
+    seqs, seq_block = routing_sequences(ref, refs, sequences, block)
     for b in np.unique(block):
         with open(out / f"b{b}.fa", "w") as fasta:
             fasta.writelines(
@@ -177,8 +216,10 @@ def route(
 
     k = k or params["k"]
     with tempfile.TemporaryDirectory(prefix=".table-", dir=out) as scratch:
-        table = kmer_table(seqs, block, k, params["alphabet"], Path(scratch), part_kmers)
-        rows, pairs = pair_hits(table, reads, k, params["alphabet"], genetic_code, batch_reads)
+        table = kmer_table(seqs, seq_block, k, params["alphabet"], Path(scratch), part_kmers)
+        rows, totals, pairs = pair_hits(
+            table, reads, k, params["alphabet"], genetic_code, batch_reads
+        )
         n_kmers = len(table.fingerprints)
         del table  # its parts are memory-mapped from the scratch directory
     rows = rows.sort("read", "block")
@@ -212,8 +253,8 @@ def route(
     # every hit, routed or not, so another min_kmers needs no rerun
     names.append(pl.Series(chunk, dtype=pl.String))
     named = pl.DataFrame({"read": hit_ids, "read_name": pl.concat(names)})
-    rows.join(named, on="read").select(
-        "read_name", pair="read", block="block", kmers="kmers"
+    rows.join(named, on="read").join(totals, on="read", how="left").select(
+        "read_name", "total_kmers", pair="read", block="block", kmers="kmers"
     ).write_parquet(out / ROUTES, compression="zstd")
     counts = {
         "k": k,
@@ -227,5 +268,17 @@ def route(
         "kmers": n_kmers,
     }
     counts["dropped_pairs"] = pairs - counts["routed_pairs"]
+    # dropped pairs by their distinct k-mers in all: few (none) is a short, N-rich or, with a
+    # quality mask, low-quality pair; many, a pair the reference lacks or holds distantly
+    dropped_totals = totals.filter(~pl.col("read").is_in(routed["read"].implode()))["total_kmers"]
+    counts["dropped_by_total_kmers"] = by_total(
+        dropped_totals, counts["dropped_pairs"] - dropped_totals.len()
+    )
+    counts["total_kmers_median"] = {
+        "routed": totals.filter(pl.col("read").is_in(routed["read"].implode()))[
+            "total_kmers"
+        ].median(),
+        "dropped": dropped_totals.median(),
+    }
     (out / ROUTE).write_text(json.dumps(counts, indent=1) + "\n")
     return counts

@@ -3,12 +3,16 @@
 
 use crate::{Error, PackedTable, threads};
 
-/// One row per (pair, block it shares a k-mer with): the distinct k-mers shared.
+/// One row per (pair, block it shares a k-mer with): the distinct k-mers shared; and one
+/// per pair with any k-mer: its distinct k-mers in all (few: a short, N-rich or, with a
+/// quality mask, low-quality read; many but few shared: a read the reference lacks).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RouteHits {
     pub read: Vec<u64>,
     pub block: Vec<u32>,
     pub kmers: Vec<u32>,
+    pub pair: Vec<u64>,
+    pub pair_kmers: Vec<u32>,
 }
 
 /// Hashes per thread below which `route_hits` does not split further.
@@ -58,6 +62,8 @@ pub fn route_hits(
         out.read.extend(part.read);
         out.block.extend(part.block);
         out.kmers.extend(part.kmers);
+        out.pair.extend(part.pair);
+        out.pair_kmers.extend(part.pair_kmers);
     }
     Ok(out)
 }
@@ -65,7 +71,8 @@ pub fn route_hits(
 fn route_serial(table: &PackedTable<'_>, reads: &[u64], hashes: &[u64]) -> RouteHits {
     let mut out = RouteHits::default();
     let mut seen: Vec<(u32, u64)> = Vec::new(); // (block, hash) of the current pair
-    let mut flush = |read: u64, seen: &mut Vec<(u32, u64)>| {
+    let mut all: Vec<u64> = Vec::new(); // every hash of the current pair
+    let mut flush = |read: u64, seen: &mut Vec<(u32, u64)>, all: &mut Vec<u64>| {
         seen.sort_unstable();
         seen.dedup();
         for run in seen.chunk_by(|a, b| a.0 == b.0) {
@@ -74,19 +81,26 @@ fn route_serial(table: &PackedTable<'_>, reads: &[u64], hashes: &[u64]) -> Route
             #[allow(clippy::cast_possible_truncation)] // a pair has far fewer than 2^32 k-mers
             out.kmers.push(run.len() as u32);
         }
+        all.sort_unstable();
+        all.dedup();
+        out.pair.push(read);
+        #[allow(clippy::cast_possible_truncation)]
+        out.pair_kmers.push(all.len() as u32);
         seen.clear();
+        all.clear();
     };
     for (i, (&read, &hash)) in reads.iter().zip(hashes).enumerate() {
         if i > 0 && read != reads[i - 1] {
-            flush(reads[i - 1], &mut seen);
+            flush(reads[i - 1], &mut seen, &mut all);
         }
+        all.push(hash);
         if let Some(set) = table.lookup(hash) {
             #[allow(clippy::cast_possible_truncation)] // block ids are far below 2^32
             seen.extend(table.values(set).map(|block| (block as u32, hash)));
         }
     }
     if let Some(&last) = reads.last() {
-        flush(last, &mut seen);
+        flush(last, &mut seen, &mut all);
     }
     out
 }
@@ -127,6 +141,9 @@ mod tests {
         assert_eq!(got.read, [4, 4, 4, 6, 6]);
         assert_eq!(got.block, [0, 1, 2, 0, 2]);
         assert_eq!(got.kmers, [1, 2, 1, 1, 1]);
+        // every pair with a k-mer, its distinct k-mers in all, shared or not
+        assert_eq!(got.pair, [4, 5, 6]);
+        assert_eq!(got.pair_kmers, [3, 1, 1]);
     }
 
     #[test]

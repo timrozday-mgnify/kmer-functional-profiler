@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +167,12 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     assert list(fasta) == refs["seq_id"].to_list()
     target = refs.filter(pl.col("role") == "target").row(0, named=True)
     assert (tmp_path / "ref" / "molecule.txt").read_text() == "protein\n"
+    # routing's own sequences only when --route-members differs from --members
+    assert not (tmp_path / "ref" / "route.tsv").exists()
+    build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "rm", members=1, route_members=2)
+    assert pl.read_csv(tmp_path / "rm" / "route.tsv", separator="\t")["unit"].n_unique() == (
+        pl.read_csv(tmp_path / "rm" / "refs.tsv", separator="\t")["unit"].n_unique()
+    )
     # a withheld unit is in no role
     held = str(target["cluster_rep"])
     build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "held", withhold=[held])
@@ -392,7 +399,7 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
         reads[-1].write_bytes(gzip.compress(gzip.decompress(path.read_bytes()) + fake))
     # small blocks: several, each of whole components
     out = tmp_path / "route"
-    counts = route(tmp_path / "ref", index_dir, reads, out, block_letters=300)
+    counts = route(tmp_path / "ref", index_dir, reads, out, 300, k=0, min_kmers=1)
     assert counts["blocks"] > 1 and counts["dropped_pairs"] >= 1
     assert (out / "letters.txt").read_text() == f"{refs['length'].sum()}\n"
     block_of = {s: int(f.stem[1:]) for f in out.glob("b*.fa") for s, _ in read_fasta(f)}
@@ -429,6 +436,8 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     assert counts["routed_pairs"] == len(set(sum(want.values(), [])))
     # routes.parquet: every hit, named; a sequence carries over unchanged
     hits = pl.read_parquet(out / "routes.parquet")
+    assert (hits["total_kmers"] >= hits["kmers"]).all()
+    assert sum(counts["dropped_by_total_kmers"].values()) == counts["dropped_pairs"]
     assert sorted(
         hits.select(pl.col("read_name").str.replace("/1$", ""), "block").rows()
     ) == sorted((n, b) for b, ns in want.items() for n in ns)
@@ -436,12 +445,21 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     fa = gzip.decompress((out / f"b{first_block}_1.fa.gz").read_bytes()).decode().splitlines()
     assert fa[1] in gzip.decompress(reads[0].read_bytes()).decode()
     # --min-kmers: only pairs sharing that many distinct k-mers with a block; --k overrides
-    strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, min_kmers=40)
+    strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, k=0, min_kmers=40)
     assert 0 < strict["routed_pairs"] < counts["routed_pairs"]
     assert hits.filter(pl.col("kmers") >= 40)["pair"].n_unique() == strict["routed_pairs"]
     assert route(tmp_path / "ref", index_dir, reads, tmp_path / "k5", 300, k=5)["k"] == 5
     # the table built in several hash ranges routes exactly as in one
-    parts = route(tmp_path / "ref", index_dir, reads, tmp_path / "parts", 300, part_kmers=500)
+    parts = route(
+        tmp_path / "ref",
+        index_dir,
+        reads,
+        tmp_path / "parts",
+        300,
+        k=0,
+        min_kmers=1,
+        part_kmers=500,
+    )
     assert parts == counts
     for f in sorted(out.glob("b*_1.fa.gz")):
         assert names(f) == names(tmp_path / "parts" / f.name)
@@ -451,4 +469,20 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     )
     first = hash_proteins([A[:7].encode()], 7)["hash"]
     got = _core.route_hits(table, np.array([5, 5], dtype=np.uint64), np.repeat(first, 2))
-    assert pl.DataFrame(got).sort("block").rows() == [(5, 0, 1), (5, 1, 1)]
+    rows = pl.DataFrame({c: got[c] for c in ("read", "block", "kmers")})
+    assert rows.sort("block").rows() == [(5, 0, 1), (5, 1, 1)]
+    assert (list(got["pair"]), list(got["pair_kmers"])) == ([5], [1])  # distinct k-mers in all
+    # route.fa (--route-members): extra sequences route pairs to their unit's block; the
+    # junk pair (poly-A: poly-K and poly-F frames) hits only an added poly-K member of s0's unit
+    extra = tmp_path / "ref_more"
+    shutil.copytree(tmp_path / "ref", extra)
+    first_row = refs.row(0, named=True)
+    more = refs.with_columns(seq_id=pl.format("r{}", pl.int_range(pl.len())))
+    added = pl.DataFrame([{**first_row, "seq_id": "rx", "length": 30}]).cast(more.schema)
+    pl.concat([more, added]).write_csv(extra / "route.tsv", separator="\t")
+    with open(extra / "route.fa", "w") as f:
+        f.writelines(f">r{i}\n{seqs[s]}\n" for i, s in enumerate(refs["seq_id"]))
+        f.write(">rx\n" + "K" * 30 + "\n")
+    rerouted = route(extra, index_dir, reads, tmp_path / "more", 300, k=0, min_kmers=1)
+    assert rerouted["routed_pairs"] == counts["routed_pairs"] + 1
+    assert "junk" in names(tmp_path / "more" / f"b{block_of[first_row['seq_id']]}_1.fa.gz")

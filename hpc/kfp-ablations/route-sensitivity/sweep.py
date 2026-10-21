@@ -4,7 +4,9 @@ hist.tsv and decision.tsv.
 Per sample, the baseline is a finished unrouted ``--sensitive -F 15`` run (step 3b's
 ``sensitive_F15`` arm: its ``ref/`` and ``pileup/assignments.parquet``). Routing is computed
 at component granularity (each component its own block, the strictest routing), for every
-k, and thresholded at every min_kmers; DIAMOND is not rerun. A pair "reaches" a sequence when
+k (and, with ``--members``, routing tables of that many sequences per unit, fetched from the
+index's store, while the baseline's DIAMOND searched its 3), and thresholded at every
+min_kmers; DIAMOND is not rerun. A pair "reaches" a sequence when
 it is routed to that sequence's component. Columns:
 
 - ``routed_share``: pairs routed (the rest are dropped); ``searched_share``: residues
@@ -26,6 +28,7 @@ routing on.
 """
 
 import argparse
+import itertools
 import json
 import tempfile
 from pathlib import Path
@@ -36,6 +39,7 @@ import polars as pl
 from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.route import _records, blocks, kmer_table, pair_hits
 from kmer_functional_profiler.index import read_fasta
+from kmer_functional_profiler.store import fetch
 
 MIN_UNIT_RECALL = 0.99  # the rule, fixed before the run (user, 2026-10-21)
 MATE_SUFFIX = r"/[12]$"
@@ -90,6 +94,14 @@ def main() -> None:
     parser.add_argument("--truth", type=Path, help="spike truth.tsv (strain, kind)")
     parser.add_argument("--k", type=int, nargs="+", default=[7, 8, 9, 10, 11])
     parser.add_argument("--min-kmers", type=int, nargs="+", default=[1, 2, 3, 5, 8])
+    parser.add_argument(
+        "--members",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="sequences per unit in routing's table (0: the baseline reference's own)",
+    )
+    parser.add_argument("--store", type=Path, nargs="*", help="members tables for --members")
     parser.add_argument("--out", type=Path, default=Path("."))
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -121,11 +133,27 @@ def main() -> None:
             "sibling": labelled.filter(pl.col("kind") == "sibling"),
         }
 
+    comp_block = dict(zip(refs["component"].to_list(), block.tolist(), strict=False))
+    unit_comp = refs.select("unit", "component").unique("unit")
+
+    def routing(members: int) -> tuple[list[bytes], np.ndarray]:
+        """Routing's sequences and their blocks: the reference's, or ``members`` per unit."""
+        if members == 0:
+            return seqs, block
+        more = fetch(args.index, unit_comp["unit"].to_list(), members, args.store or ())
+        more = more.with_columns(pl.col("unit").cast(unit_comp.schema["unit"])).join(
+            unit_comp, on="unit"
+        )
+        return [q.encode() for q in more["sequence"]], np.array(
+            [comp_block[c] for c in more["component"].to_list()], dtype=np.int64
+        )
+
     rows, hist = [], []
-    for k in args.k:
+    for members, k in itertools.product(args.members, args.k):
+        route_seqs, route_block = routing(members)
         with tempfile.TemporaryDirectory(prefix=".table-", dir=args.out) as scratch:
-            table = kmer_table(seqs, block, k, alphabet, Path(scratch))
-            hits, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
+            table = kmer_table(route_seqs, route_block, k, alphabet, Path(scratch))
+            hits, _, n_pairs = pair_hits(table, (args.r1, args.r2), k, alphabet)
             del table
         assert n_pairs == pair_names.len(), "pair numbering differs from the FASTQ"
         hits = hits.with_columns(read_name=pair_names.gather(hits["read"].cast(pl.Int64)))
@@ -133,7 +161,14 @@ def main() -> None:
         counts = np.bincount(most["kmers"].to_numpy())
         counts[0] = n_pairs - most.height
         hist += [
-            {"bench": args.bench, "sample": args.sample, "k": k, "kmers": i, "pairs": int(c)}
+            {
+                "bench": args.bench,
+                "sample": args.sample,
+                "members": members,
+                "k": k,
+                "kmers": i,
+                "pairs": int(c),
+            }
             for i, c in enumerate(counts)
             if c
         ]
@@ -143,6 +178,7 @@ def main() -> None:
             row = {
                 "bench": args.bench,
                 "sample": args.sample,
+                "members": members,
                 "k": k,
                 "min_kmers": m,
                 "pairs": n_pairs,
@@ -164,10 +200,12 @@ def decide(out: Path) -> None:
         [pl.read_csv(p, separator="\t") for p in sorted(out.glob("sweep.*.tsv"))],
         how="diagonal_relaxed",
     )
+    if "members" not in sweep.columns:  # sweeps from before the members dimension
+        sweep = sweep.with_columns(members=pl.lit(0))
     sweep.write_csv(out / "sweep.tsv", separator="\t")
     truth = [c for c in ("strain_recall", "sibling_recall") if c in sweep.columns]
     decision = (
-        sweep.group_by("k", "min_kmers")
+        sweep.group_by("members", "k", "min_kmers")
         .agg(
             pl.col("unit_recall", "best_recall", *truth).min(),
             pl.col("routed_share", "searched_share", "novel_routed").mean(),
@@ -179,7 +217,8 @@ def decide(out: Path) -> None:
     with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=200):
         print(decision)
     chosen = decision.filter("passes")
-    print("chosen:", chosen.select("k", "min_kmers").row(0) if chosen.height else "none")
+    best = chosen.select("members", "k", "min_kmers").row(0) if chosen.height else "none"
+    print("chosen (members, k, min_kmers):", best)
 
 
 if __name__ == "__main__":

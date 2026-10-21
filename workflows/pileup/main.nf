@@ -471,7 +471,7 @@ workflow PILEUP {
     ].findAll { it }.join(' ')
     def profiles = QUERY(reads, index, meta, query_opts).profile
     def refs = REFERENCE(profiles, index, meta, store, withhold,
-        "--max-fdr ${params.max_fdr} --max-targets ${params.max_targets} --neighbours ${params.neighbours} --members ${params.members}",
+        "--max-fdr ${params.max_fdr} --max-targets ${params.max_targets} --neighbours ${params.neighbours} --members ${params.members} --route-members ${params.route_members}",
         file("${moduleDir}/../../python/kfp_pileup/reference.py", checkIfExists: true)).ref
     def to_align = refs.join(reads).branch { sample, ref, molecule, r1, r2 ->
         nucleotide: molecule == 'nucleotide'

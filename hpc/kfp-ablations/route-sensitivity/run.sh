@@ -21,7 +21,12 @@ source ../common.sh
 PY="$REPO/.venv/bin/python"
 K=${K:-7 8 9 10 11}
 MIN=${MIN:-1 2 3 5 8}
-mkdir -p out
+# routing's sequences per unit: 0 = the baseline reference's own (3). The members re-run
+# (2026-10-21: can more members raise recall enough to allow a larger k, fewer false hits?):
+# OUT=out-members MEMBERS="0 5 10 20" K="8 9 10 11 12" MIN="1 2 3 5" sbatch run.sh
+MEMBERS=${MEMBERS:-0}
+OUT=${OUT:-out}
+mkdir -p "$OUT"
 
 # a spike task's work directory, from the arm's trace (its inputs are not published)
 spike=../spike-protein
@@ -42,17 +47,18 @@ index_task=$(column | awk -F '\t' 'index($1, "INDEX_TARGETS") == 1 { print $1; e
 index=$(find "$(workdir "$index_task")"/ -maxdepth 1 -type d -name 'index_*' | head -n 1)
 for s in $(cd "$base" && ls -d seed*/pileup | cut -d/ -f1 | sort -V); do
     w=$(workdir "SIMULATE (seed ${s#seed})")
-    [[ -s out/sweep.spike.$s.tsv ]] ||
+    [[ -s $OUT/sweep.spike.$s.tsv ]] ||
         "$PY" sweep.py --bench spike --sample "$s" --ref "$base/$s/ref" \
             --assignments "$base/$s/pileup/assignments.parquet" --index "$index" \
             --r1 "$w/reads_1.fq.gz" --r2 "$w/reads_2.fq.gz" --truth "$w/truth.tsv" \
-            --k $K --min-kmers $MIN --out out
+            --k $K --min-kmers $MIN --members $MEMBERS --out "$OUT"
 done
 real=../pileup-cost/results-dmnd-sensitive_F15/hadza10M
-[[ -s out/sweep.real.hadza10M.tsv ]] ||
+[[ -s $OUT/sweep.real.hadza10M.tsv ]] ||
     "$PY" sweep.py --bench real --sample hadza10M --ref "$real/ref" \
         --assignments "$real/pileup/assignments.parquet" \
         --index ../release-tiers/results-standard/index \
         --r1 ../pileup-cost/hadza10M_1.fastq.gz --r2 ../pileup-cost/hadza10M_2.fastq.gz \
-        --k $K --min-kmers $MIN --out out
-"$PY" sweep.py decide out
+        --store ../release-tiers/results-standard/members.bucket*.parquet \
+        --k $K --min-kmers $MIN --members $MEMBERS --out "$OUT"
+"$PY" sweep.py decide "$OUT"

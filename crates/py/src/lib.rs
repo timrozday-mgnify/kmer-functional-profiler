@@ -295,7 +295,8 @@ fn unit_hits<'py>(
 
 /// Routing rows of a batch's (read, hash) columns through a `PackedTable` whose values are
 /// block ids: columns `read`, `block` and `kmers` (distinct k-mers the pair shares with the
-/// block); `reads` non-decreasing.
+/// block), and per pair with any k-mer `pair` and `pair_kmers` (its distinct k-mers in all);
+/// `reads` non-decreasing.
 #[pyfunction]
 fn route_hits<'py>(
     py: Python<'py>,
@@ -313,6 +314,8 @@ fn route_hits<'py>(
     dict.set_item("read", got.read.into_pyarray(py))?;
     dict.set_item("block", got.block.into_pyarray(py))?;
     dict.set_item("kmers", got.kmers.into_pyarray(py))?;
+    dict.set_item("pair", got.pair.into_pyarray(py))?;
+    dict.set_item("pair_kmers", got.pair_kmers.into_pyarray(py))?;
     Ok(dict)
 }
 

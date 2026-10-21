@@ -22,7 +22,9 @@ Per sample:
      reference's components into blocks of about `--route_block_letters` residues and sends
      each pair to every block it shares at least `--route_min_kmers` distinct k-mers with
      (every k-mer of the reference at `--route_k`, 0 for the index's k; the reads in all six
-     frames); other pairs are dropped. `DIAMOND` then runs per block
+     frames); other pairs are dropped. `--route_members` (3, as `--members`) sets the sequences per
+     unit in routing's k-mer table apart from DIAMOND's reference (`REFERENCE` then writes
+     `route.fa`). `DIAMOND` then runs per block
      on its pairs (`makedb`, then `blastx` per mate, e-values on the whole reference's size
      with `--dbsize`, every hit within `--diamond_top` % of the read's best,
      frameshift-aware with `-F --frameshift` (0: off), tabular with BTOP);

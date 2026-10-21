@@ -40,6 +40,8 @@ NEIGHBOURS: Final = 5  # per target in a component
 MAX_TARGETS: Final = 0  # 0: no cap
 REF_FASTA: Final = "ref.fa"
 REFS: Final = "refs.tsv"
+ROUTE_FASTA: Final = "route.fa"  # routing's sequences, when route_members differs
+ROUTE_SEQS: Final = "route.tsv"
 MOLECULE: Final = "molecule.txt"  # nucleotide or protein: which aligner the pipeline runs
 
 
@@ -53,8 +55,12 @@ def build_reference(
     withhold: Sequence[str] = (),
     neighbours: int = NEIGHBOURS,
     max_targets: int = MAX_TARGETS,
+    route_members: int = 0,
 ) -> dict[str, int]:
-    """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts."""
+    """Write ``ref.fa``, ``refs.tsv`` and ``molecule.txt`` to ``out_dir``; return counts.
+    With ``route_members`` other than ``members`` (0: the same), also ``route.fa`` and
+    ``route.tsv``: the same units with that many sequences each, for routing's k-mers
+    (``kfp_pileup.route``) while DIAMOND searches ``ref.fa``."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     with open(profile) as f:
@@ -102,5 +108,15 @@ def build_reference(
     refs.drop("sequence").write_csv(out / REFS, separator="\t")
     meta = json.loads((Path(index_dir) / "meta.json").read_text())
     (out / MOLECULE).write_text(molecule(meta["params"]["alphabet"]) + "\n")
+    if route_members and route_members != members:
+        more = fetch(index_dir, roles["unit"].to_list(), route_members, store).join(
+            roles, on="unit"
+        )
+        more = more.with_columns(
+            seq_id=pl.format("r{}", pl.int_range(pl.len())),
+            length=pl.col("sequence").str.len_bytes(),
+        )
+        write_fasta(more, out / ROUTE_FASTA, ids="seq_id")
+        more.drop("sequence").write_csv(out / ROUTE_SEQS, separator="\t")
     counts = refs.group_by("role").len()
     return dict(zip(counts["role"], counts["len"], strict=True))
