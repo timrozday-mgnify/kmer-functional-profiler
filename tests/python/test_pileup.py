@@ -1,8 +1,10 @@
 """kfp-pileup (plan, phase 13, steps 2-6, 8-9) on hand-made alignments and the fixture index."""
 
+import gzip
 import json
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -10,6 +12,8 @@ from kfp_pileup.check import aai_check
 from kfp_pileup.handoff import handoff
 from kfp_pileup.pileup import DIAMOND_BITS, blosum62, call
 from kfp_pileup.reference import build_reference
+from kfp_pileup.route import kmer_table, lookup, route
+from kmer_functional_profiler._core import hash_dna, hash_proteins
 from kmer_functional_profiler.index import (
     TARGETS,
     Index,
@@ -367,3 +371,66 @@ def test_handoff_keeps_assigned_mates(tmp_path: Path) -> None:
     assert first[6:9] == ["=", "11", "14"]
     assert second[4] == first[4] == "10"  # Phred of 1 - 0.9
     assert second[6:9] == ["=", "2", "-14"]
+
+
+def test_route_blocks_and_pairs(tmp_path: Path) -> None:
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+    members_from_fasta(DATA / "proteins.faa").write_parquet(index_dir / TARGETS)
+    build_index(index_dir / TARGETS, index_dir, IndexParams(k=7, t_base=1.0))
+    profile(Index.load(index_dir), *READS).write_csv(tmp_path / "p.tsv", separator="\t")
+    build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "ref")
+    refs = pl.read_csv(tmp_path / "ref" / "refs.tsv", separator="\t")
+    # a pair sharing no k-mer with the reference is dropped
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    fake = b"@junk\n" + b"A" * 150 + b"\n+\n" + b"I" * 150 + b"\n"
+    reads = []
+    for mate, path in enumerate(READS, 1):
+        reads.append(junk / f"r{mate}.fq.gz")
+        reads[-1].write_bytes(gzip.compress(gzip.decompress(path.read_bytes()) + fake))
+    # small blocks: several, each of whole components
+    out = tmp_path / "route"
+    counts = route(tmp_path / "ref", index_dir, reads, out, block_letters=300)
+    assert counts["blocks"] > 1 and counts["dropped_pairs"] >= 1
+    assert (out / "letters.txt").read_text() == f"{refs['length'].sum()}\n"
+    block_of = {s: int(f.stem[1:]) for f in out.glob("b*.fa") for s, _ in read_fasta(f)}
+    assert sorted(block_of) == sorted(refs["seq_id"])
+    by_comp = refs.with_columns(block=pl.col("seq_id").replace_strict(block_of))
+    assert by_comp.group_by("component").agg(pl.col("block").n_unique())["block"].max() == 1
+
+    def names(path: Path) -> list[str]:
+        lines = gzip.decompress(path.read_bytes()).decode().splitlines()
+        return [line.split()[0].split("/")[0] for line in lines[::4]]  # /1, /2 dropped
+
+    # each block's mates in step; a pair in every block one of its k-mers hits, no other
+    params = json.loads((index_dir / "meta.json").read_text())["params"]
+    seqs = dict(read_fasta(tmp_path / "ref" / "ref.fa"))
+    kmers = {
+        b: set(hash_proteins([seqs[s].encode() for s, v in block_of.items() if v == b], 7)["hash"])
+        for b in set(block_of.values())
+    }
+    want: dict[int, list[str]] = {}
+    pairs = zip(*(names(p) for p in reads), strict=True)
+    raw = [gzip.decompress(p.read_bytes()).decode().splitlines()[1::4] for p in reads]
+    for (name, _), s1, s2 in zip(pairs, *raw, strict=True):
+        got = set(hash_dna([s1.encode(), s2.encode()], params["k"], frames="all")["hash"])
+        for b, ks in kmers.items():
+            if got & ks:
+                want.setdefault(b, []).append(name)
+    assert "@junk" not in sum(want.values(), [])
+    for b in kmers:
+        if b not in want:
+            assert not (out / f"b{b}_1.fq.gz").exists()
+            continue
+        assert names(out / f"b{b}_1.fq.gz") == names(out / f"b{b}_2.fq.gz") == want[b]
+    assert counts["routed_pairs"] == len(set(sum(want.values(), [])))
+    # --min-kmers: only pairs sharing that many distinct k-mers with a block; --k overrides
+    strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, min_kmers=40)
+    assert 0 < strict["routed_pairs"] < counts["routed_pairs"]
+    assert route(tmp_path / "ref", index_dir, reads, tmp_path / "k5", 300, k=5)["k"] == 5
+    # a k-mer held in two blocks sends its read to both
+    table = kmer_table([A.encode(), A.encode(), C.encode()], np.array([0, 1, 1]), 7, "protein")
+    first = hash_proteins([A[:7].encode()], 7)["hash"]
+    got = lookup(table, first, np.array([5], dtype=np.uint64))
+    assert sorted(got.rows()) == [(5, 0, 1), (5, 1, 1)]

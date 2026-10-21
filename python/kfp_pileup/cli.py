@@ -12,6 +12,7 @@ from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
 from kfp_pileup.reference import MAX_FDR, MAX_TARGETS, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
+from kfp_pileup.route import BLOCK_LETTERS, MIN_KMERS, route
 from kmer_functional_profiler.store import MEMBERS
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -53,6 +54,32 @@ def reference(
         profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours, max_targets
     )
     typer.echo(json.dumps(counts))
+
+
+@app.command(name="route")
+def route_command(
+    ref_dir: Annotated[Path, typer.Argument(help="Output of `reference` (amino acids)")],
+    index_dir: Annotated[Path, typer.Argument(help="The kfp index (its k and alphabet)")],
+    r1: Path,
+    r2: Path,
+    out_dir: Path,
+    block_letters: Annotated[
+        int, typer.Option(help="Residues per block of whole components")
+    ] = BLOCK_LETTERS,
+    k: Annotated[int, typer.Option(help="Routing k-mer length (0: the index's k)")] = 0,
+    min_kmers: Annotated[
+        int, typer.Option(help="Distinct k-mers a pair shares with a block to be sent there")
+    ] = MIN_KMERS,
+    genetic_code: int = 11,
+) -> None:
+    """Split the reference into blocks of components and each read pair to the blocks it
+    shares at least --min-kmers distinct k-mers with (other pairs dropped): b<i>.fa,
+    b<i>_1/2.fq.gz, letters.txt (DIAMOND's --dbsize), route.json; print counts."""
+    typer.echo(
+        json.dumps(
+            route(ref_dir, index_dir, (r1, r2), out_dir, block_letters, k, min_kmers, genetic_code)
+        )
+    )
 
 
 @app.command(name="call")

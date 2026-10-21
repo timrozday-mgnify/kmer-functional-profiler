@@ -18,9 +18,14 @@ Per sample:
    index's `targets.parquet`, or `--store` members tables, e.g. the partitioned build's MERGE
    output).
 3. The aligner the index's molecule calls for:
-   - amino-acid index: `DIAMOND` (`makedb`, then `blastx` per mate, every hit within
-     `--diamond_top` % of the read's best, frameshift-aware with `-F --frameshift` (0: off),
-     tabular with BTOP);
+   - amino-acid index: `ROUTE` (`kfp-pileup route`; `--route false` to skip) packs the
+     reference's components into blocks of about `--route_block_letters` residues and sends
+     each pair to every block it shares at least `--route_min_kmers` distinct k-mers with
+     (every k-mer of the reference at `--route_k`, 0 for the index's k; the reads in all six
+     frames); other pairs are dropped. `DIAMOND` then runs per block
+     on its pairs (`makedb`, then `blastx` per mate, e-values on the whole reference's size
+     with `--dbsize`, every hit within `--diamond_top` % of the read's best,
+     frameshift-aware with `-F --frameshift` (0: off), tabular with BTOP);
    - nucleotide index: `BWAMEM2` (`index`, then `mem -a`, SAM).
 4. `CALL`: `kfp-pileup call`: read posteriors (leave one column out), neighbour-best reads dropped, pileups,
    variants and per-unit identity; read assignment (steps 8-9); with DIAMOND, the reads
@@ -44,6 +49,7 @@ Outputs under `<outdir>/<sample>/`:
 | --- | --- |
 | `profile.tsv` | kfp's profile |
 | `ref/ref.fa`, `ref/refs.tsv` | the per-sample reference and its roles |
+| `route.json` | routing: pairs, pairs routed and dropped, blocks, reference residues and k-mers |
 | `pileup/assignments.parquet` | every alignment: read, mate, reference sequence, unit, role, score (bits), posterior, `kept` (best hit a target); steps 8-9's `em_posterior`, `em_novel` (the mate's novel-relative share), `em_flag` (best source differs with the prior) |
 | `pileup/pileup.parquet` | summed weights per (sequence, column, residue), with the part from sibling residues |
 | `pileup/variants.tsv` | columns with depth >= `--min_depth` and an alternative residue at >= `--min_freq`, with `sibling_share` |
@@ -65,7 +71,7 @@ step 6's check on a real sample: `aai` against the reads' alignment identity by 
 depth, length and cluster size, flagging step 6's rule.
 
 `trace.tsv` records each task's time: the aligner's against `QUERY`'s is step 3's rule (add
-a dense pre-filter if the aligner takes more than ~5x).
+routing if the aligner takes more than ~5x; routing is on by default).
 
 ```bash
 nextflow run workflows/pileup -profile docker --samples samples.csv --index idx/
