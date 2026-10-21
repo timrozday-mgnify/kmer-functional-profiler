@@ -19,7 +19,12 @@ def hash_dna(
     max_hash: int = ...,
 ) -> dict[str, NDArray[np.uint64] | NDArray[np.uint8]]: ...
 def hash_proteins(
-    seqs: Sequence[bytes], k: int, *, alphabet: str = "protein", max_hash: int = ...
+    seqs: Sequence[bytes],
+    k: int,
+    *,
+    alphabet: str = "protein",
+    max_hash: int = ...,
+    min_hash: int = 0,
 ) -> dict[str, NDArray[np.uint64]]: ...
 def distinct_kmers(
     seqs: Sequence[bytes],
@@ -60,6 +65,9 @@ def unit_hits(
     hashes: NDArray[np.uint64],
     reads: NDArray[np.uint64],
 ) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.uint8]]: ...
+def route_hits(
+    table: _Packed, reads: NDArray[np.uint64], hashes: NDArray[np.uint64]
+) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32]]: ...
 def gather(
     units: NDArray[np.uint32], hashes: NDArray[np.uint64], t_g: NDArray[np.float64]
 ) -> dict[str, NDArray[np.uint32] | NDArray[np.bool_]]: ...

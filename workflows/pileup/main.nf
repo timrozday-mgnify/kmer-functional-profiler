@@ -1,6 +1,7 @@
 // Read recruitment and crude pileups downstream of a kfp profile (plan, phase 13; the
 // nucleotide follow-up of phase 14, step 4). Per sample: kfp query -> per-sample reference
-// (kfp-pileup reference) -> DIAMOND blastx (amino-acid index, frameshift-aware) or bwa-mem2
+// (kfp-pileup reference) -> read routing by k-mers to blocks of the reference (kfp-pileup
+// route) -> DIAMOND blastx per block (amino-acid index, frameshift-aware) or bwa-mem2
 // mem (nucleotide index), chosen by the index's molecule -> read posteriors, pileups,
 // per-unit identity, read assignment and, for DIAMOND, the nucleotide pileup and consensus
 // (kfp-pileup call) -> the hand-off BAM (reads re-mapped to the consensus, or the bwa-mem2
@@ -76,6 +77,32 @@ process REFERENCE {
     "mkdir ref && echo protein > ref/molecule.txt && MOLECULE=protein"
 }
 
+process ROUTE {
+    tag "${sample}"
+    label 'process_single'
+    publishDir params.outdir, mode: 'copy', pattern: 'route*.{json,parquet}', saveAs: { "${sample}/${it}" }
+
+    input:
+    tuple val(sample), path(ref), path(r1), path(r2)
+    path meta, stageAs: 'index/meta.json'  // the index's k and alphabet
+    val opts
+    path code  // unused: staged so that -resume reruns routing when its code changes
+
+    output:
+    tuple val(sample), path('route'), path(r1), path(r2), emit: route
+    path 'route.json'  // pairs routed and dropped, blocks
+    path 'routes.parquet'  // every (pair, block) hit and its distinct k-mers
+
+    script:
+    """
+    ${params.kfp_pileup} route ${ref} index ${r1} ${r2} route ${opts}
+    cp route/route.json route/routes.parquet .
+    """
+
+    stub:
+    "mkdir route && echo 1 > route/letters.txt && echo {} > route.json && touch routes.parquet"
+}
+
 process DIAMOND {
     tag "${sample}"
     label 'process_medium'
@@ -89,14 +116,30 @@ process DIAMOND {
     tuple val(sample), val('diamond'), path('r1.tsv'), path('r2.tsv'), emit: alignments
 
     script:
-    // every hit within --top % of the read's best: the posteriors need the runners-up
+    // every hit within --top % of the read's best: the posteriors need the runners-up.
+    // Routed (ROUTE's letters.txt): each block's pairs against that block only, e-values
+    // on the whole reference's size; a pair in two blocks is sorted back to one run of
+    // lines per read (CALL reads a read's alignments as one run)
     """
-    diamond makedb --in ${ref}/ref.fa --db ref --threads ${task.cpus}
-    for m in 1 2; do
-        reads=\$([ \$m = 1 ] && echo ${r1} || echo ${r2})
-        diamond blastx --db ref.dmnd --query \$reads --out r\$m.tsv --threads ${task.cpus} \\
-            ${opts}
-    done
+    align() {  # fasta, mate 1, mate 2, extra options
+        diamond makedb --in \$1 --db ref --threads ${task.cpus}
+        diamond blastx --db ref.dmnd --query \$2 --threads ${task.cpus} ${opts} \$4 >> r1.tsv
+        diamond blastx --db ref.dmnd --query \$3 --threads ${task.cpus} ${opts} \$4 >> r2.tsv
+    }
+    : > r1.tsv
+    : > r2.tsv
+    if [ -e ${ref}/letters.txt ]; then
+        for q1 in ${ref}/b*_1.fa.gz; do
+            [ -e "\$q1" ] || continue
+            b=\${q1%_1.fa.gz}
+            align \$b.fa \$q1 \${b}_2.fa.gz "--dbsize \$(cat ${ref}/letters.txt)"
+        done
+        for m in 1 2; do
+            LC_ALL=C sort -s -t "\$(printf '\\t')" -k1,1 -o r\$m.tsv r\$m.tsv
+        done
+    else
+        align ${ref}/ref.fa ${r1} ${r2} ''
+    fi
     """
 
     stub:
@@ -398,6 +441,12 @@ process INSTRAIN {
     "mkdir instrain"
 }
 
+// A boolean param: Nextflow 26 keeps `--floria false` from the command line as the string
+// "false", which Groovy reads as true; a config's `false` stays a Boolean.
+def flag(value) {
+    value instanceof String ? value.toBoolean() : value as boolean
+}
+
 // Reusable by other pipelines (workflows/read-xref, spike-benchmark): reads (sample, r1, r2),
 // the index, the store's members tables (a list, possibly empty) and a file of units to
 // withhold from the reference (NO_WITHHOLD for none).
@@ -415,8 +464,8 @@ workflow PILEUP {
     def meta = index.map { it.resolve('meta.json') }
     // aai/ani optional (targets need neither): --aai only when asked for, or with theta
     def query_opts = [
-        params.query_stats ? '--stats stats.json' : '',
-        params.aai ? '--aai' : '',
+        flag(params.query_stats) ? '--stats stats.json' : '',
+        flag(params.aai) ? '--aai' : '',
         params.min_identity ? "--min-identity ${params.min_identity}" : '',
         params.query_args,
     ].findAll { it }.join(' ')
@@ -432,7 +481,13 @@ workflow PILEUP {
     }
     def frameshift = params.frameshift ? "-F ${params.frameshift} " : ''
     def diamond = "--outfmt 6 ${params.diamond_fields} --top ${params.diamond_top} ${frameshift}${params.diamond_args}"
-    def alignments = DIAMOND(to_align.protein, diamond).alignments
+    // routing (phase 13, step 3b's "Afterwards"): each pair against the reference blocks
+    // its k-mers hit, pairs with no hit dropped; amino-acid references only
+    def to_diamond = flag(params.route)
+        ? ROUTE(to_align.protein, meta, "--block-letters ${params.route_block_letters} --k ${params.route_k} --min-kmers ${params.route_min_kmers}",
+            file("${moduleDir}/../../python/kfp_pileup/route.py", checkIfExists: true)).route
+        : to_align.protein
+    def alignments = DIAMOND(to_diamond, diamond).alignments
         .map { sample, aligner, r1, r2 -> tuple(sample, aligner, [r1, r2]) }
         .mix(BWAMEM2(to_align.nucleotide, params.bwa_args).alignments)
     def ref_dirs = refs.map { sample, ref, molecule -> tuple(sample, ref) }
@@ -453,20 +508,20 @@ workflow PILEUP {
     def handoff = HANDOFF(to_handoff, "--min-posterior ${params.min_assign}",
         file("${moduleDir}/../../python/kfp_pileup/handoff.py", checkIfExists: true)).sam
     def bams = BAM(handoff).bam
-    if (params.cliquesnv) {
+    if (flag(params.cliquesnv)) {
         CLIQUESNV(handoff, params.cliquesnv_min_reads, params.cliquesnv_args)
     }
     def vcfs = FREEBAYES(bams, params.freebayes_args).vcf
-    if (params.lofreq) {
+    if (flag(params.lofreq)) {
         LOFREQ(bams, params.lofreq_args)
     }
     // consequences on the protein arm's consensus (a CDS by construction)
     CONSEQUENCES(vcfs.join(bams).join(protein)
         .map { s, vcf, tbi, bam, bai, fasta, fai, p -> tuple(s, vcf, tbi, fasta, fai, p.resolve('consensus.gff')) })
-    if (params.floria) {
+    if (flag(params.floria)) {
         FLORIA(bams.join(vcfs), params.floria_args)
     }
-    if (params.instrain) {
+    if (flag(params.instrain)) {
         def no_genes = file("${projectDir}/assets/NO_GENES")
         def genes = called.called.map { s, a, p ->
             tuple(s, a == 'diamond' ? p.resolve('consensus.genes.fna') : no_genes) }

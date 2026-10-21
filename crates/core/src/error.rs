@@ -16,6 +16,8 @@ pub enum Error {
     BloomSize(usize),
     #[error("mate files have different read counts")]
     MateCountMismatch,
+    #[error("read ids must be non-decreasing (each pair's hashes contiguous)")]
+    UnsortedReads,
     #[error("hashes and reads differ in length")]
     LengthMismatch,
     #[error("set value names unit {0}, beyond the unit table")]

@@ -81,7 +81,7 @@ impl PackedTable<'_> {
 
     /// Values of set `s`.
     #[inline]
-    fn values(&self, s: usize) -> impl Iterator<Item = u64> + '_ {
+    pub(crate) fn values(&self, s: usize) -> impl Iterator<Item = u64> + '_ {
         (self.set_offsets.get(s) as usize..self.set_offsets.get(s + 1) as usize)
             .map(|i| self.set_values.get(i))
     }
