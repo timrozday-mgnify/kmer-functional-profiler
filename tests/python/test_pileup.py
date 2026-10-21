@@ -392,7 +392,7 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
         reads[-1].write_bytes(gzip.compress(gzip.decompress(path.read_bytes()) + fake))
     # small blocks: several, each of whole components
     out = tmp_path / "route"
-    counts = route(tmp_path / "ref", index_dir, reads, out, block_letters=300)
+    counts = route(tmp_path / "ref", index_dir, reads, out, 300, k=0, min_kmers=1)
     assert counts["blocks"] > 1 and counts["dropped_pairs"] >= 1
     assert (out / "letters.txt").read_text() == f"{refs['length'].sum()}\n"
     block_of = {s: int(f.stem[1:]) for f in out.glob("b*.fa") for s, _ in read_fasta(f)}
@@ -436,12 +436,21 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     fa = gzip.decompress((out / f"b{first_block}_1.fa.gz").read_bytes()).decode().splitlines()
     assert fa[1] in gzip.decompress(reads[0].read_bytes()).decode()
     # --min-kmers: only pairs sharing that many distinct k-mers with a block; --k overrides
-    strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, min_kmers=40)
+    strict = route(tmp_path / "ref", index_dir, reads, tmp_path / "strict", 300, k=0, min_kmers=40)
     assert 0 < strict["routed_pairs"] < counts["routed_pairs"]
     assert hits.filter(pl.col("kmers") >= 40)["pair"].n_unique() == strict["routed_pairs"]
     assert route(tmp_path / "ref", index_dir, reads, tmp_path / "k5", 300, k=5)["k"] == 5
     # the table built in several hash ranges routes exactly as in one
-    parts = route(tmp_path / "ref", index_dir, reads, tmp_path / "parts", 300, part_kmers=500)
+    parts = route(
+        tmp_path / "ref",
+        index_dir,
+        reads,
+        tmp_path / "parts",
+        300,
+        k=0,
+        min_kmers=1,
+        part_kmers=500,
+    )
     assert parts == counts
     for f in sorted(out.glob("b*_1.fa.gz")):
         assert names(f) == names(tmp_path / "parts" / f.name)

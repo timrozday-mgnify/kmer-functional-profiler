@@ -54,7 +54,11 @@ BATCH_READS: Final = 100_000
 PART_KMERS: Final = 25_000_000  # reference residues per hash range of the table build
 FP_BITS: Final = 32  # fingerprint bits: false hits ~keys per bucket x 2^-32 per lookup
 HASH_MAX: Final = 2**64 - 1
-MIN_KMERS: Final = 1  # distinct k-mers a pair shares with a block to be sent there
+# route-sensitivity (2026-10-21): the cheapest setting keeping >= 0.99 of the pairs the
+# unrouted EM gives a unit, in every sample (spike-protein x 10, hadza10M); chance hits grow
+# as the reference's distinct k-mers over 20^k, so a much larger reference needs a larger k
+ROUTE_K: Final = 8
+MIN_KMERS: Final = 3  # distinct k-mers a pair shares with a block to be sent there
 LETTERS: Final = "letters.txt"
 ROUTE: Final = "route.json"
 ROUTES: Final = "routes.parquet"
@@ -150,7 +154,7 @@ def route(
     reads: Sequence[str | Path],
     out_dir: str | Path,
     block_letters: int = BLOCK_LETTERS,
-    k: int = 0,
+    k: int = ROUTE_K,
     min_kmers: int = MIN_KMERS,
     genetic_code: int = 11,
     batch_reads: int = BATCH_READS,

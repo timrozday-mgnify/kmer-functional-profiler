@@ -12,7 +12,7 @@ from kfp_pileup.handoff import MIN_POSTERIOR, handoff
 from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
 from kfp_pileup.reference import MAX_FDR, MAX_TARGETS, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
-from kfp_pileup.route import BLOCK_LETTERS, MIN_KMERS, route
+from kfp_pileup.route import BLOCK_LETTERS, MIN_KMERS, ROUTE_K, route
 from kmer_functional_profiler.store import MEMBERS
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -66,7 +66,7 @@ def route_command(
     block_letters: Annotated[
         int, typer.Option(help="Residues per block of whole components")
     ] = BLOCK_LETTERS,
-    k: Annotated[int, typer.Option(help="Routing k-mer length (0: the index's k)")] = 0,
+    k: Annotated[int, typer.Option(help="Routing k-mer length (0: the index's k)")] = ROUTE_K,
     min_kmers: Annotated[
         int, typer.Option(help="Distinct k-mers a pair shares with a block to be sent there")
     ] = MIN_KMERS,
