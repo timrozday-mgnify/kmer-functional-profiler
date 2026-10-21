@@ -6,7 +6,8 @@ with, not the whole of it:
 - the reference's components (``refs.tsv``) are packed, in order, into blocks of about
   ``block_letters`` residues; a component is never split, so a block holds whole components;
 - every k-mer of the reference (the index's alphabet; its k unless ``k`` is given;
-  unsampled) gives the blocks that hold it; the reads are hashed in all six frames (a
+  unsampled; ``route.fa``'s sequences when ``reference`` wrote more per unit for routing,
+  ``--route-members``) gives the blocks that hold it; the reads are hashed in all six frames (a
   frameshifted read keeps its k-mers on either side of the shift), and a pair goes to every
   block it shares at least ``min_kmers`` distinct k-mers with. A smaller ``k`` routes more
   distant relatives (more siblings, more homologues); a larger ``min_kmers`` fewer;
@@ -39,7 +40,7 @@ from typing import Final
 import numpy as np
 import polars as pl
 
-from kfp_pileup.reference import REF_FASTA, REFS
+from kfp_pileup.reference import REF_FASTA, REFS, ROUTE_FASTA, ROUTE_SEQS
 from kmer_functional_profiler import _core
 from kmer_functional_profiler.index import (
     PackedPart,
@@ -74,6 +75,23 @@ def blocks(refs: pl.DataFrame, block_letters: int) -> np.ndarray:
         block=(start // block_letters).rank("dense").cast(pl.Int64) - 1
     )  # dense: a component above block_letters skips no number
     return refs.join(comp, on="component", how="left", maintain_order="left")["block"].to_numpy()
+
+
+def routing_sequences(
+    ref: Path, refs: pl.DataFrame, sequences: dict[str, str], block: np.ndarray
+) -> tuple[list[bytes], np.ndarray]:
+    """The sequences routing hashes and each one's block: ``route.fa`` (``route_members``
+    per unit, from ``reference``) if there is one, else the reference's own, with blocks
+    by component, as the reference's."""
+    if not (ref / ROUTE_SEQS).exists():
+        return [sequences[s].encode() for s in refs["seq_id"]], block
+    of = dict(zip(refs["component"].to_list(), block.tolist(), strict=False))
+    more = pl.read_csv(ref / ROUTE_SEQS, separator="\t", infer_schema_length=None)
+    found = dict(read_fasta(ref / ROUTE_FASTA))
+    return (
+        [found[s].encode() for s in more["seq_id"]],
+        np.array([of[c] for c in more["component"].to_list()], dtype=np.int64),
+    )
 
 
 def kmer_table(
@@ -170,8 +188,8 @@ def route(
         raise ValueError("routing is for amino-acid references (DIAMOND); bwa-mem2 is not routed")
     refs = pl.read_csv(ref / REFS, separator="\t", infer_schema_length=None)
     sequences = dict(read_fasta(ref / REF_FASTA))
-    seqs = [sequences[s].encode() for s in refs["seq_id"]]
     block = blocks(refs, block_letters)
+    seqs, seq_block = routing_sequences(ref, refs, sequences, block)
     for b in np.unique(block):
         with open(out / f"b{b}.fa", "w") as fasta:
             fasta.writelines(
@@ -181,7 +199,7 @@ def route(
 
     k = k or params["k"]
     with tempfile.TemporaryDirectory(prefix=".table-", dir=out) as scratch:
-        table = kmer_table(seqs, block, k, params["alphabet"], Path(scratch), part_kmers)
+        table = kmer_table(seqs, seq_block, k, params["alphabet"], Path(scratch), part_kmers)
         rows, pairs = pair_hits(table, reads, k, params["alphabet"], genetic_code, batch_reads)
         n_kmers = len(table.fingerprints)
         del table  # its parts are memory-mapped from the scratch directory

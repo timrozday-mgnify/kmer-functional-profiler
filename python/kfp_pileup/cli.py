@@ -46,13 +46,18 @@ def reference(
         int,
         typer.Option(help="At most this many targets, the most hit first (0 = no cap)"),
     ] = MAX_TARGETS,
+    route_members: Annotated[
+        int,
+        typer.Option(help="Sequences per unit for routing's k-mers (0: --members)"),
+    ] = 0,
 ) -> None:
     """Write ref.fa (targets and component neighbours), refs.tsv and
     molecule.txt; print the sequences per role."""
     held = withhold.read_text().split() if withhold else ()
     counts = build_reference(
-        profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours, max_targets
-    )
+        profile, index_dir, out_dir, max_fdr, members, store or (), held, neighbours, max_targets,
+        route_members,
+    )  # fmt: skip
     typer.echo(json.dumps(counts))
 
 

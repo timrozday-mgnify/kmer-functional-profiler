@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +167,12 @@ def test_reference_from_a_fixture_profile(tmp_path: Path) -> None:
     assert list(fasta) == refs["seq_id"].to_list()
     target = refs.filter(pl.col("role") == "target").row(0, named=True)
     assert (tmp_path / "ref" / "molecule.txt").read_text() == "protein\n"
+    # routing's own sequences only when --route-members differs from --members
+    assert not (tmp_path / "ref" / "route.tsv").exists()
+    build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "rm", members=1, route_members=2)
+    assert pl.read_csv(tmp_path / "rm" / "route.tsv", separator="\t")["unit"].n_unique() == (
+        pl.read_csv(tmp_path / "rm" / "refs.tsv", separator="\t")["unit"].n_unique()
+    )
     # a withheld unit is in no role
     held = str(target["cluster_rep"])
     build_reference(tmp_path / "p.tsv", index_dir, tmp_path / "held", withhold=[held])
@@ -461,3 +468,17 @@ def test_route_blocks_and_pairs(tmp_path: Path) -> None:
     first = hash_proteins([A[:7].encode()], 7)["hash"]
     got = _core.route_hits(table, np.array([5, 5], dtype=np.uint64), np.repeat(first, 2))
     assert pl.DataFrame(got).sort("block").rows() == [(5, 0, 1), (5, 1, 1)]
+    # route.fa (--route-members): extra sequences route pairs to their unit's block; the
+    # junk pair (poly-A: poly-K and poly-F frames) hits only an added poly-K member of s0's unit
+    extra = tmp_path / "ref_more"
+    shutil.copytree(tmp_path / "ref", extra)
+    first_row = refs.row(0, named=True)
+    more = refs.with_columns(seq_id=pl.format("r{}", pl.int_range(pl.len())))
+    added = pl.DataFrame([{**first_row, "seq_id": "rx", "length": 30}]).cast(more.schema)
+    pl.concat([more, added]).write_csv(extra / "route.tsv", separator="\t")
+    with open(extra / "route.fa", "w") as f:
+        f.writelines(f">r{i}\n{seqs[s]}\n" for i, s in enumerate(refs["seq_id"]))
+        f.write(">rx\n" + "K" * 30 + "\n")
+    rerouted = route(extra, index_dir, reads, tmp_path / "more", 300, k=0, min_kmers=1)
+    assert rerouted["routed_pairs"] == counts["routed_pairs"] + 1
+    assert "junk" in names(tmp_path / "more" / f"b{block_of[first_row['seq_id']]}_1.fa.gz")
