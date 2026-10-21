@@ -24,6 +24,8 @@
 #                         sensitive_F15 DIAMOND on all hadza10M pairs (1.79 CPU-h)
 # and the log line "m3 vs m1": identity gained with 3 members.
 source ../common.sh
+# the venv's directory made absolute, not its python: realpath of .venv/bin/python follows the
+# symlink to the base interpreter, which has none of the venv's packages
 STD=../release-tiers/results-standard
 base=../pileup-cost/results-dmnd-sensitive_F15/hadza10M
 [[ -f $base/pileup/assignments.parquet ]] || { echo "no $base: run diamond-sensitivity first" >&2; exit 1; }
@@ -31,7 +33,7 @@ nextflow run main.nf -c ../site.config -resume \
     --ref "$base/ref" --profile "$base/profile.tsv" --index "$(realpath "$STD/index")" \
     --store "$(realpath "$STD")/members.bucket*.parquet" \
     --r1 ../pileup-cost/hadza10M_1.fastq.gz --r2 ../pileup-cost/hadza10M_2.fastq.gz \
-    --reads "${READS:-2000000}" --python "$(realpath "$REPO/.venv/bin/python")"
+    --reads "${READS:-2000000}" --python "$(realpath "$REPO/.venv")/bin/python"
 "$REPO/.venv/bin/python" dropped.py summarise --dropped results/dropped \
     --arm m1=results/m1 --arm m3=results/m3 --assignments "$base/pileup/assignments.parquet" \
     --trace results/trace.tsv --out summary.tsv
