@@ -55,8 +55,8 @@ PART_KMERS: Final = 25_000_000  # reference residues per hash range of the table
 FP_BITS: Final = 32  # fingerprint bits: false hits ~keys per bucket x 2^-32 per lookup
 HASH_MAX: Final = 2**64 - 1
 # route-sensitivity (2026-10-21): the cheapest setting keeping >= 0.99 of the pairs the
-# unrouted EM gives a unit, in every sample (spike-protein x 10, hadza10M); chance hits grow
-# as the reference's distinct k-mers over 20^k, so a much larger reference needs a larger k
+# unrouted EM gives a unit, in every sample (spike-protein x 10, hadza10M). min_kmers applies
+# per block, whose size is fixed, so chance hits per block do not grow with the reference
 ROUTE_K: Final = 8
 MIN_KMERS: Final = 3  # distinct k-mers a pair shares with a block to be sent there
 LETTERS: Final = "letters.txt"
