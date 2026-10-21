@@ -26,6 +26,14 @@ process INDEX {
     "mkdir index && echo {} > index/meta.json"
 }
 
+// kfp's query code, a QUERY input: without it -resume kept a profile from before a presence
+// change (pileup-cost's cached QUERY predates presence-fdr)
+def query_code() {
+    ['query', 'partition'].collect {
+        file("${moduleDir}/../../python/kmer_functional_profiler/${it}.py", checkIfExists: true)
+    }
+}
+
 process QUERY {
     tag "${sample}"
     label 'process_medium'
@@ -36,6 +44,7 @@ process QUERY {
     path index
     path meta, stageAs: 'index.meta.json'  // see PILEUP
     val opts  // e.g. '--stats stats.json' (query_stats), --aai, --min-identity and query_args
+    path code, stageAs: 'code/*'  // unused: staged so that -resume reruns the query when its code changes
 
     output:
     tuple val(sample), path('profile.tsv'), emit: profile
@@ -469,7 +478,7 @@ workflow PILEUP {
         params.min_identity ? "--min-identity ${params.min_identity}" : '',
         params.query_args,
     ].findAll { it }.join(' ')
-    def profiles = QUERY(reads, index, meta, query_opts).profile
+    def profiles = QUERY(reads, index, meta, query_opts, query_code()).profile
     def refs = REFERENCE(profiles, index, meta, store, withhold,
         "--max-fdr ${params.max_fdr} --max-targets ${params.max_targets} --neighbours ${params.neighbours} --members ${params.members} --route-members ${params.route_members}",
         file("${moduleDir}/../../python/kfp_pileup/reference.py", checkIfExists: true)).ref

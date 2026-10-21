@@ -6,7 +6,7 @@
 // README.md.
 
 include { PILEUP } from '../pileup/main.nf'
-include { QUERY as QUERY_AA } from '../pileup/main.nf'
+include { QUERY as QUERY_AA; query_code } from '../pileup/main.nf'
 
 process FAMILIES {
     label 'process_low'
@@ -208,7 +208,7 @@ workflow {
     def pileup = PILEUP(sim.reads, indexes.kfp.first(), channel.value([]), sibs.withhold.first())
     def aa = nucleotide && params.aa_arm
         ? QUERY_AA(sim.reads.map { s, r1, r2 -> tuple("${s}~aa", r1, r2) }, indexes.aa.first(),
-            indexes.aa.first().map { it.resolve('meta.json') }, params.query_args)
+            indexes.aa.first().map { it.resolve('meta.json') }, params.query_args, query_code())
             .profile.map { s, p -> tuple(s - '~aa', p) }
         : sim.reads.map { s, r1, r2 -> tuple(s, none('NO_AA')) }
     def kma = nucleotide && params.kma
