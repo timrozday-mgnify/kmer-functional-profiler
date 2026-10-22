@@ -81,6 +81,13 @@ cd kfp-ablations/zi-warm-query-cost && sbatch run.sh
 # Floria and inStrain, and DIAMOND's time without -F on the 10 M sample):
 for r in spike-protein spike-nucleotide; do (cd kfp-ablations/$r && sbatch run.sh); done
 cd kfp-ablations/pileup-cost && sbatch run.sh
+# presence-fdr's targets on hadza10M (needs pileup-cost's reads), then what routing drops
+# against them:
+cd kfp-ablations/pileup-fdr && sbatch run.sh
+cd kfp-ablations/route-dropped && BASE=../pileup-fdr/results/hadza10M OUT=results-fdr sbatch run.sh
+# query --background-share at full-index scale (spikes of the standard tier's own units in
+# hadza10M, plus unspiked and reversed-null samples; needs pileup-cost's reads):
+cd kfp-ablations/presence-calibration && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs

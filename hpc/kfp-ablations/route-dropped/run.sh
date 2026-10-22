@@ -28,13 +28,19 @@ source ../common.sh
 # override its params (python = '')
 [[ ! -f nextflow.config ]] || { echo "remove ./nextflow.config (stale; the workflow has its own)" >&2; exit 1; }
 STD=../release-tiers/results-standard
-base=../pileup-cost/results-dmnd-sensitive_F15/hadza10M
-[[ -f $base/pileup/assignments.parquet ]] || { echo "no $base: run diamond-sensitivity first" >&2; exit 1; }
-nextflow run "$WF/route-dropped" -c ../site.config -resume --outdir results \
+# BASE: the pileup run whose reference and profile are read (default step 3b's, before
+# presence-fdr); OUT: where this run's results go. presence-fdr's targets:
+#   BASE=../pileup-fdr/results/hadza10M OUT=results-fdr sbatch run.sh
+base=${BASE:-../pileup-cost/results-dmnd-sensitive_F15/hadza10M}
+out=${OUT:-results}
+[[ -f $base/pileup/assignments.parquet ]] || { echo "no $base/pileup/assignments.parquet: run that pileup first" >&2; exit 1; }
+# FULLREF fetched 7.95 M units at a ~285 GB peak, after four OOM kills at 128-256 GB
+printf "process { resourceLimits = [memory: 512.GB]; withName: 'FULLREF' { memory = { 320.GB * task.attempt } } }\n" > "fullref.config"
+nextflow run "$WF/route-dropped" -c ../site.config -c fullref.config -resume --outdir "$out" \
     --ref "$(realpath "$base/ref")" --profile "$(realpath "$base/profile.tsv")" \
     --index "$(realpath "$STD/index")" --store "$(realpath "$STD")/members.bucket*.parquet" \
     --r1 "$(realpath ../pileup-cost/hadza10M_1.fastq.gz)" \
     --r2 "$(realpath ../pileup-cost/hadza10M_2.fastq.gz)" --reads "${READS:-2000000}"
-"$REPO/.venv/bin/python" "$WF/route-dropped/dropped.py" summarise --dropped results/dropped \
-    --arm m1=results/m1 --arm m3=results/m3 --assignments "$base/pileup/assignments.parquet" \
-    --trace results/trace.tsv --out summary.tsv
+"$REPO/.venv/bin/python" "$WF/route-dropped/dropped.py" summarise --dropped "$out/dropped" \
+    --arm m1="$out/m1" --arm m3="$out/m3" --assignments "$base/pileup/assignments.parquet" \
+    --trace "$out/trace.tsv" --out "$out/summary.tsv"
