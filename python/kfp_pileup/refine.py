@@ -30,13 +30,18 @@ target columns are read one :mod:`kfp_pileup.spill` partition at a time for the 
 consensus updates and haplotypes, which are per sequence (plan, ``CALL``'s memory, option 5).
 """
 
+import multiprocessing
+import os
+from collections.abc import Callable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, as_completed, wait
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeVar
 
 import numpy as np
 import polars as pl
 
-from kfp_pileup.spill import Spill
+from kfp_pileup.spill import Spill, read_part
 from kmer_functional_profiler.query import Timer
 
 NOVEL: Final = 0.1  # least divergence of a novel relative: MGnify90's cluster radius
@@ -50,6 +55,14 @@ MIN_COVERED: Final = 10  # novel relatives: least covered columns
 MIN_ALT_READS: Final = 2.0  # haplotypes: least weight of a variable column's second residue
 EM_ITER, EM_TOL = 2000, 1e-8
 GAP: Final = ord("-")
+T = TypeVar("T")
+R = TypeVar("R")
+# step 9's task per spill partition (_haplotype_part) and its rows of haplotypes.tsv
+HapTask = tuple[
+    Path, pl.DataFrame, int, np.ndarray, np.ndarray, np.ndarray, float, float, float, float,
+    int, float,
+]  # fmt: skip
+HapRow = tuple[int, int, float, float, float, float, int, bool]
 
 
 def _em(
@@ -355,6 +368,142 @@ def _haplotypes(
     return best[1], best[2], best[3]
 
 
+def _haplotype_part(task: HapTask) -> tuple[list[HapRow], pl.DataFrame, list[pl.DataFrame]]:
+    """Step 9 on one spill partition: (haplotype rows of the sequences fitted, those of the
+    sequences with no variable column, reads' weight moved to novel haplotypes). ``task``:
+    the partition's file, its reads on targets (hit, seq, weight, d_unit), its first
+    sequence ``s0``, each of its sequences' offset into ``current``/``original`` (those
+    sequences' residues only, as partitions are runs of sequences) and the thresholds.
+    Runs in a worker process when ``refine`` has threads."""
+    path, on_part, s0, offs, current, original, min_depth, min_freq, error, eps, alpha, novel = task
+    cols, _ = read_part(path)
+    hap_rows: list[HapRow] = []
+    novel_hits: list[pl.DataFrame] = []
+    site_res = cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP).select(
+        "hit", "seq", "col", "residue"
+    )
+    pile = _pile(site_res, on_part)
+    columns = pile.group_by("seq", "col").agg(
+        depth=pl.col("weight").sum(),
+        second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
+    )
+    covered = columns.filter(pl.col("depth") >= min_depth)
+    at = covered["col"].to_numpy() + offs[covered["seq"].to_numpy() - s0]
+    covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
+    variable = covered.filter(
+        (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
+        | pl.col("updated")
+    )
+    # a sequence with no variable column has the original as its one haplotype, all its
+    # reads' weight and no divergence (updated columns are variable), so is never novel
+    var_seqs = variable["seq"].unique().implode()
+    plain = (
+        covered.filter(~pl.col("seq").is_in(var_seqs))
+        .group_by("seq")
+        .agg(covered=pl.len())
+        .join(
+            on_part.group_by("seq").agg(
+                reads=pl.col("weight").sum(),
+                wd=(pl.col("weight") * pl.col("d_unit").fill_null(0.0)).sum(),
+            ),
+            on="seq",
+        )
+        .select(
+            pl.col("seq").cast(pl.UInt32),
+            haplotype=pl.lit(0, pl.Int64),
+            share=pl.lit(1.0),
+            reads="reads",
+            divergence=pl.lit(0.0),
+            read_divergence=pl.when(pl.col("reads") > 0)
+            .then(pl.col("wd") / pl.col("reads") - error)
+            .otherwise(0.0),
+            covered=pl.col("covered").cast(pl.Int64),
+            novel=pl.lit(False),
+        )
+    )
+    var_by_seq = variable.partition_by("seq", as_dict=True)
+    reads_by_seq = on_part.select("hit", "seq", "weight", "d_unit").partition_by(
+        "seq", as_dict=True
+    )
+    sites_by_seq = site_res.partition_by("seq", as_dict=True)
+    for (seq,), cov in covered.filter(pl.col("seq").is_in(var_seqs)).group_by("seq"):
+        off = int(offs[seq - s0])
+        cov_cols = np.sort(cov["col"].to_numpy())
+        var = var_by_seq.get((seq,))
+        var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
+        reads_w = reads_by_seq[(seq,)].select("hit", "weight", "d_unit")
+        x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
+        if len(var_cols):
+            obs = (
+                sites_by_seq[(seq,)]
+                .filter(pl.col("col").is_in(var_cols.tolist()))
+                .join(reads_w.with_row_index("i"), on="hit")
+            )
+            x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
+                "residue"
+            ].to_numpy()
+        cons = current[off + var_cols]
+        w = reads_w["weight"].to_numpy()
+        haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
+        is_novel = np.zeros(len(haps), bool)
+        d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
+        for k, hap in enumerate(haps):
+            full = current[off + cov_cols].copy()
+            full[np.searchsorted(cov_cols, var_cols)] = hap
+            div = float((full != original[off + cov_cols]).mean())
+            mass = float(w @ resp[:, k])
+            # its reads against the unit's nearest sequence, sequencing error removed
+            read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
+            is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
+            hap_rows.append(
+                (
+                    int(seq),
+                    k,
+                    float(eta[k]),
+                    mass,
+                    div,
+                    read_div,
+                    len(cov_cols),
+                    is_novel[k],
+                )
+            )
+        if is_novel.any():
+            novel_hits.append(reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1))))
+    return hap_rows, plain, novel_hits
+
+
+@contextmanager
+def _environ(**values: str) -> Iterator[None]:
+    old = {k: os.environ.get(k) for k in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _in_workers(fn: Callable[[T], R], tasks: Iterator[T], threads: int) -> Iterator[R]:
+    """``fn`` over ``tasks``, in ``threads`` spawned processes (one polars thread each) with
+    at most two tasks per process queued, so the tasks' data is not all pickled at once;
+    results in completion order. In this process when ``threads`` <= 1."""
+    if threads <= 1:
+        yield from map(fn, tasks)
+        return
+    ctx = multiprocessing.get_context("spawn")  # polars' thread pool does not survive fork
+    with _environ(POLARS_MAX_THREADS="1"), ProcessPoolExecutor(threads, mp_context=ctx) as pool:
+        pending: set[Future[R]] = set()
+        for task in tasks:
+            pending.add(pool.submit(fn, task))
+            if len(pending) >= 2 * threads:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                yield from (f.result() for f in done)
+        yield from (f.result() for f in as_completed(pending))
+
+
 def refine(
     hits: pl.DataFrame,
     spill: Spill,
@@ -367,13 +516,15 @@ def refine(
     min_freq: float,
     novel: float = NOVEL,
     timer: Timer | None = None,
+    threads: int = 1,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Steps 8-9 on the crude pass's alignments (``hits``: assignments with hit ids, spans,
     ``qlen`` and ``mism``; ``spill``: their target columns by sequence partition). Writes
     ``sources.tsv`` and ``haplotypes.tsv``; returns per alignment
     (hit, em_posterior, em_novel, em_flag) and per unit (em_pairs, em_abundance,
     em_divergence). With ``timer``, its parts are timed as ``refine_*`` stages and the EM's
-    fits, steps and the haplotype fits counted."""
+    fits, steps and the haplotype fits counted. ``threads`` > 1 fits the haplotypes of that
+    many spill partitions at a time, in worker processes."""
     timer = timer or Timer()
     alpha = 20 if protein else 4
     error = ERROR
@@ -483,101 +634,26 @@ def refine(
             .items()
         }
         del part
-        hap_rows, hap_plain, novel_hits = [], [], []
-        for p, cols, _ in spill.parts():
-            site_res = cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP).select(
-                "hit", "seq", "col", "residue"
-            )
-            on_part = reads_by_part.get((p,), on_targets.clear())
-            pile = _pile(site_res, on_part)
-            columns = pile.group_by("seq", "col").agg(
-                depth=pl.col("weight").sum(),
-                second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
-            )
-            covered = columns.filter(pl.col("depth") >= min_depth).with_columns(g=position)
-            at = covered["g"].to_numpy()
-            covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
-            variable = covered.filter(
-                (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
-                | pl.col("updated")
-            )
-            # a sequence with no variable column has the original as its one haplotype, all its
-            # reads' weight and no divergence (updated columns are variable), so is never novel
-            var_seqs = variable["seq"].unique().implode()
-            hap_plain.append(
-                covered.filter(~pl.col("seq").is_in(var_seqs))
-                .group_by("seq")
-                .agg(covered=pl.len())
-                .join(
-                    on_part.group_by("seq").agg(
-                        reads=pl.col("weight").sum(),
-                        wd=(pl.col("weight") * pl.col("d_unit").fill_null(0.0)).sum(),
-                    ),
-                    on="seq",
-                )
-                .select(
-                    pl.col("seq").cast(pl.UInt32),
-                    haplotype=pl.lit(0, pl.Int64),
-                    share=pl.lit(1.0),
-                    reads="reads",
-                    divergence=pl.lit(0.0),
-                    read_divergence=pl.when(pl.col("reads") > 0)
-                    .then(pl.col("wd") / pl.col("reads") - error)
-                    .otherwise(0.0),
-                    covered=pl.col("covered").cast(pl.Int64),
-                    novel=pl.lit(False),
-                )
-            )
-            var_by_seq = variable.partition_by("seq", as_dict=True)
-            reads_by_seq = on_part.select("hit", "seq", "weight", "d_unit").partition_by(
-                "seq", as_dict=True
-            )
-            sites_by_seq = site_res.partition_by("seq", as_dict=True)
-            for (seq,), cov in covered.filter(pl.col("seq").is_in(var_seqs)).group_by("seq"):
-                off = int(offsets[seq])
-                cov_cols = np.sort(cov["col"].to_numpy())
-                var = var_by_seq.get((seq,))
-                var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
-                reads_w = reads_by_seq[(seq,)].select("hit", "weight", "d_unit")
-                x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
-                if len(var_cols):
-                    obs = (
-                        sites_by_seq[(seq,)]
-                        .filter(pl.col("col").is_in(var_cols.tolist()))
-                        .join(reads_w.with_row_index("i"), on="hit")
-                    )
-                    x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
-                        "residue"
-                    ].to_numpy()
-                cons = current[off + var_cols]
-                w = reads_w["weight"].to_numpy()
-                haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
-                is_novel = np.zeros(len(haps), bool)
-                d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
-                for k, hap in enumerate(haps):
-                    full = current[off + cov_cols].copy()
-                    full[np.searchsorted(cov_cols, var_cols)] = hap
-                    div = float((full != original[off + cov_cols]).mean())
-                    mass = float(w @ resp[:, k])
-                    # its reads against the unit's nearest sequence, sequencing error removed
-                    read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
-                    is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
-                    hap_rows.append(
-                        (
-                            int(seq),
-                            k,
-                            float(eta[k]),
-                            mass,
-                            div,
-                            read_div,
-                            len(cov_cols),
-                            is_novel[k],
-                        )
-                    )
-                if is_novel.any():
-                    novel_hits.append(
-                        reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1)))
-                    )
+        part_files = spill.part_files()
+
+        def tasks() -> Iterator[HapTask]:
+            for p, path in part_files:
+                seqs = np.flatnonzero(spill.part_of == p)  # a run of sequences
+                s0, s1 = int(seqs[0]), int(seqs[-1])
+                lo, hi = int(offsets[s0]), int(offsets[s1 + 1])
+                yield (
+                    path, reads_by_part.get((p,), on_targets.clear()), s0,
+                    offsets[s0 : s1 + 1] - lo, current[lo:hi], original[lo:hi],
+                    min_depth, min_freq, error, eps, alpha, novel,
+                )  # fmt: skip
+
+        hap_rows: list[HapRow] = []
+        hap_plain: list[pl.DataFrame] = []
+        novel_hits: list[pl.DataFrame] = []
+        for rows, plain, gone in _in_workers(_haplotype_part, tasks(), threads):
+            hap_rows += rows
+            hap_plain.append(plain)
+            novel_hits += gone
         fitted = pl.DataFrame(
             hap_rows,
             schema={

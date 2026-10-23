@@ -67,13 +67,22 @@ class Spill:
     def _path(self, p: int) -> Path:
         return self.root / f"part{p:04d}.parquet"
 
+    def part_files(self) -> list[tuple[int, Path]]:
+        """(partition, file) of each written partition, in order."""
+        return [(p, self._path(p)) for p in sorted(self._writers)]
+
     def parts(self) -> Iterator[tuple[int, pl.DataFrame, pl.DataFrame]]:
-        """(partition, columns: hit, seq, col, qpos, residue; events: hit, seq, col, kind,
-        qpos) of each written partition in turn."""
-        for p in sorted(self._writers):
-            rows = pl.read_parquet(self._path(p))
-            yield (
-                p,
-                rows.filter(pl.col("kind") == 0).drop("kind"),
-                rows.filter(pl.col("kind") != 0).select("hit", "seq", "col", "kind", "qpos"),
-            )
+        """(partition, columns, events) (:func:`read_part`) of each written partition in
+        turn."""
+        for p, path in self.part_files():
+            yield (p, *read_part(path))
+
+
+def read_part(path: Path) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """A partition's columns (hit, seq, col, qpos, residue) and events (hit, seq, col, kind,
+    qpos)."""
+    rows = pl.read_parquet(path)
+    return (
+        rows.filter(pl.col("kind") == 0).drop("kind"),
+        rows.filter(pl.col("kind") != 0).select("hit", "seq", "col", "kind", "qpos"),
+    )

@@ -199,7 +199,7 @@ process CALL {
     def reads = aligner == 'diamond' ? "--reads ${r1} --reads ${r2}" : ''
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} ${reads} --stats call_stats.json ${opts}
+        --profile ${profile} ${reads} --stats call_stats.json --threads ${task.cpus} ${opts}
     """
 
     stub:

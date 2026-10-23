@@ -488,6 +488,7 @@ def call(
     reads: Sequence[str | Path] = (),
     stats: str | Path | None = None,
     spill_parts: int = PARTS,
+    threads: int = 1,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
@@ -495,7 +496,8 @@ def call(
     ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
     outputs (steps 8-9); with DIAMOND alignments and the ``reads`` (FASTQ, in mate order),
     :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). With ``stats``, each
-    stage's time and memory go there as the query's (``Timer``). Returns counts.
+    stage's time and memory go there as the query's (``Timer``); ``threads`` worker
+    processes fit step 9's haplotypes. Returns counts.
 
     Target columns and events are spilled to Parquet by reference sequence in a temporary
     directory under ``out_dir`` (:mod:`kfp_pileup.spill`), so steps 6b and 8-9 hold one
@@ -524,7 +526,7 @@ def call(
             with timer("refine"):
                 refined, em_units = refine(
                     hits, spill, refs, sequences, out, aligner == "diamond", prof,
-                    min_depth, min_freq, novel, timer,
+                    min_depth, min_freq, novel, timer, threads,
                 )  # fmt: skip
             hits = hits.join(refined, on="hit", how="left")
         nt_counts = {}

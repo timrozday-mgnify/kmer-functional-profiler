@@ -33,7 +33,7 @@ process {
     withName: 'PILEUP:REFERENCE' { memory = { 128.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:ROUTE' { cpus = 8; memory = { 64.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:DIAMOND' { cpus = 32; memory = { 128.GB * task.attempt }; time = { 72.h * task.attempt } }
-    withName: 'PILEUP:CALL' { memory = { 256.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: 'PILEUP:CALL' { cpus = 16; memory = { 256.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:MAP_CONSENSUS' { cpus = 16; memory = { 32.GB * task.attempt }; time = { 24.h * task.attempt } }
     withName: 'PILEUP:(HANDOFF|BAM|FREEBAYES|CONSEQUENCES)' { memory = { 16.GB * task.attempt }; time = { 48.h * task.attempt } }
     withName: 'PILEUP:(FLORIA|INSTRAIN|CLIQUESNV)' { cpus = 16; memory = { 64.GB * task.attempt }; time = { 48.h * task.attempt } }
