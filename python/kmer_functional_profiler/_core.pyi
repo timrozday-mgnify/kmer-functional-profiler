@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from os import PathLike
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -101,3 +101,7 @@ class FastxHits:
     def n_reads(self) -> int: ...
     @property
     def base_stats(self) -> dict[str, float]: ...
+
+class DiamondReader:
+    def __init__(self, names: Sequence[bytes], seqs: Sequence[bytes]) -> None: ...
+    def parse(self, buf: bytes, batch_reads: int, eof: bool) -> tuple[dict[str, Any], int]: ...

@@ -6,6 +6,7 @@
 mod alphabet;
 mod bloom;
 mod components;
+mod diamond;
 mod distinct;
 mod error;
 mod fastx;
@@ -18,6 +19,7 @@ mod translate;
 pub use alphabet::Alphabet;
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use components::components;
+pub use diamond::{DiamondBatch, DiamondRefs};
 pub use distinct::Distinct;
 pub use error::Error;
 pub use fastx::{BaseStats, FastxHits};
