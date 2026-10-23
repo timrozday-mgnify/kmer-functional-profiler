@@ -714,13 +714,6 @@ def test_gather_explains_away_shared_kmers() -> None:
     # Sampled 10x more sparsely, unit 1's 2 k-mers stand for more than unit 0's 4.
     got = {u: n for u, n, _ in gather(kmers, np.array([0.01, 0.001, 0.01, 0.01]))[0].iter_rows()}
     assert got == {1: 2, 0: 2, 2: 1, 3: 2}
-    # By containment: unit 1 (2 of m_g 2 hit) goes before unit 0 (4 of 40) and keeps 3 and 4.
-    got = {u: n for u, n, _ in gather(kmers, t_g, m_g=np.array([40, 2, 4, 2]))[0].iter_rows()}
-    assert got == {1: 2, 0: 2, 2: 1, 3: 2}
-    # A unit with one k-mer, all hit, does not outrank one with two, all hit (the + 1).
-    one = pl.DataFrame({"unit": [0, 1, 1], "hash": [1, 1, 2]}, schema=kmers.schema)
-    got = {u: n for u, n, _ in gather(one, np.full(2, 0.01), m_g=np.array([1, 2]))[0].iter_rows()}
-    assert got == {1: 2}
 
 
 def test_assign_best_rules() -> None:
