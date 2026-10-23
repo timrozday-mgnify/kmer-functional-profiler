@@ -103,8 +103,15 @@ def mutate(seq: str, identity: float, rng: random.Random, alphabet: str) -> str:
     return "".join(out)
 
 
+SENSE: Final = [c for c, t in zip(CODONS, CODE_11, strict=True) if t != "*"]
+
+
 def back_translate(protein: str, rng: random.Random) -> str:
-    return "".join(rng.choice(SYNONYMS[aa]) for aa in protein) + rng.choice(SYNONYMS["*"])
+    """A CDS for the protein; a residue outside the 20 (X, B, Z, J, U, O in real units) takes
+    any sense codon."""
+    return "".join(rng.choice(SYNONYMS.get(aa, SENSE)) for aa in protein) + rng.choice(
+        SYNONYMS["*"]
+    )
 
 
 def translate(cds: str) -> str:

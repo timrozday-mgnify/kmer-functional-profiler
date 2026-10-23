@@ -70,3 +70,15 @@ def test_reverse_reverses_sequence_and_quality(tmp_path: Path) -> None:
     )
     with gzip.open(tmp_path / "n1.fq.gz", "rt") as f:
         assert f.read() == "@a\nTGCA\n+\nKJII\n"
+
+
+def test_back_translate_takes_ambiguous_residues() -> None:
+    import random
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "workflows" / "spike-benchmark"))
+    import spike
+
+    cds = spike.back_translate("MXBZJUOK", random.Random(0))
+    protein = spike.translate(cds)  # final stop dropped, internal stops as X
+    assert len(cds) == 27 and cds[-3:] in spike.SYNONYMS["*"]
+    assert protein[0] == "M" and protein[-1] == "K" and "X" not in protein
