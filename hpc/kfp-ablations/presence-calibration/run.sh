@@ -30,8 +30,8 @@
 # (PICK changed, so results-aai is not comparable). Read recall_gathered, recall, false_share
 # and false_share_unrelated per share between the two.
 source ../common.sh
-STD=../release-tiers/results-standard
-[[ -f $STD/index/meta.json ]] || { echo 'release-tiers has not finished (no results-standard/index)' >&2; exit 1; }
+STD=../release-tiers/results-${TIER:-standard}  # TIER=slim|standard|large, e.g. OUT=results-large AAI=true TIER=large
+[[ -f $STD/index/meta.json ]] || { echo "release-tiers has not finished (no $STD/index)" >&2; exit 1; }
 [[ -s ../pileup-cost/hadza10M_1.fastq.gz ]] || { echo 'no ../pileup-cost/hadza10M_*.fastq.gz: run pileup-cost first' >&2; exit 1; }
 nextflow run "$WF/presence-calibration" -c ../site.config -resume --outdir "${OUT:-results}" \
     --aai "${AAI:-false}" --gather "${GATHER:-greedy}" \
