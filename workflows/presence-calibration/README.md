@@ -8,14 +8,15 @@ index's own units in a real background, with two negatives of known truth.
 ```text
 PICK      calibrate.py pick: --units units drawn uniformly from the index (representative
           200-600 aa), --members sequences each from the store; units.tsv (n_members, m_g,
-          uniq: the mean share of a unit's sampled k-mers it holds alone)
+          uniq: pin_sum / m_g, the mean share of a unit's members holding each sampled
+          k-mer, 1 for a singleton; not whether other units hold them)
 SIMULATE  spike-benchmark's spike.py simulate: every picked unit carries a strain (a member
           at --identities), lognormal depth (~0.05-20x), appended to --background;
           truth.tsv (each strain's unit, member, identity, pairs, depth) published per seed
 REVERSE   calibrate.py reverse: the background reversed, a null sample (no coding homology)
 QUERY     every sample (spiked seeds, unspiked background, null) at every --shares value
 SCORE     calibrate.py score: per spiked sample, share and q (0.01, 0.05, 0.1): recall (by
-          depth, identity, uniqueness), new_false (called here, not unspiked, not spiked),
+          depth, identity, uniq), new_false (called here, not unspiked, not spiked),
           new_relative (in a spiked unit's component), false_share(_unrelated),
           null_called, unspiked_called; before presence: recall_hit1, recall_hit2,
           recall_gathered (hit-level: with --aai true, which lists every hit unit),
