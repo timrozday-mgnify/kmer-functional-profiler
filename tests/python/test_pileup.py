@@ -82,7 +82,11 @@ def test_posteriors_neighbours_and_sibling_residues(protein_refs: Path, tmp_path
     profile.write_text("unit\tother\taai\tcoverage_zi\n0\tx\t0.97\t2.0\n9\ty\t0.5\t1.0\n")
     stats = tmp_path / "stats.json"
     call([hits], protein_refs, tmp_path / "out", "diamond", profile, 0.5, 0.1, stats=stats)
-    assert set(json.loads(stats.read_text())["stages"]) == {"read", "batches", "refine", "write"}
+    timed = json.loads(stats.read_text())
+    assert set(timed["stages"]) == {"read", "batches", "refine", "write"} | {
+        f"refine_{part}" for part in ("model", "em", "consensus", "haplotypes")
+    }
+    assert timed["counts"]["refine_em_fits"] >= 3 and timed["counts"]["refine_em_steps"] > 0
     assigned = pl.read_parquet(tmp_path / "out" / "assignments.parquet")
     kept = assigned.filter("kept").group_by("read_name").len()
     assert sorted(kept["read_name"]) == ["r1", "r3", "r4"]

@@ -524,7 +524,7 @@ def call(
             with timer("refine"):
                 refined, em_units = refine(
                     hits, spill, refs, sequences, out, aligner == "diamond", prof,
-                    min_depth, min_freq, novel,
+                    min_depth, min_freq, novel, timer,
                 )  # fmt: skip
             hits = hits.join(refined, on="hit", how="left")
         nt_counts = {}

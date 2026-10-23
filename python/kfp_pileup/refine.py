@@ -37,6 +37,7 @@ import numpy as np
 import polars as pl
 
 from kfp_pileup.spill import Spill
+from kmer_functional_profiler.query import Timer
 
 NOVEL: Final = 0.1  # least divergence of a novel relative: MGnify90's cluster radius
 PRIOR_PAIRS: Final = 2.0  # weak Dirichlet: pseudo-pairs per component from coverage_zi
@@ -62,15 +63,23 @@ def _em(
     lo: np.ndarray,
     hi: np.ndarray,
     alpha: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Responsibilities (per row; rows sorted by pair), pairs per source and divergences.
-    ponytail: plain EM; SQUAREM (as kfp's) if iterations dominate at scale."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Responsibilities (per row; rows sorted by pair), pairs per source, divergences and
+    the EM steps taken.
+
+    Steps are accelerated by SQUAREM (Varadhan & Roland 2008, SqS3, as kfp's
+    ``query._squarem``): two EM steps, a squared extrapolation along them and an EM step
+    from there. Extrapolated shares are kept above 1e-3 x the second step's (EM is
+    multiplicative; a share at 0, such as a novel class started at 0, stays there) and
+    divergences inside [``lo``, ``hi``]; a cycle whose residual grows falls back to its two
+    plain steps. Stops when the shares change by less than ``EM_TOL`` in one EM step.
+    ponytail: one step length for all sources; per component (as kfp's) if cycles stay many.
+    """
     starts = np.flatnonzero(np.r_[True, pair[1:] != pair[:-1]])
     sizes = np.diff(np.r_[starts, len(pair)])
     n_src = len(init)
-    pi, d = init / init.sum(), np.clip(np.sqrt(lo * hi), lo, hi)
-    r = np.zeros(len(pair))
-    for _ in range(EM_ITER):
+
+    def step(pi: np.ndarray, d: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         ll = (
             np.log(np.maximum(pi[src], 1e-300))
             + diffs * np.log(d[src] / (alpha - 1))
@@ -82,12 +91,34 @@ def _em(
         n = np.bincount(src, r, n_src)
         new = (n + prior) / (n + prior).sum()
         dm, dn = np.bincount(src, r * diffs, n_src), np.bincount(src, r * (diffs + match), n_src)
-        d = np.clip(np.divide(dm, dn, out=d.copy(), where=dn > 0), lo, hi)
-        done = np.abs(new - pi).max() < EM_TOL
-        pi = new
-        if done:
-            break
-    return r, np.bincount(src, r, n_src), d
+        return new, np.clip(np.divide(dm, dn, out=d.copy(), where=dn > 0), lo, hi), r
+
+    pi, d = init / init.sum(), np.clip(np.sqrt(lo * hi), lo, hi)
+    step_max, steps = 1.0, 0
+    while steps < EM_ITER:
+        p1, d1, r = step(pi, d)
+        if np.abs(p1 - pi).max() < EM_TOL:  # as plain EM: r at pi, d one step on
+            return r, np.bincount(src, r, n_src), d1, steps + 1
+        p2, d2, r2 = step(p1, d1)
+        rp, rd = p1 - pi, d1 - d
+        vp, vd = p2 - p1 - rp, d2 - d1 - rd
+        rr, vv = float((rp**2).sum() + (rd**2).sum()), float((vp**2).sum() + (vd**2).sum())
+        a = max(-np.sqrt(rr / vv), -step_max) if vv > 0 else -1.0
+        a = min(a, -1.0)
+        if a <= -step_max:
+            step_max *= 4
+        px = np.maximum(pi - 2 * a * rp + a * a * vp, 1e-3 * p2)
+        px /= px.sum()
+        dx = np.clip(d - 2 * a * rd + a * a * vd, lo, hi)
+        p3, d3, r3 = step(px, dx)
+        steps += 3
+        if float(((p3 - px) ** 2).sum() + ((d3 - dx) ** 2).sum()) > rr:
+            step_max = 1.0
+            pi, d = p2, d2  # the two plain steps
+        else:
+            pi, d = p3, d3
+    _, d, r = step(pi, d)  # at the step cap
+    return r, np.bincount(src, r, n_src), d, steps + 1
 
 
 class _Model:
@@ -103,6 +134,7 @@ class _Model:
         novel: float,
     ) -> None:
         self.alpha = 20 if protein else 4
+        self.fits, self.steps = 0, 0  # EM fits run and their steps, for the stats
         nt = 3 if protein else 1
         h = (
             hits.select(
@@ -200,7 +232,7 @@ class _Model:
         init = self.init.copy()
         if not novel:
             init[self.n_u :] = 0.0
-        r, n, d = _em(
+        r, n, d, steps = _em(
             c["pair"].to_numpy(),
             c["src"].to_numpy(),
             c["diffs"].to_numpy().astype(float),
@@ -212,6 +244,7 @@ class _Model:
             self.hi,
             self.alpha,
         )
+        self.fits, self.steps = self.fits + 1, self.steps + steps
         return c.select("pair", "src").with_columns(r=pl.Series(r)), n, d
 
     def rescore(self, hits: pl.DataFrame) -> None:
@@ -333,17 +366,21 @@ def refine(
     min_depth: float,
     min_freq: float,
     novel: float = NOVEL,
+    timer: Timer | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Steps 8-9 on the crude pass's alignments (``hits``: assignments with hit ids, spans,
     ``qlen`` and ``mism``; ``spill``: their target columns by sequence partition). Writes
     ``sources.tsv`` and ``haplotypes.tsv``; returns per alignment
     (hit, em_posterior, em_novel, em_flag) and per unit (em_pairs, em_abundance,
-    em_divergence)."""
+    em_divergence). With ``timer``, its parts are timed as ``refine_*`` stages and the EM's
+    fits, steps and the haplotype fits counted."""
+    timer = timer or Timer()
     alpha = 20 if protein else 4
     error = ERROR
 
     # step 8: the joint EM; step 9: consensus updates and re-scoring between fits
-    em = _Model(hits, refs, prof, protein, error, novel)
+    with timer("refine_model"):
+        em = _Model(hits, refs, prof, protein, error, novel)
     offsets = np.cumsum([0, *refs["length"].to_list()])
     original = np.frombuffer("".join(sequences[s] for s in refs["seq_id"]).encode(), np.uint8)
     current = original.copy()
@@ -356,176 +393,229 @@ def refine(
     for _ in range(ROUNDS):
         # without the novel class: a strain's reads must reach its consensus before the
         # final fit and the haplotypes judge novelty against the original sequence
-        fit, _, _ = em.fit(prior=False, novel=False)
-        weights = em.hit_weights(fit).filter(pl.col("src") < em.n_u)
-        before = current.copy()
-        moved = np.zeros(hits.height, np.int64)
-        changed = 0
-        for _, cols, _ in spill.parts():  # a partition's sequences: its columns are all here
-            pile = _pile(
-                cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP), weights
-            ).with_columns(g=position)
-            pile = pile.with_columns(orig=pl.Series(original[pile["g"].to_numpy()]))
-            # a new majority, where the original residue has lost its support (not where a
-            # misplaced relative outnumbers the unit's own strain)
-            top = (
-                pile.group_by("seq", "col", "g")
-                .agg(
-                    consensus=pl.col("residue")
-                    .sort_by("weight", "residue", descending=[True, False])
-                    .first(),
-                    freq=pl.col("weight").max() / pl.col("weight").sum(),
-                    depth=pl.col("weight").sum(),
-                    orig_weight=pl.col("weight").filter(pl.col("residue") == pl.col("orig")).sum(),
+        with timer("refine_em"):
+            fit, _, _ = em.fit(prior=False, novel=False)
+            weights = em.hit_weights(fit).filter(pl.col("src") < em.n_u)
+        with timer("refine_consensus"):
+            before = current.copy()
+            moved = np.zeros(hits.height, np.int64)
+            changed = 0
+            for _, cols, _ in spill.parts():  # a partition's sequences: its columns are all here
+                pile = _pile(
+                    cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP), weights
+                ).with_columns(g=position)
+                pile = pile.with_columns(orig=pl.Series(original[pile["g"].to_numpy()]))
+                # a new majority, where the original residue has lost its support (not where a
+                # misplaced relative outnumbers the unit's own strain)
+                top = (
+                    pile.group_by("seq", "col", "g")
+                    .agg(
+                        consensus=pl.col("residue")
+                        .sort_by("weight", "residue", descending=[True, False])
+                        .first(),
+                        freq=pl.col("weight").max() / pl.col("weight").sum(),
+                        depth=pl.col("weight").sum(),
+                        orig_weight=pl.col("weight")
+                        .filter(pl.col("residue") == pl.col("orig"))
+                        .sum(),
+                    )
+                    .filter(
+                        pl.col("depth") >= min_depth,
+                        pl.col("freq") > 0.5,
+                        pl.col("orig_weight")
+                        < pl.max_horizontal(MIN_ALT_READS, min_freq * pl.col("depth")),
+                    )
                 )
-                .filter(
-                    pl.col("depth") >= min_depth,
-                    pl.col("freq") > 0.5,
-                    pl.col("orig_weight")
-                    < pl.max_horizontal(MIN_ALT_READS, min_freq * pl.col("depth")),
+                at = top["g"].to_numpy()
+                change = top["consensus"].to_numpy() != current[at]
+                if not change.any():
+                    continue
+                current[at[change]] = top["consensus"].to_numpy()[change]
+                changed += int(change.sum())
+                g = cols.select(position).to_series().to_numpy()
+                res = cols["residue"].to_numpy()
+                delta = (res != current[g]).astype(np.int64) - (res != before[g])
+                moved += np.bincount(cols["hit"].to_numpy(), delta, minlength=hits.height).astype(
+                    np.int64
                 )
-            )
-            at = top["g"].to_numpy()
-            change = top["consensus"].to_numpy() != current[at]
-            if not change.any():
-                continue
-            current[at[change]] = top["consensus"].to_numpy()[change]
-            changed += int(change.sum())
-            g = cols.select(position).to_series().to_numpy()
-            res = cols["residue"].to_numpy()
-            delta = (res != current[g]).astype(np.int64) - (res != before[g])
-            moved += np.bincount(cols["hit"].to_numpy(), delta, minlength=hits.height).astype(
-                np.int64
-            )
+            if changed:
+                updated += changed
+                mism = mism.with_columns(
+                    mism=pl.col("mism") + pl.Series(moved[mism["hit"].to_numpy()].astype(np.int32))
+                )
+                em.rescore(mism)
         if not changed:
             break
-        updated += changed
-        mism = mism.with_columns(
-            mism=pl.col("mism") + pl.Series(moved[mism["hit"].to_numpy()].astype(np.int32))
+    with timer("refine_em"):
+        fit, n_free, d = em.fit(prior=False)
+        fit_prior, n_prior, _ = em.fit(prior=True)
+        flagged = (
+            _best(fit)
+            .join(_best(fit_prior), on="pair", suffix="_prior")
+            .select("pair", em_flag=pl.col("src") != pl.col("src_prior"))
         )
-        em.rescore(mism)
-    fit, n_free, d = em.fit(prior=False)
-    fit_prior, n_prior, _ = em.fit(prior=True)
-    flagged = (
-        _best(fit)
-        .join(_best(fit_prior), on="pair", suffix="_prior")
-        .select("pair", em_flag=pl.col("src") != pl.col("src_prior"))
-    )
-    weights = em.hit_weights(fit)
+        weights = em.hit_weights(fit)
+    timer.counts.update(refine_em_fits=em.fits, refine_em_steps=em.steps)
 
-    # step 9: haplotypes per target sequence; novel ones move their reads' weight
-    on_targets = (
-        weights.filter(pl.col("src") < em.n_u)
-        .join(hits.select("hit", "role"), on="hit")
-        .filter(pl.col("role") == "target", pl.col("weight") > 1e-3)
-    )
-    eps = max(error, 0.01)
-    # each mate's divergence from the nearest of the unit's original sequences
-    nearest = (
-        hits.with_columns(n=pl.col("qlen").max().over("read_name", "mate"))
-        .with_columns(d=(pl.col("mism") + pl.col("n") - pl.col("qlen")) / pl.col("n"))
-        .with_columns(d_unit=pl.col("d").min().over("read_name", "mate", "unit"))
-        .select("hit", "d_unit")
-    )
-    # reads on each sequence, in on_targets' order (the haplotype seeds depend on it)
-    part = pl.Series(spill.part_of[on_targets["seq"].to_numpy()])
-    reads_by_part = {
-        k: v.drop("part")
-        for k, v in on_targets.with_columns(part=part).partition_by("part", as_dict=True).items()
-    }
-    del part
-    hap_rows, novel_hits = [], []
-    for p, cols, _ in spill.parts():
-        site_res = cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP).select(
-            "hit", "seq", "col", "residue"
+    with timer("refine_haplotypes"):
+        # step 9: haplotypes per target sequence; novel ones move their reads' weight
+        on_targets = (
+            weights.filter(pl.col("src") < em.n_u)
+            .join(hits.select("hit", "role"), on="hit")
+            .filter(pl.col("role") == "target", pl.col("weight") > 1e-3)
         )
-        on_part = reads_by_part.get((p,), on_targets.clear())
-        pile = _pile(site_res, on_part)
-        columns = pile.group_by("seq", "col").agg(
-            depth=pl.col("weight").sum(),
-            second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
+        eps = max(error, 0.01)
+        # each mate's divergence from the nearest of the unit's original sequences
+        nearest = (
+            hits.with_columns(n=pl.col("qlen").max().over("read_name", "mate"))
+            .with_columns(d=(pl.col("mism") + pl.col("n") - pl.col("qlen")) / pl.col("n"))
+            .with_columns(d_unit=pl.col("d").min().over("read_name", "mate", "unit"))
+            .select("hit", "d_unit")
         )
-        covered = columns.filter(pl.col("depth") >= min_depth).with_columns(g=position)
-        at = covered["g"].to_numpy()
-        covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
-        variable = covered.filter(
-            (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
-            | pl.col("updated")
-        )
-        var_by_seq = variable.partition_by("seq", as_dict=True)
-        reads_by_seq = on_part.select("hit", "seq", "weight").partition_by("seq", as_dict=True)
-        sites_by_seq = site_res.partition_by("seq", as_dict=True)
-        for (seq,), cov in covered.group_by("seq"):
-            off = int(offsets[seq])
-            cov_cols = np.sort(cov["col"].to_numpy())
-            var = var_by_seq.get((seq,))
-            var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
-            reads_w = (
-                reads_by_seq[(seq,)]
-                .select("hit", "weight")
-                .join(nearest, on="hit", how="left", maintain_order="left")
+        # reads on each sequence, in on_targets' order (the haplotype seeds depend on it)
+        part = pl.Series(spill.part_of[on_targets["seq"].to_numpy()])
+        reads_by_part = {
+            k: v.drop("part")
+            for k, v in on_targets.with_columns(part=part)
+            .partition_by("part", as_dict=True)
+            .items()
+        }
+        del part
+        hap_rows, hap_plain, novel_hits = [], [], []
+        for p, cols, _ in spill.parts():
+            site_res = cols.filter(pl.col("qpos") >= 0, pl.col("residue") != GAP).select(
+                "hit", "seq", "col", "residue"
             )
-            x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
-            if len(var_cols):
-                obs = (
-                    sites_by_seq[(seq,)]
-                    .filter(pl.col("col").is_in(var_cols.tolist()))
-                    .join(reads_w.with_row_index("i"), on="hit")
+            on_part = reads_by_part.get((p,), on_targets.clear())
+            pile = _pile(site_res, on_part)
+            columns = pile.group_by("seq", "col").agg(
+                depth=pl.col("weight").sum(),
+                second=pl.col("weight").sort(descending=True).slice(1, 1).first().fill_null(0.0),
+            )
+            covered = columns.filter(pl.col("depth") >= min_depth).with_columns(g=position)
+            at = covered["g"].to_numpy()
+            covered = covered.with_columns(updated=pl.Series(current[at] != original[at]))
+            variable = covered.filter(
+                (pl.col("second") >= pl.max_horizontal(min_freq * pl.col("depth"), MIN_ALT_READS))
+                | pl.col("updated")
+            )
+            # a sequence with no variable column has the original as its one haplotype, all its
+            # reads' weight and no divergence (updated columns are variable), so is never novel
+            var_seqs = variable["seq"].unique().implode()
+            hap_plain.append(
+                covered.filter(~pl.col("seq").is_in(var_seqs))
+                .group_by("seq")
+                .agg(covered=pl.len())
+                .join(
+                    on_part.join(nearest, on="hit", how="left")
+                    .group_by("seq")
+                    .agg(
+                        reads=pl.col("weight").sum(),
+                        wd=(pl.col("weight") * pl.col("d_unit").fill_null(0.0)).sum(),
+                    ),
+                    on="seq",
                 )
-                x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
-                    "residue"
-                ].to_numpy()
-            cons = current[off + var_cols]
-            w = reads_w["weight"].to_numpy()
-            haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
-            is_novel = np.zeros(len(haps), bool)
-            d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
-            for k, hap in enumerate(haps):
-                full = current[off + cov_cols].copy()
-                full[np.searchsorted(cov_cols, var_cols)] = hap
-                div = float((full != original[off + cov_cols]).mean())
-                mass = float(w @ resp[:, k])
-                # its reads, against the nearest of the unit's sequences, sequencing error removed
-                read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
-                is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
-                hap_rows.append(
-                    (int(seq), k, float(eta[k]), mass, div, read_div, len(cov_cols), is_novel[k])
+                .select(
+                    pl.col("seq").cast(pl.UInt32),
+                    haplotype=pl.lit(0, pl.Int64),
+                    share=pl.lit(1.0),
+                    reads="reads",
+                    divergence=pl.lit(0.0),
+                    read_divergence=pl.when(pl.col("reads") > 0)
+                    .then(pl.col("wd") / pl.col("reads") - error)
+                    .otherwise(0.0),
+                    covered=pl.col("covered").cast(pl.Int64),
+                    novel=pl.lit(False),
                 )
-            if is_novel.any():
-                novel_hits.append(
-                    reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1)))
+            )
+            var_by_seq = variable.partition_by("seq", as_dict=True)
+            reads_by_seq = on_part.select("hit", "seq", "weight").partition_by("seq", as_dict=True)
+            sites_by_seq = site_res.partition_by("seq", as_dict=True)
+            for (seq,), cov in covered.filter(pl.col("seq").is_in(var_seqs)).group_by("seq"):
+                off = int(offsets[seq])
+                cov_cols = np.sort(cov["col"].to_numpy())
+                var = var_by_seq.get((seq,))
+                var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
+                reads_w = (
+                    reads_by_seq[(seq,)]
+                    .select("hit", "weight")
+                    .join(nearest, on="hit", how="left", maintain_order="left")
                 )
-    haplotypes = pl.DataFrame(
-        hap_rows,
-        schema={
-            "seq": pl.UInt32,
-            "haplotype": pl.Int64,
-            "share": pl.Float64,
-            "reads": pl.Float64,
-            "divergence": pl.Float64,
-            "read_divergence": pl.Float64,
-            "covered": pl.Int64,
-            "novel": pl.Boolean,
-        },
-        orient="row",
-    )
-    refs.select("seq", "seq_id", "unit", "cluster_rep").join(haplotypes, on="seq").drop("seq").sort(
-        "seq_id", "haplotype"
-    ).write_csv(out / "haplotypes.tsv", separator="\t")
-    to_novel = (
-        pl.concat(novel_hits)
-        if novel_hits
-        else pl.DataFrame(schema={"hit": pl.UInt32, "p_novel": pl.Float64})
-    )
-    weights = (
-        weights.join(to_novel, on="hit", how="left")
-        .with_columns(p_novel=pl.col("p_novel").fill_null(0.0))
-        .with_columns(
-            gone=pl.col("weight") * pl.col("p_novel"),
-            weight=pl.col("weight") * (1 - pl.col("p_novel")),
+                x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
+                if len(var_cols):
+                    obs = (
+                        sites_by_seq[(seq,)]
+                        .filter(pl.col("col").is_in(var_cols.tolist()))
+                        .join(reads_w.with_row_index("i"), on="hit")
+                    )
+                    x[obs["i"].to_numpy(), np.searchsorted(var_cols, obs["col"].to_numpy())] = obs[
+                        "residue"
+                    ].to_numpy()
+                cons = current[off + var_cols]
+                w = reads_w["weight"].to_numpy()
+                haps, eta, resp = _haplotypes(x, w, cons, original[off + var_cols], eps, alpha)
+                is_novel = np.zeros(len(haps), bool)
+                d_unit = reads_w["d_unit"].fill_null(0.0).to_numpy()
+                for k, hap in enumerate(haps):
+                    full = current[off + cov_cols].copy()
+                    full[np.searchsorted(cov_cols, var_cols)] = hap
+                    div = float((full != original[off + cov_cols]).mean())
+                    mass = float(w @ resp[:, k])
+                    # its reads against the unit's nearest sequence, sequencing error removed
+                    read_div = float((w * resp[:, k]) @ d_unit / mass) - error if mass > 0 else 0.0
+                    is_novel[k] = len(cov_cols) >= MIN_COVERED and min(div, read_div) > novel
+                    hap_rows.append(
+                        (
+                            int(seq),
+                            k,
+                            float(eta[k]),
+                            mass,
+                            div,
+                            read_div,
+                            len(cov_cols),
+                            is_novel[k],
+                        )
+                    )
+                if is_novel.any():
+                    novel_hits.append(
+                        reads_w.select("hit", p_novel=pl.Series(resp[:, is_novel].sum(1)))
+                    )
+        fitted = pl.DataFrame(
+            hap_rows,
+            schema={
+                "seq": pl.UInt32,
+                "haplotype": pl.Int64,
+                "share": pl.Float64,
+                "reads": pl.Float64,
+                "divergence": pl.Float64,
+                "read_divergence": pl.Float64,
+                "covered": pl.Int64,
+                "novel": pl.Boolean,
+            },
+            orient="row",
         )
-        .with_columns(novel=pl.col("novel") + pl.col("gone").sum().over("pair", "mate"))
-    )
+        timer.counts.update(
+            haplotype_seqs_fitted=fitted["seq"].n_unique(),
+            haplotype_seqs_plain=sum(f.height for f in hap_plain),
+        )
+        haplotypes = pl.concat([fitted, *hap_plain])
+        refs.select("seq", "seq_id", "unit", "cluster_rep").join(haplotypes, on="seq").drop(
+            "seq"
+        ).sort("seq_id", "haplotype").write_csv(out / "haplotypes.tsv", separator="\t")
+        to_novel = (
+            pl.concat(novel_hits)
+            if novel_hits
+            else pl.DataFrame(schema={"hit": pl.UInt32, "p_novel": pl.Float64})
+        )
+        weights = (
+            weights.join(to_novel, on="hit", how="left")
+            .with_columns(p_novel=pl.col("p_novel").fill_null(0.0))
+            .with_columns(
+                gone=pl.col("weight") * pl.col("p_novel"),
+                weight=pl.col("weight") * (1 - pl.col("p_novel")),
+            )
+            .with_columns(novel=pl.col("novel") + pl.col("gone").sum().over("pair", "mate"))
+        )
 
     # outputs
     kinds = ["unit"] * em.n_u + ["novel"] * em.n_c
