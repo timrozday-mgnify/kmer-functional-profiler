@@ -170,7 +170,8 @@ class _Model:
         h = h.with_columns(m=pl.col("mism") + n_read - pl.col("qlen"), n=n_read)
         self.hits = h
         # fragment length from pairs whose mates' best alignments share a sequence
-        best = h.sort("score", descending=True).group_by("pair", "mate", "src").first()
+        ranked = h.sort("score", descending=True)
+        best = ranked.group_by("pair", "mate", "src").first()
         same = (
             best.group_by("pair", "src")
             .agg(
@@ -184,7 +185,6 @@ class _Model:
         self.fragment = float(np.median(spans)) if len(spans) else 0.0
         sigma = 1.4826 * float(np.median(np.abs(spans - self.fragment))) if len(spans) else 0.0
         # novel class: each mate's best alignment; the pair's component from its best
-        ranked = h.sort("score", descending=True)
         pair_comp = (
             ranked.group_by("pair")
             .first()
@@ -196,6 +196,7 @@ class _Model:
             .join(pair_comp, on="pair")
             .select("pair", "mate", src=pl.col("novel").cast(pl.Int64), m="m")
         )
+        del ranked
         per_src = pl.concat([best.select("pair", "mate", "src", "m"), novel_rows])
         mates = h.group_by("pair", "mate").agg(n=pl.col("n").first(), worst=pl.col("m").max())
         cand = (
@@ -264,8 +265,8 @@ class _Model:
         """New differences after consensus updates (hit, mism): rebuild the candidates."""
         h = self.hits.drop("mism", "m").join(hits, on="hit")
         self.hits = h.with_columns(m=pl.col("mism") + pl.col("n") - pl.col("qlen"))
-        best = self.hits.sort("score", descending=True).group_by("pair", "mate", "src").first()
         ranked = self.hits.sort("score", descending=True)
+        best = ranked.group_by("pair", "mate", "src").first()
         novel_src = self.cand.filter(pl.col("src") >= self.n_u).select("pair", novel="src")
         novel_rows = (
             ranked.group_by("pair", "mate")
