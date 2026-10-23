@@ -472,6 +472,8 @@ def refine(
             .with_columns(d_unit=pl.col("d").min().over("read_name", "mate", "unit"))
             .select("hit", "d_unit")
         )
+        on_targets = on_targets.join(nearest, on="hit", how="left", maintain_order="left")
+        del nearest
         # reads on each sequence, in on_targets' order (the haplotype seeds depend on it)
         part = pl.Series(spill.part_of[on_targets["seq"].to_numpy()])
         reads_by_part = {
@@ -507,9 +509,7 @@ def refine(
                 .group_by("seq")
                 .agg(covered=pl.len())
                 .join(
-                    on_part.join(nearest, on="hit", how="left")
-                    .group_by("seq")
-                    .agg(
+                    on_part.group_by("seq").agg(
                         reads=pl.col("weight").sum(),
                         wd=(pl.col("weight") * pl.col("d_unit").fill_null(0.0)).sum(),
                     ),
@@ -529,18 +529,16 @@ def refine(
                 )
             )
             var_by_seq = variable.partition_by("seq", as_dict=True)
-            reads_by_seq = on_part.select("hit", "seq", "weight").partition_by("seq", as_dict=True)
+            reads_by_seq = on_part.select("hit", "seq", "weight", "d_unit").partition_by(
+                "seq", as_dict=True
+            )
             sites_by_seq = site_res.partition_by("seq", as_dict=True)
             for (seq,), cov in covered.filter(pl.col("seq").is_in(var_seqs)).group_by("seq"):
                 off = int(offsets[seq])
                 cov_cols = np.sort(cov["col"].to_numpy())
                 var = var_by_seq.get((seq,))
                 var_cols = np.sort(var["col"].to_numpy()) if var is not None else np.zeros(0, int)
-                reads_w = (
-                    reads_by_seq[(seq,)]
-                    .select("hit", "weight")
-                    .join(nearest, on="hit", how="left", maintain_order="left")
-                )
+                reads_w = reads_by_seq[(seq,)].select("hit", "weight", "d_unit")
                 x = np.zeros((reads_w.height, len(var_cols)), np.uint8)
                 if len(var_cols):
                     obs = (
