@@ -36,6 +36,7 @@ process PICK {
 process SIMULATE {
     tag "seed ${seed}"
     label 'process_low'
+    publishDir params.outdir, mode: 'copy', pattern: 'truth.tsv', saveAs: { "seed${seed}/${it}" }
 
     input:
     path spike

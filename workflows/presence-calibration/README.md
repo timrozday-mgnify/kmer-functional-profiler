@@ -10,7 +10,8 @@ PICK      calibrate.py pick: --units units drawn uniformly from the index (repre
           200-600 aa), --members sequences each from the store; units.tsv (n_members, m_g,
           uniq: the mean share of a unit's sampled k-mers it holds alone)
 SIMULATE  spike-benchmark's spike.py simulate: every picked unit carries a strain (a member
-          at --identities), lognormal depth (~0.05-20x), appended to --background
+          at --identities), lognormal depth (~0.05-20x), appended to --background;
+          truth.tsv (each strain's unit, member, identity, pairs, depth) published per seed
 REVERSE   calibrate.py reverse: the background reversed, a null sample (no coding homology)
 QUERY     every sample (spiked seeds, unspiked background, null) at every --shares value
 SCORE     calibrate.py score: per spiked sample, share and q (0.01, 0.05, 0.1): recall (by
