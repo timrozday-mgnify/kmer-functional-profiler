@@ -428,11 +428,17 @@ def score_batch(
         .otherwise(pl.col("posterior"))
     )
     piled = rows.filter(pl.col("kept"), pl.col("role") == TARGET)
-    others = rows.select(*MATE, "qpos", residue="ref", other="unit")
+    # units whose alignments carry each reference residue at a read position: one row per
+    # key, so a read with k alignments costs k rows here, not k^2 in a join on its own rows
+    others = (
+        rows.filter(pl.col("qpos") >= 0)
+        .group_by(*MATE, "qpos", pl.col("ref").alias("residue"))
+        .agg(units=pl.col("unit").n_unique(), other=pl.col("unit").first())
+    )
     sibling = (
         piled.filter(pl.col("residue") != pl.col("ref"), pl.col("qpos") >= 0)
         .join(others, on=[*MATE, "qpos", "residue"])
-        .filter(pl.col("other") != pl.col("unit"))
+        .filter((pl.col("units") > 1) | (pl.col("other") != pl.col("unit")))
         .select("hit", "col", sibling=pl.lit(True))
         .unique()
     )
