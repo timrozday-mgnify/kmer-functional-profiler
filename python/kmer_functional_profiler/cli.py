@@ -25,6 +25,7 @@ from kmer_functional_profiler.mask import Mask, build_mask
 from kmer_functional_profiler.query import (
     BACKGROUND_SHARE,
     MIN_AAI_KMERS,
+    MIN_OWN_KMERS,
     Timer,
     check_aai_calibration,
     profile,
@@ -298,6 +299,13 @@ def query(
             "be background hits, in expectation (inf: the calibrated per-unit rate, uncapped)"
         ),
     ] = BACKGROUND_SHARE,
+    min_own_kmers: Annotated[
+        int,
+        typer.Option(
+            help="present_prob 0 for units with fewer own k-mers (gather's), which are as "
+            "likely chance matches (1 = off)"
+        ),
+    ] = MIN_OWN_KMERS,
     min_identity: Annotated[
         float,
         typer.Option(
@@ -402,6 +410,7 @@ def query(
             min_aai=min_aai,
             min_aai_kmers=min_aai_kmers,
             background_share=background_share,
+            min_own_kmers=min_own_kmers,
             min_identity=min_identity,
             extra=extra,
             mask=masked,

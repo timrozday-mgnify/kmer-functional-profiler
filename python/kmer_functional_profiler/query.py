@@ -1312,6 +1312,10 @@ CLUMP: Final = 0.3
 # choice (2026-10-20), to calibrate against spikes on the full standard tier.
 BACKGROUND_SHARE: Final = 0.1
 H_CAP: Final = 20  # hit counts pooled at and above this in the present-unit distribution
+# Units with fewer own k-mers are not called present (present_prob 0, query --min-own-kmers):
+# on the MGnify90 standard tier, reversed hadza10M reads (no coding homology) give 270 k units
+# one own k-mer by chance, 2.7 k two, 52 three (plan, phase 13 / phase 7, 2026-10-23).
+MIN_OWN_KMERS: Final = 2
 
 
 def presence(
@@ -1323,6 +1327,7 @@ def presence(
     background: float = BACKGROUND,
     clump: float = CLUMP,
     share: float = BACKGROUND_SHARE,
+    min_own: int = MIN_OWN_KMERS,
     max_iter: int = 500,
     tol: float = 1e-9,
     report: dict[str, float] | None = None,
@@ -1333,9 +1338,15 @@ def presence(
     hits other units explain are not evidence. An absent unit is still detected by
     background (off-target homologs, error k-mers) with probability 1 - exp(-mu_g), mu_g =
     ``background`` x ``n_reads`` x ``t_g``, then with h own k-mers ~ Geometric (ratio
-    ``clump``), each hit k-mer's odds scaled by its index ``holders`` (k-mers many units
-    share are conserved motifs, which unindexed genes carry too). A present unit has h
-    drawn from a distribution f fitted to the sample.
+    ``clump``), each own k-mer past the first scaled by min(1, ``clump`` x its index
+    ``holders``) rather than ``clump``: a k-mer many units share is a conserved motif, which
+    unindexed genes carry too, so it is weaker evidence, but never evidence against presence
+    (an uncapped holders factor made more shared own k-mers *less* credible: present_prob
+    fell to ~1e-5 at 17-19 own k-mers on the standard tier). A present unit has h drawn
+    from a distribution f fitted to the sample (bins pooled at ``H_CAP``). Units with
+    fewer than ``min_own`` own k-mers get 0: a lone k-mer is as likely a chance match, which
+    the share cap below would otherwise let through. ponytail: a floor, not a chance-match
+    term; fit one from a reversed-read pass if the floor costs recall.
     With A absent units (``n_index_units`` minus the expected present), P(present | h) =
     w_h / (w_h + A x P(h | absent)), w_h the expected present units with h own k-mers; w
     and A are fitted by fixed-point iteration, at which w_h is about the units seen with h
@@ -1359,22 +1370,19 @@ def presence(
     """
     per_unit = (
         own.group_by("unit")
-        .agg(h=pl.len(), log_holders=pl.col("holders").cast(pl.Float64).log().sum())
+        .agg(
+            h=pl.len(),
+            log_factor=(pl.col("holders").cast(pl.Float64) * clump).clip(upper_bound=1).log().sum(),
+        )
         .sort("unit")
     )
     units = per_unit["unit"].to_numpy()
     h = per_unit["h"].to_numpy().astype(np.float64)
     mu = background * n_reads * t_g[units]
     capped = np.minimum(h, H_CAP).astype(np.intp)
-    # P(own hits | absent); units at the cap are never taken for background.
-    absent = np.where(
-        capped < H_CAP,
-        -np.expm1(-mu)
-        * (1 - clump)
-        * clump ** (h - 1)
-        * np.exp(per_unit["log_holders"].to_numpy()),
-        0.0,
-    )
+    # P(own hits | absent): (1 - clump) x clump^(h - 1) with each k-mer's clump raised
+    # toward 1 by its holders (the product over all h, the first's clump swapped back out).
+    absent = -np.expm1(-mu) * (1 - clump) / clump * np.exp(per_unit["log_factor"].to_numpy())
     detect = float(np.mean(-np.expm1(-mu))) if len(units) else 0.0
     prob = np.ones(len(units))
     it, done, scale = 0, False, 1.0
@@ -1383,7 +1391,7 @@ def presence(
         n_absent = n_index_units - prob.sum()
         predicted = n_absent * detect  # background units the calibrated rate predicts
         scale = min(1.0, share * len(units) / predicted) if predicted > 0 else 1.0
-        new = w[capped] / (w[capped] + scale * n_absent * absent)
+        new = np.where(h >= min_own, w[capped] / (w[capped] + scale * n_absent * absent), 0.0)
         done = np.abs(new - prob).max(initial=0) <= tol
         prob = new
         it += 1
@@ -2399,6 +2407,7 @@ def profile(
     min_aai: float = 0.0,
     min_aai_kmers: float = MIN_AAI_KMERS,
     background_share: float = BACKGROUND_SHARE,
+    min_own_kmers: int = MIN_OWN_KMERS,
     min_identity: float = 0.0,
     extra: Sequence[Index] = (),
     mask: "Mask | None" = None,
@@ -2436,7 +2445,8 @@ def profile(
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
     present rather than hit by background, from the tier-1 k-mers gather gave it, with
-    background at most ``background_share`` of those units; units gather drops get 0.
+    background at most ``background_share`` of those units; units gather drops, and units
+    with fewer than ``min_own_kmers`` own k-mers, get 0.
     ``present_q`` is its q-value (:func:`fdr_q`, over every row before ``min_aai`` drops
     any): keep ``present_q`` <= x for an expected false share of at most x. With
     ``min_identity`` (theta) > 0, implying ``with_aai``, "present" means a member within
@@ -2701,7 +2711,13 @@ def profile(
     len_cv = hit_info["len_cv"].to_numpy()
     with timer("presence"):
         present_prob = presence(
-            own, t_g, n_reads, joint.height, share=background_share, report=counts
+            own,
+            t_g,
+            n_reads,
+            joint.height,
+            share=background_share,
+            min_own=min_own_kmers,
+            report=counts,
         )
     greedy_fit = (
         greedy_coverage(own, np.bincount(kmer_hits["unit"].to_numpy(), minlength=len(m_g)), m_g)
