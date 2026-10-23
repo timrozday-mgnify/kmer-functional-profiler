@@ -16,7 +16,10 @@ REVERSE   calibrate.py reverse: the background reversed, a null sample (no codin
 QUERY     every sample (spiked seeds, unspiked background, null) at every --shares value
 SCORE     calibrate.py score: per spiked sample, share and q (0.01, 0.05, 0.1): recall (by
           depth, identity, uniqueness), new_false (called here, not unspiked, not spiked),
-          false_share, null_called, unspiked_called
+          new_relative (in a spiked unit's component), false_share(_unrelated),
+          null_called, unspiked_called; before presence: recall_hit1, recall_hit2,
+          recall_gathered (hit-level: with --aai true, which lists every hit unit),
+          unspiked_hit1/2, null_hit1/2
 DECIDE    calibrate.py decide -> summary.tsv, decision.tsv (the largest share passing the
           rule at --q in every seed), scores.tsv
 ```

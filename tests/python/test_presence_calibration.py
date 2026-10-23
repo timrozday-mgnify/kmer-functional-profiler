@@ -10,10 +10,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "workflows" / "pres
 import calibrate  # noqa: E402
 
 
-def _profile(path: Path, q: dict[int, float], component: dict[int, int] | None = None) -> Path:
-    comp = component or {}
+def _profile(
+    path: Path,
+    q: dict[int, float],
+    component: dict[int, int] | None = None,
+    kmers: dict[int, tuple[int, int]] | None = None,  # unit -> (kmers_hit, kmers_unique)
+) -> Path:
+    comp, km = component or {}, kmers or {}
     pl.DataFrame(
-        {"unit": list(q), "present_q": list(q.values()), "component": [comp.get(u, u) for u in q]}
+        {
+            "unit": list(q),
+            "present_q": list(q.values()),
+            "component": [comp.get(u, u) for u in q],
+            "kmers_hit": [km.get(u, (3, 3))[0] for u in q],
+            "kmers_unique": [km.get(u, (3, 3))[1] for u in q],
+        }
     ).write_csv(path, separator="\t")
     return path
 
@@ -26,11 +37,13 @@ def test_score_counts_spike_recall_new_false_and_null(tmp_path: Path) -> None:
         tmp_path / "units.tsv", separator="\t"
     )
     # spiked: 2, 3 called at 0.05 (4 only at 0.1); 7 already in the unspiked sample; 8 new,
-    # false, in spiked 3's component (a relative); 10 new, false, unrelated
+    # false, in spiked 3's component (a relative); 10 new, false, unrelated. Spiked 1 is hit
+    # (one shared k-mer) but not gathered; 4 has two hit k-mers, one its own.
     spiked = _profile(
         tmp_path / "p.tsv",
-        {2: 0.0, 3: 0.04, 4: 0.08, 7: 0.0, 8: 0.01, 9: 0.5, 10: 0.03},
+        {1: 1.0, 2: 0.0, 3: 0.04, 4: 0.08, 7: 0.0, 8: 0.01, 9: 0.5, 10: 0.03},
         component={3: 3, 8: 3},
+        kmers={1: (1, 0), 4: (2, 1)},
     )
     unspiked = _profile(tmp_path / "u.tsv", {7: 0.0, 8: 0.5})
     null = _profile(tmp_path / "n.tsv", {5: 0.02})
@@ -46,6 +59,9 @@ def test_score_counts_spike_recall_new_false_and_null(tmp_path: Path) -> None:
     assert s["recall"] == 0.5
     assert s["false_share"] == 2 / 4
     assert s["new_relative"] == 1 and s["false_share_unrelated"] == 1 / 3
+    assert (s["recall_hit1"], s["recall_hit2"], s["recall_gathered"]) == (1.0, 0.75, 0.75)
+    assert s["recall_hit1_depth_0"] == 1.0 and s["recall_hit1_identity_0.9"] == 1.0
+    assert (s["unspiked_hit1"], s["unspiked_hit2"], s["null_hit1"]) == (2, 2, 1)
     assert s["recall_depth_0"] == 0.0 and s["recall_depth_2"] == 1.0 and s["recall_depth_5"] == 0.0
     assert s["recall_identity_0.9"] == 0.5 and s["n_uniq_0.75"] == 3
 
@@ -63,6 +79,8 @@ def test_score_counts_spike_recall_new_false_and_null(tmp_path: Path) -> None:
     d = pl.read_csv(tmp_path / "decision.tsv", separator="\t")
     assert d.filter(pl.col("chosen"))["share"].to_list() == [0.01]
     assert (tmp_path / "scores.tsv").exists()
+    summary = pl.read_csv(tmp_path / "summary.tsv", separator="\t")
+    assert {"recall_hit1", "unspiked_hit2", "null_hit1"} <= set(summary.columns)
 
 
 def test_reverse_reverses_sequence_and_quality(tmp_path: Path) -> None:
