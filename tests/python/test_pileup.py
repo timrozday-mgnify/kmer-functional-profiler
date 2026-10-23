@@ -82,7 +82,11 @@ def test_posteriors_neighbours_and_sibling_residues(protein_refs: Path, tmp_path
     profile.write_text("unit\tother\taai\tcoverage_zi\n0\tx\t0.97\t2.0\n9\ty\t0.5\t1.0\n")
     stats = tmp_path / "stats.json"
     call([hits], protein_refs, tmp_path / "out", "diamond", profile, 0.5, 0.1, stats=stats)
-    assert set(json.loads(stats.read_text())["stages"]) == {"read", "batches", "refine", "write"}
+    timed = json.loads(stats.read_text())
+    assert set(timed["stages"]) == {"read", "batches", "refine", "write"} | {
+        f"refine_{part}" for part in ("model", "em", "consensus", "haplotypes")
+    }
+    assert timed["counts"]["refine_em_fits"] >= 3 and timed["counts"]["refine_em_steps"] > 0
     assigned = pl.read_parquet(tmp_path / "out" / "assignments.parquet")
     kept = assigned.filter("kept").group_by("read_name").len()
     assert sorted(kept["read_name"]) == ["r1", "r3", "r4"]
@@ -281,20 +285,22 @@ def test_spill_partitions_do_not_change_results(tmp_path: Path) -> None:
     hits = tmp_path / "r1.tsv"
     hits.write_text("".join(lines))
     outs = {}
-    for parts in (1, 2):
-        out, stats = tmp_path / f"p{parts}", tmp_path / f"p{parts}.json"
+    for parts, threads in ((1, 1), (2, 1), (2, 2)):  # 2 threads: haplotypes in workers
+        out, stats = tmp_path / f"p{parts}t{threads}", tmp_path / f"p{parts}t{threads}.json"
         call(
-            [hits], refs, out, "diamond", min_depth=3, min_freq=0.2, stats=stats, spill_parts=parts
-        )
+            [hits], refs, out, "diamond", min_depth=3, min_freq=0.2, stats=stats,
+            spill_parts=parts, threads=threads,
+        )  # fmt: skip
         assert json.loads(stats.read_text())["counts"]["spill_parts"] == parts
         assert not [p for p in out.iterdir() if p.name.startswith(".spill")]  # cleaned up
-        outs[parts] = out
-    for name in ("assignments.parquet", "pileup.parquet"):
-        one, two = (pl.read_parquet(outs[p] / name) for p in (1, 2))
-        assert one.sort(one.columns).equals(two.sort(two.columns))
-    for name in ("sources.tsv", "haplotypes.tsv", "units.tsv", "variants.tsv"):
-        assert (outs[1] / name).read_text() == (outs[2] / name).read_text(), name
-    haps = pl.read_csv(outs[1] / "haplotypes.tsv", separator="\t")
+        outs[parts, threads] = out
+    for run in ((2, 1), (2, 2)):
+        for name in ("assignments.parquet", "pileup.parquet"):
+            one, two = (pl.read_parquet(outs[r] / name) for r in ((1, 1), run))
+            assert one.sort(one.columns).equals(two.sort(two.columns))
+        for name in ("sources.tsv", "haplotypes.tsv", "units.tsv", "variants.tsv"):
+            assert (outs[1, 1] / name).read_text() == (outs[run] / name).read_text(), name
+    haps = pl.read_csv(outs[1, 1] / "haplotypes.tsv", separator="\t")
     assert set(haps["seq_id"]) == {"s0", "s1"}
 
 

@@ -22,6 +22,8 @@ pub enum Error {
     LengthMismatch,
     #[error("set value names unit {0}, beyond the unit table")]
     UnitOutOfRange(u64),
+    #[error("DIAMOND output: {0}")]
+    DiamondLine(String),
     #[error(transparent)]
     Fastx(#[from] needletail::errors::ParseError),
 }

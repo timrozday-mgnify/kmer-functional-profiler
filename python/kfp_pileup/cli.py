@@ -115,6 +115,7 @@ def call_command(
     stats: Annotated[
         Path | None, typer.Option(help="JSON of each stage's time and memory (as query's)")
     ] = None,
+    threads: Annotated[int, typer.Option(help="Worker processes for the haplotypes")] = 1,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
     per-unit identity (units.tsv) from alignments to the reference; then the joint EM over
@@ -123,7 +124,7 @@ def call_command(
     consensus.*, recruited_*.fq.gz); print counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads, novel, reads or (), stats,
+        batch_reads, novel, reads or (), stats, threads=threads,
     )  # fmt: skip
     typer.echo(json.dumps(counts))
 

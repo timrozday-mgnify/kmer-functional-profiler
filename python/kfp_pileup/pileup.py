@@ -36,7 +36,7 @@ import re
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 import polars as pl
@@ -45,6 +45,7 @@ from kfp_pileup.nucleotide import nucleotide_pileup
 from kfp_pileup.reference import REF_FASTA, REFS
 from kfp_pileup.refine import NOVEL, refine
 from kfp_pileup.spill import PARTS, Spill, partitions
+from kmer_functional_profiler._core import DiamondReader
 from kmer_functional_profiler.index import read_fasta
 from kmer_functional_profiler.query import Timer
 
@@ -58,6 +59,9 @@ BWA_MATCH, BWA_MISMATCH, BWA_N, GAP_EXTEND = 1, -4, -1, -1  # bwa-mem2's default
 MIN_DEPTH: Final = 3.0
 MIN_FREQ: Final = 0.2
 BATCH_READS: Final = 20_000
+BYTES: Final = list(range(256))
+CHARS: Final = [chr(b) for b in BYTES]
+DIAMOND_CHUNK: Final = 1 << 24  # bytes of DIAMOND output read at a time
 ROLES: Final = ("target", "neighbour")
 TARGET, NEIGHBOUR = range(2)
 GAP: Final = ord("-")
@@ -180,78 +184,56 @@ class _Batch:
         self.ev_key.append(key)
 
 
-_BTOP: Final = re.compile(r"(\d+)|(.)(.)")
+class _Columns:
+    """A batch from :class:`~kmer_functional_profiler._core.DiamondReader`: the columns
+    :class:`_Batch` keeps, as arrays."""
 
+    names: list[str]
+    read: np.ndarray
+    seq: np.ndarray
+    score: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+    reverse: np.ndarray
+    ins: np.ndarray
+    shifts: np.ndarray
+    hit: np.ndarray
+    col: np.ndarray
+    qpos: np.ndarray
+    rres: np.ndarray
+    sres: np.ndarray
+    ev_hit: np.ndarray
+    ev_col: np.ndarray
+    ev_kind: np.ndarray
+    ev_key: np.ndarray
 
-def _diamond_hit(batch: _Batch, hit: int, fields: list[str], ref: bytes) -> None:
-    """Columns of one DIAMOND alignment from its BTOP (query letter, then subject letter).
-
-    Read positions are tracked in nucleotides along the frame: a residue (matched, mismatched
-    or inserted) takes 3 bases, a deletion none, and DIAMOND's frameshifts (``-F``) move the
-    next codon's start: ``/`` (a base missing from the read) 1 back, ``\\`` (an extra base)
-    1 on. Neither takes a reference column (observed on DIAMOND 2.2.8)."""
-    qstart, sstart, frame, btop = int(fields[3]), int(fields[5]), int(fields[7]), fields[8]
-    # Read position key of a base: twice its position on the original read, plus 1 on the
-    # reverse strand (DIAMOND's qstart is then the higher coordinate, and a codon's key is
-    # that of its first base in the frame's direction).
-    rev = frame < 0
-    sign = -1 if rev else 1
-
-    def key(nt: int) -> int:
-        return 2 * (qstart - 1 + sign * nt) + rev
-
-    col, nt = sstart - 1, 0
-    for num, q, s in _BTOP.findall(btop):
-        if num:
-            n = int(num)
-            run = ref[col : col + n]
-            batch.columns(
-                hit, range(col, col + n), range(key(nt), key(nt + 3 * n), 6 * sign), run, run
-            )
-            col, nt = col + n, nt + 3 * n
-        elif q == "/":  # a base missing from the read: the next codon re-reads one
-            batch.event(hit, col, b"/", -1)
-            batch.shifts[hit] += 1
-            nt -= 1
-        elif q == "\\":  # an extra base in the read
-            batch.event(hit, col, b"\\", key(nt))
-            batch.shifts[hit] += 1
-            nt += 1
-        elif s == "-":  # an insertion in the read: no reference column
-            batch.event(hit, col, b"I", key(nt))
-            batch.ins[hit] += 1
-            nt += 3
-        elif q == "-":  # a deletion: a reference column without a read residue
-            batch.columns(hit, range(col, col + 1), [-1], b"-", s.encode())
-            col += 1
-        else:
-            batch.columns(hit, range(col, col + 1), [key(nt)], q.encode(), s.encode())
-            col, nt = col + 1, nt + 3
-    batch.end[hit] = col
+    def __init__(self, cols: dict[str, Any], mate: int) -> None:
+        for name, value in cols.items():
+            setattr(self, name, value)
+        self.mate = np.full(len(self.read), mate, np.uint8)
 
 
 def read_diamond(
-    paths: Sequence[str | Path], seq_index: dict[str, int], refs: list[bytes], batch_reads: int
-) -> Iterator[_Batch]:
-    """Batches of DIAMOND alignments; ``paths`` are the mates' outputs, in mate order."""
-    batch, reads = _Batch(), 0
+    paths: Sequence[str | Path], names: Sequence[str], refs: list[bytes], batch_reads: int
+) -> Iterator[_Columns]:
+    """Batches of DIAMOND alignments (``paths`` the mates' outputs, in mate order) against
+    sequences ``names`` with residues ``refs``, each of whole reads (a read's alignments are
+    consecutive), parsed in Rust from chunks of ``DIAMOND_CHUNK`` bytes."""
+    reader = DiamondReader([n.encode() for n in names], refs)
     for mate, path in enumerate(paths):
-        last, read = None, -1
-        with open(path) as f:
-            for line in f:
-                fields = line.rstrip("\n").split("\t")
-                if fields[0] != last:
-                    if reads >= batch_reads:
-                        yield batch
-                        batch, reads = _Batch(), 0
-                    last, read, reads = fields[0], batch.start_read(fields[0]), reads + 1
-                seq = seq_index[fields[1]]
-                hit = batch.start_hit(
-                    read, mate, seq, float(fields[2]), int(fields[5]) - 1, int(fields[7]) < 0
-                )
-                _diamond_hit(batch, hit, fields, refs[seq])
-    if reads:
-        yield batch
+        with open(path, "rb") as f:
+            buf, eof = b"", False
+            while True:
+                if not eof:
+                    more = f.read(DIAMOND_CHUNK)
+                    eof, buf = not more, buf + more
+                cols, used = reader.parse(buf, batch_reads, eof)
+                buf = buf[used:]
+                if cols["names"]:
+                    yield _Columns(cols, mate)
+                elif eof:
+                    break
+                # else a read longer than the buffer: read more
 
 
 _CIGAR: Final = re.compile(r"(\d+)([MIDNSHP=X])")
@@ -332,12 +314,8 @@ def read_sam(
         yield batch
 
 
-def _chars(data: bytearray) -> np.ndarray:
-    return np.frombuffer(bytes(data), dtype="S1").astype("U1")
-
-
 def score_batch(
-    batch: _Batch, refs: pl.DataFrame, matrix: np.ndarray, term_bits: float
+    batch: _Batch | _Columns, refs: pl.DataFrame, matrix: np.ndarray, term_bits: float
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """(assignments, pileup part, per-sequence read stats, target columns, target events)
     of one batch. Assignments keep each alignment's ``hit`` id, reference span, strand,
@@ -388,9 +366,8 @@ def score_batch(
             "hit": np.asarray(batch.hit, np.uint32),
             "col": np.asarray(batch.col, np.int32),
             "qpos": np.asarray(batch.qpos, np.int64),
-            "residue": _chars(batch.rres),
-            "rbyte": rres,
-            "ref": _chars(batch.sres),
+            "residue": rres,  # bytes; the pileup part's residues become strings
+            "ref": sres,
             "term": matrix[rres, sres] * term_bits,
         }
     ).join(
@@ -427,6 +404,7 @@ def score_batch(
             weight=pl.col("weight").sum(),
             sibling=pl.col("weight").filter(pl.col("sibling").fill_null(False)).sum(),
         )
+        .with_columns(pl.col("residue").replace_strict(BYTES, CHARS, return_dtype=pl.String))
     )
     identity = piled.group_by("hit").agg(identity=(pl.col("residue") == pl.col("ref")).mean())
     stats = (
@@ -461,7 +439,7 @@ def score_batch(
         mism=pl.col("mism").fill_null(0) + pl.col("ins") + pl.col("shifts"),
     )
     target_cols = rows.filter(pl.col("role") == TARGET).select(
-        "hit", "seq", "col", "qpos", residue="rbyte"
+        "hit", "seq", "col", "qpos", "residue"
     )
     events = pl.DataFrame(
         {
@@ -488,6 +466,7 @@ def call(
     reads: Sequence[str | Path] = (),
     stats: str | Path | None = None,
     spill_parts: int = PARTS,
+    threads: int = 1,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
@@ -495,7 +474,8 @@ def call(
     ``units.tsv`` to ``out_dir`` (the crude pass), then :func:`kfp_pileup.refine.refine`'s
     outputs (steps 8-9); with DIAMOND alignments and the ``reads`` (FASTQ, in mate order),
     :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). With ``stats``, each
-    stage's time and memory go there as the query's (``Timer``). Returns counts.
+    stage's time and memory go there as the query's (``Timer``); ``threads`` worker
+    processes fit step 9's haplotypes. Returns counts.
 
     Target columns and events are spilled to Parquet by reference sequence in a temporary
     directory under ``out_dir`` (:mod:`kfp_pileup.spill`), so steps 6b and 8-9 hold one
@@ -524,7 +504,7 @@ def call(
             with timer("refine"):
                 refined, em_units = refine(
                     hits, spill, refs, sequences, out, aligner == "diamond", prof,
-                    min_depth, min_freq, novel,
+                    min_depth, min_freq, novel, timer, threads,
                 )  # fmt: skip
             hits = hits.join(refined, on="hit", how="left")
         nt_counts = {}
@@ -594,8 +574,9 @@ def _score(
     and per-sequence read stats; target columns and events go to ``spill``."""
     seq_index = {s: i for i, s in enumerate(refs["seq_id"])}
     ref_bytes = [sequences[s].encode() for s in refs["seq_id"]]
+    batches: Iterator[_Batch] | Iterator[_Columns]
     if aligner == "diamond":
-        batches = read_diamond(alignments, seq_index, ref_bytes, batch_reads)
+        batches = read_diamond(alignments, refs["seq_id"].to_list(), ref_bytes, batch_reads)
         matrix, term_bits = blosum62(), DIAMOND_BITS
     elif aligner == "bwa":
         if len(alignments) != 1:
