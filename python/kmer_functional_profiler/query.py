@@ -1021,19 +1021,29 @@ class _Joint:
         return pl.concat(parts, how="diagonal_relaxed")
 
 
-def gather(kmers: pl.DataFrame, t_g: np.ndarray) -> tuple[pl.DataFrame, np.ndarray]:
+def gather(
+    kmers: pl.DataFrame, t_g: np.ndarray, m_g: np.ndarray | None = None
+) -> tuple[pl.DataFrame, np.ndarray]:
     """Assign each hit k-mer to one unit, greedily, as ``sourmash gather`` does.
 
     Repeatedly take the unit with the most unassigned hit k-mers, scaled by ``1 / t_g`` so
     units sampled at different rates compare as estimated k-mer counts, and give it those
-    k-mers. Units left with none are explained away and get no row. Returns ``unit``,
+    k-mers. With ``m_g`` (``query --gather containment``) the score is the unit's remaining
+    containment instead, unassigned hit k-mers / (``m_g`` + 1): a small unit whose every
+    k-mer is hit is taken before a large one holding the same k-mers among many unhit ones
+    (on the standard tier greedy gather left 14% of spiked units no own k-mer; plan, phase
+    13 / phase 7, 2026-10-23). ponytail: the + 1 is a pseudo-count so a unit with one hit
+    k-mer does not outrank a fully contained one with six; fit it if the rule is kept.
+    Units left with none are explained away and get no row. Returns ``unit``,
     ``kmers_unique`` (k-mers assigned) and ``gather_rank`` (0 = taken first), and per row of
     ``kmers`` whether its unit took its k-mer (the k-mer's first holder in gather order).
     """
+    # the kernel divides untaken k-mers by a per-unit weight: t_g, or m_g + 1
+    weight = t_g if m_g is None else np.asarray(m_g, dtype=np.float64) + 1
     got = _core.gather(
         kmers["unit"].cast(pl.UInt32).to_numpy(),
         kmers["hash"].cast(pl.UInt64).to_numpy(),
-        np.asarray(t_g, dtype=np.float64),
+        np.asarray(weight, dtype=np.float64),
     )
     owned = got.pop("owned")
     taken = pl.DataFrame(got).with_columns(
@@ -2408,6 +2418,7 @@ def profile(
     min_aai_kmers: float = MIN_AAI_KMERS,
     background_share: float = BACKGROUND_SHARE,
     min_own_kmers: int = MIN_OWN_KMERS,
+    gather_rule: str = "greedy",
     min_identity: float = 0.0,
     extra: Sequence[Index] = (),
     mask: "Mask | None" = None,
@@ -2445,7 +2456,8 @@ def profile(
 
     ``present_prob`` (:func:`presence`) is the probability that a unit gather keeps is
     present rather than hit by background, from the tier-1 k-mers gather gave it, with
-    background at most ``background_share`` of those units; units gather drops, and units
+    background at most ``background_share`` of those units; ``gather_rule`` is ``greedy``
+    (:func:`gather` by estimated k-mer count) or ``containment``; units gather drops, and units
     with fewer than ``min_own_kmers`` own k-mers, get 0.
     ``present_q`` is its q-value (:func:`fdr_q`, over every row before ``min_aai`` drops
     any): keep ``present_q`` <= x for an expected false share of at most x. With
@@ -2698,8 +2710,11 @@ def profile(
             counts["largest_component_pairs"] = int(np.count_nonzero(label[pair_unit] == largest))
         del pair_unit
     t_g = hit_info["t_g"].to_numpy()
+    if gather_rule not in ("greedy", "containment"):
+        raise ValueError(f"gather_rule {gather_rule!r}: greedy or containment")
     with timer("gather"):
-        assigned, owned = gather(kmer_hits.select("unit", "hash"), t_g)
+        by_containment = hit_info["m_g"].to_numpy() if gather_rule == "containment" else None
+        assigned, owned = gather(kmer_hits.select("unit", "hash"), t_g, by_containment)
         # Each hit k-mer is gather's: the first unit in gather order holding it.
         own = kmer_hits.filter(pl.Series(owned)).select("unit", "hash", "holders", "hits")
         del owned
