@@ -27,6 +27,7 @@ from kmer_functional_profiler.index import (
     write_unit_columns,
 )
 from kmer_functional_profiler.query import (
+    H_CAP,
     UFIRST_SCORE,
     WTA_SCORE,
     Timer,
@@ -1024,12 +1025,12 @@ def test_presence_doubts_few_and_shared_hits() -> None:
         schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32},
     )
     t_g = np.full(len(h), 0.01)
-    got = presence(own, t_g, 3_000_000, 2000)["present_prob"].to_numpy()
+    got = presence(own, t_g, 3_000_000, 2000, min_own=1)["present_prob"].to_numpy()
     many, unique, shared, two = got[:400], got[400], got[500], got[520]
     assert many.min() > 0.95
     assert shared < unique < two < 1
     # Ten times fewer reads: less background, so one k-mer is more credible.
-    fewer = presence(own, t_g, 300_000, 2000)["present_prob"].to_numpy()
+    fewer = presence(own, t_g, 300_000, 2000, min_own=1)["present_prob"].to_numpy()
     assert fewer[400] > unique
     report: dict[str, int] = {}
     presence(own, t_g, 3_000_000, 2000, report=report)
@@ -1050,15 +1051,43 @@ def test_presence_background_capped_by_share() -> None:
     )
     t_g = np.full(len(h), 0.05)
     report: dict[str, float] = {}
-    uncapped = presence(own, t_g, 10_000_000, 10**9, share=float("inf"))["present_prob"]
-    capped = presence(own, t_g, 10_000_000, 10**9, share=0.1, report=report)["present_prob"]
+    kw = {"min_own": 1}
+    uncapped = presence(own, t_g, 10_000_000, 10**9, share=float("inf"), **kw)["present_prob"]
+    capped = presence(own, t_g, 10_000_000, 10**9, share=0.1, report=report, **kw)["present_prob"]
     assert uncapped[:900].max() < 0.01  # one to three own k-mers: background, uncapped
     assert report["presence_background_scale"] < 1e-5
     assert report["presence_background_units"] <= 0.1 * len(h) + 1e-6
     assert capped[0] > uncapped[0] and capped[900] > 0.99
-    small = presence(own, t_g, 10_000, 2000, share=0.1, report=report)["present_prob"]
+    small = presence(own, t_g, 10_000, 2000, share=0.1, report=report, **kw)["present_prob"]
     assert report["presence_background_scale"] == 1.0
-    assert small.equals(presence(own, t_g, 10_000, 2000, share=float("inf"))["present_prob"])
+    assert small.equals(presence(own, t_g, 10_000, 2000, share=float("inf"), **kw)["present_prob"])
+
+
+def test_presence_rises_with_shared_own_kmers_and_floors_lone_ones() -> None:
+    # Units with 1-25 own k-mers, a third of them held by 40 index units, at the standard
+    # tier's scale (10^9 units, 10 M reads). Before, shared k-mers' holders compounded, so
+    # every unit under H_CAP was background and every unit at it present.
+    h = np.repeat(np.arange(1, 26), 50)
+
+    def per_h(holders: np.ndarray, **kw: int) -> np.ndarray:
+        own = pl.DataFrame(
+            {
+                "unit": np.repeat(np.arange(len(h)), h),
+                "hash": np.arange(h.sum()),
+                "holders": holders,
+            },
+            schema={"unit": pl.UInt32, "hash": pl.UInt64, "holders": pl.UInt32},
+        )
+        got = presence(own, np.full(len(h), 0.05), 10_000_000, 10**9, share=0.3, **kw)
+        return got["present_prob"].to_numpy().reshape(25, 50)[:, 0]
+
+    mixed = per_h(np.where(np.arange(h.sum()) % 3 == 0, 40, 1))
+    assert mixed[0] == 0  # under MIN_OWN_KMERS (2)
+    assert np.all(np.diff(mixed[1:]) >= -1e-12) and mixed[9] > 0.95
+    # Every k-mer shared: no evidence from their number, and no step at H_CAP.
+    shared = per_h(np.full(h.sum(), 40))
+    assert shared[H_CAP - 1] < 0.5 and np.all(np.diff(shared[1:]) >= -1e-12)
+    assert per_h(np.ones(h.sum()), min_own=1)[0] > 0
 
 
 def test_fdr_q_values() -> None:

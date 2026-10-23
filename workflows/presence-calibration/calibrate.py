@@ -14,8 +14,17 @@ Subcommands (run by ``main.nf``; each prints what it wrote):
   samples' profiles at the same share -> one row per q threshold (``Q``): ``called``,
   ``recall`` (spiked units called; also by depth, identity and uniqueness bins),
   ``new_false`` (units called here but not unspiked, not spiked: the spike's relatives, an
-  upper bound), ``false_share`` = new_false / (spiked called + new_false), ``unspiked_called``
-  and ``null_called``.
+  upper bound), ``false_share`` = new_false / (spiked called + new_false), ``new_relative``
+  (new_false in a component, of this profile, that holds a spiked unit: relatives the strain
+  may be nearer than its own unit), ``false_share_unrelated`` (false_share without them: the
+  q cut moving, chance), ``unspiked_called`` and ``null_called``. Before any presence call
+  (the same in every q row): ``recall_hit1``, ``recall_hit2`` (spiked units with >= 1, >= 2
+  hit k-mers, shared ones included: what a routing threshold can reach), ``recall_gathered``
+  (gather gave them an own k-mer: what presence can reach), ``recall_hit1`` by depth and
+  identity bins, and ``unspiked_hit1``, ``_hit2``, ``null_hit1``, ``_hit2``: those samples'
+  units at the same thresholds (a routing threshold's reference size and chance hits). A
+  profile lists every hit unit only with ``query --aai``; without, the hit counts are of
+  gathered units.
 - ``decide``: every score row -> ``summary.tsv`` (per share and q, the worst seed's
   false_share and the mean recalls) and ``decision.tsv``: the largest share passing the rule
   at q = ``--q`` in every seed: false_share <= ``--max-false`` and null_called <=
@@ -108,6 +117,31 @@ def score(args: argparse.Namespace) -> None:
         )
     )
     spiked = truth["unit"]
+    components = (
+        pl.scan_csv(args.profile, separator="\t")
+        .select(pl.col("unit").cast(pl.Int64), "component", "kmers_hit", "kmers_unique")
+        .collect()
+    )
+    evidence = truth.join(components, on="unit", how="left").with_columns(
+        pl.col("kmers_hit", "kmers_unique").fill_null(0)
+    )
+    reach: dict[str, object] = {
+        "recall_hit1": (evidence["kmers_hit"] >= 1).mean(),
+        "recall_hit2": (evidence["kmers_hit"] >= 2).mean(),
+        "recall_gathered": (evidence["kmers_unique"] >= 1).mean(),
+    }
+    for name, path in (("unspiked", args.unspiked), ("null", args.null)):
+        hits = pl.scan_csv(path, separator="\t").select("kmers_hit").collect()["kmers_hit"]
+        reach[f"{name}_hit1"], reach[f"{name}_hit2"] = (
+            int((hits >= 1).sum()),
+            int((hits >= 2).sum()),
+        )
+    for col in ("depth_bin", "identity_bin"):
+        by = evidence.group_by(col).agg((pl.col("kmers_hit") >= 1).mean()).sort(col)
+        for key, frac in by.iter_rows():
+            reach[f"recall_hit1_{col.removesuffix('_bin')}_{key}"] = frac
+    spiked_components = components.filter(pl.col("unit").is_in(spiked.implode()))["component"]
+    relatives = components.filter(pl.col("component").is_in(spiked_components.implode()))["unit"]
     rows = []
     for q in Q:
         called = _called(args.profile, q)
@@ -116,6 +150,8 @@ def score(args: argparse.Namespace) -> None:
         new_false = called.filter(
             ~called.is_in(unspiked.implode()) & ~called.is_in(spiked.implode())
         )
+        relative = int(new_false.is_in(relatives.implode()).sum())
+        unrelated = new_false.len() - relative
         tp = int(hit["called"].sum())
         row: dict[str, object] = {
             "sample": args.sample,
@@ -126,8 +162,11 @@ def score(args: argparse.Namespace) -> None:
             "recall": tp / max(truth.height, 1),
             "new_false": new_false.len(),
             "false_share": new_false.len() / max(tp + new_false.len(), 1),
+            "new_relative": relative,
+            "false_share_unrelated": unrelated / max(tp + unrelated, 1),
             "unspiked_called": unspiked.len(),
             "null_called": _called(args.null, q).len(),
+            **reach,
         }
         for col in ("depth_bin", "identity_bin", "uniq_bin"):
             for key, frac, n in (
@@ -154,9 +193,16 @@ def decide(args: argparse.Namespace) -> None:
             pl.len().alias("seeds"),
             pl.col("false_share").max().alias("false_share_worst"),
             pl.col("new_false").mean(),
+            pl.col("new_relative").mean(),
+            pl.col("false_share_unrelated").max().alias("false_share_unrelated_worst"),
             pl.col("null_called").max().alias("null_called_worst"),
             pl.col("null_ratio").max().alias("null_ratio_worst"),
             pl.col("unspiked_called").first(),
+            *[
+                pl.col(c).first()
+                for c in scores.columns
+                if c.endswith(("_hit1", "_hit2")) and c not in recalls
+            ],
             pl.col("passes").all(),
             *[pl.col(c).mean() for c in recalls],
         )
