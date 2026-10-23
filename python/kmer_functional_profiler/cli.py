@@ -306,14 +306,6 @@ def query(
             "likely chance matches (1 = off)"
         ),
     ] = MIN_OWN_KMERS,
-    gather: Annotated[
-        str,
-        typer.Option(
-            help="greedy: take units by most untaken hit k-mers / t_g (sourmash gather); "
-            "containment: by untaken hit k-mers / (m_g + 1), so fully contained small units "
-            "keep their k-mers"
-        ),
-    ] = "greedy",
     min_identity: Annotated[
         float,
         typer.Option(
@@ -419,7 +411,6 @@ def query(
             min_aai_kmers=min_aai_kmers,
             background_share=background_share,
             min_own_kmers=min_own_kmers,
-            gather_rule=gather,
             min_identity=min_identity,
             extra=extra,
             mask=masked,
