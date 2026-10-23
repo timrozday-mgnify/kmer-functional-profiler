@@ -24,11 +24,16 @@
 # work/ into $OUT). Read summary.tsv's recall_hit1, recall_hit2 and recall_gathered beside
 # recall, recall_hit1_depth_* and _identity_*, and unspiked_hit*, null_hit* (reference size,
 # chance hits); $OUT/seed<N>/truth.tsv is now published.
+# Containment gather, full-length members (PICK --min-member-frac 0.9, 2026-10-23):
+#   OUT=results-containment AAI=true GATHER=containment sbatch run.sh
+# against a greedy baseline on the same picks: OUT=results-greedy AAI=true sbatch run.sh
+# (PICK changed, so results-aai is not comparable). Read recall_gathered, recall, false_share
+# and false_share_unrelated per share between the two.
 source ../common.sh
 STD=../release-tiers/results-standard
 [[ -f $STD/index/meta.json ]] || { echo 'release-tiers has not finished (no results-standard/index)' >&2; exit 1; }
 [[ -s ../pileup-cost/hadza10M_1.fastq.gz ]] || { echo 'no ../pileup-cost/hadza10M_*.fastq.gz: run pileup-cost first' >&2; exit 1; }
 nextflow run "$WF/presence-calibration" -c ../site.config -resume --outdir "${OUT:-results}" \
-    --aai "${AAI:-false}" \
+    --aai "${AAI:-false}" --gather "${GATHER:-greedy}" \
     --index "$(realpath "$STD/index")" --store "$(realpath "$STD")/members.bucket*.parquet" \
     --background "$(realpath ../pileup-cost/hadza10M_1.fastq.gz),$(realpath ../pileup-cost/hadza10M_2.fastq.gz)"

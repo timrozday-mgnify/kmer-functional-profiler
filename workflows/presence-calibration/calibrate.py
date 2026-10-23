@@ -60,7 +60,11 @@ def pick(args: argparse.Namespace) -> None:
         .head(args.units)
         .select("unit", "rep_len")
     )
-    seqs = seqs.join(keep.select("unit"), on="unit", how="semi")
+    # members under --min-member-frac of the representative's length are dropped: strains of
+    # fragments cover few of the unit's sampled k-mers (21% of spikes, plan 2026-10-23)
+    seqs = seqs.join(keep, on="unit").filter(
+        pl.col("sequence").str.len_bytes() >= args.min_member_frac * pl.col("rep_len")
+    )
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "targets.fa", "w") as fa, open(out / "groups.tsv", "w") as groups:
@@ -232,6 +236,7 @@ def main() -> None:
     p.add_argument("--members", type=int, default=3)
     p.add_argument("--min-len", type=int, default=200)
     p.add_argument("--max-len", type=int, default=600)
+    p.add_argument("--min-member-frac", type=float, default=0.9)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out", type=Path, default=Path("."))
     p = sub.add_parser("reverse")
