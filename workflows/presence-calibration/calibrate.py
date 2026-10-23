@@ -7,12 +7,13 @@ Subcommands (run by ``main.nf``; each prints what it wrote):
   representative is ``--min-len``-``--max-len`` residues; fetched with up to ``--members``
   sequences each. Writes ``targets.fa`` and ``groups.tsv`` (member, unit: ``spike.py
   simulate``'s inputs) and ``units.tsv`` (unit, ``rep_len``, ``n_members``, ``m_g`` and
-  ``uniq`` = ``pin_sum`` / ``m_g``, the mean share of the unit's sampled k-mers it holds alone).
+  ``uniq`` = ``pin_sum`` / ``m_g``, the mean ``p_in`` of the unit's sampled k-mers: the share
+  of its members holding each, 1 for a singleton; not whether other units hold them).
 - ``reverse``: a null sample, the reads reversed (not complemented): same count, lengths and
   composition, no coding homology, so every unit it calls present is a false call.
 - ``score``: one spiked sample's profile against its truth, beside the unspiked and null
   samples' profiles at the same share -> one row per q threshold (``Q``): ``called``,
-  ``recall`` (spiked units called; also by depth, identity and uniqueness bins),
+  ``recall`` (spiked units called; also by depth, identity and ``uniq`` bins),
   ``new_false`` (units called here but not unspiked, not spiked: the spike's relatives, an
   upper bound), ``false_share`` = new_false / (spiked called + new_false), ``new_relative``
   (new_false in a component, of this profile, that holds a spiked unit: relatives the strain
