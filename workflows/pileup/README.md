@@ -29,7 +29,12 @@ Per sample:
      with `--dbsize`, every hit within `--diamond_top` % of the read's best,
      frameshift-aware with `-F --frameshift` (0: off), tabular with BTOP);
    - nucleotide index: `BWAMEM2` (`index`, then `mem -a`, SAM).
-4. `CALL`: `kfp-pileup call`: read posteriors (leave one column out), neighbour-best reads dropped, pileups,
+4. `CALL`: `kfp-pileup call`: first, of each read's DIAMOND lines (from all its routed blocks
+   together), those within `--call_top` % (10, as `--diamond_top`, which routed runs apply per
+   block) and `--call_max_bits_below` bits (10) of its best, and within `--call_unit_bits_below`
+   bits (5) of its best to the same unit; reads whose best alignment is under
+   `--call_min_identity` (0.7) are dropped (counts in `call_stats.json`, `dropped_*`); then
+   read posteriors (leave one column out), neighbour-best reads dropped, pileups,
    variants and per-unit identity; read assignment (steps 8-9); with DIAMOND, the reads
    brought back to nucleotides along their alignments, a nucleotide pileup and a consensus
    coding sequence per unit (step 6b).
