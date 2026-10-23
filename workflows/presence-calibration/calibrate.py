@@ -14,8 +14,10 @@ Subcommands (run by ``main.nf``; each prints what it wrote):
   samples' profiles at the same share -> one row per q threshold (``Q``): ``called``,
   ``recall`` (spiked units called; also by depth, identity and uniqueness bins),
   ``new_false`` (units called here but not unspiked, not spiked: the spike's relatives, an
-  upper bound), ``false_share`` = new_false / (spiked called + new_false), ``unspiked_called``
-  and ``null_called``.
+  upper bound), ``false_share`` = new_false / (spiked called + new_false), ``new_relative``
+  (new_false in a component, of this profile, that holds a spiked unit: relatives the strain
+  may be nearer than its own unit), ``false_share_unrelated`` (false_share without them: the
+  q cut moving, chance), ``unspiked_called`` and ``null_called``.
 - ``decide``: every score row -> ``summary.tsv`` (per share and q, the worst seed's
   false_share and the mean recalls) and ``decision.tsv``: the largest share passing the rule
   at q = ``--q`` in every seed: false_share <= ``--max-false`` and null_called <=
@@ -108,6 +110,13 @@ def score(args: argparse.Namespace) -> None:
         )
     )
     spiked = truth["unit"]
+    components = (
+        pl.scan_csv(args.profile, separator="\t")
+        .select(pl.col("unit").cast(pl.Int64), "component")
+        .collect()
+    )
+    spiked_components = components.filter(pl.col("unit").is_in(spiked.implode()))["component"]
+    relatives = components.filter(pl.col("component").is_in(spiked_components.implode()))["unit"]
     rows = []
     for q in Q:
         called = _called(args.profile, q)
@@ -116,6 +125,8 @@ def score(args: argparse.Namespace) -> None:
         new_false = called.filter(
             ~called.is_in(unspiked.implode()) & ~called.is_in(spiked.implode())
         )
+        relative = int(new_false.is_in(relatives.implode()).sum())
+        unrelated = new_false.len() - relative
         tp = int(hit["called"].sum())
         row: dict[str, object] = {
             "sample": args.sample,
@@ -126,6 +137,8 @@ def score(args: argparse.Namespace) -> None:
             "recall": tp / max(truth.height, 1),
             "new_false": new_false.len(),
             "false_share": new_false.len() / max(tp + new_false.len(), 1),
+            "new_relative": relative,
+            "false_share_unrelated": unrelated / max(tp + unrelated, 1),
             "unspiked_called": unspiked.len(),
             "null_called": _called(args.null, q).len(),
         }
@@ -154,6 +167,8 @@ def decide(args: argparse.Namespace) -> None:
             pl.len().alias("seeds"),
             pl.col("false_share").max().alias("false_share_worst"),
             pl.col("new_false").mean(),
+            pl.col("new_relative").mean(),
+            pl.col("false_share_unrelated").max().alias("false_share_unrelated_worst"),
             pl.col("null_called").max().alias("null_called_worst"),
             pl.col("null_ratio").max().alias("null_ratio_worst"),
             pl.col("unspiked_called").first(),
