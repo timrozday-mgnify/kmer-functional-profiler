@@ -35,6 +35,7 @@ import math
 import re
 import tempfile
 from collections.abc import Iterator, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -62,6 +63,30 @@ BATCH_READS: Final = 20_000
 BYTES: Final = list(range(256))
 CHARS: Final = [chr(b) for b in BYTES]
 DIAMOND_CHUNK: Final = 1 << 24  # bytes of DIAMOND output read at a time
+DROPPED: Final = ("top", "margin", "unit", "floor_reads", "floor_lines")
+
+
+@dataclass(frozen=True)
+class HitFilter:
+    """Which of a read's DIAMOND alignments ``call`` keeps, against the read's best (highest
+    bit score), decided over all its lines before any is expanded; a line goes by the first
+    rule it fails. ``top``: percent below the best (DIAMOND's ``--top``, re-applied because
+    routed runs apply it per block); ``max_bits_below``: bits below the best (a ~3-bit
+    mismatch costs the EM ~10^3 in likelihood, so 10 bits keeps every alignment it could
+    weigh); ``unit_bits_below``: bits below the read's best alignment to the same unit (its
+    other members, which the EM does not use and the pileup weighs at 2^-bits);
+    ``min_identity``: the best alignment's identity, below which the read is dropped (a
+    distant homologue, which the EM sends to the novel class). ``inf`` / 0 keep all.
+    ponytail: defaults chosen, not yet checked against spike-protein's truth."""
+
+    top: float = 10.0
+    max_bits_below: float = 10.0
+    unit_bits_below: float = 5.0
+    min_identity: float = 0.7
+
+
+KEEP_ALL: Final = HitFilter(math.inf, math.inf, math.inf, 0.0)
+DEFAULT_FILTER: Final = HitFilter()
 ROLES: Final = ("target", "neighbour")
 TARGET, NEIGHBOUR = range(2)
 GAP: Final = ord("-")
@@ -207,6 +232,12 @@ class _Columns:
     ev_kind: np.ndarray
     ev_key: np.ndarray
 
+    dropped_top: int
+    dropped_margin: int
+    dropped_unit: int
+    dropped_floor_reads: int
+    dropped_floor_lines: int
+
     def __init__(self, cols: dict[str, Any], mate: int) -> None:
         for name, value in cols.items():
             setattr(self, name, value)
@@ -214,12 +245,20 @@ class _Columns:
 
 
 def read_diamond(
-    paths: Sequence[str | Path], names: Sequence[str], refs: list[bytes], batch_reads: int
+    paths: Sequence[str | Path],
+    names: Sequence[str],
+    refs: list[bytes],
+    units: np.ndarray,
+    batch_reads: int,
+    hit_filter: HitFilter = KEEP_ALL,
 ) -> Iterator[_Columns]:
     """Batches of DIAMOND alignments (``paths`` the mates' outputs, in mate order) against
-    sequences ``names`` with residues ``refs``, each of whole reads (a read's alignments are
-    consecutive), parsed in Rust from chunks of ``DIAMOND_CHUNK`` bytes."""
-    reader = DiamondReader([n.encode() for n in names], refs)
+    sequences ``names`` with residues ``refs`` of ``units``, each of whole reads (a read's
+    alignments are consecutive) and their lines ``hit_filter`` keeps, parsed in Rust from
+    chunks of ``DIAMOND_CHUNK`` bytes."""
+    reader = DiamondReader(
+        [n.encode() for n in names], refs, units.astype(np.uint32), **asdict(hit_filter)
+    )
     for mate, path in enumerate(paths):
         with open(path, "rb") as f:
             buf, eof = b"", False
@@ -467,6 +506,7 @@ def call(
     stats: str | Path | None = None,
     spill_parts: int = PARTS,
     threads: int = 1,
+    hit_filter: HitFilter = DEFAULT_FILTER,
 ) -> dict[str, int]:
     """Read posteriors, pileups and the unit table from ``alignments`` (``aligner``
     ``diamond``: one tabular file per mate; ``bwa``: one SAM) against the reference in
@@ -475,7 +515,8 @@ def call(
     outputs (steps 8-9); with DIAMOND alignments and the ``reads`` (FASTQ, in mate order),
     :func:`kfp_pileup.nucleotide.nucleotide_pileup`'s (step 6b). With ``stats``, each
     stage's time and memory go there as the query's (``Timer``); ``threads`` worker
-    processes fit step 9's haplotypes. Returns counts.
+    processes fit step 9's haplotypes. DIAMOND alignments are kept by ``hit_filter``
+    (:class:`HitFilter`; the lines each rule drops are counted in the stats). Returns counts.
 
     Target columns and events are spilled to Parquet by reference sequence in a temporary
     directory under ``out_dir`` (:mod:`kfp_pileup.spill`), so steps 6b and 8-9 hold one
@@ -490,8 +531,9 @@ def call(
         spill = Spill(Path(tmp), partitions(target_len, spill_parts))
         with timer("batches"):
             hits, parts, stat_parts = _score(
-                alignments, refs, sequences, aligner, score_nats, batch_reads, spill
-            )
+                alignments, refs, sequences, aligner, score_nats, batch_reads, spill,
+                hit_filter, timer.counts,
+            )  # fmt: skip
             spill.close()
         timer.counts.update(
             alignments=0 if hits is None else hits.height,
@@ -569,14 +611,20 @@ def _score(
     score_nats: float,
     batch_reads: int,
     spill: Spill,
+    hit_filter: HitFilter,
+    dropped: dict[str, int],
 ) -> tuple[pl.DataFrame | None, list[pl.DataFrame], list[pl.DataFrame]]:
     """The crude pass, batch by batch: alignments with hit ids, the summed pileup's parts
-    and per-sequence read stats; target columns and events go to ``spill``."""
+    and per-sequence read stats; target columns and events go to ``spill``; DIAMOND lines
+    ``hit_filter`` drops counted in ``dropped``."""
     seq_index = {s: i for i, s in enumerate(refs["seq_id"])}
     ref_bytes = [sequences[s].encode() for s in refs["seq_id"]]
     batches: Iterator[_Batch] | Iterator[_Columns]
     if aligner == "diamond":
-        batches = read_diamond(alignments, refs["seq_id"].to_list(), ref_bytes, batch_reads)
+        batches = read_diamond(
+            alignments, refs["seq_id"].to_list(), ref_bytes, refs["unit"].to_numpy(),
+            batch_reads, hit_filter,
+        )  # fmt: skip
         matrix, term_bits = blosum62(), DIAMOND_BITS
     elif aligner == "bwa":
         if len(alignments) != 1:
@@ -588,6 +636,11 @@ def _score(
     parts, stats, n_assigned = [], [], 0
     assigned_parts = []
     for batch in batches:
+        if isinstance(batch, _Columns):
+            for k in DROPPED:
+                dropped[f"dropped_{k}"] = dropped.get(f"dropped_{k}", 0) + getattr(
+                    batch, f"dropped_{k}"
+                )
         assignments, part, stat, cols, events = score_batch(batch, refs, matrix, term_bits)
         offset = pl.lit(n_assigned, pl.UInt32)
         assigned_parts.append(assignments.with_columns(pl.col("hit") + offset))

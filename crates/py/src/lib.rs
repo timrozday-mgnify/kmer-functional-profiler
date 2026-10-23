@@ -409,23 +409,45 @@ impl PyDistinct {
 #[pyclass(name = "DiamondReader")]
 struct PyDiamondReader {
     refs: kfp::DiamondRefs,
+    filter: kfp::HitFilter,
 }
 
 #[pymethods]
 impl PyDiamondReader {
-    /// Sequence `i` is `names[i]` with residues `seqs[i]`.
+    /// Sequence `i` is `names[i]` with residues `seqs[i]`, of unit `units[i]`; each read's
+    /// lines are kept by `HitFilter`'s rules (the defaults keep all).
     #[new]
-    fn new(names: Vec<PyBackedBytes>, seqs: Vec<PyBackedBytes>) -> PyResult<Self> {
+    #[pyo3(signature = (
+        names, seqs, units, *, top = f64::INFINITY, max_bits_below = f64::INFINITY,
+        unit_bits_below = f64::INFINITY, min_identity = 0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        names: Vec<PyBackedBytes>,
+        seqs: Vec<PyBackedBytes>,
+        units: PyReadonlyArray1<'_, u32>,
+        top: f64,
+        max_bits_below: f64,
+        unit_bits_below: f64,
+        min_identity: f64,
+    ) -> PyResult<Self> {
         Ok(Self {
-            refs: kfp::DiamondRefs::new(&names, &seqs).map_err(to_py_err)?,
+            refs: kfp::DiamondRefs::new(&names, &seqs, units.as_slice()?).map_err(to_py_err)?,
+            filter: kfp::HitFilter {
+                top,
+                max_bits_below,
+                unit_bits_below,
+                min_identity,
+            },
         })
     }
 
     /// Whole reads from the start of `buf`, at most `batch_reads`: a dict of columns
     /// (`names` a list; `read`, `seq`, `score`, `start`, `end`, `reverse`, `ins`, `shifts`
     /// per alignment; `hit`, `col`, `qpos`, `rres`, `sres` per aligned column; `ev_hit`,
-    /// `ev_col`, `ev_kind`, `ev_key` per event) and the bytes consumed. The last read in
-    /// `buf` is whole only at `eof`.
+    /// `ev_col`, `ev_kind`, `ev_key` per event; `dropped_top`, `dropped_margin`,
+    /// `dropped_unit`, `dropped_floor_reads`, `dropped_floor_lines` counts) and the bytes
+    /// consumed. The last read in `buf` is whole only at `eof`.
     fn parse<'py>(
         &self,
         py: Python<'py>,
@@ -434,7 +456,7 @@ impl PyDiamondReader {
         eof: bool,
     ) -> PyResult<(Bound<'py, PyDict>, usize)> {
         let (b, used) = py
-            .detach(|| kfp::DiamondBatch::parse(&self.refs, &buf, batch_reads, eof))
+            .detach(|| kfp::DiamondBatch::parse(&self.refs, &self.filter, &buf, batch_reads, eof))
             .map_err(to_py_err)?;
         let dict = PyDict::new(py);
         dict.set_item("names", b.names)?;
@@ -455,6 +477,12 @@ impl PyDiamondReader {
         dict.set_item("ev_col", b.ev_col.into_pyarray(py))?;
         dict.set_item("ev_kind", b.ev_kind.into_pyarray(py))?;
         dict.set_item("ev_key", b.ev_key.into_pyarray(py))?;
+        let d = b.dropped;
+        dict.set_item("dropped_top", d.top)?;
+        dict.set_item("dropped_margin", d.margin)?;
+        dict.set_item("dropped_unit", d.unit)?;
+        dict.set_item("dropped_floor_reads", d.floor_reads)?;
+        dict.set_item("dropped_floor_lines", d.floor_lines)?;
         Ok((dict, used))
     }
 }
