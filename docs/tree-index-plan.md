@@ -156,6 +156,22 @@ Memory is one chunk's table plus one range of the sample sketch, both set by *B*
 
 *Precedent:* MiniPhy groups genomes into batches of up to ~10k by their phylogeny, and Phylign searches one batch at a time (phylogenetic compression, below); HIBF lays bins out by similarity.
 
+## Updates
+
+Adding proteins needs no re-clustering, unlike today's tier 1, whose units follow MGnify90 membership. The difficulty is keeping DFS numbering contiguous, which a delta index handles (the user's question, 2026-10-24).
+
+- **One protein** (the build's insertion path): query it against the index; the interval sweep gives its overlap with every touched node. Then:
+  - an equal or contained stored set joins that node as a member (nothing else changes);
+  - otherwise it becomes a leaf under the node minimising |S\_new| + |S\_v| − 2|∩|, with its additions and deletions, or a fresh root if no node beats its own size.
+- **Delta index (LSM-style).** The main index stays frozen. New nodes go to a small delta: each has its parent (main or delta) and its diffs, in a small k-mer table.
+  - Queries stay exact. The main sweep runs as now. A delta node's count is its parent's count (a lookup in the sweep's breakpoints), minus hits on its deletions, plus hits on its additions, per level band; delta nodes are evaluated in topological order, so chains work.
+- **Compaction** folds the delta in: renumber, rewrite postings in one sequential merge, split chunks above *B*.
+- **Staying near-optimal.** Leaf-only insertion drifts from the MST, since a new protein may be a better parent for existing nodes. This costs storage, not correctness, and the batch fix is exact:
+  - the MST of the enlarged set uses only the old tree's edges plus the new proteins' candidate edges, so a batch update is Kruskal over those, linear in their size, re-parenting only where cheaper;
+  - new candidate edges come from the staged joins (digests, pigeonhole signatures, prefix join); existing nodes' signatures are recomputed from their sets, reconstructed by a DFS over the diffs, without re-hashing their sequences.
+- **Refreshed at compaction:** per-k-mer gain counts (kept current, with the uninformative cut applied here, since a k-mer can cross it), per-subtree *p\_in*, chunk boundaries, the background calibration. Removed proteins are tombstoned until then.
+- **A new MGnify release** is then: hash only the new proteins; join them against existing nodes; Kruskal over old edges plus new ones; one compaction. Small user additions (a lab's own proteins) go to the delta with no rebuild.
+
 ## Prior art
 
 The closest precedents, in order of closeness:
@@ -203,6 +219,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - the staged build: set digests (Δ = 0), pigeonhole signatures (Δ ≤ d), the rarity-ordered prefix join on representatives (Δ > d), Kruskal by integer level with the virtual empty root, and dense tie-breaks; collapses;
    - DFS numbering; postings with level bands; node table; a sequence store reordered by DFS.
    - Checked against a brute-force reconstruction: every sequence's sampled set from its path equals its own.
+   - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
 2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures.
 3. **Reporting, recall first.** Candidate subtrees above background, members as DFS ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
 4. **Benchmark against tier 1**, at matched index size and *t*:
@@ -230,3 +247,5 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 * **Amendment (2026-10-24, the user's question: is the tree also useful for tier 2, routing or reclassification, and is it fast enough to build and use?).** Density added: no dense global tier (postings ≥ distinct k-mers, ~5–8 TB dense); tier 1 perhaps ~1.2–2× denser at matched size; tier 2 still needed for resolution. Uses beyond tier 1 added: tier 2 / round-2 presence, routing and read reclassification built per sample from the candidate subtrees along tier 1's topology ("one topology, many densities"), per sample or node-major precomputed. Phase 0 now measures distinct-over-total k-mers and the reuse of one topology across densities; phase 4b gates each use on build and use time against its flat table.
 
 * **Amendment (2026-10-24, the user's idea: split an index too large for one go into similarity chunks from the tree and query them in turn).** Chunks by similarity added: whole forest components packed into chunks of size ≤ *B*, larger components split at their heaviest edges (Kundu & Misra), chunk roots stored in full, chunk-major numbering. Querying merge-joins one stored sample sketch against each needed chunk, and merges per-node counts before the model, so results are identical to an unchunked run. Phase 0 measures duplication against *B*; phase 4b runs each use chunked, with identical outputs required.
+
+* **Amendment (2026-10-24, the user's question: can the index be updated with new proteins efficiently?).** Updates added: insertion by the index's own query; an LSM-style delta index (new nodes with parent and diffs, counts from the parent's count plus own diffs, exact); compaction (renumber, one merge, chunk splits, gain counts and the uninformative cut refreshed); an exact batched MST update by Kruskal over the old tree's edges plus new candidate edges; a release update that hashes only new proteins. Phase 1 checks delta queries and compaction against a rebuild, and the batched update against a from-scratch tree.
