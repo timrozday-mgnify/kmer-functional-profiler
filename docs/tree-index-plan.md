@@ -1,0 +1,173 @@
+# A k-mer tree index: every sequence, no clustering threshold
+
+Plan, 2026-10-24 (the user's request): explore a tier-1 index built as a tree of k-mer diffs over every sequence of a set (all of MGnify Proteins, not only 90% cluster representatives or unions), instead of fixed-identity units; its feasibility, precedent, and a build order. A separate design from [kmer-functional-profiler-plan.md](kmer-functional-profiler-plan.md) (the main plan), which it would replace at tier 1 only if the gates below pass. No code yet.
+
+## Verdict
+
+Feasible, and worth a measurement phase before any build. The encoding is sound and has close precedent. Its cost is known exactly: the number of postings is the parsimony length of the k-mer presence matrix on the tree. Near-identical sequences then cost almost nothing at kfp's sampling rate. Four points decide it:
+
+- **Compactness.** At *t\_base* = 0.02 a substitution changes ~22 k-mers and so ~0.44 sampled postings. A member at 99% identity to its tree neighbour (187 aa, the release mean) costs ~1 posting, and often 0, in which case it collapses into its neighbour's node. Leaf resolution therefore costs roughly as much as the per-unit unions the standard tier already stores. It does not cost the ~2 × 10¹⁰ postings a flat per-protein index would need. This is an estimate: phase 0 measures it.
+- **No identity threshold, but resolution is still set by something.** It is set by the sampling density (*t*, k) and by the data. Nodes are the distinct sampled k-mer sets, so what the index can tell apart is exactly what its k-mers can tell apart. Reported units are subtrees chosen per sample, not fixed clusters. For MGnify specifically this is the main gain; it is also why the method generalises to other sets of short sequences.
+- **The query keeps its cost; the reporting changes.** Lookups are the same: one table probe per sampled read k-mer. Per-node hit counts come from an interval sweep over DFS order, not from per-unit posting expansion, and k-mers shared by a whole clade become one posting instead of a large unit set (today such k-mers are dropped above 16 units). The new work is the assignment model over nested subtrees (greedy, recall-first candidates, or a placement-style model), which today's per-unit gather and EM do not cover.
+- **Build is the expensive part, but k-mer joins keep it to sorts.** The edge weight is defined on stored k-mer sets, so the tree can be built exactly from them, with no alignment (Building the tree): set digests, pigeonhole signatures and a rarity-ordered prefix join, then Kruskal by integer weight. That is estimated at hours of HPC, against today's reuse of MGnify90 membership, which is free, and it needs no clustering of the input.
+
+Not shown yet, and the reason for phase 0: whether the tree's postings and node table fit in the standard tier's budget (~108–196 GB), and whether 82% partial sequences collapse into their full-length containers as expected.
+
+## The structure
+
+**Tree.** Nodes are sequences. Edge weight between sequences *a* and *b* is the size of the symmetric difference of their sampled k-mer sets, |S\_a Δ S\_b|. A minimum spanning tree under that weight minimises the total diff size over spanning trees. It is a 2-approximation of the parsimony-optimal (Steiner) tree in this Hamming space, which is Mantis-MST's argument for colour classes (below). The tree is rooted, and nodes are numbered in DFS order, so every subtree is a contiguous id range [*v*, *v* + size(*v*)).
+
+**Diffs.** A node stores additions (k-mers it has and its parent lacks) and deletions (the reverse). A sequence's set is the union of additions along its root path, minus the deletions. As an inverted index, each k-mer *x* maps to a posting list of (node, ±): the nested subtrees where *x* is gained or lost. The sequences holding *x* are the add-intervals minus the nested delete-intervals.
+
+**Exact cost.** For one k-mer, the fewest postings that describe its sequence set on a fixed tree is that character's Fitch parsimony score (+1 for the first gain). So total postings = Σ\_x parsimony(*x*), the parsimony length of the k-mer presence/absence matrix. A flat per-sequence index costs Σ\_x |S\_x| instead. Today's tier 1 costs Σ\_x |units(*x*)| before set deduplication.
+
+**When a diff pays.** With uniform substitutions at identity *p*, two sequences share ~*p*¹¹ of their 11-mers, so an edge costs ~2(1 − *p*¹¹) of the child's k-mers: 0.21 at 99%, 0.57 at 97%, 0.86 at 95%, 1.0 at ~94%, 1.37 at 90%. Below ~94% (at k 11), storing the child fresh is cheaper than a diff. The tree then becomes a forest, cut wherever an edge costs more than a fresh set, and k-mers shared across a cut are posted on each side, as unit sets post them today. That cut falls out of the storage cost; it is not imposed as a clustering threshold.
+
+**Collapses (generic, no threshold):**
+
+- *Zero-diff nodes:* a sequence whose sampled set equals its parent's is merged into the parent's node, which then lists several sequences. Node count = distinct sampled sets, so resolution follows *t*.
+- *Contained sequences:* a sequence whose k-mers are (almost) all inside another's, such as a fragment of a full-length protein, joins the container's node as a member. Diffing it would post every k-mer outside the fragment as a deletion. In MGnify 4.7 × 10⁹ of 5.74 × 10⁹ proteins are partial, so this collapse sets the node table's size. Phase 0 measures its rate.
+
+## Variable thresholds (FracMinHash by length)
+
+Today *t\_g* = max(*t\_base*, *n\_min* / (*L\_g* − *k* + 1)) per unit, and the query keeps every k-mer with hash ≤ *t\_max*. The nesting carries over to nodes unchanged: S\_v = kmers(*v*) ∩ {h ≤ *t\_v*}, and a hit counts for *v* only if h ≤ *t\_v*.
+
+- **Coordinated floors.** A threshold set by length is close to a bottom-*n* sketch. Near-identical neighbours of similar length pick nearly the same low-hash k-mers, so their floors share postings high in the tree. Floors therefore cost far less per node than *n\_min* fresh k-mers. Fragments would break this, but they collapse into their containers.
+- **Implicit, not stored, threshold deletions.** A child with a lower *t* than its parent should not post the parent's k-mers in (*t\_c*, *t\_p*] as deletions. Thresholds are quantised to a few levels (e.g. 8, log-spaced from *t\_base* to *t\_cap*). Each posting carries its level, and the query sweeps each level band separately: node *v*'s count = Σ over bands *j* ≤ level(*v*). This is exact, and 8 sweeps over the touched intervals are cheap.
+- **Where floors apply.** Today the floor skips singletons to fit memory. The tree's equivalent: the floor applies to nodes inside a forest component (an edge cheaper than a fresh set), not to isolated sequences. This is a cost rule, not an identity rule. Phase 0 sizes both choices.
+
+## Building the tree from k-mers
+
+The edge weight is defined on the stored k-mer sets themselves: storage cost, not similarity. So k-mer methods compute the objective exactly, rather than approximating sequence identity. Three facts make the build cheap.
+
+- **Fresh storage is an edge to the empty set.** Add a virtual root whose set is empty: its edge to any *v* costs |S\_v|, which is exactly storing *v* fresh. The minimum spanning tree over every sequence plus that root is the storage-optimal tree under symmetric-difference cost, rooted at the empty set, with the forest cuts built in. (It is within 2× of the Steiner optimum, which may also invent ancestral sets.)
+- **Only pairs sharing at least half the smaller set can be tree edges.** On the cycle *a*–*b*–root, edge (*a*, *b*) is excluded whenever |S\_a Δ S\_b| > max(|S\_a|, |S\_b|), i.e. when |S\_a ∩ S\_b| < min(|S\_a|, |S\_b|) / 2. Candidate generation is therefore an overlap set-similarity join with a fixed threshold, a problem with exact, fast algorithms. In particular, pairs sharing no stored k-mer never matter.
+- **Weights are small integers.** With the floor, most stored sets hold ~16 k-mers (*t\_g* = 16 / (*L* − 10) binds below ~800 aa), so Δ ∈ {0, …, 32}. Kruskal over integer weights is a bucket queue plus union-find, linear in the candidate edges, and it can run level by level: Δ = 0, then 1, 2, …. Each level only needs the edges of that weight, so later levels see the components that earlier levels already merged, not raw sequences.
+
+**Staged build (each stage exact for its weights, unless noted):**
+
+1. **Hash once.** Every sequence's stored set S\_v (its own level), with today's Rust kernels, partitioned by sequence id. The same pass writes the inverted index (k-mer → sequences) partitioned by hash range, which is today's partitioned build with unit = sequence.
+2. **Δ = 0: group by set hash.** Identical stored sets become one node. Linear (one sort or hash of 64-bit set digests).
+3. **Δ ≤ d (d ≈ 3) by pigeonhole signatures** (PartEnum, Arasu et al. VLDB 2006). Split hash space into d + 1 parts by a second hash. If |S\_a Δ S\_b| ≤ d, the d differing k-mers fall in at most d parts, so a and b agree exactly on at least one part's restriction. Each node emits d + 1 (part, digest of S ∩ part) signatures, and an equi-join on signatures gives every pair within d, plus false positives removed by an exact Δ (a merge of two ~16-element sorted arrays, ~20 ns). Kruskal levels 1…d follow.
+   - *Empty parts* are skipped (they match everything). A pair agreeing only on empty parts is missed here and found in stage 4.
+   - *Large signature groups* (many nodes agreeing on one part) are not expanded into all pairs. Members are sorted by full digest and linked to their sort neighbours and to the group's longest member (Linclust's centre). This is approximate, and only for groups above a cap.
+   - This stage covers the near-identical bulk: pairs above ~99% identity differ by about one stored k-mer.
+4. **Δ > d: prefix-filtered overlap join** (Chaudhuri et al. ICDE 2006; AllPairs, Bayardo et al. WWW 2007; PPJoin, Xiao et al. WWW 2008), over one representative per component left by stage 3. Order k-mers globally by rarity, rarest first. A pair sharing at least half the smaller set must share a k-mer within the first ⌊|S|/2⌋ + 1 of the smaller set's sorted k-mers, so only those prefix postings are joined, and overlaps are counted only for the pairs they generate.
+   - Rarity order is what makes this cheap. Unique k-mers (one sequence) fill prefixes and generate no pairs, and the frequent k-mers of large near-identical clades are already gone, because stage 3 merged those clades into single representatives. That is the reason for the staging.
+   - Posting lists above a cap fall back to sorted-neighbourhood candidates: sort by the bottom few hashes in a few random orders and link window neighbours, which is MinHash LSH by sorting.
+   - Kruskal levels d + 1 … 32 follow; the virtual root's edges close the forest.
+5. **Optional refinement: NN-descent** (Dong, Charikar, Li, WWW 2011). Neighbours of neighbours are candidates; one or two rounds over the tree's own edges catch what the stage-3 caps and empty parts missed.
+
+**Why it is fast:**
+
+- Stages 1–3 are sorts and equi-joins over ~(d + 2) × 5.74 × 10⁹ 64-bit digests (~3 × 10¹⁰ records at d = 3, a few hundred GB), done by hash range as the partitioned build already does: hours of HPC, no alignment, and no pairwise comparison beyond the candidates.
+- Stage 4 runs on the representatives stage 3 leaves, over prefix postings that are mostly length 1.
+
+**Free by-products:**
+
+- *A dendrogram.* Kruskal's merge order at levels Δ = 0, 1, 2, … is a single-linkage hierarchy, so a partition into clusters at any stored-k-mer distance is available without another clustering. This is useful for reporting and for benchmarks against fixed-identity units.
+- *Containment.* Stage 4's overlap counts flag a set entirely inside another (overlap = |S\_a|) for the containment collapse.
+- *Components.* Stage 4's join graph is also the source of cross-component links (relatives below the fresh-cost cut) for grouped routing and round 2.
+
+**Thresholds in weights.** With per-sequence levels, the cost depends on direction: a child at a higher level pays for its band, and a parent's k-mers above the child's level are free (implicit deletion). Weights use the cost with the lower-level (longer) end as parent; each tree is rooted at its longest sequence, which keeps nearly every edge in that orientation. An exact directed optimum (Edmonds' arborescence) is not worth its cost.
+
+**Two alternatives kept for comparison:**
+
+- *Self-build by insertion.* Insert sequences longest first, in batches. Each batch is queried against the index built so far, with the query's own interval sweep, which gives |S\_new ∩ S\_v| for every touched node in one pass. Each sequence is attached to the node minimising |S\_new| + |S\_v| − 2|∩|, or collapsed into it if contained. This is one code path for build and query, and order-dependent, like CD-HIT, but with the right objective. A good fallback if stages 3–4's joins are too large.
+- *Dense tie-breaks.* Many nodes tie at the stored density. Ties can be broken by Δ at a denser nested rate (S at *t\_store* ⊂ S at *t\_dense*, computed only for tied candidates), so subtrees also group relatives sensibly for reporting. Storage cost is unchanged.
+
+## Uninformative k-mers
+
+The tree gives each k-mer a natural score: its number of independent gains, compared with the one gain a clade marker needs. That is the phylogenetic consistency index (CI = minimum changes / observed changes).
+
+- *Low CI* (many separate gains across unrelated subtrees): convergent or chance k-mers, low-complexity runs, compositional bias, common motifs. These are the k-mers that cost the most postings and carry the least information, so one cut on gains (or CI) removes both cost and noise. It replaces today's "held by more than 16 units".
+- *One gain high in the tree:* a clade marker, kept however many sequences hold it (one posting). Today such k-mers in dense families are dropped by the 16-unit cut, so the tree keeps signal the current tier loses.
+- *Gained once, then lost many times:* a variable-site k-mer. It weighs like today's low *p\_in*, which can be computed per subtree from the tree (the share of a subtree's sequences holding *x*).
+
+## Querying a metagenome
+
+1. **Lookup** (unchanged): sampled read k-mers (h ≤ *t\_max*, sketch-first and merge-join as today), each probing the k-mer table for its posting list.
+2. **Counting:** each hit adds +1 over its add-intervals and −1 over its delete-intervals, per level band. A sweep over the sorted interval endpoints gives piecewise-constant hit counts over DFS order. The cost is O(P log P) for P hit postings, independent of the 10⁹ nodes; node sizes |S\_v| and levels are read only for touched ranges.
+3. **What to report (the user's three options):**
+   - *Recall-first candidates (first to build):* every subtree with hits above a background, its members fetched as one contiguous range (the sequence store reordered by DFS), into a dense sample-specific index or the pileup's reference. This is the main plan's round-2 candidate stage, with subtrees in place of components. It also gives grouped routing its similarity groups for free, and fixes the scattered fetch (members of one MGnify90 cluster spread over the whole id space).
+   - *Greedy (gather):* take the node with the largest remaining hits normalised by |S\_v|, remove its k-mers' hits, repeat. Nodes tied within noise are reported as their smallest common subtree, like an LCA but ranked by evidence rather than by taxonomy.
+   - *Placement-style model (later):* for each touched subtree, the best node by containment (hits / |S\_v| at its level) gives AAI as containment^(1/k), with an interval as today. The reported unit is the subtree of nodes whose containment is within that interval of the best: resolution adapts to the data, coarse for divergent strains and fine for close ones. Presence uses today's Poisson background, per reported subtree.
+4. **Roll-ups:** each node's sequences carry their annotations (MGnify ships Pfam for every protein), so subtree → Pfam or KOfam roll-ups are direct. Mapping nodes to MGnify90 membership gives a like-for-like comparison with today's tier 1.
+
+## Against today's tier 1
+
+| | Tier 1 today (MGnify90 units) | Tree index |
+| --- | --- | --- |
+| Units | 1.66 × 10⁹ fixed 90% clusters | nodes = distinct sampled sets, after collapses (phase 0: expected ~1–2.5 × 10⁹); reported units = subtrees per sample |
+| Postings | Σ\_x \|units(x)\|, set-deduplicated; k-mers in > 16 units dropped | Σ\_x parsimony(x) ≈ per-unit unions + within-unit deletions − cross-unit sharing; low-CI k-mers dropped. Expected within ~0.5–2× (phase 0) |
+| Clade-wide k-mers | dropped above 16 units | one posting |
+| Lookup | one probe per sampled k-mer | the same |
+| Hit expansion | posting set → units | interval sweep per level band |
+| Resolution | fixed 90% | follows the data and *t* |
+| AAI | per unit, through *p\_in* | to the best node (nearest sequence), plus per-subtree *p\_in* |
+| Build | from MGnify's membership (free) | spanning tree over 5.74 × 10⁹ sequences: candidate edges + Borůvka, days of HPC |
+| Generic sets | needs a clustering made for the set | any set; parameters k, *t*, a CI cut |
+| Fetch for round 2 / pileup | scattered over the store | one contiguous range per subtree |
+
+It may be more efficient at query time: fewer, shorter posting lists for clade k-mers, and no per-unit expansion of large sets. It is less efficient to build. Index size has to be measured.
+
+## Prior art
+
+The closest precedents, in order of closeness:
+
+- **Mantis-MST** (Almodaresi, Pandey, Ferdman, Johnson, Patro; RECOMB 2019, JCB 2020): colour classes of a coloured de Bruijn graph stored as deltas along a minimum spanning tree, using the graph to find near neighbours (>11× smaller than RRR on 10,000 samples). The same MST-of-deltas encoding, over sample colour vectors rather than sequences. [RECOMB](https://link.springer.com/10.1007/978-3-030-17083-7_1), [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC6612864)
+- **RowDiff** (Danciu, Karasikov, Mustafa, Kahles, Rätsch; Bioinformatics 2021): annotations stored as diffs between adjacent graph vertices, 30% smaller than Mantis-MST on 10,000 RNA-seq sets. Diffs along a topology, built in linear time. [PMC](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8346655/)
+- **ProPhyle** (Břinda et al.): k-mers propagated bottom-up on a reference tree, each stored at the highest node whose descendants all share it, then queried through a BWT index; lossless, so accurate on close genomes. This is the tree index with additions only, on a given tree. [PyPI](https://pypi.org/project/prophyle/0.3.1.0/)
+- **Phylogenetic compression** (Břinda et al., Nature Methods 2025; MiniPhy): ordering genomes by an estimated tree compresses assemblies, de Bruijn graphs and k-mer indexes 10–100×, and makes search over all sequenced bacteria possible on a desktop. Evidence that tree order is what makes such collections small. [GitHub](https://github.com/karel-brinda/miniphy), [PDF](https://baymlab.hms.harvard.edu/pdfs/BrindaEtAlnmeth.pdf)
+- **panCAKES / CAKES / CLAM** (Prior, Howard, Light, Ishaq, Daniels; IEEE Big Data 2024): a divisive hierarchical clustering tree that both compresses (each point as differences from a centre) and searches without full decompression, for any distance whose value tracks encoding cost (edit distance, Jaccard). The same "compression structure = search index" idea, as a generic metric method. [arXiv](https://arxiv.org/abs/2409.12161v2)
+- **CaBLASTP** (Daniels, Gallant, Peng, Cowen, Baym, Berger; ISMB 2013): protein databases compressed to a coarse set of unique segments plus links, searched coarse-first, at a cost that scales with unique data. [Bioinformatics](https://academic.oup.com/bioinformatics/article/29/13/i283/189542)
+- **Sequence Bloom trees and HowDe-SBT** (Solomon & Kingsford 2016; Harris & Medvedev 2020): a tree built by clustering filters, internal nodes summarising descendants, split into "determined/how" bits; queries descend. The reverse layout (top-down membership tests); at 10⁹ leaves an inverted index with intervals scales better. [Bioinformatics](https://academic.oup.com/bioinformatics/article/36/3/721/5553093), [GitHub](https://github.com/medvedevgroup/HowDeSBT)
+- **Fulgor and Mac-dBG** (Fan, Pibiri, Patro et al., WABI 2023 onwards): colour sets factored across the collection ("meta-colours", NP-hard to optimise, solved heuristically) and repetition-aware colour compression (2.5–22× smaller). The best current practice for the posting-list side. [WABI 2023](https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.WABI.2023.18), [Mac-dBG](https://par.nsf.gov//servlets/purl/10546249), [WABI 2025](https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.WABI.2025.6)
+- **HIBF / Raptor** (Mehringer et al., Genome Biology 2023): a similarity-based hierarchical layout of bins, built 211× faster and up to 14× smaller. Hierarchy by similarity for membership queries. [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC10230713/)
+- **Linclust** (Steinegger & Söding, Nature Communications 2018): linear-time grouping by m lowest-hash k-mers, comparing each sequence only to its group's centre (1.6 × 10⁹ sequences in 10 h on one server). The candidate-edge step for the spanning tree. [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC6026198)
+- **Placement and adaptive resolution:** Kraken's LCA (Wood & Salzberg 2014), the lossy single-node version of a posting list; RAPPAS phylo-k-mers and App-SpaM, alignment-free read placement on a tree ([bioRxiv](https://www.biorxiv.org/content/10.1101/328740v5), [bioRxiv](https://www.biorxiv.org/content/10.1101/2020.10.19.344986v2.full.pdf)); TreeCluster (Balaban et al., PLoS ONE 2019), clusters chosen on a tree by criteria rather than by one global threshold ([PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC6705769)).
+- **Kaiju** (Menzel, Ng, Krogh, Nature Communications 2016): protein-level classification against a whole reference protein set through an FM index, with LCA for ties. Indexing every sequence works at NR scale. At MGnify's 1.07 × 10¹² residues a full-text index is ~TB, which is what sampled k-mer diffs avoid. [PMC](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4833860/)
+
+*What I found no precedent for:* this combination of a k-mer diff tree over every sequence of a protein set, nested FracMinHash thresholds per node, a CI-based k-mer cut, and abundance or presence at adaptive subtree resolution for metagenome profiling. Each part has precedent, but the combination appears new.
+
+## Risks
+
+- **Postings above budget.** If MGnify's members are less redundant than assumed (members at 90–94% to their nearest neighbour post more than a fresh set), the tree degenerates into today's per-unit storage plus a node table. Phase 0 decides.
+- **Node table.** One row per node: DFS end, level, |S\_v|, length, and the first sequence of its member list. At ~2 × 10⁹ nodes and ~12 B per row that is ~24 GB, memory-mapped and read only for touched ranges. If partials do not collapse, it becomes ~70 GB at 5.74 × 10⁹ nodes.
+- **Ties at the stored density.** The stored sets define the storage objective exactly (Building the tree), but with ~16 k-mers per set many candidate parents tie, and the tree's topology among relatives is then arbitrary. That does not matter for storage, but it does for reported subtrees, so ties are broken at a denser nested rate.
+- **Single-linkage chaining.** A spanning tree chains: a subtree can span distant ends through intermediates. This matters for what a reported subtree means (a function), not for storage. The reporting model has to bound a subtree's diameter, as TreeCluster does, rather than take whole subtrees.
+- **Assignment model.** Gather and EM over nested subtrees are new code. Today's component-wise EM does not carry over directly.
+- **Build at scale.** The staged k-mer build (Building the tree) is sorts and joins over ~3 × 10¹⁰ digests plus a prefix join on stage 3's representatives. Its unknowns are the size of stage 3's largest signature groups and stage 4's posting lengths after merging, both measured in phase 0. MGnify90 membership is not needed; it is kept only as a check (does the tree recover the clusters?).
+
+## Implementation plan
+
+Laptop work runs one job at a time with capped threads; full-scale runs go to HPC as Nextflow (SLURM + Singularity) for the user to run.
+
+0. **Measure, no index (gate for everything after).** On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
+   - spanning tree under |S\_a Δ S\_b| with the virtual empty root: exact (all candidate pairs from the inverted index, Kruskal) at this size, and the staged build (stages 1–4) beside it. Report the staged tree's total weight against the exact one, each stage's candidates, largest signature group, and prefix posting lengths;
+   - zero-diff and containment collapses;
+   - nodes against sequences and units; the containment-collapse rate of partials;
+   - Σ parsimony (postings) against today's tier-1 postings for the same proteins (built by today's `index`), with and without floors, and with floors on components only;
+   - CI distribution, and postings saved by cuts at 2, 4 and 8 gains, against the 16-unit cut;
+   - edge-cost histogram by identity (does the ~94% cut appear?);
+   - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
+1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
+   - the staged build: set digests (Δ = 0), pigeonhole signatures (Δ ≤ d), the rarity-ordered prefix join on representatives (Δ > d), Kruskal by integer level with the virtual empty root, and dense tie-breaks; collapses;
+   - DFS numbering; postings with level bands; node table; a sequence store reordered by DFS.
+   - Checked against a brute-force reconstruction: every sequence's sampled set from its path equals its own.
+2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures.
+3. **Reporting, recall first.** Candidate subtrees above background, members as DFS ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
+4. **Benchmark against tier 1**, at matched index size and *t*:
+   - `fmh-benchmark` and `presence-calibration` (spiked truth): recall and precision, rolled up to MGnify90 (via membership), Pfam and KOfam;
+   - AAI calibration against `presence-calibration`'s truth;
+   - cost: index size, build CPU-h, query wall and peak RSS per stage;
+   - **gate (proposed):** recall at matched precision ≥ tier 1's at every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
+5. **Full scale** (HPC, the user's run): the MGnify build seeded by MGnify90 membership, then the phase-4 benchmark at full size.
+6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
+7. **Later:** the placement-style model with adaptive subtree resolution and bounded diameter; posting-list compression in the Fulgor/Mac-dBG manner.
+
+## Progress log
+
+* **Plan (2026-10-24, the user's request).** Written from the main plan's tier-1 design (*t\_g* floors, *p\_in*, unit sets, 16-unit promiscuity cut, standard tier ~108–196 GB) and a literature search. The estimates above are analytic: 11-mer sharing ~*p*¹¹ under uniform substitutions, 22 changed k-mers per substitution, MGnify 2026\_07 counts. No data measured yet; phase 0 is next.
+
+* **Amendment (2026-10-24, the user's point: k-mer sharing is the objective itself, not a proxy for similarity).** Building the tree added: a virtual empty root makes fresh storage an edge, so the MST over sequences plus that root is the storage-optimal tree. Only pairs sharing ≥ half the smaller set can be edges (an overlap set-similarity join). Integer weights allow Kruskal level by level. Stages: set digests (Δ = 0), PartEnum pigeonhole signatures (Δ ≤ d), a rarity-ordered prefix join on the remaining representatives (Δ > d), optional NN-descent; self-build by insertion kept as the alternative. This replaces the Linclust-plus-Borůvka sketch, and MGnify90 membership is no longer needed to seed it.
