@@ -111,6 +111,30 @@ The tree gives each k-mer a natural score: its number of independent gains, comp
 
 It may be more efficient at query time: fewer, shorter posting lists for clade k-mers, and no per-unit expansion of large sets. It is less efficient to build. Index size has to be measured.
 
+## Density
+
+- **No dense global tier.** Every distinct k-mer needs at least one gain, so the tree's postings are at least the distinct k-mer count, ~5 × 10¹¹ dense 11-mers if about half of MGnify's ~10¹² occurrences are distinct (the main plan's guess). With deletions that is ~5–8 TB, ~2× smaller than a flat dense index but ~50× the standard tier.
+- **Tier 1 can be somewhat denser at the same size.** Today's postings are ~1.7 units per k-mer; the tree posts a clade's k-mer once. Deletions, the node table and the k-mers today's 16-unit cut drops take part of that back, so the room is ~1.2–2× the sampling rate at matched size (phase 0). The query does not get denser: it already probes every hash ≤ *t\_max* = 0.2, so per-node rates under the cap add hits, not lookups.
+- **Resolution follows density.** At tier 1's rates (effectively ~0.06, with floors), near-identical members share nodes. Dense, almost every sequence is its own node (MGnify is 100%-deduplicated), and only contained fragments collapse. Per-sequence resolution and presence on a candidate's own k-mers therefore still need a dense second tier.
+- **One topology, many densities.** Sampling is uniform, so a tree near-optimal at one rate is near-optimal at another. Dense, near-dense and other-k diffs can be computed along the edges of the tree built once at tier 1's rate (plus dense tie-breaks), as a linear pass over edges with no new spanning tree. Phase 0 checks this against a tree built at the dense rate.
+
+## Uses beyond tier 1 (open question)
+
+The same structure may serve the per-sample dense stages, which today each build a flat table. Each use has to be checked for **build speed** and **use speed** against what it replaces, not only for size.
+
+| Use | Today | With the tree | Build must be | Use must be |
+| --- | --- | --- | --- | --- |
+| **Tier 2 / round-2 dense presence** (main plan, round-2 candidate stage) | dense flat table over candidates' members | the candidate subtrees' members (contiguous DFS ranges), diffs at the dense rate along tier 1's topology; per-node hits by interval sweep | minutes per sample: fetch + dense hashing + per-edge diffs; no spanning tree | ≤ today's dense pass |
+| **Routing** (`kfp-pileup route`; grouped routing) | flat table of every k 8 k-mer of the reference's members → block | the same topology at k 8 (all six frames on the read side); blocks and similarity groups = subtrees (DFS ranges); per-(pair, subtree) counts by sweep | ≤ today's table build (~1 min per group at `hadza10M`) | ≤ today's pass (~1.5 min at `hadza10M`) |
+| **Read reclassification** (per-read candidate units for an aligner; main plan amendment 2026-10-21) | routing table with unit values | per-read hits per node, each read's candidates = the nodes or smallest subtree its k-mers support | as routing | per-read sweeps on few postings: to measure |
+
+Two layouts for the dense diffs, to compare:
+
+- **Per sample:** fetch the candidate subtrees' members and diff them along the stored topology. Nothing extra on disk; the cost is hashing per sample.
+- **Precomputed, node-major:** dense diffs for every node stored on disk in DFS order (~5–8 TB), with candidate ranges read with `pread` and inverted into an in-memory k-mer table, as sylph's stage 2 does. No hashing per sample; it costs disk and one sequential read per range.
+
+Where it should help most: candidates are clades of near-identical members, so most of a flat dense table over them is repeated k-mers. For `hadza10M`'s ~8 M hit units with all members (~10¹⁰ residues), a flat dense table is ~10¹⁰ postings, and the tree should be 3–5× fewer (estimate). Where it may not help: k 8 shares more k-mers across relatives (0.9⁸ ≈ 0.43 against 0.31 at k 11), so routing's diffs are larger, and per-read sweeps add work that a flat lookup does not have.
+
 ## Prior art
 
 The closest precedents, in order of closeness:
@@ -150,6 +174,8 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - Σ parsimony (postings) against today's tier-1 postings for the same proteins (built by today's `index`), with and without floors, and with floors on components only;
    - CI distribution, and postings saved by cuts at 2, 4 and 8 gains, against the 16-unit cut;
    - edge-cost histogram by identity (does the ~94% cut appear?);
+   - distinct over total k-mers at *t* 0.06 (tier 1's effective rate), 0.2 and 1, which sets every density estimate above;
+   - *one topology, many densities:* diffs at *t* 1 and at k 8 along the tree built at tier 1's rate, against a tree built at those settings;
    - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
 1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
    - the staged build: set digests (Δ = 0), pigeonhole signatures (Δ ≤ d), the rarity-ordered prefix join on representatives (Δ > d), Kruskal by integer level with the virtual empty root, and dense tie-breaks; collapses;
@@ -162,6 +188,12 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - AAI calibration against `presence-calibration`'s truth;
    - cost: index size, build CPU-h, query wall and peak RSS per stage;
    - **gate (proposed):** recall at matched precision ≥ tier 1's at every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
+4b. **Tier 2, routing and reclassification** (Uses beyond tier 1): on `spike-benchmark` locally, then `pileup-fdr`'s `hadza10M` candidate set on HPC. Each use is built from the candidate subtrees along tier 1's topology, per sample and node-major precomputed, and compared with the flat table it replaces:
+   - build time and peak RSS;
+   - use time (dense pass, routing pass, per-read candidates);
+   - table size;
+   - and the same truth metrics: recall and precision for tier 2; for routing, `route.json`'s routed and dropped pairs and the spike benchmark's `read_precision_em` and `sibling_caught_em`.
+   - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the MGnify build seeded by MGnify90 membership, then the phase-4 benchmark at full size.
 6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
 7. **Later:** the placement-style model with adaptive subtree resolution and bounded diameter; posting-list compression in the Fulgor/Mac-dBG manner.
@@ -171,3 +203,5 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 * **Plan (2026-10-24, the user's request).** Written from the main plan's tier-1 design (*t\_g* floors, *p\_in*, unit sets, 16-unit promiscuity cut, standard tier ~108–196 GB) and a literature search. The estimates above are analytic: 11-mer sharing ~*p*¹¹ under uniform substitutions, 22 changed k-mers per substitution, MGnify 2026\_07 counts. No data measured yet; phase 0 is next.
 
 * **Amendment (2026-10-24, the user's point: k-mer sharing is the objective itself, not a proxy for similarity).** Building the tree added: a virtual empty root makes fresh storage an edge, so the MST over sequences plus that root is the storage-optimal tree. Only pairs sharing ≥ half the smaller set can be edges (an overlap set-similarity join). Integer weights allow Kruskal level by level. Stages: set digests (Δ = 0), PartEnum pigeonhole signatures (Δ ≤ d), a rarity-ordered prefix join on the remaining representatives (Δ > d), optional NN-descent; self-build by insertion kept as the alternative. This replaces the Linclust-plus-Borůvka sketch, and MGnify90 membership is no longer needed to seed it.
+
+* **Amendment (2026-10-24, the user's question: is the tree also useful for tier 2, routing or reclassification, and is it fast enough to build and use?).** Density added: no dense global tier (postings ≥ distinct k-mers, ~5–8 TB dense); tier 1 perhaps ~1.2–2× denser at matched size; tier 2 still needed for resolution. Uses beyond tier 1 added: tier 2 / round-2 presence, routing and read reclassification built per sample from the candidate subtrees along tier 1's topology ("one topology, many densities"), per sample or node-major precomputed. Phase 0 now measures distinct-over-total k-mers and the reuse of one topology across densities; phase 4b gates each use on build and use time against its flat table.
