@@ -156,6 +156,39 @@ Memory is one chunk's table plus one range of the sample sketch, both set by *B*
 
 *Precedent:* MiniPhy groups genomes into batches of up to ~10k by their phylogeny, and Phylign searches one batch at a time (phylogenetic compression, below); HIBF lays bins out by similarity.
 
+## Recall-first candidates and neighbours
+
+Tier 1's job before tier 2 is not to miss: every unit the sample holds should reach the dense stage, even when tier 1 hit only a relative of it (the user's request, 2026-10-24).
+
+**The property.** In a minimum spanning tree, the largest edge on the path between two nodes is no larger than their direct distance (the minimax path property). So the single-linkage cluster at level *R* containing *v* (everything reachable from *v* by edges ≤ *R*) holds every node within *R* of *v*. The Kruskal merge order is that hierarchy, so the cluster at any level is a lookup. Numbered in the hierarchy's leaf order, each cluster is one contiguous range.
+
+**The rule.** For each hit node *v*, take its single-linkage cluster at *R\_v* = *d̂⁺*(X, *v*) + δ:
+
+- *d̂⁺*(X, *v*) is the upper bound of the sample protein X's divergence from *v*, from *v*'s containment interval, in the tree's distance units.
+- δ is the tolerance: how close a sequence must be to X to count as one not to miss.
+- **Guarantee:** by the triangle inequality, d(*v*, *w*) ≤ d(*v*, X) + d(X, *w*) ≤ *R\_v*, so every indexed *w* within δ of X is a candidate whenever any relative of it is hit and its bound holds. It holds for any distance that is a metric; Jaccard distance is one.
+- *It adapts on its own:* a close hit expands little, a divergent one more, and a hit with few k-mers (a wide interval) more again, the right direction for recall.
+- *Budget:* a cluster over a cap is cut nearest-first in minimax distance from *v* (the order in which Prim's algorithm from *v* visits nodes), so chaining drops the farthest neighbours, not arbitrary ones.
+- *Built from a candidate graph rather than all pairs,* the guarantee holds wherever the candidate graph has some chain of edges ≤ *R* between the two nodes (not necessarily their direct edge); phase 0 measures how often it does not.
+
+**It needs a sensitive topology.** The storage tree (k 11, tier 1's rate) splits below ~94% identity, exactly where family-level neighbours are, so the rule would never reach them. The topology is built at a sensitive setting and storage diffs are taken along it (next section).
+
+**What it cannot fix.** If no relative of X is hit, no neighbour rule helps. The main plan's deep misses (90–95% strains of units with 1–5 sampled k-mers) need tier-1 density or sensitivity, for which the tree's ~1.2–2× room is the lever.
+
+**The alternative:** candidates as the credible region of X's placement on the tree (pplacer and RAPPAS style). It is better founded statistically, but it is more code and gives no clean guarantee.
+
+## A sensitive topology at MGnify scale
+
+**Separating seeds from weights** is what makes it feasible. Candidate pairs need selective seeds; edge weights need sensitive, dense k-mers; neither needs all pairs.
+
+1. **Nodes.** The storage collapses first (equal and contained sets at k 11, from the staged build), then one representative per storage forest component (sets ≥ ~94% apart). At least ~1.7 × 10⁹, since MGnify90's 1.2 × 10⁹ singletons are separate components by definition; perhaps ~2 × 10⁹ (phase 0). The storage tree resolves everything inside a component; the sensitive topology links components.
+2. **Candidate edges** as Linclust (which clusters 1.6 × 10⁹ sequences to 50% in ~10 h on one server): m ≈ 20 lowest-hash seeds per node on a reduced alphabet (k ~ 10–12), grouped by seed. Each node is linked to its group's centre and its sort neighbours: ~20–40 edges per node, ~4–8 × 10¹⁰ edges. Sorting ~10¹¹ records (~1 TB) by hash range is hours of HPC.
+3. **Weights** are Jaccard distance on dense short-k sets (k 6: 70% identity still shares 0.7⁶ ≈ 12% of 6-mers; chance overlap between unrelated 180-mers is ~5 × 10⁻⁴ of 6-mers). They are estimated from a per-node sketch: FracMinHash at *t* ≈ 0.25 (~45 hashes) or bottom-128, ~0.2–0.5 KB per node, ~0.5–1 TB for 2 × 10⁹ nodes. Weighting is two streaming joins of the edges (sorted by each endpoint) against the sketch table; compute is negligible (an edge is a merge of two short sorted arrays), I/O is ~2 sequential TB passes.
+4. **Kruskal** over the weighted edges: an external sort by weight (~1 TB) and a union–find over 2 × 10⁹ nodes (8 GB). Hours; or a distributed Borůvka.
+5. **Storage along it.** k 11 diffs are taken along the sensitive topology inside components, with each component root stored fresh. Within close clades the two trees nearly coincide, so storage should cost little more than the storage-optimal tree (phase 0).
+
+**Estimate:** a few hundred to ~1,000 core-hours and a few TB of scratch, comparable to MGnify's own cascaded clustering and to today's full index build. HPC only. An exact dense MST (all pairs) is not feasible and not needed. *Not yet known:* the node count after collapses, the largest seed groups, and how much the sketch's noise in weights at low Jaccard (≤ 0.05) costs the guarantee.
+
 ## Updates
 
 Adding proteins needs no re-clustering, unlike today's tier 1, whose units follow MGnify90 membership. The difficulty is keeping DFS numbering contiguous, which a delta index handles (the user's question, 2026-10-24).
@@ -213,6 +246,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - edge-cost histogram by identity (does the ~94% cut appear?);
    - distinct over total k-mers at *t* 0.06 (tier 1's effective rate), 0.2 and 1, which sets every density estimate above;
    - *one topology, many densities:* diffs at *t* 1 and at k 8 along the tree built at tier 1's rate, against a tree built at those settings;
+   - *sensitive topology:* on the sample, the exact MST at k 6 Jaccard (all candidate pairs from the dense inverted index) against the seeded build (reduced-alphabet seeds, sketch weights): total weight, the share of exact edges recovered, and the share of node pairs within *R* (0.05–0.3) that lack a chain of edges ≤ *R* in the seeded candidate graph; node counts after collapses; storage cost of k 11 diffs along the sensitive topology against the storage-optimal tree;
    - *chunking:* duplicated postings against chunk size *B* (at *t* 1 and at tier 1's rate), the share of forest components larger than *B*, and how many chunks the spike benchmark's candidate subtrees touch;
    - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
 1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
@@ -225,6 +259,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 4. **Benchmark against tier 1**, at matched index size and *t*:
    - `fmh-benchmark` and `presence-calibration` (spiked truth): recall and precision, rolled up to MGnify90 (via membership), Pfam and KOfam;
    - AAI calibration against `presence-calibration`'s truth;
+   - *neighbour rule* (Recall-first candidates and neighbours): δ at 0.05, 0.1 and 0.15. Report the share of spiked units with no own hit that reach the candidate set, by depth and identity; the candidate count against "every hit node"; and how often the true divergence exceeds *d̂⁺*. Against the main plan's index-level neighbour graph (recall-first pileup, next step 0), by that step's rule: worth it if it reaches a substantial share of unhit spikes for < ~2× the candidates;
    - cost: index size, build CPU-h, query wall and peak RSS per stage;
    - **gate (proposed):** recall at matched precision ≥ tier 1's at every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
 4b. **Tier 2, routing and reclassification** (Uses beyond tier 1): on `spike-benchmark` locally, then `pileup-fdr`'s `hadza10M` candidate set on HPC. Each use is built from the candidate subtrees along tier 1's topology, per sample and node-major precomputed, and compared with the flat table it replaces:
@@ -249,3 +284,5 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 * **Amendment (2026-10-24, the user's idea: split an index too large for one go into similarity chunks from the tree and query them in turn).** Chunks by similarity added: whole forest components packed into chunks of size ≤ *B*, larger components split at their heaviest edges (Kundu & Misra), chunk roots stored in full, chunk-major numbering. Querying merge-joins one stored sample sketch against each needed chunk, and merges per-node counts before the model, so results are identical to an unchunked run. Phase 0 measures duplication against *B*; phase 4b runs each use chunked, with identical outputs required.
 
 * **Amendment (2026-10-24, the user's question: can the index be updated with new proteins efficiently?).** Updates added: insertion by the index's own query; an LSM-style delta index (new nodes with parent and diffs, counts from the parent's count plus own diffs, exact); compaction (renumber, one merge, chunk splits, gain counts and the uninformative cut refreshed); an exact batched MST update by Kruskal over the old tree's edges plus new candidate edges; a release update that hashes only new proteins. Phase 1 checks delta queries and compaction against a rebuild, and the batched update against a from-scratch tree.
+
+* **Amendment (2026-10-24, the user's request: err on recall in tier 1's output for tier 2, with a clean neighbour rule; then, is a dense topology feasible?).** Recall-first candidates and neighbours added: each hit node's single-linkage cluster at *d̂⁺*(X, *v*) + δ, with a guarantee from the MST minimax property and the triangle inequality; capped in Prim order. A sensitive topology added, since the k 11 storage tree splits below ~94%: Linclust-style reduced-alphabet seeds for candidate edges, k 6 Jaccard weights from per-node sketches, Kruskal, and storage diffs along it. Estimated at a few hundred to ~1,000 core-h and a few TB of scratch on HPC. Phase 0 compares it with the exact MST on the sample; phase 4 sweeps δ.
