@@ -171,7 +171,7 @@ Tier 1's job before tier 2 is not to miss: every unit the sample holds should re
 - *Budget:* a cluster over a cap is cut nearest-first in minimax distance from *v* (the order in which Prim's algorithm from *v* visits nodes), so chaining drops the farthest neighbours, not arbitrary ones.
 - *Built from a candidate graph rather than all pairs,* the guarantee holds wherever the candidate graph has some chain of edges ≤ *R* between the two nodes (not necessarily their direct edge); phase 0 measures how often it does not.
 
-**It needs a sensitive topology.** The storage tree (k 11, tier 1's rate) splits below ~94% identity, exactly where family-level neighbours are, so the rule would never reach them. The topology is built at a sensitive setting and storage diffs are taken along it (next section).
+**It needs a topology that reaches past the storage cuts.** The storage tree (k 11, tier 1's rate) splits below ~94% identity, so on it the rule never reaches family-level neighbours. There are two ways to reach further, compared in the next section: a sparse topology from tier 1's own k-mers with the overlap requirement relaxed to any shared k-mer (reach ~85%), or a dense sensitive topology (reach ~60–70%). Storage diffs are taken along whichever is built.
 
 **What it cannot fix.** If no relative of X is hit, no neighbour rule helps. The main plan's deep misses (90–95% strains of units with 1–5 sampled k-mers) need tier-1 density or sensitivity, for which the tree's ~1.2–2× room is the lever.
 
@@ -188,6 +188,26 @@ Tier 1's job before tier 2 is not to miss: every unit the sample holds should re
 5. **Storage along it.** k 11 diffs are taken along the sensitive topology inside components, with each component root stored fresh. Within close clades the two trees nearly coincide, so storage should cost little more than the storage-optimal tree (phase 0).
 
 **Estimate:** a few hundred to ~1,000 core-hours and a few TB of scratch, comparable to MGnify's own cascaded clustering and to today's full index build. HPC only. An exact dense MST (all pairs) is not feasible and not needed. *Not yet known:* the node count after collapses, the largest seed groups, and how much the sketch's noise in weights at low Jaccard (≤ 0.05) costs the guarantee.
+
+**Against a sparse topology from tier 1** (2026-10-24, estimates, scaled against today's full index build, ~1,300 core-h: ~20 h of one node):
+
+| | Sparse (tier 1's k 11 sets, ~16 k-mers per protein; edges: any shared stored k-mer) | Dense (reduced-alphabet seeds, k 6 sketch weights) |
+| --- | --- | --- |
+| Hashing | free (the tier-1 build's) | a seed pass over ~2 × 10⁹ representatives (~4 × 10¹¹ residues): a few core-h |
+| Candidate edges | digests and pigeonhole signatures (~3 × 10¹⁰ records, ~250 GB), and the prefix join relaxed to one shared k-mer on representatives | ~10¹¹ seed records (~1 TB) sorted; group centres and sort neighbours |
+| Weights | merges of the stored ~16-element sets: negligible | a sketch table (0.5–1 TB), two streaming joins |
+| Kruskal | ~3 × 10¹⁰ edges | ~4–8 × 10¹⁰ edges, ~1 TB external sort |
+| **Total** | **~50–300 core-h, ~0.3–0.5 TB scratch** | **~300–1,000 core-h, ~2–4 TB scratch** |
+| Against today's build | +5–20% | +25–75% |
+| Storage edges (≥ ~94%) | exact (this is the storage tree) | the same |
+| Neighbour reach | ~85%: ~16 k-mers share 1.4 at 80% identity on average and 0.3 at 70% (16 × *p*¹¹), so most 70% relatives share none | ~60–70%: at 70% about 12% of 6-mers are shared (~21 of 175; ~5–8 in the sketch) |
+| Weight noise | coarse: Jaccard in steps of ~1/16 | finer: steps of ~1/45 to 1/128 |
+| Neighbour guarantee | δ up to ~0.1–0.15, noisy there | δ up to ~0.3 |
+| Relation to the main plan | in effect its index-level neighbour graph (recall-first pileup, next step 0) | new |
+
+Neither changes query time: the topology is a build cost only. The two are not exclusive. The sparse storage tree is built anyway, so the decision is whether to spend ~250–700 core-h more for neighbours between ~85% and ~60–70%.
+
+**Decision rule (proposed):** build the dense topology only if it reaches substantially more of tier 1's misses than the sparse one, for its extra cost. Specifically, only if a substantial share of `presence-calibration`'s spiked units with no own hit have their nearest hit relative below ~85% (phase 0). The main plan's deep misses were mostly 90–95% strains of units with 1–5 sampled k-mers, inside the sparse reach, so sparse is the default until phase 0 says otherwise.
 
 ## Updates
 
@@ -247,6 +267,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - distinct over total k-mers at *t* 0.06 (tier 1's effective rate), 0.2 and 1, which sets every density estimate above;
    - *one topology, many densities:* diffs at *t* 1 and at k 8 along the tree built at tier 1's rate, against a tree built at those settings;
    - *sensitive topology:* on the sample, the exact MST at k 6 Jaccard (all candidate pairs from the dense inverted index) against the seeded build (reduced-alphabet seeds, sketch weights): total weight, the share of exact edges recovered, and the share of node pairs within *R* (0.05–0.3) that lack a chain of edges ≤ *R* in the seeded candidate graph; node counts after collapses; storage cost of k 11 diffs along the sensitive topology against the storage-optimal tree;
+   - *sparse against dense topology* (A sensitive topology at MGnify scale): both built on the sample, with build CPU-h and scratch for each. On `presence-calibration`'s spiked units with no own hit (their profiles and `truth.tsv`): the identity of each miss's nearest hit relative, and the share each topology's neighbour rule reaches at δ 0.05, 0.1 and 0.15, with the candidate count. **Decision:** dense only if it reaches substantially more misses than sparse, for its extra cost;
    - *chunking:* duplicated postings against chunk size *B* (at *t* 1 and at tier 1's rate), the share of forest components larger than *B*, and how many chunks the spike benchmark's candidate subtrees touch;
    - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
 1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
@@ -286,3 +307,9 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 * **Amendment (2026-10-24, the user's question: can the index be updated with new proteins efficiently?).** Updates added: insertion by the index's own query; an LSM-style delta index (new nodes with parent and diffs, counts from the parent's count plus own diffs, exact); compaction (renumber, one merge, chunk splits, gain counts and the uninformative cut refreshed); an exact batched MST update by Kruskal over the old tree's edges plus new candidate edges; a release update that hashes only new proteins. Phase 1 checks delta queries and compaction against a rebuild, and the batched update against a from-scratch tree.
 
 * **Amendment (2026-10-24, the user's request: err on recall in tier 1's output for tier 2, with a clean neighbour rule; then, is a dense topology feasible?).** Recall-first candidates and neighbours added: each hit node's single-linkage cluster at *d̂⁺*(X, *v*) + δ, with a guarantee from the MST minimax property and the triangle inequality; capped in Prim order. A sensitive topology added, since the k 11 storage tree splits below ~94%: Linclust-style reduced-alphabet seeds for candidate edges, k 6 Jaccard weights from per-node sketches, Kruskal, and storage diffs along it. Estimated at a few hundred to ~1,000 core-h and a few TB of scratch on HPC. Phase 0 compares it with the exact MST on the sample; phase 4 sweeps δ.
+
+* **Amendment (2026-10-24, the user's request: compare a dense topology's cost with tier 1's sparse one).** Comparison added (estimates against today's ~1,300 core-h build):
+  - *Sparse* (tier 1's k 11 sets, edges from any shared stored k-mer): ~50–300 core-h and ~0.3–0.5 TB scratch (+5–20%); reach ~85%; coarse weights; guarantee to δ ~0.1–0.15. In effect the main plan's index-level neighbour graph.
+  - *Dense* (reduced-alphabet seeds, k 6 sketch weights): ~300–1,000 core-h and ~2–4 TB (+25–75%); reach ~60–70%; guarantee to δ ~0.3.
+  - Neither costs query time.
+  - *Decision rule:* sparse by default, since the main plan's deep misses (90–95% strains) are inside its reach; dense only if phase 0 shows a substantial share of hit-less spikes whose nearest hit relative is below ~85%, reached by dense and not sparse, for its extra cost. Phase 0 now builds both on the sample and measures this.
