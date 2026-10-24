@@ -135,6 +135,27 @@ Two layouts for the dense diffs, to compare:
 
 Where it should help most: candidates are clades of near-identical members, so most of a flat dense table over them is repeated k-mers. For `hadza10M`'s ~8 M hit units with all members (~10¹⁰ residues), a flat dense table is ~10¹⁰ postings, and the tree should be 3–5× fewer (estimate). Where it may not help: k 8 shares more k-mers across relatives (0.9⁸ ≈ 0.43 against 0.31 at k 11), so routing's diffs are larger, and per-read sweeps add work that a flat lookup does not have.
 
+## Chunks by similarity
+
+An index too large to handle at once, such as a dense tier 2, is split along the tree into chunks of similar proteins, and each chunk is queried in turn (the user's idea, 2026-10-24).
+
+- **Chunks come from the tree.** DFS numbering makes every subtree a contiguous range, so a chunk (a set of whole subtrees) is one contiguous block on disk, and its members one contiguous range of the store.
+  - The build's forest cuts (edges costlier than a fresh set) are free boundaries. Whole components are packed into chunks of size ≤ *B*.
+  - Components larger than *B* are split at their heaviest edges, where relatives diverge most, so near-identical competitors stay together. Kundu & Misra's linear-time algorithm gives the fewest connected pieces under a weight bound.
+  - Nodes are numbered chunk-major (DFS within chunk), so a chunk stays contiguous even when it is a subtree with holes.
+- **A chunk decodes alone.** A chunk root whose parent sits in another chunk stores its set in full: one set per chunk.
+- **Cost:** the k-mers shared across each cut edge, posted in both chunks. This is zero at forest cuts, and small when *B* is much larger than a typical component (phase 0 measures duplication against *B*).
+
+**Querying chunk by chunk:**
+
+1. The sample is sketched once at the dense rate: distinct hashes and counts, sorted, on disk. Each chunk pass is a sequential merge-join of that sketch against the chunk's sorted k-mers, with no read pass per chunk. Read-level outputs (reclassification, routing) read the stored translated frames (main plan: `kmer-functional-profiler translate`) instead.
+2. Only chunks holding candidate subtrees are loaded. This is the main plan's grouped routing ("built as needed"), with the tree giving the groups.
+3. Each pass gives per-node hit counts, complete for its nodes, since each node is in one chunk. Merged counts go to gather, EM or presence, so results are identical to an unchunked run: chunking changes memory, not results. Models that need a read's evidence across chunks keep (read, node, hits) rows per chunk and merge them at the end.
+
+Memory is one chunk's table plus one range of the sample sketch, both set by *B*.
+
+*Precedent:* MiniPhy groups genomes into batches of up to ~10k by their phylogeny, and Phylign searches one batch at a time (phylogenetic compression, below); HIBF lays bins out by similarity.
+
 ## Prior art
 
 The closest precedents, in order of closeness:
@@ -176,6 +197,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - edge-cost histogram by identity (does the ~94% cut appear?);
    - distinct over total k-mers at *t* 0.06 (tier 1's effective rate), 0.2 and 1, which sets every density estimate above;
    - *one topology, many densities:* diffs at *t* 1 and at k 8 along the tree built at tier 1's rate, against a tree built at those settings;
+   - *chunking:* duplicated postings against chunk size *B* (at *t* 1 and at tier 1's rate), the share of forest components larger than *B*, and how many chunks the spike benchmark's candidate subtrees touch;
    - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
 1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
    - the staged build: set digests (Δ = 0), pigeonhole signatures (Δ ≤ d), the rarity-ordered prefix join on representatives (Δ > d), Kruskal by integer level with the virtual empty root, and dense tie-breaks; collapses;
@@ -193,6 +215,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - use time (dense pass, routing pass, per-read candidates);
    - table size;
    - and the same truth metrics: recall and precision for tier 2; for routing, `route.json`'s routed and dropped pairs and the spike benchmark's `read_precision_em` and `sibling_caught_em`.
+   - *chunked:* each use run chunk by chunk (Chunks by similarity) at two budgets *B*. Outputs must be identical to the unchunked run; report peak RSS and wall against *B*;
    - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the MGnify build seeded by MGnify90 membership, then the phase-4 benchmark at full size.
 6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
@@ -205,3 +228,5 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 * **Amendment (2026-10-24, the user's point: k-mer sharing is the objective itself, not a proxy for similarity).** Building the tree added: a virtual empty root makes fresh storage an edge, so the MST over sequences plus that root is the storage-optimal tree. Only pairs sharing ≥ half the smaller set can be edges (an overlap set-similarity join). Integer weights allow Kruskal level by level. Stages: set digests (Δ = 0), PartEnum pigeonhole signatures (Δ ≤ d), a rarity-ordered prefix join on the remaining representatives (Δ > d), optional NN-descent; self-build by insertion kept as the alternative. This replaces the Linclust-plus-Borůvka sketch, and MGnify90 membership is no longer needed to seed it.
 
 * **Amendment (2026-10-24, the user's question: is the tree also useful for tier 2, routing or reclassification, and is it fast enough to build and use?).** Density added: no dense global tier (postings ≥ distinct k-mers, ~5–8 TB dense); tier 1 perhaps ~1.2–2× denser at matched size; tier 2 still needed for resolution. Uses beyond tier 1 added: tier 2 / round-2 presence, routing and read reclassification built per sample from the candidate subtrees along tier 1's topology ("one topology, many densities"), per sample or node-major precomputed. Phase 0 now measures distinct-over-total k-mers and the reuse of one topology across densities; phase 4b gates each use on build and use time against its flat table.
+
+* **Amendment (2026-10-24, the user's idea: split an index too large for one go into similarity chunks from the tree and query them in turn).** Chunks by similarity added: whole forest components packed into chunks of size ≤ *B*, larger components split at their heaviest edges (Kundu & Misra), chunk roots stored in full, chunk-major numbering. Querying merge-joins one stored sample sketch against each needed chunk, and merges per-node counts before the model, so results are identical to an unchunked run. Phase 0 measures duplication against *B*; phase 4b runs each use chunked, with identical outputs required.
