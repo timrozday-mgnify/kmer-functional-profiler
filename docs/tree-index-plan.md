@@ -279,6 +279,20 @@ The closest precedents, in order of closeness:
 
 *What I found no precedent for:* this combination of a k-mer diff tree over every sequence of a protein set, nested FracMinHash thresholds per node, a CI-based k-mer cut, and abundance or presence at adaptive subtree resolution for metagenome profiling. Each part has precedent, but the combination appears new.
 
+## Benchmark scoring without fixed units
+
+Without MGnify90 units, "the right unit" is no longer defined, so accuracy is scored by distance to the truth rather than by unit identity (the user's question, 2026-10-24).
+
+- **Primary: threshold-free nearest-match curves.**
+  - *Recall side:* for each true spiked sequence, the identity of the nearest reported sequence, as a distribution by depth and by strain divergence.
+  - *Precision side:* for each reported unit (leaf or subtree), the identity of its nearest true sequence in the sample.
+  - This mirrors how phylogenetic placement is scored (node distance to the true placement in EPA-ng and RAPPAS benchmarks). It separates near misses ("missed at 99%, within 95%") from failures, which fixed thresholds hide.
+- **Threshold read-outs:** the shares at ≥ 99%, 95%, 90% (and 80%) identity on both curves, which give recall and precision per level. They are measured directly against the truth rather than through clusters at those levels, so no pair is split by a cluster boundary.
+- **Abundance:** earth mover's distance between true and estimated abundance, with 1 − AAI between sequences as the ground distance (weighted UniFrac on a tree, as CAMI's OPAL does on taxonomies). One number per sample; credit given to a 98% neighbour costs little, to a 60% relative a lot.
+- **Distances independent of the method.** The tree is built from the method's own k-mers, so its distances would favour it. Identities are computed by alignment (DIAMOND) on the sequences involved (truth plus reported, small per sample). `presence-calibration`'s and `spike-benchmark`'s `truth.tsv` already hold each strain's coding sequence (`cds`), its source `member` and its `identity`, so no new simulation is needed.
+- **Today's tier 1 scored the same way.** Each reported MGnify90 unit is expanded to its member sequences and scored by the same curves, a like-for-like comparison. The existing roll-ups (MGnify90 via membership, Pfam, KOfam) are kept for continuity with past results.
+- **Pitfall:** in dense families a reported sequence can be near the truth by chance, so precision inflates at loose levels (90%). The whole curve, not only the 90% read-out, is reported.
+
 ## Risks
 
 - **Postings above budget.** If MGnify's members are less redundant than assumed (members at 90–94% to their nearest neighbour post more than a fresh set), the tree degenerates into today's per-unit storage plus a node table. Phase 0 decides.
@@ -314,11 +328,15 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures.
 3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
 4. **Benchmark against tier 1**, at matched index size and *t*:
-   - `fmh-benchmark` and `presence-calibration` (spiked truth): recall and precision, rolled up to MGnify90 (via membership), Pfam and KOfam;
+   - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
+     - nearest-match identity curves for recall and precision, with read-outs at 99, 95, 90 and 80%;
+     - earth mover's distance for abundance, with alignment identities (DIAMOND) as ground distances;
+     - the same for today's tier 1, its units expanded to members;
+     - and the roll-ups to MGnify90 (via membership), Pfam and KOfam;
    - AAI calibration against `presence-calibration`'s truth;
    - *neighbour rule* (Recall-first candidates and neighbours): δ at 0.05, 0.1 and 0.15. Report the share of spiked units with no own hit that reach the candidate set, by depth and identity; the candidate count against "every hit node"; and how often the true divergence exceeds *d̂⁺*. Against the main plan's index-level neighbour graph (recall-first pileup, next step 0), by that step's rule: worth it if it reaches a substantial share of unhit spikes for < ~2× the candidates;
    - cost: index size, build CPU-h, query wall and peak RSS per stage;
-   - **gate (proposed):** recall at matched precision ≥ tier 1's at every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
+   - **gate (proposed):** recall at matched precision ≥ tier 1's at every read-out level (99–80%) and every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
 4b. **Tier 2, routing and reclassification** (Uses beyond tier 1): on `spike-benchmark` locally, then `pileup-fdr`'s `hadza10M` candidate set on HPC. Each use is built from the candidate subtrees along tier 1's topology, per sample and node-major precomputed, and compared with the flat table it replaces:
    - build time and peak RSS;
    - use time (dense pass, routing pass, per-read candidates);
@@ -355,3 +373,10 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - *Corrected:* the first version's "Exact cost" (postings = parsimony length) was wrong for sequence nodes, whose states are fixed: their cost is Σ edge Δ. It is right for Fitch states on virtual nodes.
   - *Changed with it:* range postings over one leaf order, which also orders single-linkage clusters and chunks; threshold differences as Fitch missing data, with the per-band sweep kept; edge weights over k-mers both ends could hold (symmetric, so no Edmonds); stage 6 (Fitch per k-mer from the inverted index, O(Σ h log h)); chunking top-down on the merge tree (no Kundu & Misra); updates by attaching new leaves beside their nearest leaf, with Fitch recomputed at compaction; leaf and node tables (~48 GB).
   - Diff schemes added, with a decision in phase 0: Fitch on the merge tree unless the sequence MST is within ~10% of its postings and clearly cheaper to build. The sequence MST is kept as the baseline.
+
+* **Amendment (2026-10-25, the user's question: how to benchmark without 90% units, e.g. at several AAI thresholds?).** Benchmark scoring without fixed units added:
+  - Threshold-free nearest-match identity curves (recall: truth to nearest reported; precision: reported to nearest truth), with read-outs at 99, 95, 90 and 80% as the threshold figures.
+  - Earth mover's distance for abundance, with 1 − AAI as the ground distance.
+  - Identities by alignment (DIAMOND) on the sequences involved, independent of the method's k-mers, from `truth.tsv`'s `cds`.
+  - Today's tier 1 scored the same way (units expanded to members); the MGnify90, Pfam and KOfam roll-ups kept.
+  - Phase 4's gate now applies at every read-out level.
