@@ -800,3 +800,22 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Large:* L3 meets the target (100% at ≥ 95% identity, short proteins included; 99.3% at ≥ 90%) at ~475–575 GB, ~10% over w30 min 8's budget.
     - *Medium:* M4 gives 98.9% at ≥ 95% (99.4% over 60 aa, 95.5% for short) at ~255–305 GB. M5 fits ~half the large budget (~190–230 GB) at 97.1%.
     - The remaining misses at ≥ 95% identity are mostly strains whose reads hold few or no source 11-mers.
+* **Tiers by depth at L3's recall (2026-10-30, the user's request: L3-level recall with large to depth 0.5, medium to 1–1.5, small to 3–4).**
+  - **Second sample** (`sim2`): 3,000 other targets at identity 1 / 0.98 / 0.95 / 0.9, depth lognormal (μ 0.9, σ 0.8), the same background. Pooled with the first sample: 2,991 strains at ≥ 95% identity and 3,998 at ≥ 90% above depth 0.5, and 989 / 1,321 above depth 4.
+  - **Minimizer-only builds** (*t\_base* 0.001, no floors, `--window 1000 --window-min M`: about 2M spread minimizers per protein; k 7 at w 4 for < 16 informative 11-mers) are the efficient frontier at ≥ 90% identity.
+  - **Recall at ≥ 95% / ≥ 90% identity above each depth** (seeds by evidence at 1% chance share plus the neighbour rule; release size scaled as above, without spanning-tree edges):
+
+    | Index | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 1.5 | > 2 | > 3 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S3: *t\_base* 0.01, ~4 minimizers | 0.99 | 140–165 GB | 786 | 0.964 / 0.924 | 0.980 / 0.944 | 0.985 / 0.951 | 0.986 / 0.956 | 0.988 / 0.959 | 0.990 / 0.964 |
+    | M5 | 1.46 | 190–230 GB | 1,124 | 0.987 / 0.961 | 0.996 / 0.975 | 0.998 / 0.978 | 0.999 / 0.983 | 0.999 / 0.984 | 1.000 / 0.986 |
+    | S4: ~8 minimizers | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | – | 0.999 / 0.987 | 0.999 / 0.988 | 0.999 / 0.990 |
+    | **S5:** ~10 minimizers | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 0.999 / 0.990 | 1.000 / 0.994 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | M4 | 2.04 | 255–305 GB | 1,683 | 0.994 / 0.978 | 0.999 / 0.988 | 0.999 / 0.990 | 1.000 / 0.992 | 1.000 / 0.994 | 1.000 / 0.995 |
+    | **S7:** ~14 minimizers | 2.73 | 330–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.994 | 1.000 / 0.996 | 1.000 / 0.997 | – |
+    | **L3** | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 0.999 | 1.000 / 1.000 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - L3's level at depth > 0.5 is 0.999 / 0.993. It is reached by L3 at depth 0.5, by S7 (~14 minimizers) at 1.5, and by S5 (~10) at 2. S4 (~8) reaches 0.999 / 0.988–0.990 at depth 3–4.
+    - *Depth stops paying once the reads cover the protein.* What is left at ≥ 90% identity is proteins whose indexed 11-mers all carry a substitution: at identity p a protein with n indexed 11-mers is missed with probability ~(1 − p¹¹)ⁿ, 0.69ⁿ at 90%, at any depth. ~99.3% at 90% therefore needs n ≈ 14, which is S7.
+    - So tiers separated by depth compress: below ~1.5× (S3) recall at ≥ 90% stalls near 96% even at depth 4. A small tier at L3's ≥ 90% level is not much cheaper than the medium. At ≥ 95% only (miss ~0.43ⁿ), ~8 minimizers suffice from depth 2.
