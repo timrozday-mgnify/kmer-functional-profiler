@@ -479,6 +479,131 @@ impl PyFastxHits {
     }
 }
 
+/// Pairs of CSR sets sharing at least `min_shared` stored k-mers (tree index, phase 0):
+/// columns `a`, `b`, `shared`, `weight` and counts `probes`, `skipped`.
+#[pyfunction]
+#[pyo3(signature = (offsets, hashes, max_hash, *, min_shared = 1, storage = true, max_holders = usize::MAX))]
+fn overlap_pairs<'py>(
+    py: Python<'py>,
+    offsets: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    max_hash: PyReadonlyArray1<'py, u64>,
+    min_shared: u32,
+    storage: bool,
+    max_holders: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (offsets, hashes, max_hash) = (
+        offsets.as_slice()?,
+        hashes.as_slice()?,
+        max_hash.as_slice()?,
+    );
+    let got = py
+        .detach(|| kfp::overlap_pairs(offsets, hashes, max_hash, min_shared, storage, max_holders))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("a", got.a.into_pyarray(py))?;
+    dict.set_item("b", got.b.into_pyarray(py))?;
+    dict.set_item("shared", got.shared.into_pyarray(py))?;
+    dict.set_item("weight", got.weight.into_pyarray(py))?;
+    dict.set_item("probes", got.probes)?;
+    dict.set_item("skipped", got.skipped)?;
+    Ok(dict)
+}
+
+/// Kruskal spanning forest of nodes `0..n` and its merge forest: `mst` (per edge), `left`,
+/// `right`, `level` (internal node `n + i`) and `tops`.
+#[pyfunction]
+fn kruskal<'py>(
+    py: Python<'py>,
+    n: usize,
+    u: PyReadonlyArray1<'py, u32>,
+    v: PyReadonlyArray1<'py, u32>,
+    w: PyReadonlyArray1<'py, u32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (u, v, w) = (u.as_slice()?, v.as_slice()?, w.as_slice()?);
+    let got = py.detach(|| kfp::kruskal(n, u, v, w)).map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("mst", got.mst.into_pyarray(py))?;
+    dict.set_item("left", got.left.into_pyarray(py))?;
+    dict.set_item("right", got.right.into_pyarray(py))?;
+    dict.set_item("level", got.level.into_pyarray(py))?;
+    dict.set_item("tops", got.tops.into_pyarray(py))?;
+    Ok(dict)
+}
+
+/// Leaf order of a merge forest: `order` (leaf per position), `lo`, `hi`, `parent` per node.
+#[pyfunction]
+fn tree_layout<'py>(
+    py: Python<'py>,
+    n: usize,
+    left: PyReadonlyArray1<'py, u32>,
+    right: PyReadonlyArray1<'py, u32>,
+    tops: PyReadonlyArray1<'py, u32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (left, right, tops) = (left.as_slice()?, right.as_slice()?, tops.as_slice()?);
+    let got = py
+        .detach(|| kfp::layout(n, left, right, tops))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("order", got.order.into_pyarray(py))?;
+    dict.set_item("lo", got.lo.into_pyarray(py))?;
+    dict.set_item("hi", got.hi.into_pyarray(py))?;
+    dict.set_item("parent", got.parent.into_pyarray(py))?;
+    Ok(dict)
+}
+
+/// Per k-mer postings of each diff scheme on a merge forest: `hash`, `holders`, `fitch`,
+/// `gains`, `majority`, `add_only`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn tree_schemes<'py>(
+    py: Python<'py>,
+    n: usize,
+    left: PyReadonlyArray1<'py, u32>,
+    right: PyReadonlyArray1<'py, u32>,
+    tops: PyReadonlyArray1<'py, u32>,
+    offsets: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    leaf_level: PyReadonlyArray1<'py, u8>,
+    level_hash: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (left, right, tops) = (left.as_slice()?, right.as_slice()?, tops.as_slice()?);
+    let (offsets, hashes) = (offsets.as_slice()?, hashes.as_slice()?);
+    let (leaf_level, level_hash) = (leaf_level.as_slice()?, level_hash.as_slice()?);
+    let got = py
+        .detach(|| {
+            kfp::schemes(
+                n, left, right, tops, offsets, hashes, leaf_level, level_hash,
+            )
+        })
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("hash", got.hash.into_pyarray(py))?;
+    dict.set_item("holders", got.holders.into_pyarray(py))?;
+    dict.set_item("fitch", got.fitch.into_pyarray(py))?;
+    dict.set_item("gains", got.gains.into_pyarray(py))?;
+    dict.set_item("majority", got.majority.into_pyarray(py))?;
+    dict.set_item("add_only", got.add_only.into_pyarray(py))?;
+    Ok(dict)
+}
+
+/// Overlap-alignment identity of each protein pair: `identity` and aligned `columns`.
+#[pyfunction]
+fn align_identity<'py>(
+    py: Python<'py>,
+    a: Vec<PyBackedBytes>,
+    b: Vec<PyBackedBytes>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if a.len() != b.len() {
+        return Err(to_py_err(Error::LengthMismatch));
+    }
+    let (ident, cols) = py.detach(|| kfp::identities(&a, &b));
+    let dict = PyDict::new(py);
+    dict.set_item("identity", ident.into_pyarray(py))?;
+    dict.set_item("columns", cols.into_pyarray(py))?;
+    Ok(dict)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", kfp::VERSION)?;
@@ -495,6 +620,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(route_hits, m)?)?;
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_function(wrap_pyfunction!(components, m)?)?;
+    m.add_function(wrap_pyfunction!(overlap_pairs, m)?)?;
+    m.add_function(wrap_pyfunction!(kruskal, m)?)?;
+    m.add_function(wrap_pyfunction!(tree_layout, m)?)?;
+    m.add_function(wrap_pyfunction!(tree_schemes, m)?)?;
+    m.add_function(wrap_pyfunction!(align_identity, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     Ok(())

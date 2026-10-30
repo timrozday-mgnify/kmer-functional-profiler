@@ -3,6 +3,7 @@
 //! sampling.
 //! No PyO3 here, so the final CLI reuses them unchanged.
 
+mod align;
 mod alphabet;
 mod bloom;
 mod components;
@@ -14,7 +15,9 @@ mod kmers;
 mod packed;
 mod route;
 mod translate;
+mod tree;
 
+pub use align::{identities, identity};
 pub use alphabet::Alphabet;
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use components::components;
@@ -31,6 +34,7 @@ pub use route::{RouteHits, route_hits};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
 };
+pub use tree::{Kruskal, Layout, Pairs, Schemes, kruskal, layout, overlap_pairs, schemes};
 
 /// Worker threads for the parallel kernels: the CPUs this process may use.
 pub(crate) fn threads() -> usize {

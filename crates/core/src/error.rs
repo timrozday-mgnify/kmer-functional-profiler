@@ -22,6 +22,10 @@ pub enum Error {
     LengthMismatch,
     #[error("set value names unit {0}, beyond the unit table")]
     UnitOutOfRange(u64),
+    #[error("set offsets must start at 0, be non-decreasing and end at the hash count")]
+    BadOffsets,
+    #[error("tree node {0} out of range")]
+    NodeOutOfRange(u64),
     #[error(transparent)]
     Fastx(#[from] needletail::errors::ParseError),
 }

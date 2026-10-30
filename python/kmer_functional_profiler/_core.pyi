@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from os import PathLike
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -74,6 +74,34 @@ def gather(
 def components(
     units: NDArray[np.uint32], hashes: NDArray[np.uint64], n: int
 ) -> NDArray[np.uint32]: ...
+def overlap_pairs(
+    offsets: NDArray[np.uint64],
+    hashes: NDArray[np.uint64],
+    max_hash: NDArray[np.uint64],
+    *,
+    min_shared: int = 1,
+    storage: bool = True,
+    max_holders: int = ...,
+) -> dict[str, Any]: ...
+def kruskal(
+    n: int, u: NDArray[np.uint32], v: NDArray[np.uint32], w: NDArray[np.uint32]
+) -> dict[str, NDArray[np.uint32] | NDArray[np.bool_]]: ...
+def tree_layout(
+    n: int, left: NDArray[np.uint32], right: NDArray[np.uint32], tops: NDArray[np.uint32]
+) -> dict[str, NDArray[np.uint32]]: ...
+def tree_schemes(
+    n: int,
+    left: NDArray[np.uint32],
+    right: NDArray[np.uint32],
+    tops: NDArray[np.uint32],
+    offsets: NDArray[np.uint64],
+    hashes: NDArray[np.uint64],
+    leaf_level: NDArray[np.uint8],
+    level_hash: NDArray[np.uint64],
+) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32]]: ...
+def align_identity(
+    a: Sequence[bytes], b: Sequence[bytes]
+) -> dict[str, NDArray[np.float32] | NDArray[np.uint32]]: ...
 
 class DistinctHashes:
     def __init__(self, max_hash: int) -> None: ...
