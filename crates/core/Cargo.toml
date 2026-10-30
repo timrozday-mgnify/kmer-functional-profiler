@@ -11,9 +11,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# no "zstd": needletail 0.7.3 pins zstd 0.13, open advisories RUSTSEC-2026-0391/0398/0403
 needletail = { version = "0.7.3", default-features = false, features = [
   "flate2",
-  "zstd",
 ] }
 thiserror = "2.0.21"
 

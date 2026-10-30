@@ -487,7 +487,7 @@ impl PyDiamondReader {
     }
 }
 
-/// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
+/// Iterator over FASTA/FASTQ (optionally paired, gzip) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
     inner: Mutex<kfp::FastxHits>,
