@@ -84,8 +84,18 @@ Full scale runs from the release's members buckets on Slurm. See
 ### Floor survey
 
 `survey.py` measures the design that followed phase 0's failed gate (the plan's Progress log:
-forest floors, pieces by coherence, floors on every piece). One topology per sample is kept
-whole: phase 0's storage tree on per-sequence floored sets. On it, each configuration stores:
+forest floors, pieces by coherence, floors on every piece). One topology per sample and leaf
+mode is kept whole: the storage tree on per-sequence floored sets. Its leaves (`--leaves`) are:
+
+- `collapsed`: phase 0's, distinct sets at the topology rates after the equal-set and
+  containment collapses, each stored as its longest member's k-mers;
+- `proteins`: a leaf per distinct dense set (every 8-mer, `--topology-k`, at rate 1,
+  `--topology-t`), so proteins share a leaf only when those sets are equal. There is no
+  containment collapse, and each leaf stores its own k-mers. The topology is the storage tree
+  (Kruskal with the virtual empty root) under |A Δ B| of the dense sets, from an exact pair
+  join (`--topology-max-holders` caps common k-mers, then weighs pairs exactly).
+
+On each tree, each configuration stores:
 
 - **base band:** each leaf's k-mers at or below *t\_base*, diffed by Fitch over the whole tree;
 - **piece floors:** top-down from each component, a node whose floor is at least *τ* coherent
@@ -96,16 +106,17 @@ whole: phase 0's storage tree on per-sequence floored sets. On it, each configur
 - **leaf minimum:** each leaf topped up to *n\_1* stored k-mers of its own, and each protein
   without a leaf (no k-mer up to *t\_cap*) given one.
 
-The default grid is *t\_base* 0.01 and 0.02, *n\_min* 8 and 16, *τ* 0, 0.3, 0.6 and 0.9,
-*n\_single* 0, 2, 4 and 16, and *n\_1* 0, 1, 2 and 4 (`--survey_args` to change it). On a
-quarter of the sample it took 17 s and 2.1 GB.
+The default grid is both leaf modes, *t\_base* 0.01, 0.02 and 0.05, *n\_min* 8, 16 and 32,
+*τ* 0, 0.3, 0.6 and 0.9, *n\_single* 0, 2, 4 and 16, and *n\_1* 0, 1, 2 and 4
+(`--survey_args` to change it). On a quarter of the sample, both modes with *τ* 0 and 0.3 and
+*n\_single* 0 took 2.7 min and 2.5 GB.
 
 | Output | Content |
 | --- | --- |
-| `survey-*/survey.tsv` | One row per configuration. Pieces, single-leaf pieces, mean coherence; base, floor and top-up postings, and their total; distinct k-mers; proteins with no stored k-mer (`blind_proteins`); `over_standard` (the standard tier on the same proteins) and `over_matched` (tier 1 at the same *t\_base* and *n\_min*, where built); release-scale projections of postings, keys and pieces (× release proteins / sample proteins). |
-| `survey-*/survey.json` | Proteins, units, leaves, internal nodes, components. Per *t\_base*, how proteins without an own base k-mer reach the hierarchy (component with relatives, sharing a leaf, alone, no leaf, no valid k-mer). Tier 1's own floor coherence per (*t\_base*, *n\_min*). |
+| `survey-*/survey.tsv` | One row per leaf mode and configuration. Pieces, single-leaf pieces, mean coherence; base, floor and top-up postings, and their total; distinct k-mers; proteins with no stored k-mer (`blind_proteins`); `over_standard` (the standard tier on the same proteins) and `over_matched` (tier 1 at the same *t\_base* and *n\_min*, where built); release-scale projections of postings, keys and pieces (× release proteins / sample proteins). |
+| `survey-*/survey.json` | Proteins and units; per leaf mode, leaves, internal nodes, components and, per *t\_base*, how proteins without an own base k-mer reach the hierarchy (component with relatives, sharing a leaf, alone, no leaf, no valid k-mer). Tier 1's own floor coherence per (*t\_base*, *n\_min*). |
 | `tier1-*.json` | Tier 1 at each `--tier1_variants` rate, built on the sample's proteins. |
-| `index_sizes.tsv` | File sizes of the release's standard tier, so posting tables and unit columns can be sized separately. |
+| `index_sizes.tsv` | File sizes of the release's standard tier, every file under its directory, so posting tables and unit columns can be sized separately. |
 
 Not covered here:
 

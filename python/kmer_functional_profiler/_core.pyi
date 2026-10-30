@@ -105,7 +105,16 @@ def tree_schemes(
     hashes: NDArray[np.uint64],
     leaf_level: NDArray[np.uint8],
     level_hash: NDArray[np.uint64],
-) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32]]: ...
+    *,
+    emit: bool = False,
+) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.bool_]]: ...
+def contained_sums(
+    lo: NDArray[np.uint32],
+    hi: NDArray[np.uint32],
+    w: NDArray[np.int64],
+    q_lo: NDArray[np.uint32],
+    q_hi: NDArray[np.uint32],
+) -> NDArray[np.int64]: ...
 def align_identity(
     a: Sequence[bytes], b: Sequence[bytes]
 ) -> dict[str, NDArray[np.float32] | NDArray[np.uint32]]: ...

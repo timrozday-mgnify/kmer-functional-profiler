@@ -229,7 +229,7 @@ process INDEX_SIZES {
     script:
     """
     printf 'file\tbytes\n' > index_sizes.tsv
-    find -L ${index} -maxdepth 1 -type f -printf '%f\t%s\n' | sort >> index_sizes.tsv
+    find -L ${index} -type f -printf '%P\t%s\n' | sort >> index_sizes.tsv
     """
 }
 

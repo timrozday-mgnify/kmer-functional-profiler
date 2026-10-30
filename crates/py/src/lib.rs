@@ -661,8 +661,10 @@ fn tree_layout<'py>(
 }
 
 /// Per k-mer postings of each diff scheme on a merge forest: `hash`, `holders`, `fitch`,
-/// `gains`, `majority`, `add_only`.
+/// `gains`, `majority`, `add_only`; with `emit`, also Fitch's changes: `change_hash`,
+/// `change_node`, `change_gain`.
 #[pyfunction]
+#[pyo3(signature = (n, left, right, tops, offsets, hashes, leaf_level, level_hash, *, emit = false))]
 #[allow(clippy::too_many_arguments)]
 fn tree_schemes<'py>(
     py: Python<'py>,
@@ -674,6 +676,7 @@ fn tree_schemes<'py>(
     hashes: PyReadonlyArray1<'py, u64>,
     leaf_level: PyReadonlyArray1<'py, u8>,
     level_hash: PyReadonlyArray1<'py, u64>,
+    emit: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (left, right, tops) = (left.as_slice()?, right.as_slice()?, tops.as_slice()?);
     let (offsets, hashes) = (offsets.as_slice()?, hashes.as_slice()?);
@@ -681,7 +684,7 @@ fn tree_schemes<'py>(
     let got = py
         .detach(|| {
             kfp::schemes(
-                n, left, right, tops, offsets, hashes, leaf_level, level_hash,
+                n, left, right, tops, offsets, hashes, leaf_level, level_hash, emit,
             )
         })
         .map_err(to_py_err)?;
@@ -692,7 +695,30 @@ fn tree_schemes<'py>(
     dict.set_item("gains", got.gains.into_pyarray(py))?;
     dict.set_item("majority", got.majority.into_pyarray(py))?;
     dict.set_item("add_only", got.add_only.into_pyarray(py))?;
+    if emit {
+        dict.set_item("change_hash", got.change_hash.into_pyarray(py))?;
+        dict.set_item("change_node", got.change_node.into_pyarray(py))?;
+        dict.set_item("change_gain", got.change_gain.into_pyarray(py))?;
+    }
     Ok(dict)
+}
+
+/// For each query range, the summed weights of the ranges that contain it (tree index).
+#[pyfunction]
+fn contained_sums<'py>(
+    py: Python<'py>,
+    lo: PyReadonlyArray1<'py, u32>,
+    hi: PyReadonlyArray1<'py, u32>,
+    w: PyReadonlyArray1<'py, i64>,
+    q_lo: PyReadonlyArray1<'py, u32>,
+    q_hi: PyReadonlyArray1<'py, u32>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let (lo, hi, w) = (lo.as_slice()?, hi.as_slice()?, w.as_slice()?);
+    let (q_lo, q_hi) = (q_lo.as_slice()?, q_hi.as_slice()?);
+    let got = py
+        .detach(|| kfp::contained_sums(lo, hi, w, q_lo, q_hi))
+        .map_err(to_py_err)?;
+    Ok(got.into_pyarray(py))
 }
 
 /// Overlap-alignment identity of each protein pair: `identity` and aligned `columns`.
@@ -716,6 +742,7 @@ fn align_identity<'py>(
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", kfp::VERSION)?;
     m.add_function(wrap_pyfunction!(translate_frames, m)?)?;
+    m.add_function(wrap_pyfunction!(contained_sums, m)?)?;
     m.add_function(wrap_pyfunction!(max_hash_py, m)?)?;
     m.add_function(wrap_pyfunction!(hash_dna, m)?)?;
     m.add_function(wrap_pyfunction!(hash_proteins, m)?)?;

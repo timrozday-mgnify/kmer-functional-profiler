@@ -47,7 +47,7 @@ def test_survey_invariants(tmp_path: Path) -> None:
         cwd=tmp_path, script=SURVEY,
     )  # fmt: skip
     t = pl.read_csv(tmp_path / "s" / "survey.tsv", separator="\t")
-    key = ["t_base", "n_min", "tau", "n_single"]
+    key = ["leaves", "t_base", "n_min", "tau", "n_single"]
     by = t.sort("n_1").group_by(key, maintain_order=True).agg("postings", "blind_proteins", "n_1")
     for postings, blind, n_1 in by.select("postings", "blind_proteins", "n_1").rows():
         assert postings == sorted(postings)  # a larger leaf minimum only adds postings

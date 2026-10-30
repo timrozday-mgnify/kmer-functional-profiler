@@ -19,7 +19,11 @@
 #   results/stream.json               whole-release counts (equal-set collapse, signature
 #                                     groups, k-mer holders and distinct/total per slice)
 #   results/survey-core/survey.tsv    the floor survey (survey.py): postings, coverage and
-#   results/survey-all/               tier-1 ratios per (t_base, n_min, tau, n_single, n_1)
+#   results/survey-all/               tier-1 ratios per (leaves, t_base, n_min, tau, n_single,
+#                                     n_1); leaves: collapsed (phase 0's) or proteins (a leaf
+#                                     per distinct protein set)
+#   results/tier1-*.json              today's tier 1 at the survey's other rates (slim's,
+#                                     large's)
 #   results/index_sizes.tsv           file sizes of the release's standard tier
 # Re-submitting resumes: SAMPLE, STREAM, REDUCE, MEASURE are reused; the survey runs on top.
 source ../common.sh

@@ -306,7 +306,7 @@ Without MGnify90 units, "the right unit" is no longer defined, so accuracy is sc
 
 Laptop work runs one job at a time with capped threads; full-scale runs go to HPC as Nextflow (SLURM + Singularity) for the user to run.
 
-0. **Measure, no index (gate for everything after).** *Run 2026-10-30: **gate failed** on postings (3.8× tier 1 with per-sequence floors; 0.64× without floors); leaves 1.98× units (passes). Stopped here pending a decision on floors; see Progress log.* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
+0. **Measure, no index (gate for everything after).** *Run 2026-10-30: **gate failed** on postings (3.8× tier 1 with per-sequence floors; 0.64× without floors); leaves 1.98× units (passes). Stopped here pending a decision on floors; see Progress log. Survey 2026-10-30: with floors per piece and a per-leaf minimum, **passes** on the full sample (1.11× tier 1, every protein with a valid 11-mer covered).* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
    - spanning tree under |S\_a Δ S\_b| with the virtual empty root: exact (all candidate pairs from the inverted index, Kruskal) at this size, and the staged build (stages 1–4) beside it. Report the staged tree's total weight against the exact one, each stage's candidates, largest signature group, and prefix posting lengths;
    - equal-set and containment collapses;
    - *diff schemes* (Diff schemes): postings and build time for the sequence MST, add-only, majority and Fitch on the same merge tree, on the same sample. **Decision:** Fitch on the merge tree unless the sequence MST is within ~10% of its postings and clearly cheaper to build;
@@ -320,12 +320,12 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - *sparse against dense topology* (A sensitive topology at MGnify scale): both built on the sample, with build CPU-h and scratch for each. On `presence-calibration`'s spiked units with no own hit (their profiles and `truth.tsv`): the identity of each miss's nearest hit relative, and the share each topology's neighbour rule reaches at δ 0.05, 0.1 and 0.15, with the candidate count. **Decision:** dense only if it reaches substantially more misses than sparse, for its extra cost;
    - *chunking:* duplicated postings against chunk size *B* (at *t* 1 and at tier 1's rate), the share of forest components larger than *B*, and how many chunks the spike benchmark's candidate subtrees touch;
    - **gate:** postings ≤ 1.5× today's, and nodes ≤ 2× units, at matched *t*. If it fails, stop here and record why.
-1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0):
+1. **Build prototype** (Python, Rust kernels as the existing tier, on the laptop scale of phase 0). *Started 2026-10-30: `workflows/tree-index/build.py` builds one tier with the survey's design on the exact topology, checked against brute force; see Progress log.*
    - the staged build: set digests (Δ = 0), pigeonhole signatures (Δ ≤ d), the rarity-ordered prefix join on representatives (Δ > d), Kruskal by integer level with the virtual empty root, and dense tie-breaks; collapses;
    - the merge tree and leaf order; Fitch states per k-mer (stage 6, missing data for leaves below a k-mer's level); range postings with level bands; leaf and node tables; a sequence store reordered by leaf order.
    - Checked against a brute-force reconstruction: every sequence's sampled set from its root path equals its own; and against brute-force Fitch on small trees (equal minimum change counts).
    - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
-2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures.
+2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures. *Done 2026-10-30 (`workflows/tree-index/query.py`); see Progress log.*
 3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
 4. **Benchmark against tier 1**, at matched index size and *t*:
    - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
@@ -535,3 +535,93 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
       - Coherence and floors are now per leaf (one representative per leaf) rather than per protein, so pieces of one leaf with several identical proteins count as single-leaf pieces.
       - Proteins without a leaf (no k-mer up to *t\_cap*) get a leaf of their own under the minimum.
     - **On the quarter sample** (17 s, 2.1 GB): at components with no single-leaf floor and *n\_1* = 1, **1.10× the standard tier** with only the 38 proteins that have no valid 11-mer uncovered. *n\_1* = 2: 1.19×; *n\_single* = 2 with *n\_1* = 1: 1.35×.
+  - **Survey results (HPC, 2026-10-30).** `tree-index-phase0.tar.gz`: SURVEY on core (1,067,329 proteins, 308,997 units) and all (+10⁶ cross-cluster representatives), TIER1_MATCHED, INDEX_SIZES. SURVEY took 3.3 min / 5.6 GB (core) and 6 min / 21 GB (all).
+    - **Core confirms the quarter sample.** At *t\_base* 0.02, *n\_min* 16, no single-leaf floor (*n\_single* 0), totals over the standard tier (1,727,926):
+
+      | *τ* | *n\_1* = 0 (blind) | 1 | 2 | 4 |
+      | --- | --- | --- | --- | --- |
+      | 0 (components) | 1.06× (91,752) | **1.11×** | 1.20× | 1.49× |
+      | 0.3 | 1.08× (90,434) | **1.12×** | 1.21× | 1.50× |
+      | 0.6 | 1.11× (97,041) | 1.16× | 1.26× | 1.56× |
+      | 0.9 | 0.85× (127,500) | 0.91× | 1.03× | 1.42× |
+
+      With *n\_1* ≥ 1 only 172 proteins stay uncovered (no valid 11-mer). Every *τ* ≤ 0.6 with *n\_1* ≤ 2 passes the 1.5× gate.
+    - *τ* 0.9 is cheaper only because it splits clades into single leaves, which get no floor at *n\_single* 0; the top-up covers them with fewer k-mers. It trades floors for top-ups rather than buying resolution.
+    - **Single-leaf floors are the expensive part.** *n\_single* 2 / 4 / 16 cost 1.36× / 1.63× / 2.47× (τ 0, *n\_1* 1). Only *n\_single* ≤ 2 passes.
+    - **Lower rate.** At *t\_base* 0.01, *n\_min* 8 the tree is 1.23× tier 1 built at the same rate (869,021; *τ* 0, *n\_1* 1), and 0.62× the standard tier. Whether that rate is sensitive enough is phase 4's question.
+    - **All (cross-cluster sharing).** The extra 10⁶ representatives add 0.90 M base postings (+72%) and 41 k floor postings for +94% proteins. Its ratios in `survey.tsv` (1.65× at the settings above) are **not comparable**: the denominator is tier 1 on core only. A matched check needs tier 1 built on core + extra.
+    - **Release scale.** Projected linearly by protein count (5,378× from core): 1.03 × 10¹⁰ postings (τ 0, *n\_1* 1) against 9.3 × 10⁹ for the standard tier on the same scaling; from all (2,776×) 7.9 × 10⁹. Linear scaling ignores the growth of sharing with depth, so these are upper bounds.
+    - **Gap:** `index_sizes.tsv` has no tier-1 file (INDEX_SIZES lists one directory level only), so the release's tier-1 bytes are still unknown.
+    - **Reading.** The phase-0 gate passes on the full sample with floors per piece (components or *τ* 0.3), no single-leaf floor, and *n\_1* = 1: ~1.11× tier 1 with every valid protein covered. Pending the user's decision: proceed to phase 1 on these settings, or first re-run with a tier 1 on core + extra for the matched `all` check.
+  - **Tree tiers proposed (2026-10-30, the user's request: ~64, ~128 and ~256 GB; quick profile, good profile followed by the dense tier, and a performance boost).** Sizes use the standard tier's all-in compact cost, ~11.6 B per posting (~108 GB for ~9.3 × 10⁹ postings, unit table included). Postings are projected from all (lower bound) and from core (upper bound). Every tier has a floor on each multi-leaf piece and a per-leaf minimum *n\_1*, so no protein with a valid 11-mer is blind; none has single-leaf floors (*n\_single* 0), since those cost the most.
+
+    | Tier | *t\_base* | *n\_min* | *τ* | *n\_1* | Postings (release) | ~Size | Why |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | quick (~64 GB) | 0.01 | 8 | 0 (components) | 1 | 4.3–5.7 × 10⁹ | 50–67 GB | slim's rates; cheapest floors; one own k-mer per leaf |
+    | medium (~128 GB) | 0.02 | 16 | 0.3 | 2 | 8.4–11.3 × 10⁹ | 98–130 GB | the standard tier's rates; floors more coherent than tier 1's for +1%; two own k-mers so a leaf can reach `min_hits` 2 before the dense tier |
+    | large (~256 GB) | 0.05 | 16 | 0.3 | 4 | ~1.5–1.9 × 10¹⁰ (estimate) | ~175–220 GB | the large tier's rate, which calibrates `aai`; floors rarely bind at 0.05, so a higher *n\_1* is cheap |
+
+    - The large tier is not measured: the survey stopped at *t\_base* 0.02. Base postings doubled from 0.01 to 0.02 (623 k to 1.25 M on core), so ~3.1 M at 0.05, with floors and top-ups shrinking. Add *t\_base* 0.05 to the survey before building it.
+    - **Leaf table.** At ~2.5–3.3 × 10⁹ leaves the leaf table is ~30–40 GB at ~12 B per row, against tier 1's ~16 GB for 5.3 × 10⁸ posted units. That may push quick past 64 GB. If it does, quick's leaf rows can drop to leaf boundaries and level band (~8 B).
+* **Phase 1 begun: a tier builder, checked locally (2026-10-30, the user's request: build the tiers at 1 in 100 on HPC, but do the local development steps first).**
+  - **Kernel.** `tree_schemes(..., emit=True)` returns Fitch's changes (hash, node, gain or loss) of the assignment it counts. The Rust test checks, over 3,000 random forests with missing data, that they number exactly Fitch's postings and rebuild every leaf that could hold each k-mer.
+  - **Kruskal** now breaks weight ties by node pair rather than input order. `overlap_pairs` emits pairs in thread order, so builds differed slightly from run to run: ±0.01% postings against the survey's HPC run. The build is now deterministic.
+  - **`build.py`**, format `tree-v0`:
+    - Range postings `(hash, lo, hi, sign)` over leaf positions, sorted by hash: base-band Fitch changes (kind 0), floors on multi-leaf pieces at *τ* (kind 1), and per-leaf top-ups to *n\_1* (kind 2). A leaf holds a k-mer iff the signs covering it sum to 1.
+    - Proteins without a leaf get positions after the tree's.
+    - Beside the postings: the merge tree as position ranges, `pieces.parquet` and `proteins.parquet`.
+    - No single-leaf floors (*n\_single* 0, as every proposed tier).
+  - **Test** (`tests/python/test_tree_build.py`, fixture):
+    - posting counts per kind equal the survey's for the same configuration;
+    - expanding the ranges, every cover sums to 0 or 1;
+    - each leaf's base band equals its representative's k-mers;
+    - every floor is held across its piece;
+    - every protein with a valid k-mer is covered by at least min(*n\_1*, its k-mers).
+  - **The three tiers on phase 0's core sample** (1,067,329 proteins; laptop, 4 threads):
+
+    | Tier | Postings | Base / floor / top-up | / tier 1 | Build | Peak RSS | `tree-v0` bytes |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | quick (0.01, 8, *τ* 0, *n\_1* 1) | 1,069,817 | 624 k / 298 k / 148 k | 1.23× matched (0.62× standard) | 73 s | 4.6 GB | 33 MB |
+    | medium (0.02, 16, *τ* 0.3, *n\_1* 2) | 2,093,942 | 1,250 k / 611 k / 233 k | 1.21× | 61 s | 4.9 GB | 52 MB |
+    | large (0.05, 16, *τ* 0.3, *n\_1* 4) | 3,775,732 | 3,134 k / 288 k / 353 k | 2.19× standard | 61 s | 4.7 GB | 82 MB |
+
+    - The large tier is now measured: its base band (3.13 M) is as estimated, floors shrink to 288 k, and top-ups are 353 k.
+    - At tier 1's all-in compact ~11.6 B per posting, scaled from core: quick ~67 GB, medium ~131 GB, large ~236 GB. These are upper bounds, since sharing grows with scale.
+    - `tree-v0` is a development format (18 B per posting plus 9.6 MB of `proteins.parquet` here), not the compact one.
+  - *Next:* phase 2 (counting query: lookup, interval sweep, node counts) locally against brute force on these builds. Then a BUILD step for the 1-in-100 subset on HPC (~57 M proteins, ~50× this sample; the exact topology may need the staged build at that size).
+* **Phase 2: counting query (2026-10-30, the user's request).**
+  - **Kernel.** `_core.contained_sums(lo, hi, w, q_lo, q_hi)` sums, for each query range, the weights of the posting ranges that contain it: one sweep in `lo` order with a Fenwick tree over `hi`, O((P + Q) log P). A Rust test checks it against brute force on random ranges.
+  - **Build** now also writes |S\_v|: `pos_size.npy` per leaf position and `node_size.npy` per internal node (Fitch's states), both from that kernel over all postings.
+  - **`query.py`:**
+    - *Lookup.* Reads (six-frame translated, as today) or proteins are hashed. A hash is kept if it is ≤ *t\_cap* or one of the few keys beyond it, then counted per distinct hash and probed in the sorted key array.
+    - *Counting.* Leaves come from one sweep over the hit postings' endpoints, giving piecewise-constant segments, of which the positive ones are expanded. Internal nodes come from `contained_sums`. Each gets distinct hit k-mers, occurrences, |S\_v| and containment.
+    - Writes `leaves.parquet`, `nodes.parquet` and `query.json`.
+    - *Ceiling:* every internal node is queried (O(N log P)). At full scale, only the touched nodes' ancestors should be.
+  - **Test** (fixture, protein sample with duplicates and an unrelated sequence):
+    - leaf counts and occurrences equal brute-force holdings joined to the sample;
+    - `pos_size` equals each leaf's held k-mers;
+    - for every internal node, the k-mers whose containing postings sum to 1 number `node_size`, and their sample hits equal the query's counts.
+  - **Sketch beyond *t\_cap*.** Top-ups beyond *t\_cap* are 0.2–1.3% of postings: quick 1,898, medium 8,693, large 50,926, on 1,898 / 6,870 / 27,037 positions. Because of them the largest key is ~2⁶⁴, which would make the query keep every read k-mer. Keeping only hashes ≤ *t\_cap* plus those keys cut sampled hashes 5× (4.4 M to 0.88 M on 125 k read pairs of SRR1438000), with identical results.
+  - **Local timings on the core sample's tiers** (4 threads):
+    - 125 k read pairs (SRR1438000): 0.4–0.6 s, ~0.9 GB peak RSS. Few hits, as expected at 1 in 5,000: 162 / 332 / 582 hit hashes.
+    - 50,000 of the sample's own proteins as the query: counting takes 0.15–0.46 s for 186 k / 363 k / 715 k hit postings. Lookup takes 10–13 s, all of it in the protein path's per-sequence hashing (tests only). Peak RSS 0.44–0.56 GB.
+  - **Finding: the leaf minimum covers leaves, not every member.** Of those 50,000 proteins, 1,023 (quick), 296 (medium) and 86 (large) do not hit their own leaf. 99% are partial fragments shorter than their leaf's representative (median 43–66 aa against 134–155). The leaf's base band, floor and top-ups are the representative's k-mers, some outside the fragment.
+    - Reads from the fragment's real gene will usually hit the container's k-mers too, so this matters mainly for fragment-only genes.
+    - A per-member guarantee would top up each member from its own hashes (posted at its leaf, held by all its members, as floors are). Its cost is not measured. The survey's "every protein covered" holds per leaf.
+  - *Next:* phase 3 (reporting, recall first) on these counts, or the HPC BUILD of the 1-in-100 tiers.
+* **A leaf per protein, surveyed (2026-10-30, the user's request: every protein, not representatives; survey on HPC first, to size the tiers and choose parameters).**
+  - **What was stored.** In phase 0's tree, leaves are distinct sets at the topology rates after the equal-set and containment collapses. Each leaf stores its longest member's k-mers. So contained fragments, and members whose sets differ at a tier's own rates, are not indexed by their own k-mers: phase 2's 1–2% own-leaf misses.
+  - **`--leaves proteins`** (survey and build; the builder's default; the user, same day: the topology is built from dense k 8, and proteins share a leaf only when those dense sets match exactly):
+    - Each distinct dense 8-mer set (every 8-mer, rate 1) is a leaf, with no containment collapse. Each leaf stores its own k-mers (its longest member's; members have equal 8-mer sets, so nearly always equal sequences).
+    - The topology is the storage tree (Kruskal with the virtual empty root) under |A Δ B| of the dense sets, from an exact pair join. `--topology-max-holders` can cap common k-mers, after which pairs are weighed exactly.
+    - *First try, superseded:* distinct 11-mer sets up to *t\_cap* as leaves, on the sampled topology. On the quarter sample: 237,875 leaves against 151,474 collapsed, 21–26% more postings. Medium (*t\_base* 0.02, *n\_min* 16, *τ* 0.3, *n\_1* 2): 637,307 against 519,959, i.e. 1.47× tier 1 (432,440) against 1.20×.
+  - **Quarter sample, dense 8-mer leaves** (3.3 min, 3.9 GB; the 8-mer pair join took 92 s):
+    - 262,391 proteins give 261,954 leaves, so almost every protein has its own. There are 179,062 internal nodes and 82,892 components.
+    - Postings are 1.25–1.33× the collapsed tree's at every setting with *n\_1* ≥ 1.
+    - Over tier 1 (432,440): quick (0.01/8, *τ* 0, *n\_1* 1) 0.82×; medium (0.02/16, *τ* 0.3, *n\_1* 2) 1.56×; large (0.05/32, *τ* 0.3, *n\_1* 2) 2.96× (tier 1 at 0.05/32 is not built on the quarter).
+  - **Set up for HPC** (`hpc/kfp-ablations/tree-index-phase0`, resumed):
+    - SURVEY over both leaf modes. Grid: *t\_base* 0.01 / 0.02 / 0.05, *n\_min* 8 / 16 / 32, *τ* 0 / 0.3 / 0.6 / 0.9, *n\_single* 0 / 2 / 4 / 16, *n\_1* 0 / 1 / 2 / 4.
+    - TIER1_MATCHED also builds the large tier (`tbase05_all`: 0.05, *n\_min* 32) on the sample, so 0.05/32 rows get `over_matched`.
+    - INDEX_SIZES lists every file under the release index, so tier 1's bytes are included.
+    - Test profile run locally: 1,152 rows, both modes, matched rows at 0.01/8, 0.02/16 and 0.05/32.
+    - *Not included:* tier 1 on core + extra, so `all`'s ratios still compare against core-only tier 1.
