@@ -553,3 +553,13 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - **Release scale.** Projected linearly by protein count (5,378× from core): 1.03 × 10¹⁰ postings (τ 0, *n\_1* 1) against 9.3 × 10⁹ for the standard tier on the same scaling; from all (2,776×) 7.9 × 10⁹. Linear scaling ignores the growth of sharing with depth, so these are upper bounds.
     - **Gap:** `index_sizes.tsv` has no tier-1 file (INDEX_SIZES lists one directory level only), so the release's tier-1 bytes are still unknown.
     - **Reading.** The phase-0 gate passes on the full sample with floors per piece (components or *τ* 0.3), no single-leaf floor, and *n\_1* = 1: ~1.11× tier 1 with every valid protein covered. Pending the user's decision: proceed to phase 1 on these settings, or first re-run with a tier 1 on core + extra for the matched `all` check.
+  - **Tree tiers proposed (2026-10-30, the user's request: ~64, ~128 and ~256 GB; quick profile, good profile followed by the dense tier, and a performance boost).** Sizes use the standard tier's all-in compact cost, ~11.6 B per posting (~108 GB for ~9.3 × 10⁹ postings, unit table included). Postings are projected from all (lower bound) and from core (upper bound). Every tier has a floor on each multi-leaf piece and a per-leaf minimum *n\_1*, so no protein with a valid 11-mer is blind; none has single-leaf floors (*n\_single* 0), since those cost the most.
+
+    | Tier | *t\_base* | *n\_min* | *τ* | *n\_1* | Postings (release) | ~Size | Why |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | quick (~64 GB) | 0.01 | 8 | 0 (components) | 1 | 4.3–5.7 × 10⁹ | 50–67 GB | slim's rates; cheapest floors; one own k-mer per leaf |
+    | medium (~128 GB) | 0.02 | 16 | 0.3 | 2 | 8.4–11.3 × 10⁹ | 98–130 GB | the standard tier's rates; floors more coherent than tier 1's for +1%; two own k-mers so a leaf can reach `min_hits` 2 before the dense tier |
+    | large (~256 GB) | 0.05 | 16 | 0.3 | 4 | ~1.5–1.9 × 10¹⁰ (estimate) | ~175–220 GB | the large tier's rate, which calibrates `aai`; floors rarely bind at 0.05, so a higher *n\_1* is cheap |
+
+    - The large tier is not measured: the survey stopped at *t\_base* 0.02. Base postings doubled from 0.01 to 0.02 (623 k to 1.25 M on core), so ~3.1 M at 0.05, with floors and top-ups shrinking. Add *t\_base* 0.05 to the survey before building it.
+    - **Leaf table.** At ~2.5–3.3 × 10⁹ leaves the leaf table is ~30–40 GB at ~12 B per row, against tier 1's ~16 GB for 5.3 × 10⁸ posted units. That may push quick past 64 GB. If it does, quick's leaf rows can drop to leaf boundaries and level band (~8 B).
