@@ -130,6 +130,63 @@ pub fn overlap_pairs(
     Ok(out)
 }
 
+/// Shared stored k-mers and weight (as in [`overlap_pairs`]) of given pairs (`a[i]`, `b[i]`).
+pub fn pair_weights(
+    offsets: &[u64],
+    hashes: &[u64],
+    max_hash: &[u64],
+    a: &[u32],
+    b: &[u32],
+) -> Result<(Vec<u32>, Vec<u32>), Error> {
+    let n = check_sets(offsets, hashes)?;
+    if max_hash.len() != n || a.len() != b.len() {
+        return Err(Error::LengthMismatch);
+    }
+    if let Some(&x) = a.iter().chain(b).find(|&&x| x as usize >= n) {
+        return Err(Error::NodeOutOfRange(u64::from(x)));
+    }
+    let mut shared = vec![0u32; a.len()];
+    let mut weight = vec![0u32; a.len()];
+    let per_thread = a.len().div_ceil(threads()).max(1);
+    std::thread::scope(|scope| {
+        for (t, (sh, we)) in shared
+            .chunks_mut(per_thread)
+            .zip(weight.chunks_mut(per_thread))
+            .enumerate()
+        {
+            scope.spawn(move || {
+                for k in 0..sh.len() {
+                    let (i, j) = (
+                        a[t * per_thread + k] as usize,
+                        b[t * per_thread + k] as usize,
+                    );
+                    let m = max_hash[i].min(max_hash[j]);
+                    let (x, y) = (set(offsets, hashes, i), set(offsets, hashes, j));
+                    let (x, y) = (
+                        &x[..x.partition_point(|&h| h <= m)],
+                        &y[..y.partition_point(|&h| h <= m)],
+                    );
+                    let (mut p, mut q, mut c) = (0, 0, 0u32);
+                    while p < x.len() && q < y.len() {
+                        match x[p].cmp(&y[q]) {
+                            std::cmp::Ordering::Less => p += 1,
+                            std::cmp::Ordering::Greater => q += 1,
+                            std::cmp::Ordering::Equal => {
+                                c += 1;
+                                p += 1;
+                                q += 1;
+                            }
+                        }
+                    }
+                    sh[k] = c;
+                    we[k] = (x.len() + y.len()) as u32 - 2 * c;
+                }
+            });
+        }
+    });
+    Ok((shared, weight))
+}
+
 fn find(parent: &mut [u32], mut u: u32) -> u32 {
     while parent[u as usize] != u {
         let up = parent[parent[u as usize] as usize];
@@ -868,6 +925,8 @@ mod tests {
         rows.sort_unstable();
         // 0-1: Δ 2; 0-3: Δ 4 ≤ 8; 1-3: shared 3, Δ 1 + 5 = 6 ≤ 8
         assert_eq!(rows, [(0, 1, 3, 2), (0, 3, 4, 4), (1, 3, 3, 6)]);
+        let (sh, w) = pair_weights(&offsets, &hashes, &mh, &[0, 1, 2], &[1, 3, 3]).unwrap();
+        assert_eq!((sh, w), (vec![3, 3, 0], vec![2, 6, 9]));
         // a lower threshold on set 3 restricts its side of the difference
         let mh = [u64::MAX, u64::MAX, u64::MAX, 4];
         let got = overlap_pairs(&offsets, &hashes, &mh, 1, true, usize::MAX).unwrap();

@@ -34,7 +34,9 @@ pub use route::{RouteHits, route_hits};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
 };
-pub use tree::{Kruskal, Layout, Pairs, Schemes, kruskal, layout, overlap_pairs, schemes};
+pub use tree::{
+    Kruskal, Layout, Pairs, Schemes, kruskal, layout, overlap_pairs, pair_weights, schemes,
+};
 
 /// Worker threads for the parallel kernels: the CPUs this process may use.
 pub(crate) fn threads() -> usize {

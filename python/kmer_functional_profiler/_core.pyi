@@ -83,6 +83,13 @@ def overlap_pairs(
     storage: bool = True,
     max_holders: int = ...,
 ) -> dict[str, Any]: ...
+def pair_weights(
+    offsets: NDArray[np.uint64],
+    hashes: NDArray[np.uint64],
+    max_hash: NDArray[np.uint64],
+    a: NDArray[np.uint32],
+    b: NDArray[np.uint32],
+) -> dict[str, NDArray[np.uint32]]: ...
 def kruskal(
     n: int, u: NDArray[np.uint32], v: NDArray[np.uint32], w: NDArray[np.uint32]
 ) -> dict[str, NDArray[np.uint32] | NDArray[np.bool_]]: ...

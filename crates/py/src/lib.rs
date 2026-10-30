@@ -510,6 +510,31 @@ fn overlap_pairs<'py>(
     Ok(dict)
 }
 
+/// Shared stored k-mers and weight of given pairs of CSR sets: `shared`, `weight`.
+#[pyfunction]
+fn pair_weights<'py>(
+    py: Python<'py>,
+    offsets: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    max_hash: PyReadonlyArray1<'py, u64>,
+    a: PyReadonlyArray1<'py, u32>,
+    b: PyReadonlyArray1<'py, u32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (offsets, hashes, max_hash) = (
+        offsets.as_slice()?,
+        hashes.as_slice()?,
+        max_hash.as_slice()?,
+    );
+    let (a, b) = (a.as_slice()?, b.as_slice()?);
+    let (shared, weight) = py
+        .detach(|| kfp::pair_weights(offsets, hashes, max_hash, a, b))
+        .map_err(to_py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("shared", shared.into_pyarray(py))?;
+    dict.set_item("weight", weight.into_pyarray(py))?;
+    Ok(dict)
+}
+
 /// Kruskal spanning forest of nodes `0..n` and its merge forest: `mst` (per edge), `left`,
 /// `right`, `level` (internal node `n + i`) and `tops`.
 #[pyfunction]
@@ -621,6 +646,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     m.add_function(wrap_pyfunction!(components, m)?)?;
     m.add_function(wrap_pyfunction!(overlap_pairs, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_weights, m)?)?;
     m.add_function(wrap_pyfunction!(kruskal, m)?)?;
     m.add_function(wrap_pyfunction!(tree_layout, m)?)?;
     m.add_function(wrap_pyfunction!(tree_schemes, m)?)?;
