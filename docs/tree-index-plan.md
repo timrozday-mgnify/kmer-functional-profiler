@@ -663,3 +663,15 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Medium:* the standard tier's rates, for a profile followed by the dense tier. *n\_1* 2 lets every protein reach two hits, and *τ* 0.3 gives floors more coherent than tier 1's for +1–2%. If ~128 GB is a hard limit, 0.02/8 (128–142 GB) halves the floors, at the cost in short-protein detection that *n\_min* 16 was chosen to avoid.
     - *Large:* today's large tier's rates (`tbase05_all`, which calibrates `aai`), so the two compare like for like. 0.05/16 with *n\_1* 4 (246–266 GB) fits 256 GB more closely.
     - In today's format, each tree tier is about the size of the tier it replaces or smaller, at per-protein resolution.
+* **The three tiers built in parts, set up for HPC (2026-10-30, the user's request).** One process cannot build the 1-in-100 subset (~9.9 × 10⁹ residues, ~53 M proteins). From the quarter sample, a proteins-mode build is 3.4 GB per 262 k proteins (most of it the dense 8-mer join), so ~700 GB at that size. `workflows/tree-index/build.nf` builds it in parts instead:
+  - **PARTITION** (`partition.py`). Proteins are linked when they can share a k-11 storage edge at the topology rates, or have the same sequence, so equal dense sets never straddle parts. Components are packed, largest first, into parts of ~2 M proteins.
+    - A new kernel, `_core.overlap_components`, unions pairs as `overlap_pairs`' scan finds them (shared scan, batched union-find), so the pairs are never held. On the core sample there would be 72 M of them.
+    - Core sample: 311,795 components, the largest 3,454 proteins; 37 s, 2.6 GB (3.8 GB with the pairs kept). That is ~130 GB at 53 M proteins, in a 256 GB job.
+  - **BUILD:** `build.py` per part and tier, ~26 GB per 2 M-protein part.
+  - **MERGE** (`merge.py`): parts concatenated in name order, positions offset, postings re-sorted by hash. Same format, so `query.py` reads it.
+  - **Ceiling:** dense-topology edges between parts are lost, so a k-mer shared across parts is posted in each. Cuts fall between k-11 storage components, which few such edges cross.
+  - **Tests:**
+    - Rust: `overlap_components` equals union-find over `overlap_pairs` on random sets.
+    - `test_partitioned_build_is_sound`: fixture in ≥ 3 parts, built and merged. The merged index passes the single build's brute-force checks: positions one-to-one with dense 8-mer sets, base band, floors, coverage, and leaf and node query counts.
+    - `build.nf`'s test profile runs locally: 5 parts × 3 tiers merged.
+  - **HPC:** `hpc/kfp-ablations/tree-index-build/run.sh` builds quick, medium and large from `lin100-dense/members.parquet` into `results/index-<tier>/`.

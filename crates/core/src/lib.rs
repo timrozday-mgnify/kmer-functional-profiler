@@ -37,8 +37,8 @@ pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
 };
 pub use tree::{
-    Kruskal, Layout, Pairs, Schemes, contained_sums, kruskal, layout, overlap_pairs, pair_weights,
-    schemes,
+    Kruskal, Layout, Pairs, Schemes, contained_sums, kruskal, layout, overlap_components,
+    overlap_pairs, pair_weights, schemes,
 };
 
 /// Worker threads for the parallel kernels: the CPUs this process may use.

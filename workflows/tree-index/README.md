@@ -125,3 +125,35 @@ Not covered here:
 - how many chunks the spike benchmark's candidate subtrees touch;
 - NN-descent refinement (stage 5);
 - dense tie-breaks.
+
+## Building the tiers (`build.nf`)
+
+`build.nf` builds the three tiers chosen from the per-protein survey (the plan's Progress log)
+from one members table, in parts:
+
+```
+FIXTURE    synthetic members when --members is '' (the test profile)
+PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-find during
+           the pair join, _core.overlap_components) or an equal sequence; components packed
+           into parts of ~--part_proteins (2 M) -> partition.json
+BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
+           topology, base band by Fitch, floors per piece, per-leaf top-ups
+MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
+```
+
+```bash
+nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts
+nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
+```
+
+`--tiers` holds `name:build.py options` pairs, `;`-separated. The defaults are quick
+(*t\_base* 0.01, *n\_min* 8, *τ* 0, *n\_1* 1), medium (0.02, 16, 0.3, 2) and large (0.05, 32,
+0.3, 2). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
+Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
+RSS.
+
+Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITION 37 s and
+2.6 GB (~2.4 KB per protein); BUILD 68 s and 3.4 GB per 262 k proteins (the medium tier).
+
+Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
+each. Cuts fall between k-11 storage components, which few such edges cross.

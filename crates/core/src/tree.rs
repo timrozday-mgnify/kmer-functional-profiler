@@ -52,6 +52,81 @@ pub fn overlap_pairs(
     storage: bool,
     max_holders: usize,
 ) -> Result<Pairs, Error> {
+    let parts = overlap_scan(
+        offsets,
+        hashes,
+        max_hash,
+        (min_shared, storage, max_holders),
+        Pairs::default,
+        |out: &mut Pairs, a, b, shared, weight| {
+            out.a.push(a);
+            out.b.push(b);
+            out.shared.push(shared);
+            out.weight.push(weight);
+        },
+    )?;
+    let mut out = Pairs::default();
+    for (p, probes, skipped) in parts {
+        out.a.extend(p.a);
+        out.b.extend(p.b);
+        out.shared.extend(p.shared);
+        out.weight.extend(p.weight);
+        out.probes += probes;
+        out.skipped += skipped;
+    }
+    Ok(out)
+}
+
+/// Connected components of [`overlap_pairs`]'s graph (with `storage`, exact): each set's
+/// component, numbered by its smallest set. Pairs are unioned as they are found, in batches,
+/// so memory is the inverted index's, not the pairs'.
+pub fn overlap_components(
+    offsets: &[u64],
+    hashes: &[u64],
+    max_hash: &[u64],
+) -> Result<Vec<u32>, Error> {
+    const BATCH: usize = 1 << 20;
+    let n = check_sets(offsets, hashes)?;
+    let parent = std::sync::Mutex::new((0..n as u32).collect::<Vec<u32>>());
+    let flush = |buf: &mut Vec<(u32, u32)>| {
+        let mut parent = parent.lock().unwrap();
+        for &(a, b) in buf.iter() {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            let (lo, hi) = (ra.min(rb), ra.max(rb));
+            parent[hi as usize] = lo;
+        }
+        buf.clear();
+    };
+    let parts = overlap_scan(
+        offsets,
+        hashes,
+        max_hash,
+        (1, true, usize::MAX),
+        Vec::new,
+        |buf: &mut Vec<(u32, u32)>, a, b, _, _| {
+            buf.push((a, b));
+            if buf.len() >= BATCH {
+                flush(buf);
+            }
+        },
+    )?;
+    for (mut buf, _, _) in parts {
+        flush(&mut buf);
+    }
+    let mut parent = parent.into_inner().unwrap();
+    Ok((0..n as u32).map(|x| find(&mut parent, x)).collect())
+}
+
+/// The join both run: per thread (sets `t`, `t + threads`, ...), `visit(state, a, b, shared,
+/// weight)` for each kept pair `a < b`; returns each thread's state, probes and skipped k-mers.
+fn overlap_scan<T: Send>(
+    offsets: &[u64],
+    hashes: &[u64],
+    max_hash: &[u64],
+    (min_shared, storage, max_holders): (u32, bool, usize),
+    init: impl Fn() -> T + Sync,
+    visit: impl Fn(&mut T, u32, u32, u32, u32) + Sync,
+) -> Result<Vec<(T, u64, u64)>, Error> {
     let n = check_sets(offsets, hashes)?;
     if max_hash.len() != n {
         return Err(Error::LengthMismatch);
@@ -69,18 +144,20 @@ pub fn overlap_pairs(
     };
     let below = |i: usize, m: u64| set(offsets, hashes, i).partition_point(|&h| h <= m) as u32;
     let n_threads = threads().min(n.max(1));
-    let parts: Vec<Pairs> = std::thread::scope(|scope| {
+    let (init, visit) = (&init, &visit);
+    Ok(std::thread::scope(|scope| {
         let workers: Vec<_> = (0..n_threads)
             .map(|t| {
                 scope.spawn(move || {
-                    let mut out = Pairs::default();
+                    let mut state = init();
+                    let (mut probes, mut skipped) = (0u64, 0u64);
                     let mut count = vec![0u32; n];
                     let mut touched: Vec<u32> = Vec::new();
                     for a in (t..n).step_by(n_threads) {
                         for &h in set(offsets, hashes, a) {
                             let list = posting(h);
                             if list.len() > max_holders {
-                                out.skipped += 1;
+                                skipped += 1;
                                 continue;
                             }
                             let after = list.partition_point(|&(_, b)| b as usize <= a);
@@ -90,7 +167,7 @@ pub fn overlap_pairs(
                                 }
                                 count[b as usize] += 1;
                             }
-                            out.probes += (list.len() - after) as u64;
+                            probes += (list.len() - after) as u64;
                         }
                         let size_a = (offsets[a + 1] - offsets[a]) as u32;
                         for &b in &touched {
@@ -105,29 +182,16 @@ pub fn overlap_pairs(
                             if storage && weight > size_a.max(size_b) {
                                 continue;
                             }
-                            out.a.push(a as u32);
-                            out.b.push(b);
-                            out.shared.push(shared);
-                            out.weight.push(weight);
+                            visit(&mut state, a as u32, b, shared, weight);
                         }
                         touched.clear();
                     }
-                    out
+                    (state, probes, skipped)
                 })
             })
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
-    });
-    let mut out = Pairs::default();
-    for p in parts {
-        out.a.extend(p.a);
-        out.b.extend(p.b);
-        out.shared.extend(p.shared);
-        out.weight.extend(p.weight);
-        out.probes += p.probes;
-        out.skipped += p.skipped;
-    }
-    Ok(out)
+    }))
 }
 
 /// Shared stored k-mers and weight (as in [`overlap_pairs`]) of given pairs (`a[i]`, `b[i]`).
@@ -1036,6 +1100,34 @@ mod tests {
                     .sum();
                 assert_eq!(got[j], want);
             }
+        }
+    }
+
+    #[test]
+    fn overlap_components_match_the_pairs() {
+        let mut rng = Lcg(5);
+        for _ in 0..200 {
+            let n = 1 + rng.next(25) as usize;
+            let mut offsets = vec![0u64];
+            let mut hashes = Vec::new();
+            for _ in 0..n {
+                let mut s: Vec<u64> = (0..rng.next(6)).map(|_| rng.next(12)).collect();
+                s.sort_unstable();
+                s.dedup();
+                hashes.extend(&s);
+                offsets.push(hashes.len() as u64);
+            }
+            let mh = vec![u64::MAX; n];
+            let pairs = overlap_pairs(&offsets, &hashes, &mh, 1, true, usize::MAX).unwrap();
+            let got = overlap_components(&offsets, &hashes, &mh).unwrap();
+            // same partition as union-find over the pairs, numbered by the smallest set
+            let mut parent: Vec<u32> = (0..n as u32).collect();
+            for (&a, &b) in pairs.a.iter().zip(&pairs.b) {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
+            let want: Vec<u32> = (0..n as u32).map(|x| find(&mut parent, x)).collect();
+            assert_eq!(got, want);
         }
     }
 
