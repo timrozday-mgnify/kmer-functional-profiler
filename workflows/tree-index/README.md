@@ -16,6 +16,9 @@ EXTRA    -> extra.parquet (at most --max_extra representatives, sharing most fir
 MEASURE  the sample (core) and the sample plus representatives (all) -> measure-core/, measure-all/
 TIER1    today's standard tier on the sample's proteins -> tier1/meta.json
 REPORT   -> gate.tsv
+TIER1_MATCHED  today's index at the survey's other rates (--tier1_variants)   (--survey false: skip)
+SURVEY   the floor survey (survey.py) on core and all -> survey-core/, survey-all/
+INDEX_SIZES    file sizes of the release's standard tier (--release_index)
 ```
 
 Stored sets follow the plan. Each sequence's set is its k-mers with hash ≤ *t\_v*, where
@@ -77,6 +80,32 @@ Full scale runs from the release's members buckets on Slurm. See
 | `sensitive` | On one representative per storage component of a subsample (`--sensitive-seqs`), the exact k 6 MST against the seeded build. Seeds are 20 lowest murphy10 10-mers, with centre and sort-neighbour candidates; weights come from a *t* 0.25 sketch. Reported: weights in divergence units, the share of exact MST edges among the seeded candidates, the share of pairs within *R* that the seeded graph does not connect at ≤ *R*, and k 11 storage along the sensitive topology against the storage tree. |
 | `measure-all/` | The same on the sample plus the cross-cluster representatives. `mst_edges_across_units` shows cross-cluster sharing. |
 | `stream.json`, `stream.tsv` | Whole-release counts. Per kind (`digest`, `signature`, `slice<t>`, `dense<t>`): groups, members, the largest group, and distinct over total. Also `equal_set_collapse_share`, the 20 largest groups per kind, and totals. |
+
+### Floor survey
+
+`survey.py` measures the design that followed phase 0's failed gate (the plan's Progress log:
+forest floors, pieces by coherence, floors on every piece). One topology per sample is kept
+whole: phase 0's storage tree on per-sequence floored sets. On it, each configuration stores:
+
+- **base band:** each leaf's k-mers at or below *t\_base*, diffed by Fitch over the whole tree;
+- **piece floors:** top-down from each component, a node whose floor is at least *τ* coherent
+  becomes a piece (*τ* 0 keeps the components). Its floor is tier 1's: up to *n\_min* k-mers
+  above *t\_base*, those held by most of its leaves, posted once at its root. Coherence is the
+  mean share of the floor a leaf holds;
+- **single-leaf pieces:** a floor of their own *n\_single* lowest hashes above *t\_base*;
+- **leaf minimum:** each leaf topped up to *n\_1* stored k-mers of its own, and each protein
+  without a leaf (no k-mer up to *t\_cap*) given one.
+
+The default grid is *t\_base* 0.01 and 0.02, *n\_min* 8 and 16, *τ* 0, 0.3, 0.6 and 0.9,
+*n\_single* 0, 2, 4 and 16, and *n\_1* 0, 1, 2 and 4 (`--survey_args` to change it). On a
+quarter of the sample it took 17 s and 2.1 GB.
+
+| Output | Content |
+| --- | --- |
+| `survey-*/survey.tsv` | One row per configuration. Pieces, single-leaf pieces, mean coherence; base, floor and top-up postings, and their total; distinct k-mers; proteins with no stored k-mer (`blind_proteins`); `over_standard` (the standard tier on the same proteins) and `over_matched` (tier 1 at the same *t\_base* and *n\_min*, where built); release-scale projections of postings, keys and pieces (× release proteins / sample proteins). |
+| `survey-*/survey.json` | Proteins, units, leaves, internal nodes, components. Per *t\_base*, how proteins without an own base k-mer reach the hierarchy (component with relatives, sharing a leaf, alone, no leaf, no valid k-mer). Tier 1's own floor coherence per (*t\_base*, *n\_min*). |
+| `tier1-*.json` | Tier 1 at each `--tier1_variants` rate, built on the sample's proteins. |
+| `index_sizes.tsv` | File sizes of the release's standard tier, so posting tables and unit columns can be sized separately. |
 
 Not covered here:
 

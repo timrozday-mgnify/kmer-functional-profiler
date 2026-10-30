@@ -528,3 +528,10 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - Within the 1.5× gate, every protein is covered at *τ* 0.3 with *n\_1* ≤ 2, or at *τ* 0.6 with *n\_1* = 1.
     - These are upper bounds: a single leaf's floor here is up to *n\_1* candidates above *t\_base* even when it has base k-mers already. A top-up rule (floor only to reach *n\_1* stored k-mers in all) is cheaper.
     - The rule becomes uniform in tree terms: a floor of up to *n\_min* k-mers per piece, chosen by coherence, with a minimum of *n\_1* stored k-mers per leaf.
+  - **Survey set up for HPC (2026-10-30, the user's request).**
+    - `workflows/tree-index/survey.py` implements the design above in the workflow: SURVEY on core and all, TIER1_MATCHED for tier 1 at *t\_base* 0.01 and *n\_min* 8, and INDEX_SIZES for the release's standard-tier file sizes. It reuses the run's cached tasks, since `phase0.py` is unchanged.
+    - **Grid:** *t\_base* {0.01, 0.02} × *n\_min* {8, 16} × *τ* {0, 0.3, 0.6, 0.9} × *n\_single* {0, 2, 4, 16} × *n\_1* {0, 1, 2, 4}.
+    - **Two differences from the exploration scripts:**
+      - Coherence and floors are now per leaf (one representative per leaf) rather than per protein, so pieces of one leaf with several identical proteins count as single-leaf pieces.
+      - Proteins without a leaf (no k-mer up to *t\_cap*) get a leaf of their own under the minimum.
+    - **On the quarter sample** (17 s, 2.1 GB): at components with no single-leaf floor and *n\_1* = 1, **1.10× the standard tier** with only the 38 proteins that have no valid 11-mer uncovered. *n\_1* = 2: 1.19×; *n\_single* = 2 with *n\_1* = 1: 1.35×.

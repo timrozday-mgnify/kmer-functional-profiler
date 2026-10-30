@@ -18,8 +18,13 @@
 #   results/measure-all/              the same with the cross-cluster representatives
 #   results/stream.json               whole-release counts (equal-set collapse, signature
 #                                     groups, k-mer holders and distinct/total per slice)
+#   results/survey-core/survey.tsv    the floor survey (survey.py): postings, coverage and
+#   results/survey-all/               tier-1 ratios per (t_base, n_min, tau, n_single, n_1)
+#   results/index_sizes.tsv           file sizes of the release's standard tier
+# Re-submitting resumes: SAMPLE, STREAM, REDUCE, MEASURE are reused; the survey runs on top.
 source ../common.sh
 STD=../release-tiers/results-standard
 compgen -G "$STD/members.bucket*.parquet" >/dev/null || { echo "no $STD/members.bucket*.parquet: run release-tiers first" >&2; exit 1; }
 nextflow run "$WF/tree-index" -c ../site.config -resume --outdir results \
-    --store "$(realpath "$STD")/members.bucket*.parquet" --sample 5000
+    --store "$(realpath "$STD")/members.bucket*.parquet" --sample 5000 \
+    --release_index "$(realpath "$STD/index")"
