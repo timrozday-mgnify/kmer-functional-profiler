@@ -2888,7 +2888,7 @@ Most of the plumbing exists; the amino-acid k-mer hashing and the translation LU
 | Need | Crate | Note |
 | --- | --- | --- |
 | FASTA/FASTQ parsing | `paraseq` or `needletail` | paraseq has parallel paired-end record sets; needletail is the mature default. |
-| Compression | `niffler` + `flate2` (zlib-rs backend), `zstd` | Transparent gz/zst input. |
+| Compression | `niffler` + `flate2` (zlib-rs backend) | Transparent gz input. *Amended 2026-10-30:* zstd input dropped. needletail 0.7.3 pins zstd 0.13, which has open advisories RUSTSEC-2026-0391/0398/0403 with no 0.13 fix. Restore it when needletail moves to zstd ≥ 0.14.3. |
 | DNA minimizers/hashing | [`simd-minimizers`](https://github.com/rust-seq/simd-minimizers), `packed-seq`, `seq-hash` | Needs AVX2 or NEON; also accepts ASCII text, so could sample amino-acid strings. |
 | General hashing | `xxhash-rust` or `wyhash` | For u64-packed amino-acid k-mers. |
 | sourmash compatibility | `sourmash` (Rust core) | Protein/Dayhoff/HP encodings and its hash, for the compat mode. |

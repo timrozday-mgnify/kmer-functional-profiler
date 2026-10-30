@@ -54,7 +54,7 @@ static PHRED_ERROR: LazyLock<[f64; 256]> = LazyLock::new(|| {
     std::array::from_fn(|q| 10f64.powf(-(q.saturating_sub(33) as f64) / 10.0).min(1.0))
 });
 
-/// Streams FASTA/FASTQ (plain, gzip or zstd; single or paired) as batches of k-mer hits.
+/// Streams FASTA/FASTQ (plain or gzip; single or paired) as batches of k-mer hits.
 ///
 /// Each item holds the hits of up to `batch_reads` reads (pairs). A batch can be empty
 /// when none of its reads had a sampled k-mer; [`FastxHits::n_reads`] counts all reads.

@@ -88,6 +88,9 @@ cd kfp-ablations/route-dropped && BASE=../pileup-fdr/results/hadza10M OUT=result
 # query --background-share at full-index scale (spikes of the standard tier's own units in
 # hadza10M, plus unspiked and reversed-null samples; needs pileup-cost's reads):
 cd kfp-ablations/presence-calibration && sbatch run.sh
+# tree index, phase 0 (docs/tree-index-plan.md): trees on a 1-in-5,000 cluster sample,
+# whole-release streaming counts, and the gate against today's standard tier:
+cd kfp-ablations/tree-index-phase0 && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs

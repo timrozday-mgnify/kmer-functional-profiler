@@ -1,0 +1,36 @@
+"""workflows/tree-index/phase0.py: invariants of the phase-0 measurements on a fixture."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[2] / "workflows" / "tree-index" / "phase0.py"
+
+
+def run(*args: str, cwd: Path) -> None:
+    env = os.environ | {"RAYON_NUM_THREADS": "2", "POLARS_MAX_THREADS": "2"}
+    subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, check=True, env=env)
+
+
+def test_measure_invariants(tmp_path: Path) -> None:
+    run("fixture", "--families", "15", "--members", "8", "--buckets", "1", cwd=tmp_path)
+    run(
+        "measure", "--members", "members.bucket0.parquet", "--out", "m",
+        "--dense-seqs", "100", "--sensitive-seqs", "100", "--chunk-sizes", "50,1000",
+        cwd=tmp_path,
+    )  # fmt: skip
+    m = json.loads((tmp_path / "m" / "measure.json").read_text())
+    for tag in ("floors", "no_floors"):
+        p = m[tag]["postings"]
+        # Fitch is the minimum on its tree; every distinct k-mer costs at least one gain
+        assert p["distinct_kmers"] <= p["fitch"] <= min(p["majority"], p["add_only"])
+        assert p["fitch"] <= p["flat"]
+        assert m[tag]["collapse"]["leaves"] <= m[tag]["collapse"]["distinct_sets"]
+    # one level: the sequence-node scheme costs exactly the spanning tree's weight
+    flat = m["no_floors"]["postings"]
+    assert flat["sequence_mst"] == flat["spanning_tree_weight"]
+    # the staged build can only miss edges of the exact spanning tree
+    assert m["floors"]["staged"]["staged_weight"] >= m["floors"]["exact_weight"]
+    assert all(c["duplicated_postings"] >= 0 for c in m["floors"]["chunks_stored"])
