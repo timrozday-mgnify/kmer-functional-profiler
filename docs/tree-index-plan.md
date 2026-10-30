@@ -498,3 +498,19 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
       - Minimum description length (MDL), counting each member that lacks a floor k-mer as a correction posting. With no weight on the corrections it is the postings-only answer (components); with full weight it is per-sequence floors again (3.8×). It needs a weight, which is *τ* in other units.
       - A detection-probability rule: *τ* set so that a member's reads give ≥ *m* floor hits with probability *P* at a given depth. Same rule, with *τ* derived from the query's needs.
     - Floor candidates here are ranked by holders only, and the union's k-mer count is estimated from hashes ≤ *t\_cap*.
+  - **Proteins without a k-mer of their own (the user, same day: "that should never be"; would they still reach tier 2 through a higher node?).** On the quarter sample, 40,199 of 262,391 proteins (15.3%) have no 11-mer at or below *t\_base* 0.02. By how the hierarchy reaches them:
+    - 18,589 sit in a storage component with other leaves. A hit on a relative reaches them by the neighbour rule (its single-linkage cluster at *R\_v*), so a recall-first tier 1 sends them to the sample's dense tier 2 whenever a relative is hit within reach.
+    - 4,174 share a leaf (equal or contained set), so they come with that leaf.
+    - 16,936 are alone: their own component and their own leaf. The storage hierarchy cannot reach them. Linking components above the storage forest (the sparse or sensitive topology, built from more k-mers than are stored, at no posting cost) would, if they have any relative; otherwise only an own k-mer can.
+    - 500 have no leaf at all: no k-mer at or below even *t\_cap* 0.2. Of those, 38 have no valid 11-mer (too short or ambiguous).
+    - Tier 1 today has the same gap: 16,075 proteins on this quarter sample. On the whole sample, 65,004 of 308,997 units (21%) have no posting.
+  - **Guaranteeing own k-mers** (a per-protein bottom-*m* floor: each protein's *m* lowest hashes, coordinated across near-identical proteins). Extra stored k-mers on the quarter sample, an upper bound on their postings:
+
+    | Own k-mers ≥ | Extra | / tier 1 (432,440) | Proteins needing it |
+    | --- | --- | --- | --- |
+    | 1 | 40,161 | +9% | 40,161 |
+    | 2 | 128,107 | +30% | 87,966 |
+    | 4 | 424,518 | +98% | 165,987 |
+    | 8 | 1,294,562 | +299% | 236,950 |
+
+    **≥ 1 own k-mer costs +9%** and leaves only the 38 proteins with no valid 11-mer. Those need a different route (a shorter *k*, or an exact-sequence table). The hierarchy route, together with ≥ 1–2 own k-mers, gives every protein some way into tier 2.
