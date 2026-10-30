@@ -89,8 +89,11 @@ mode is kept whole: the storage tree on per-sequence floored sets. Its leaves (`
 
 - `collapsed`: phase 0's, distinct sets at the topology rates after the equal-set and
   containment collapses, each stored as its longest member's k-mers;
-- `proteins`: every distinct protein k-mer set up to *t\_cap*, so each protein's own k-mers
-  are stored. Only identical sets share a leaf, and there is no containment collapse.
+- `proteins`: a leaf per distinct dense set (every 8-mer, `--topology-k`, at rate 1,
+  `--topology-t`), so proteins share a leaf only when those sets are equal. There is no
+  containment collapse, and each leaf stores its own k-mers. The topology is the storage tree
+  (Kruskal with the virtual empty root) under |A Δ B| of the dense sets, from an exact pair
+  join (`--topology-max-holders` caps common k-mers, then weighs pairs exactly).
 
 On each tree, each configuration stores:
 

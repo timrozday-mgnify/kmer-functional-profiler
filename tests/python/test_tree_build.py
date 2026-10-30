@@ -41,6 +41,11 @@ def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
     seqs = p0.seq_bytes(members)
     lengths = np.array([len(s) for s in seqs])
     pos = prot["pos"].to_numpy()
+    # proteins share a position only when their dense 8-mer sets are equal
+    d8 = p0.digests(p0.dense_sets(seqs, 8))
+    by_pos = pl.DataFrame({"pos": pos, "d0": d8[:, 0], "d1": d8[:, 1]}).filter(pl.col("pos") >= 0)
+    assert by_pos.group_by("pos").agg(pl.struct("d0", "d1").n_unique() == 1)["d0"].all()
+    assert by_pos.group_by("d0", "d1").agg(pl.col("pos").n_unique() == 1)["pos"].all()
     # each tree position's base band is its representative's (longest protein, then first)
     n = stats["tree_leaves"]
     rep = (

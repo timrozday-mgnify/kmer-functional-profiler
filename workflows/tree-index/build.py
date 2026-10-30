@@ -172,8 +172,11 @@ def main() -> None:
     parser.add_argument("--n-1", type=int, default=2)
     parser.add_argument(
         "--leaves", choices=["proteins", "collapsed"], default="proteins",
-        help="proteins: a leaf per distinct protein set; collapsed: phase 0's (survey.Tree)",
+        help="proteins: a leaf per distinct dense set; collapsed: phase 0's (survey.Tree)",
     )  # fmt: skip
+    parser.add_argument("--topology-k", type=int, default=8)
+    parser.add_argument("--topology-t", type=float, default=1.0)
+    parser.add_argument("--topology-max-holders", type=int, default=0)
     a = parser.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)

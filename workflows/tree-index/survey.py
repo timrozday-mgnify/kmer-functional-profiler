@@ -3,7 +3,8 @@ coherence, floors on every piece, size options).
 
 One topology per sample and leaf mode (``--leaves``; see ``Tree``): the exact storage tree on
 per-sequence floored sets (the full hierarchy, kept whole). Its leaves are phase 0's collapsed
-sets (``collapsed``) or every distinct protein set (``proteins``). On it, for each
+sets (``collapsed``) or distinct dense 8-mer sets, which the topology uses too (``proteins``).
+On it, for each
 configuration (t\\_base, n\\_min, tau, n\\_single, n\\_1):
 
 - **base band:** every leaf's k-mers with hash <= t\\_base, diffed by Fitch over the whole
@@ -46,10 +47,10 @@ class Tree:
 
     - ``collapsed``: phase 0's, distinct sets at the topology rates after the equal-set and
       containment collapses, each stored as its longest member's k-mers;
-    - ``proteins``: every distinct protein k-mer set up to t\\_cap, so each protein's own
-      k-mers are stored at every rate the survey uses; only identical sets share a leaf. The
-      topology is the storage tree over their topology-rate sets, with no containment
-      collapse; leaves whose topology sets are equal join it by weight-0 edges.
+    - ``proteins``: a leaf per distinct dense set (every ``topology_k``-mer, 8, at rate
+      ``topology_t``, 1), so proteins share a leaf only when those sets are equal; no
+      containment collapse. The topology is the storage tree (Kruskal with the virtual empty
+      root) under |A Δ B| of the dense sets.
     """
 
     def __init__(self, members: pl.DataFrame, args: argparse.Namespace) -> None:
@@ -63,7 +64,7 @@ class Tree:
             leaf_of, n = col.leaf_of, col.leaves.n
             a, b, w, root = pairs["a"], pairs["b"], pairs["weight"], col.leaves.size
         else:
-            leaf_of, n, a, b, w, root = protein_leaves(seqs, args, rates)
+            leaf_of, n, a, b, w, root = protein_leaves(seqs, args)
         self.forest = p0.spanning_forest(n, a, b, w, root)
         self.build_s = time.perf_counter() - t0
         f = self.forest
@@ -96,32 +97,28 @@ class Tree:
 
 
 def protein_leaves(
-    seqs: list[bytes], args: argparse.Namespace, rates: p0.Rates
+    seqs: list[bytes], args: argparse.Namespace
 ) -> tuple[NDArray[np.int64], int, NDArray[np.int64], NDArray[np.int64], NDArray[np.int64],
            NDArray[np.int64]]:  # fmt: skip
-    """``proteins`` leaves: each protein's leaf (-1: no k-mer up to t\\_cap), the leaf count,
-    and the topology's candidate edges (a, b, weight) and root weights."""
-    cap = np.array([_core.max_hash(args.t_cap)], dtype=U64)
-    seq, h = p0.hashed(seqs, args.k, int(cap[0]))
-    capped = p0.Sets(p0.csr(seq, h, len(seqs)), h, np.zeros(len(seqs), np.uint8), cap)
-    nonempty = np.flatnonzero(capped.size > 0)
-    ids, first = p0._dense_ids(p0.digests(capped)[nonempty])
+    """``proteins`` leaves: each distinct dense set (every ``topology_k``-mer at rate
+    ``topology_t``) is a leaf, so proteins share one only when those sets are equal; each
+    protein's leaf (-1: no valid topology k-mer), the leaf count, and the topology's candidate
+    edges (a, b, weight) and root weights under |A Δ B| of those sets."""
+    dense = p0.dense_sets(seqs, args.topology_k, args.topology_t)
+    some = np.flatnonzero(dense.size > 0)
+    ids, first = p0._dense_ids(p0.digests(dense)[some])
+    sets = dense.take(some[first])
+    cap = args.topology_max_holders or 2**63
+    pairs = _core.overlap_pairs(*sets.kernel(), storage=cap == 2**63, max_holders=cap)
+    a, b = pairs["a"].astype(np.uint32), pairs["b"].astype(np.uint32)
+    w = pairs["weight"].astype(np.int64)
+    if cap != 2**63:  # shared k-mers undercounted: weigh exactly, then the storage rule
+        w = _core.pair_weights(*sets.kernel(), a, b)["weight"].astype(np.int64)
+        keep = w <= np.maximum(sets.size[a], sets.size[b])
+        a, b, w = a[keep], b[keep], w[keep]
     leaf_of = np.full(len(seqs), -1, dtype=np.int64)
-    leaf_of[nonempty] = ids
-    n = len(first)
-    # topology sets: each leaf's first member's at the topology rates; distinct ones paired
-    topo = p0.stored_sets([seqs[i] for i in nonempty[first]], rates)
-    some = np.flatnonzero(topo.size > 0)
-    tid, tfirst = p0._dense_ids(p0.digests(topo)[some])
-    distinct = topo.take(some[tfirst])
-    pairs = _core.overlap_pairs(*distinct.kernel())
-    leaf = some[tfirst]  # the leaf of each distinct topology set
-    a = [leaf[pairs["a"].astype(np.int64)], some]
-    b = [leaf[pairs["b"].astype(np.int64)], leaf[tid]]
-    w = [pairs["weight"].astype(np.int64), np.zeros(len(some), dtype=np.int64)]
-    a, b, w = (np.concatenate(x) for x in (a, b, w))
-    keep = a != b  # a leaf's weight-0 edge to itself (its set's first leaf)
-    return leaf_of, n, a[keep], b[keep], w[keep], topo.size
+    leaf_of[some] = ids
+    return leaf_of, len(first), a.astype(np.int64), b.astype(np.int64), w, sets.size
 
 
 def base_postings(tree: Tree, t_base: float) -> tuple[int, int, NDArray[np.int64]]:
@@ -335,6 +332,12 @@ def main() -> None:
     parser.add_argument("--levels", type=int, default=8)
     parser.add_argument("--topology-t-base", type=float, default=0.02)
     parser.add_argument("--topology-n-min", type=int, default=16)
+    parser.add_argument("--topology-k", type=int, default=8, help="proteins mode: dense k")
+    parser.add_argument("--topology-t", type=float, default=1.0, help="proteins mode: its rate")
+    parser.add_argument(
+        "--topology-max-holders", type=int, default=0,
+        help="proteins mode: skip k-mers with more holders when pairing (0: exact)",
+    )  # fmt: skip
     parser.add_argument(
         "--leaves", type=lambda s: s.split(","), default=["collapsed", "proteins"],
         help="leaf modes to survey (Tree): collapsed, proteins",
