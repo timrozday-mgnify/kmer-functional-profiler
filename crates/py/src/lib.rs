@@ -593,6 +593,26 @@ fn overlap_pairs<'py>(
     Ok(dict)
 }
 
+/// Connected components of `overlap_pairs`' storage graph: each set's component (its
+/// smallest set), without keeping the pairs.
+#[pyfunction]
+fn overlap_components<'py>(
+    py: Python<'py>,
+    offsets: PyReadonlyArray1<'py, u64>,
+    hashes: PyReadonlyArray1<'py, u64>,
+    max_hash: PyReadonlyArray1<'py, u64>,
+) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    let (offsets, hashes, max_hash) = (
+        offsets.as_slice()?,
+        hashes.as_slice()?,
+        max_hash.as_slice()?,
+    );
+    let got = py
+        .detach(|| kfp::overlap_components(offsets, hashes, max_hash))
+        .map_err(to_py_err)?;
+    Ok(got.into_pyarray(py))
+}
+
 /// Shared stored k-mers and weight of given pairs of CSR sets: `shared`, `weight`.
 #[pyfunction]
 fn pair_weights<'py>(
@@ -743,6 +763,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", kfp::VERSION)?;
     m.add_function(wrap_pyfunction!(translate_frames, m)?)?;
     m.add_function(wrap_pyfunction!(contained_sums, m)?)?;
+    m.add_function(wrap_pyfunction!(overlap_components, m)?)?;
     m.add_function(wrap_pyfunction!(max_hash_py, m)?)?;
     m.add_function(wrap_pyfunction!(hash_dna, m)?)?;
     m.add_function(wrap_pyfunction!(hash_proteins, m)?)?;

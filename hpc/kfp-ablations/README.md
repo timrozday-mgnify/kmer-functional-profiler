@@ -91,6 +91,8 @@ cd kfp-ablations/presence-calibration && sbatch run.sh
 # tree index, phase 0 (docs/tree-index-plan.md): trees on a 1-in-5,000 cluster sample,
 # whole-release streaming counts, and the gate against today's standard tier:
 cd kfp-ablations/tree-index-phase0 && sbatch run.sh
+# tree index, the three tiers (quick, medium, large) on the 1-in-100 subset, built in parts:
+cd kfp-ablations/tree-index-build && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs

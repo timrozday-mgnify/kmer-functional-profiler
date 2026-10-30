@@ -108,6 +108,9 @@ def tree_schemes(
     *,
     emit: bool = False,
 ) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.bool_]]: ...
+def overlap_components(
+    offsets: NDArray[np.uint64], hashes: NDArray[np.uint64], max_hash: NDArray[np.uint64]
+) -> NDArray[np.uint32]: ...
 def contained_sums(
     lo: NDArray[np.uint32],
     hi: NDArray[np.uint32],
