@@ -74,15 +74,20 @@ class Index:
 
 
 def read_pairs(
-    index: Index, r1: str, r2: str | None, frames: str, ladder_frames: str | None = None
+    index: Index,
+    r1: str,
+    r2: str | None,
+    frames: str,
+    ladder_frames: str | None = None,
+    mode: str = "recall",
 ) -> tuple[pl.DataFrame, dict[int, int], int]:
     """Distinct (read, hash) of the sample's k-mers that are keys, at the index's k and each
     ladder k; the read windows hashed per k; and the read pairs."""
     parts, windows, n_reads = [], {}, 0
-    steps = [(index.k, "protein", 0)] + [
-        (k, alpha, code) for k, _, alpha, code in ladder(index.meta["params"].get("ladder", ""))
+    todo = [(index.k, "protein", 0)] + [
+        (k, alpha, code) for k, _, alpha, code in steps(index, mode)
     ]
-    for k, alpha, code in steps:
+    for k, alpha, code in todo:
         f = (ladder_frames or frames) if code else frames
         it = _core.FastxHits(r1, r2, k=k, frames=f, alphabet=alpha)
         for b in it:
@@ -210,14 +215,22 @@ def ladder(spec: str) -> list[tuple[int, int, str, int]]:
     return out
 
 
-FLAGS: Final = ("rare", "unit")
+FLAGS: Final = ("rare",)
 
 
 def ladder_flags(spec: str) -> list[set[str]]:
-    """Per ladder step, its flags: ``rare`` (each window's rarest k-mer in the database, not
-    its least hash) and ``unit`` (chosen on each tree unit's first protein and held by every
-    member, ``build.py --ladder-radius``)."""
+    """Per step, its flags: ``rare`` (each window's rarest k-mer in the database, not its
+    least hash)."""
     return [set(step.split(":")) & set(FLAGS) for step in filter(None, spec.split(","))]
+
+
+def steps(index: Index, mode: str = "recall") -> list[tuple[int, int, str, int]]:
+    """The index's ladder and layer steps a query uses: all of them in ``recall`` mode; in
+    ``precision`` mode only full-alphabet ones (reduced alphabets are not yet tested for
+    precision or F1)."""
+    params = index.meta["params"]
+    got = ladder(params.get("ladder", "")) + ladder(params.get("layers", "") or "")
+    return [s for s in got if mode == "recall" or s[2] == "protein"]
 
 
 def salted(h: NDArray[np.uint64], k: int) -> NDArray[np.uint64]:
@@ -236,15 +249,17 @@ def sample_counts(batches: Iterable[NDArray[np.uint64]]) -> pl.DataFrame:
     return pl.concat(parts).group_by("hash").agg(pl.col("n").sum()).sort("hash")
 
 
-def read_hashes(index: Index, r1: str, r2: str | None, frames: str) -> Iterable[NDArray[Any]]:
+def read_hashes(
+    index: Index, r1: str, r2: str | None, frames: str, mode: str = "recall"
+) -> Iterable[NDArray[Any]]:
     for b in _core.FastxHits(r1, r2, k=index.k, frames=frames, max_hash=index.max_hash):
         yield index.sampled(b["hash"])
-    for k, _, alpha, code in ladder(index.meta["params"].get("ladder", "")):  # every key k-mer
+    for k, _, alpha, code in steps(index, mode):  # every k-mer that is a key
         for b in _core.FastxHits(r1, r2, k=k, frames=frames, alphabet=alpha):
             yield index.keyed(salted(b["hash"], code))
 
 
-def protein_hashes(index: Index, fasta: str) -> Iterable[NDArray[Any]]:
+def protein_hashes(index: Index, fasta: str, mode: str = "recall") -> Iterable[NDArray[Any]]:
     seqs, cur = [], []
     for line in Path(fasta).read_text().splitlines():
         if line.startswith(">"):
@@ -258,7 +273,7 @@ def protein_hashes(index: Index, fasta: str) -> Iterable[NDArray[Any]]:
     # one sequence at a time: hash_proteins dedups within a call, so n counts sequences
     for s in seqs:
         h = index.sampled(_core.hash_proteins([s], index.k, max_hash=index.max_hash)["hash"])
-        for k, _, alpha, code in ladder(index.meta["params"].get("ladder", "")):
+        for k, _, alpha, code in steps(index, mode):
             g = _core.hash_proteins([s], k, alphabet=alpha)["hash"]
             h = np.concatenate([h, index.keyed(salted(g, code))])
         yield h
@@ -333,13 +348,18 @@ def main() -> None:
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--reads", nargs="+", help="R1 [R2] FASTQ")
     src.add_argument("--proteins", help="protein FASTA")
-    parser.add_argument("--frames", default="stopfree")
+    parser.add_argument("--frames", default="all")
     parser.add_argument(
         "--chance-share", type=float, default=0.01,
         help="reads: seeds by evidence, at the least bits whose expected chance seeds are at "
         "most this share of the seeds (seeds.parquet)",
     )  # fmt: skip
     parser.add_argument("--ladder-frames", help="frames for ladder k-mers (default: --frames)")
+    parser.add_argument(
+        "--mode", choices=["recall", "precision"], default="recall",
+        help="recall: every layer of the index (Dayhoff included); precision: full-alphabet "
+        "k-mers only (reduced alphabets are not yet tested for precision or F1)",
+    )  # fmt: skip
     parser.add_argument(
         "--decoy", action="store_true",
         help="count chance seeds on the reads reversed (target-decoy) instead of modelling them",
@@ -350,9 +370,9 @@ def main() -> None:
     index = Index(a.index)
     t0 = time.perf_counter()
     if a.reads:
-        batches = read_hashes(index, a.reads[0], (a.reads[1:] or [None])[0], a.frames)
+        batches = read_hashes(index, a.reads[0], (a.reads[1:] or [None])[0], a.frames, a.mode)
     else:
-        batches = protein_hashes(index, a.proteins)
+        batches = protein_hashes(index, a.proteins, a.mode)
     sample = sample_counts(batches)
     lookup_s = time.perf_counter() - t0
     leaves, nodes, stats = count(index, sample)
@@ -365,13 +385,13 @@ def main() -> None:
     if a.reads and hasattr(index, "keys"):
         t1 = time.perf_counter()
         pairs, windows, n_reads = read_pairs(
-            index, a.reads[0], (a.reads[1:] or [None])[0], a.frames, a.ladder_frames
+            index, a.reads[0], (a.reads[1:] or [None])[0], a.frames, a.ladder_frames, a.mode
         )
         log2_w = float(np.log2(max(windows.get(index.k, 1) / max(n_reads, 1), 2)))
         seeds = evidence_chunked(index, pairs, log2_w, clamp=a.decoy)
         if a.decoy:  # the bar from reversed reads: chance seeds counted, not modelled
             dr = reversed_reads(a.reads, out)
-            d_pairs, _, _ = read_pairs(index, *dr, a.frames, a.ladder_frames)
+            d_pairs, _, _ = read_pairs(index, *dr, a.frames, a.ladder_frames, a.mode)
             decoys = evidence_chunked(index, d_pairs, log2_w, clamp=True)
             decoys.write_parquet(out / "decoy_seeds.parquet")
             bar, curve = decoy_bar(seeds, decoys, a.chance_share)

@@ -1,22 +1,21 @@
-// Tree index, the three tiers (docs/tree-index-plan.md, Progress log: tiers chosen from the
-// per-protein survey), built in parts. See README.md; on HPC,
+// Tree index, the standard tier and the high-recall one (docs/tree-index-plan.md, Progress log:
+// the standard index restored), built in parts. See README.md; on HPC,
 // hpc/kfp-ablations/tree-index-build/run.sh. Run as: nextflow run workflows/tree-index/build.nf
 //
 // FIXTURE    synthetic members when --members is '' (the test profile)
 // PARTITION  proteins -> parts of ~--part_proteins (k 11 storage components and equal
 //            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py)
 // BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology,
-//            diffs and pieces on the spanning tree itself)
+//            spread minimizers and the k 7 ladder diffed on the spanning tree; recall adds a
+//            Dayhoff layer on every leaf)
 // MERGE      per tier: the parts -> index-<tier>/ (merge.py), query.py's format
 
 nextflow.enable.dsl = 2
 
 params.members       = ''         // members parquet (absolute path or glob), '' = fixture
 params.part_proteins = 2000000    // proteins per part
-// name:build.py options, ';'-separated
-params.tiers         = 'quick:--t-base 0.01 --n-min 8 --tau 0 --n-1 1;' +
-                       'medium:--t-base 0.02 --n-min 16 --tau 0.3 --n-1 2;' +
-                       'large:--t-base 0.05 --n-min 32 --tau 0.3 --n-1 2'
+// name:build.py options, ';'-separated (options must not contain ':')
+params.tiers         = 'standard:--mode standard;recall:--mode recall'
 
 def py() { "${params.venv}/bin/python" }
 

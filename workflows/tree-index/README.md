@@ -142,8 +142,8 @@ Not covered here:
 
 ## Building the tiers (`build.nf`)
 
-`build.nf` builds the three tiers chosen from the per-protein survey (the plan's Progress log)
-from one members table, in parts:
+`build.nf` builds the standard tier and the high-recall one (the plan's Progress log: the
+standard index restored) from one members table, in parts:
 
 ```
 FIXTURE    synthetic members when --members is '' (the test profile)
@@ -151,8 +151,8 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            the pair join, _core.overlap_components) or an equal sequence; components packed
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
-           topology, base band by Fitch on the spanning tree, floors per piece, per-leaf
-           top-ups
+           topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
+           tree, per-leaf top-ups; recall also a Dayhoff 7-mer layer on every leaf
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
 ```
 
@@ -161,9 +161,12 @@ nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixtur
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
 ```
 
-`--tiers` holds `name:build.py options` pairs, `;`-separated. The defaults are quick
-(*t\_base* 0.01, *n\_min* 8, *τ* 0, *n\_1* 1), medium (0.02, 16, 0.3, 2) and large (0.05, 32,
-0.3, 2). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
+`--tiers` holds `name:build.py options` pairs, `;`-separated (options without `:`). The
+defaults are `standard` (`build.py --mode standard`, the defaults: *t\_base* 0.01, no floors,
+~4 spread minimizers per protein, k 7 at window 4 for leaves with < 32 informative 11-mers;
+~140–165 GB at release, estimated) and `recall` (`--mode recall`: also the rarest Dayhoff 7-mer
+per window of 8 on every leaf, for high recall at 70–85% identity; several times the standard
+size, and not yet tested for precision or F1). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
 

@@ -900,3 +900,17 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - Exact seeds on a reduced alphabet reach divergent strains (R9: 0.88 at 70%), but their hits from one read pair cannot be told from chance by counting bits. At release scale, where every Dayhoff 7-mer is held by most families, that is worse.
     - Telling homologs from chance at 70% from a read needs the read aligned: an ungapped extension along the hit's diagonal against the candidate's sequence, as BLAST and DIAMOND do after their seeds. That is the follow-up's alignment stage, not something the k-mer index can do alone.
     - The bars should also be per layer, so a noisy layer cannot raise the bar for 11-mer seeds.
+* **The standard index restored, and a high-recall mode (2026-10-30, the user's decisions).** Below 200 GB including the neighbour rule's edges (which they judged important), so S3; the per-group sets, intersections and cuts removed for lack of value; Murphy-10/Dayhoff and BLOSUM62 strains kept; Dayhoff on by default in a high-recall mode, not for precision or F1 until tested there. Also agreed: verify reduced-alphabet seeds by ungapped extension, decoy bars per layer, and 80–85% as tier 1's target with 70–75% left to the follow-up's aligner.
+  - **`build.py` defaults are now S3** (`--mode standard`): a leaf per dense 8-mer set on the dense 8-mer spanning tree, Fitch diffs on it.
+    - *t\_base* 0.01, no floors (*n\_min* 0), top-ups to *n\_1* 2.
+    - ~4 spread 11-mer minimizers per protein (`--window 1000 --window-min 2`).
+    - The k 7 ladder at window 4 for leaves with < 32 informative 11-mers (`--ladder 7:4 --min-kmers 32`).
+    - ~140–165 GB at release (estimate, without the ~45 GB of spanning-tree edges). Recall ≥ 95% / ≥ 90% identity at depth > 0.5: 0.964 / 0.924; > 1: 0.980 / 0.944; > 4: 0.990 / 0.964.
+    - *For comparison:* ~6 minimizers per protein (S6m3, `--window-min 3`) measured 1.12× medium, ~155–185 GB, 0.992 / 0.965 at depth > 1.
+  - **`--mode recall`** adds `--layers dayhoff:7:8:rare`: the rarest Dayhoff 7-mer per window of 8 on every leaf. Layers are steps every leaf holds, unlike the ladder, which only leaves short of informative 11-mers take. Its size and decoy-controlled recall are as measured above for Dayhoff; precision and F1 are untested.
+  - **`query.py`:**
+    - `--frames` now defaults to `all` (`stopfree` loses reads across gene ends).
+    - `--mode recall` (default) uses every layer of the index; `--mode precision` uses full-alphabet k-mers only.
+  - **Removed:** `--unit-radius`, `--detect-aai`/`--detect-miss`, `--unit-kmers`/`--unit-tau`, `--cut-detect`, the ladder's `unit` flag and `--ladder-radius`, with their functions. Their results stay recorded above.
+  - **`build.nf`'s tiers** are now `standard` and `recall`. The recall tier's BUILD needs more memory per part: 9.4 GB per 262 k proteins on the quarter sample, so ~70 GB per 2 M-protein part, above BUILD's first 64 GB attempt.
+  - **Tests:** phase 1's medium settings (pinned with `--window 0 --ladder ""`) keep their brute-force checks. `test_default_modes_query_soundly` builds both modes and checks the query's counts and evidence against brute force, Dayhoff keys included.

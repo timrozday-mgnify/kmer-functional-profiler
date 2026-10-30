@@ -6,14 +6,15 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --export=ALL
-# Tree index, the three tiers on the 1-in-100 subset (docs/tree-index-plan.md, Progress log:
-# tiers chosen from the per-protein survey), with workflows/tree-index/build.nf:
-#   quick   t_base 0.01, n_min 8, tau 0, n_1 1
-#   medium  t_base 0.02, n_min 16, tau 0.3, n_1 2
-#   large   t_base 0.05, n_min 32, tau 0.3, n_1 2
-# a leaf per distinct dense 8-mer set, the dense 8-mer topology, Fitch diffs and pieces on the
-# spanning tree itself (build.py --topology-tree spanning, the default; 12.5% fewer base-band
-# postings than on Kruskal's merge tree in phase 0's sample). PARTITION (~130 GB, one job)
+# Tree index on the 1-in-100 subset (docs/tree-index-plan.md, Progress log: the standard index
+# restored), with workflows/tree-index/build.nf:
+#   standard  build.py --mode standard: t_base 0.01, no floors, ~4 spread 11-mer minimizers per
+#             protein, k 7 ladder (window 4) for leaves with < 32 informative 11-mers
+#   recall    build.py --mode recall: the same plus the rarest Dayhoff 7-mer per window of 8 on
+#             every leaf (high recall at 70-85% identity; not yet tested for precision or F1)
+# a leaf per distinct dense 8-mer set, the dense 8-mer topology, Fitch diffs on the spanning
+# tree itself. The recall tier's BUILD needs more memory per part (the Dayhoff frequency table
+# and per-k-mer hashing): on phase 0's quarter sample 9.4 GB per 262 k proteins. PARTITION (~130 GB, one job)
 # splits ~53 M proteins into parts of 2 M; BUILD runs per part and tier (~26 GB each); MERGE
 # writes one index per tier.
 # Read:

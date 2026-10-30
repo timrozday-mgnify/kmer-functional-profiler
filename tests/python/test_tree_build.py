@@ -24,7 +24,9 @@ import report  # noqa: E402
 from scipy.sparse import coo_array  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
 
-MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2"]
+# phase 1's medium tier: base band, floors and top-ups only, which check_index checks in full
+MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2", "--window", "0",
+          "--ladder", ""]  # fmt: skip
 
 
 def fixture(tmp_path: Path) -> Path:
@@ -265,3 +267,20 @@ def test_window_kmers_match_brute_force() -> None:
             wins = [hs[i : i + ww] for i in range(len(hs) - ww + 1)] if len(hs) >= ww else [hs]
             want = {min(v) for v in ([x for x in win if x is not None] for win in wins) if v}
             assert {int(x) for x in h[seq == j]} == want, (w, min_count, j)
+
+
+def test_default_modes_query_soundly(tmp_path: Path) -> None:
+    """The default build (standard: spread minimizers, k 7 ladder) and ``--mode recall`` (a
+    Dayhoff layer on every leaf): covers sum to 0 or 1, and the query and report checks hold
+    against brute force, the Dayhoff layer's k-mers included."""
+    members = fixture(tmp_path)
+    for mode in ("standard", "recall"):
+        idx = tmp_path / f"idx-{mode}"
+        run(
+            "--members", str(members), "--out", str(idx), "--mode", mode, cwd=tmp_path, script=BUILD
+        )
+        meta = json.loads((idx / "meta.json").read_text())
+        assert meta["params"]["layers"] == ("dayhoff:7:8:rare" if mode == "recall" else "")
+        codes = set(np.load(idx / "key_k.npy").tolist())
+        assert (71 in codes) == (mode == "recall")  # Dayhoff 7: 7 + 32 x 2
+        check_query(tmp_path, idx, members)
