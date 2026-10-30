@@ -477,3 +477,24 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     | ∞ (components) | 80,880 | 309,853 | 196,385 | 506,238 | 1.17× | 16,936 |
 
     Every cut now passes 1.5×: the cost of finer floors is only the floors themselves. The cut sets floor resolution (and blindness: finer pieces of one member leave short proteins unfloored), not diff cost or neighbour reach.
+  - **Pieces by a metric, not a fixed cut (the user, same day: "can the point the diffs start be based on some metric (e.g. some information metric) rather than an arbitrary threshold").**
+    - Postings alone always choose the coarsest cut (components), so the metric has to value resolution. The natural one is **floor coherence**: the mean share of a piece's floor k-mers that a member holds (the floor's mean *p\_in*), about the chance that a member's reads hit its floor.
+    - Rule: top-down from each component, a node whose floor is at least *τ* coherent is a piece; otherwise its children are tried. Pieces grow where members agree and split where they do not, so the cut level adapts per clade.
+    - *τ* can be set from data rather than chosen: today's tier-1 units have a floor coherence of 0.62 (mean; median 0.625) by the same measure, over 19,187 units with ≥ 2 members on this quarter sample. Quarter sample, base band 309,853 postings over the whole tree:
+
+    | *τ* | Pieces | Floored | Floor postings | Total | / tier 1 | Floored pieces' mean coherence | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 0.3 | 83,471 | 20,284 | 211,822 | 521,675 | 1.21× | 0.66 | 17,127 |
+    | 0.5 | 90,761 | 23,067 | 245,779 | 555,632 | 1.28× | 0.70 | 17,666 |
+    | 0.6 | 97,378 | 24,357 | 263,447 | 573,300 | 1.33× | 0.73 | 18,404 |
+    | 0.7 | 104,986 | 24,250 | 263,742 | 573,595 | 1.33× | 0.77 | 19,629 |
+    | 0.9 | 117,064 | 21,183 | 231,862 | 541,715 | 1.25× | 0.80 | 21,630 |
+    | tier 1 | 77,317 units | 19,187 | | 432,440 | 1× | 0.62 | 16,075 |
+
+    - **Reading.** At *τ* = 0.3, floors are already more coherent than tier 1's (0.66 against 0.62), for 1.21× its postings, with about tier 1's blindness. That beats the fixed cut at level 8 (1.24×, 19,018 blind).
+    - Raising *τ* buys coherence (0.80 at *τ* 0.9) but splits more clades into single members, which get no floor, so blindness rises. Above 0.7 floor postings fall for that reason.
+    - Matching tier 1's coherence (*τ* ≈ 0.6) costs 1.33×. All are within the 1.5× gate.
+    - **Alternatives considered:**
+      - Minimum description length (MDL), counting each member that lacks a floor k-mer as a correction posting. With no weight on the corrections it is the postings-only answer (components); with full weight it is per-sequence floors again (3.8×). It needs a weight, which is *τ* in other units.
+      - A detection-probability rule: *τ* set so that a member's reads give ≥ *m* floor hits with probability *P* at a given depth. Same rule, with *τ* derived from the query's needs.
+    - Floor candidates here are ranked by holders only, and the union's k-mer count is estimated from hashes ≤ *t\_cap*.
