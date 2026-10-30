@@ -170,6 +170,10 @@ def main() -> None:
     parser.add_argument("--n-min", type=int, default=16)
     parser.add_argument("--tau", type=float, default=0.3)
     parser.add_argument("--n-1", type=int, default=2)
+    parser.add_argument(
+        "--leaves", choices=["proteins", "collapsed"], default="proteins",
+        help="proteins: a leaf per distinct protein set; collapsed: phase 0's (survey.Tree)",
+    )  # fmt: skip
     a = parser.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)

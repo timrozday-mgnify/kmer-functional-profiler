@@ -29,7 +29,8 @@ def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
     )  # fmt: skip
     idx = tmp_path / "idx"
     stats = json.loads((idx / "meta.json").read_text())["stats"]
-    row = pl.read_csv(tmp_path / "s" / "survey.tsv", separator="\t").row(0, named=True)
+    survey = pl.read_csv(tmp_path / "s" / "survey.tsv", separator="\t")
+    row = survey.filter(pl.col("leaves") == "proteins").row(0, named=True)
     # the index is the survey's configuration written out
     for kind in ("base_postings", "floor_postings", "topup_postings"):
         assert stats[kind] == row[kind], kind
@@ -120,3 +121,9 @@ def test_query_counts_match_brute_force(tmp_path: Path) -> None:
         hit = state.join(sample, on="hash")
         expect = (hit.height, int(hit["n"].sum())) if hit.height else None
         assert by_node.get(v) == expect, v
+
+    # with a leaf per protein set, every sampled protein with a position hits its own leaf
+    prot = pl.read_parquet(idx / "proteins.parquet").with_row_index("i")
+    own = prot.filter(pl.col("i").is_in(list(range(0, len(members), 3))), pl.col("pos") >= 0)
+    assert own.height > 0
+    assert own.join(leaves, on="pos", how="anti").height == 0

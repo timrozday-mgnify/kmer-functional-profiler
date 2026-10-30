@@ -609,3 +609,16 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - Reads from the fragment's real gene will usually hit the container's k-mers too, so this matters mainly for fragment-only genes.
     - A per-member guarantee would top up each member from its own hashes (posted at its leaf, held by all its members, as floors are). Its cost is not measured. The survey's "every protein covered" holds per leaf.
   - *Next:* phase 3 (reporting, recall first) on these counts, or the HPC BUILD of the 1-in-100 tiers.
+* **A leaf per protein, surveyed (2026-10-30, the user's request: every protein, not representatives; survey on HPC first, to size the tiers and choose parameters).**
+  - **What was stored.** In phase 0's tree, leaves are distinct sets at the topology rates after the equal-set and containment collapses. Each leaf stores its longest member's k-mers. So contained fragments, and members whose sets differ at a tier's own rates, are not indexed by their own k-mers: phase 2's 1–2% own-leaf misses.
+  - **`--leaves proteins`** (survey and build; the builder's default):
+    - Each distinct protein k-mer set up to *t\_cap* is a leaf, so each protein's own k-mers are stored at every rate up to *t\_cap*. Only identical sets share a leaf; nothing distinguishes them.
+    - The topology is the exact storage tree over the leaves' distinct topology-rate sets, with no containment collapse. Leaves with equal topology sets join it by weight-0 edges.
+    - *Ceiling:* top-ups beyond *t\_cap* come from one member of a leaf, so members identical up to *t\_cap* but different beyond it share those.
+  - **Quarter sample** (both modes, 2.7 min, 2.5 GB): leaves 237,875 against 151,474, and 21–26% more postings. Medium (*t\_base* 0.02, *n\_min* 16, *τ* 0.3, *n\_1* 2) is 637,307 against 519,959, i.e. 1.47× tier 1 (432,440) against 1.20×. Large at 0.05/32 (*τ* 0.3, *n\_1* 2) is 1,220,739 against 1,015,144.
+  - **Set up for HPC** (`hpc/kfp-ablations/tree-index-phase0`, resumed):
+    - SURVEY over both leaf modes. Grid: *t\_base* 0.01 / 0.02 / 0.05, *n\_min* 8 / 16 / 32, *τ* 0 / 0.3 / 0.6 / 0.9, *n\_single* 0 / 2 / 4 / 16, *n\_1* 0 / 1 / 2 / 4.
+    - TIER1_MATCHED also builds the large tier (`tbase05_all`: 0.05, *n\_min* 32) on the sample, so 0.05/32 rows get `over_matched`.
+    - INDEX_SIZES lists every file under the release index, so tier 1's bytes are included.
+    - Test profile run locally: 1,152 rows, both modes, matched rows at 0.01/8, 0.02/16 and 0.05/32.
+    - *Not included:* tier 1 on core + extra, so `all`'s ratios still compare against core-only tier 1.

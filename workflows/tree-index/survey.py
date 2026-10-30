@@ -1,8 +1,10 @@
 """Tree index, floor survey (docs/tree-index-plan.md, Progress log: forest floors, pieces by
 coherence, floors on every piece, size options).
 
-One topology per sample: phase 0's exact storage tree on per-sequence floored sets (the full
-hierarchy, kept whole). On it, for each configuration (t\\_base, n\\_min, tau, n\\_single, n\\_1):
+One topology per sample and leaf mode (``--leaves``; see ``Tree``): the exact storage tree on
+per-sequence floored sets (the full hierarchy, kept whole). Its leaves are phase 0's collapsed
+sets (``collapsed``) or every distinct protein set (``proteins``). On it, for each
+configuration (t\\_base, n\\_min, tau, n\\_single, n\\_1):
 
 - **base band:** every leaf's k-mers with hash <= t\\_base, diffed by Fitch over the whole
   tree;
@@ -38,22 +40,31 @@ U64 = np.uint64
 
 
 class Tree:
-    """The storage tree and every protein's k-mers above the lowest t\\_base, in leaf order."""
+    """The storage tree and every protein's k-mers above the lowest t\\_base, in leaf order.
+
+    Leaves (``args.leaves``):
+
+    - ``collapsed``: phase 0's, distinct sets at the topology rates after the equal-set and
+      containment collapses, each stored as its longest member's k-mers;
+    - ``proteins``: every distinct protein k-mer set up to t\\_cap, so each protein's own
+      k-mers are stored at every rate the survey uses; only identical sets share a leaf. The
+      topology is the storage tree over their topology-rate sets, with no containment
+      collapse; leaves whose topology sets are equal join it by weight-0 edges.
+    """
 
     def __init__(self, members: pl.DataFrame, args: argparse.Namespace) -> None:
         self.args = args
         seqs = p0.seq_bytes(members)
         self.n_proteins = len(seqs)
-        sets = p0.stored_sets(
-            seqs,
-            p0.Rates(args.k, args.topology_t_base, args.topology_n_min, args.t_cap, args.levels),
-        )
-        col, pairs = p0.collapse(sets, members["full_length"].to_numpy())
-        self.col, self.leaves = col, col.leaves
+        rates = p0.Rates(args.k, args.topology_t_base, args.topology_n_min, args.t_cap, args.levels)
         t0 = time.perf_counter()
-        self.forest = p0.spanning_forest(
-            self.leaves.n, pairs["a"], pairs["b"], pairs["weight"], self.leaves.size
-        )
+        if getattr(args, "leaves", "collapsed") == "collapsed":
+            col, pairs = p0.collapse(p0.stored_sets(seqs, rates), members["full_length"].to_numpy())
+            leaf_of, n = col.leaf_of, col.leaves.n
+            a, b, w, root = pairs["a"], pairs["b"], pairs["weight"], col.leaves.size
+        else:
+            leaf_of, n, a, b, w, root = protein_leaves(seqs, args, rates)
+        self.forest = p0.spanning_forest(n, a, b, w, root)
         self.build_s = time.perf_counter() - t0
         f = self.forest
         self.lay = _core.tree_layout(f.n, f.left, f.right, f.tops)
@@ -61,9 +72,9 @@ class Tree:
         pos_of_leaf[self.lay["order"]] = np.arange(f.n)
         # proteins with a leaf, in leaf order: one representative per leaf (its longest)
         lengths = np.array([len(s) for s in seqs])
-        has = np.flatnonzero(col.leaf_of >= 0)
+        has = np.flatnonzero(leaf_of >= 0)
         rep = (
-            pl.DataFrame({"seq": has, "leaf": col.leaf_of[has], "len": lengths[has]})
+            pl.DataFrame({"seq": has, "leaf": leaf_of[has], "len": lengths[has]})
             .sort("leaf", "len", "seq", descending=[False, True, False])
             .group_by("leaf", maintain_order=True)
             .first()
@@ -71,8 +82,8 @@ class Tree:
             .to_numpy()
         )
         self.rep_by_pos = rep[self.lay["order"]]  # the leaf at each position's representative
-        self.members_per_leaf = np.bincount(col.leaf_of[has], minlength=f.n)
-        self.leaf_of = col.leaf_of
+        self.members_per_leaf = np.bincount(leaf_of[has], minlength=f.n)
+        self.leaf_of = leaf_of
         self.n_kmers = _core.distinct_kmers(seqs, np.arange(len(seqs), dtype=np.uint32), args.k)
         self.n_valid = np.zeros(len(seqs), dtype=np.int64)
         self.n_valid[self.n_kmers["group"]] = self.n_kmers["n_kmers"]
@@ -82,6 +93,35 @@ class Tree:
         self.pos, self.h = seq, h  # sorted by (position, hash)
         self.row = np.searchsorted(seq, np.arange(f.n + 1))
         self.seqs = seqs
+
+
+def protein_leaves(
+    seqs: list[bytes], args: argparse.Namespace, rates: p0.Rates
+) -> tuple[NDArray[np.int64], int, NDArray[np.int64], NDArray[np.int64], NDArray[np.int64],
+           NDArray[np.int64]]:  # fmt: skip
+    """``proteins`` leaves: each protein's leaf (-1: no k-mer up to t\\_cap), the leaf count,
+    and the topology's candidate edges (a, b, weight) and root weights."""
+    cap = np.array([_core.max_hash(args.t_cap)], dtype=U64)
+    seq, h = p0.hashed(seqs, args.k, int(cap[0]))
+    capped = p0.Sets(p0.csr(seq, h, len(seqs)), h, np.zeros(len(seqs), np.uint8), cap)
+    nonempty = np.flatnonzero(capped.size > 0)
+    ids, first = p0._dense_ids(p0.digests(capped)[nonempty])
+    leaf_of = np.full(len(seqs), -1, dtype=np.int64)
+    leaf_of[nonempty] = ids
+    n = len(first)
+    # topology sets: each leaf's first member's at the topology rates; distinct ones paired
+    topo = p0.stored_sets([seqs[i] for i in nonempty[first]], rates)
+    some = np.flatnonzero(topo.size > 0)
+    tid, tfirst = p0._dense_ids(p0.digests(topo)[some])
+    distinct = topo.take(some[tfirst])
+    pairs = _core.overlap_pairs(*distinct.kernel())
+    leaf = some[tfirst]  # the leaf of each distinct topology set
+    a = [leaf[pairs["a"].astype(np.int64)], some]
+    b = [leaf[pairs["b"].astype(np.int64)], leaf[tid]]
+    w = [pairs["weight"].astype(np.int64), np.zeros(len(some), dtype=np.int64)]
+    a, b, w = (np.concatenate(x) for x in (a, b, w))
+    keep = a != b  # a leaf's weight-0 edge to itself (its set's first leaf)
+    return leaf_of, n, a[keep], b[keep], w[keep], topo.size
 
 
 def base_postings(tree: Tree, t_base: float) -> tuple[int, int, NDArray[np.int64]]:
@@ -295,8 +335,14 @@ def main() -> None:
     parser.add_argument("--levels", type=int, default=8)
     parser.add_argument("--topology-t-base", type=float, default=0.02)
     parser.add_argument("--topology-n-min", type=int, default=16)
-    parser.add_argument("--t-bases", type=p0.floats, default=[0.01, 0.02])
-    parser.add_argument("--n-mins", type=lambda s: [int(x) for x in s.split(",")], default=[8, 16])
+    parser.add_argument(
+        "--leaves", type=lambda s: s.split(","), default=["collapsed", "proteins"],
+        help="leaf modes to survey (Tree): collapsed, proteins",
+    )  # fmt: skip
+    parser.add_argument("--t-bases", type=p0.floats, default=[0.01, 0.02, 0.05])
+    parser.add_argument(
+        "--n-mins", type=lambda s: [int(x) for x in s.split(",")], default=[8, 16, 32]
+    )
     parser.add_argument("--taus", type=p0.floats, default=[0.0, 0.3, 0.6, 0.9])
     parser.add_argument(
         "--n-singles", type=lambda s: [int(x) for x in s.split(",")], default=[0, 2, 4, 16]
@@ -315,29 +361,35 @@ def main() -> None:
             .unique("protein_id", keep="first")
             .sort("cluster_rep", "protein_id")
         )
-    tree = Tree(members, args)
     rows: list[dict[str, Any]] = []
     summary: dict[str, Any] = {
-        "proteins": tree.n_proteins,
+        "proteins": len(members),
         "units": int(members["cluster_rep"].n_unique()),
-        "leaves": tree.forest.n,
-        "internal_nodes": len(tree.forest.left),
-        "components": len(tree.forest.tops),
-        "topology_build_s": tree.build_s,
-        "reach": {},
+        "trees": {},
         "tier1_coherence": {},
     }
-    for t_base in args.t_bases:
-        base = base_postings(tree, t_base)
-        summary["reach"][str(t_base)] = reach(tree, t_base)
-        for n_min in args.n_mins:
-            summary["tier1_coherence"][f"{t_base}/{n_min}"] = tier1_coherence(
-                members, tree, t_base, n_min
-            )
-            for tau in args.taus:
-                for r in configuration(tree, base, t_base, n_min, tau, args.n_singles, args.n_1s):
-                    rows.append(r)
-                    print(json.dumps(r), flush=True)
+    for mode in args.leaves:
+        tree = Tree(members, argparse.Namespace(**(vars(args) | {"leaves": mode})))
+        summary["trees"][mode] = {
+            "leaves": tree.forest.n,
+            "internal_nodes": len(tree.forest.left),
+            "components": len(tree.forest.tops),
+            "topology_build_s": tree.build_s,
+            "reach": {},
+        }
+        for t_base in args.t_bases:
+            base = base_postings(tree, t_base)
+            summary["trees"][mode]["reach"][str(t_base)] = reach(tree, t_base)
+            for n_min in args.n_mins:
+                key = f"{t_base}/{n_min}"
+                if key not in summary["tier1_coherence"]:  # the same for every tree
+                    summary["tier1_coherence"][key] = tier1_coherence(members, tree, t_base, n_min)
+                for tau in args.taus:
+                    got = configuration(tree, base, t_base, n_min, tau, args.n_singles, args.n_1s)
+                    for r in got:
+                        rows.append({"leaves": mode, **r})
+                        print(json.dumps(rows[-1]), flush=True)
+        del tree
     table = pl.DataFrame(rows)
     # tier 1 at matching rates (and the standard tier for every row)
     tiers = []
@@ -357,14 +409,15 @@ def main() -> None:
         )
     if args.stream:
         release = json.loads(Path(args.stream).read_text())["totals"]["sequences"]
-        scale = release / tree.n_proteins
+        scale = release / len(members)
         summary["release_scale"] = scale
         table = table.with_columns(
             release_postings=pl.col("postings") * scale,
             release_keys=(pl.col("keys_base") + pl.col("keys_floor")) * scale,
             release_pieces=pl.col("pieces") * scale,
         )
-        summary["release_leaves"] = tree.forest.n * scale
+        for t in summary["trees"].values():
+            t["release_leaves"] = t["leaves"] * scale
     summary["tier1"] = tiers
     table.write_csv(out / "survey.tsv", separator="\t")
     (out / "survey.json").write_text(json.dumps(summary, indent=1) + "\n")
