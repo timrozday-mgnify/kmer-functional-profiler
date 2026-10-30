@@ -11,9 +11,11 @@ from test_tree_phase0 import SCRIPT, SURVEY, run
 from kmer_functional_profiler import _core
 
 BUILD = SCRIPT.with_name("build.py")
+QUERY = SCRIPT.with_name("query.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import build  # noqa: E402
 import phase0 as p0  # noqa: E402
+import query  # noqa: E402
 
 
 def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
@@ -70,3 +72,51 @@ def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
             assert covered.get(int(pos[i]), 0) >= min(2, valid[i])
         else:
             assert pos[i] == -1
+
+
+def test_query_counts_match_brute_force(tmp_path: Path) -> None:
+    run("fixture", "--families", "15", "--members", "8", "--buckets", "1", cwd=tmp_path)
+    cfg = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2"]
+    run("--members", "members.bucket0.parquet", "--out", "idx", *cfg, cwd=tmp_path, script=BUILD)
+    idx = tmp_path / "idx"
+    members = p0.load_members(tmp_path / "members.bucket0.parquet")
+    # a sample: every third protein, some twice, and one unrelated sequence
+    picked = [*members["sequence"][::3], *members["sequence"][::9], "MKVLAAGIVGLLLAQ" * 4]
+    fasta = tmp_path / "sample.fasta"
+    fasta.write_text("".join(f">s{i}\n{s}\n" for i, s in enumerate(picked)))
+    run("--index", str(idx), "--proteins", str(fasta), "--out", "q", cwd=tmp_path, script=QUERY)
+    leaves = pl.read_parquet(tmp_path / "q" / "leaves.parquet")
+    nodes = pl.read_parquet(tmp_path / "q" / "nodes.parquet")
+    sample = query.sample_counts(query.protein_hashes(query.Index(idx), str(fasta)))
+    assert leaves.height > 0 and nodes.height > 0
+
+    # leaves: brute-force holdings joined to the sample
+    want = (
+        build.holdings(idx)
+        .join(sample, on="hash")
+        .group_by("pos")
+        .agg(hit_kmers=pl.len(), hits=pl.col("n").sum())
+    )
+    got = leaves.select("pos", "hit_kmers", "hits")
+    assert got.sort("pos").equals(want.sort("pos").cast(got.schema))  # type: ignore[arg-type]
+    size = np.load(idx / "pos_size.npy")
+    held = build.holdings(idx).group_by("pos").len()
+    assert (size[held["pos"].to_numpy()] == held["len"].to_numpy()).all()
+
+    # internal nodes: a k-mer is present at a node iff the signs of the postings whose range
+    # contains the node's sum to 1 (checked one node at a time)
+    t = pl.DataFrame({x: np.load(idx / f"{x}.npy") for x in ("hash", "lo", "hi", "sign")})
+    n_lo, n_hi = np.load(idx / "node_lo.npy"), np.load(idx / "node_hi.npy")
+    node_size = np.load(idx / "node_size.npy")
+    by_node = {r[0]: r[1:] for r in nodes.select("node", "hit_kmers", "hits").rows()}
+    for v in range(len(n_lo)):
+        state = (
+            t.filter((pl.col("lo") <= n_lo[v]) & (pl.col("hi") >= n_hi[v]))
+            .group_by("hash")
+            .agg(pl.col("sign").cast(pl.Int32).sum())
+            .filter(pl.col("sign") == 1)
+        )
+        assert node_size[v] == state.height
+        hit = state.join(sample, on="hash")
+        expect = (hit.height, int(hit["n"].sum())) if hit.height else None
+        assert by_node.get(v) == expect, v

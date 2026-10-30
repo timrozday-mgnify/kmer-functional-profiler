@@ -325,7 +325,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - the merge tree and leaf order; Fitch states per k-mer (stage 6, missing data for leaves below a k-mer's level); range postings with level bands; leaf and node tables; a sequence store reordered by leaf order.
    - Checked against a brute-force reconstruction: every sequence's sampled set from its root path equals its own; and against brute-force Fitch on small trees (equal minimum change counts).
    - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
-2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures.
+2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures. *Done 2026-10-30 (`workflows/tree-index/query.py`); see Progress log.*
 3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
 4. **Benchmark against tier 1**, at matched index size and *t*:
    - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
@@ -589,3 +589,23 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - At tier 1's all-in compact ~11.6 B per posting, scaled from core: quick ~67 GB, medium ~131 GB, large ~236 GB. These are upper bounds, since sharing grows with scale.
     - `tree-v0` is a development format (18 B per posting plus 9.6 MB of `proteins.parquet` here), not the compact one.
   - *Next:* phase 2 (counting query: lookup, interval sweep, node counts) locally against brute force on these builds. Then a BUILD step for the 1-in-100 subset on HPC (~57 M proteins, ~50× this sample; the exact topology may need the staged build at that size).
+* **Phase 2: counting query (2026-10-30, the user's request).**
+  - **Kernel.** `_core.contained_sums(lo, hi, w, q_lo, q_hi)` sums, for each query range, the weights of the posting ranges that contain it: one sweep in `lo` order with a Fenwick tree over `hi`, O((P + Q) log P). A Rust test checks it against brute force on random ranges.
+  - **Build** now also writes |S\_v|: `pos_size.npy` per leaf position and `node_size.npy` per internal node (Fitch's states), both from that kernel over all postings.
+  - **`query.py`:**
+    - *Lookup.* Reads (six-frame translated, as today) or proteins are hashed. A hash is kept if it is ≤ *t\_cap* or one of the few keys beyond it, then counted per distinct hash and probed in the sorted key array.
+    - *Counting.* Leaves come from one sweep over the hit postings' endpoints, giving piecewise-constant segments, of which the positive ones are expanded. Internal nodes come from `contained_sums`. Each gets distinct hit k-mers, occurrences, |S\_v| and containment.
+    - Writes `leaves.parquet`, `nodes.parquet` and `query.json`.
+    - *Ceiling:* every internal node is queried (O(N log P)). At full scale, only the touched nodes' ancestors should be.
+  - **Test** (fixture, protein sample with duplicates and an unrelated sequence):
+    - leaf counts and occurrences equal brute-force holdings joined to the sample;
+    - `pos_size` equals each leaf's held k-mers;
+    - for every internal node, the k-mers whose containing postings sum to 1 number `node_size`, and their sample hits equal the query's counts.
+  - **Sketch beyond *t\_cap*.** Top-ups beyond *t\_cap* are 0.2–1.3% of postings: quick 1,898, medium 8,693, large 50,926, on 1,898 / 6,870 / 27,037 positions. Because of them the largest key is ~2⁶⁴, which would make the query keep every read k-mer. Keeping only hashes ≤ *t\_cap* plus those keys cut sampled hashes 5× (4.4 M to 0.88 M on 125 k read pairs of SRR1438000), with identical results.
+  - **Local timings on the core sample's tiers** (4 threads):
+    - 125 k read pairs (SRR1438000): 0.4–0.6 s, ~0.9 GB peak RSS. Few hits, as expected at 1 in 5,000: 162 / 332 / 582 hit hashes.
+    - 50,000 of the sample's own proteins as the query: counting takes 0.15–0.46 s for 186 k / 363 k / 715 k hit postings. Lookup takes 10–13 s, all of it in the protein path's per-sequence hashing (tests only). Peak RSS 0.44–0.56 GB.
+  - **Finding: the leaf minimum covers leaves, not every member.** Of those 50,000 proteins, 1,023 (quick), 296 (medium) and 86 (large) do not hit their own leaf. 99% are partial fragments shorter than their leaf's representative (median 43–66 aa against 134–155). The leaf's base band, floor and top-ups are the representative's k-mers, some outside the fragment.
+    - Reads from the fragment's real gene will usually hit the container's k-mers too, so this matters mainly for fragment-only genes.
+    - A per-member guarantee would top up each member from its own hashes (posted at its leaf, held by all its members, as floors are). Its cost is not measured. The survey's "every protein covered" holds per leaf.
+  - *Next:* phase 3 (reporting, recall first) on these counts, or the HPC BUILD of the 1-in-100 tiers.

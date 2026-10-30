@@ -789,6 +789,56 @@ pub fn schemes(
     Ok(out)
 }
 
+/// For each query range `q_lo[j]..q_hi[j]`, the summed weights of the ranges `lo[i]..hi[i]`
+/// that contain it (`lo <= q_lo` and `q_hi <= hi`): a range posting's hits at a leaf (a
+/// one-position range) or at a node (its leaf range). One sweep in `lo` order with a Fenwick
+/// tree over the ranges' `hi`: O((P + Q) log P).
+pub fn contained_sums(
+    lo: &[u32],
+    hi: &[u32],
+    w: &[i64],
+    q_lo: &[u32],
+    q_hi: &[u32],
+) -> Result<Vec<i64>, Error> {
+    if lo.len() != hi.len() || lo.len() != w.len() || q_lo.len() != q_hi.len() {
+        return Err(Error::LengthMismatch);
+    }
+    let mut his: Vec<u32> = hi.to_vec();
+    his.sort_unstable();
+    his.dedup();
+    // Fenwick over his, indexed in descending hi order so a prefix is "hi >= x"
+    let m = his.len();
+    let mut fen = vec![0i64; m + 1];
+    let slot = |h: u32| m - his.partition_point(|&x| x < h); // 1-based, descending
+    let mut by_lo: Vec<u32> = (0..lo.len() as u32).collect();
+    by_lo.sort_unstable_by_key(|&i| lo[i as usize]);
+    let mut by_q: Vec<u32> = (0..q_lo.len() as u32).collect();
+    by_q.sort_unstable_by_key(|&j| q_lo[j as usize]);
+    let mut out = vec![0i64; q_lo.len()];
+    let mut next = 0;
+    for j in by_q {
+        let j = j as usize;
+        while next < by_lo.len() && lo[by_lo[next] as usize] <= q_lo[j] {
+            let i = by_lo[next] as usize;
+            let mut x = slot(hi[i]);
+            while x <= m {
+                fen[x] += w[i];
+                x += x & x.wrapping_neg();
+            }
+            next += 1;
+        }
+        // ranges with hi >= q_hi: the first slots, down to the smallest such hi
+        let mut x = m - his.partition_point(|&h| h < q_hi[j]);
+        let mut sum = 0;
+        while x > 0 {
+            sum += fen[x];
+            x &= x - 1;
+        }
+        out[j] = sum;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,6 +1002,39 @@ mod tests {
                     }
                     assert_eq!(state, held[leaf], "leaf {leaf}, hash {h}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn contained_sums_match_brute_force() {
+        let mut rng = Lcg(11);
+        for _ in 0..500 {
+            let (p, q) = (rng.next(30) as usize, rng.next(30) as usize);
+            let span = |rng: &mut Lcg| {
+                let a = rng.next(20) as u32;
+                (a, a + 1 + rng.next(8) as u32)
+            };
+            let (mut lo, mut hi, mut w) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..p {
+                let (a, b) = span(&mut rng);
+                lo.push(a);
+                hi.push(b);
+                w.push(rng.next(7) as i64 - 3);
+            }
+            let (mut q_lo, mut q_hi) = (Vec::new(), Vec::new());
+            for _ in 0..q {
+                let (a, b) = span(&mut rng);
+                q_lo.push(a);
+                q_hi.push(b);
+            }
+            let got = contained_sums(&lo, &hi, &w, &q_lo, &q_hi).unwrap();
+            for j in 0..q {
+                let want: i64 = (0..p)
+                    .filter(|&i| lo[i] <= q_lo[j] && q_hi[j] <= hi[i])
+                    .map(|i| w[i])
+                    .sum();
+                assert_eq!(got[j], want);
             }
         }
     }

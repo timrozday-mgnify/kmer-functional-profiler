@@ -17,7 +17,8 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
 
 Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8) and
 ``kind.npy`` (u8), sorted by (hash, lo); ``node_lo.npy``, ``node_hi.npy``, ``node_level.npy``
-(internal node i of the merge tree, by positions); ``pieces.parquet`` (lo, hi, floor,
+(internal node i of the merge tree, by positions); ``pos_size.npy`` and ``node_size.npy``
+(|S\\_v|: k-mers held at each position and each internal node); ``pieces.parquet`` (lo, hi, floor,
 coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and
 ``meta.json``.
 """
@@ -184,6 +185,16 @@ def main() -> None:
     np.save(out / "node_lo.npy", lay["lo"][n:])
     np.save(out / "node_hi.npy", lay["hi"][n:])
     np.save(out / "node_level.npy", tree.forest.level)
+    # |S_v|: k-mers held at each position and each internal node (Fitch's states)
+    rng = (
+        table["lo"].to_numpy(),
+        table["hi"].to_numpy(),
+        table["sign"].to_numpy().astype(np.int64),
+    )
+    pos = np.arange(n_pos, dtype=np.uint32)
+    np.save(out / "pos_size.npy", _core.contained_sums(*rng, pos, pos + 1).astype(np.uint32))
+    size = _core.contained_sums(*rng, lay["lo"][n:], lay["hi"][n:])
+    np.save(out / "node_size.npy", size.astype(np.uint32))
     pieces.write_parquet(out / "pieces.parquet")
     members.select("protein_id", "cluster_rep").with_columns(
         pos=protein_positions(tree, a.n_1)
