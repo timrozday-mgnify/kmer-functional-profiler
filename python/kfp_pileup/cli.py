@@ -9,7 +9,7 @@ import typer
 
 from kfp_pileup.check import MIN_READS, aai_check
 from kfp_pileup.handoff import MIN_POSTERIOR, handoff
-from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, call
+from kfp_pileup.pileup import BATCH_READS, MIN_DEPTH, MIN_FREQ, SCORE_NATS, HitFilter, call
 from kfp_pileup.reference import MAX_FDR, MAX_TARGETS, NEIGHBOURS, build_reference
 from kfp_pileup.refine import NOVEL
 from kfp_pileup.route import BLOCK_LETTERS, MIN_KMERS, ROUTE_K, route
@@ -115,6 +115,19 @@ def call_command(
     stats: Annotated[
         Path | None, typer.Option(help="JSON of each stage's time and memory (as query's)")
     ] = None,
+    threads: Annotated[int, typer.Option(help="Worker processes for the haplotypes")] = 1,
+    top: Annotated[
+        float, typer.Option(help="diamond: keep a read's lines within this % of its best score")
+    ] = HitFilter.top,
+    max_bits_below: Annotated[
+        float, typer.Option(help="diamond: and within this many bits of its best (inf: all)")
+    ] = HitFilter.max_bits_below,
+    unit_bits_below: Annotated[
+        float, typer.Option(help="diamond: and of its best alignment to the same unit")
+    ] = HitFilter.unit_bits_below,
+    min_identity: Annotated[
+        float, typer.Option(help="diamond: drop reads whose best alignment is less identical")
+    ] = HitFilter.min_identity,
 ) -> None:
     """Read posteriors (assignments.parquet), pileups (pileup.parquet, variants.tsv) and
     per-unit identity (units.tsv) from alignments to the reference; then the joint EM over
@@ -123,7 +136,8 @@ def call_command(
     consensus.*, recruited_*.fq.gz); print counts."""
     counts = call(
         alignments, ref_dir, out_dir, aligner, profile, min_depth, min_freq, score_nats,
-        batch_reads, novel, reads or (), stats,
+        batch_reads, novel, reads or (), stats, threads=threads,
+        hit_filter=HitFilter(top, max_bits_below, unit_bits_below, min_identity),
     )  # fmt: skip
     typer.echo(json.dumps(counts))
 

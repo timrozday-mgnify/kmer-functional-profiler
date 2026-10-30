@@ -404,6 +404,89 @@ impl PyDistinct {
     }
 }
 
+/// DIAMOND tabular alignments against a reference (`qseqid sseqid bitscore qstart qend
+/// sstart send qframe btop`) parsed into per-residue columns, for `kfp-pileup call`.
+#[pyclass(name = "DiamondReader")]
+struct PyDiamondReader {
+    refs: kfp::DiamondRefs,
+    filter: kfp::HitFilter,
+}
+
+#[pymethods]
+impl PyDiamondReader {
+    /// Sequence `i` is `names[i]` with residues `seqs[i]`, of unit `units[i]`; each read's
+    /// lines are kept by `HitFilter`'s rules (the defaults keep all).
+    #[new]
+    #[pyo3(signature = (
+        names, seqs, units, *, top = f64::INFINITY, max_bits_below = f64::INFINITY,
+        unit_bits_below = f64::INFINITY, min_identity = 0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        names: Vec<PyBackedBytes>,
+        seqs: Vec<PyBackedBytes>,
+        units: PyReadonlyArray1<'_, u32>,
+        top: f64,
+        max_bits_below: f64,
+        unit_bits_below: f64,
+        min_identity: f64,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            refs: kfp::DiamondRefs::new(&names, &seqs, units.as_slice()?).map_err(to_py_err)?,
+            filter: kfp::HitFilter {
+                top,
+                max_bits_below,
+                unit_bits_below,
+                min_identity,
+            },
+        })
+    }
+
+    /// Whole reads from the start of `buf`, at most `batch_reads`: a dict of columns
+    /// (`names` a list; `read`, `seq`, `score`, `start`, `end`, `reverse`, `ins`, `shifts`
+    /// per alignment; `hit`, `col`, `qpos`, `rres`, `sres` per aligned column; `ev_hit`,
+    /// `ev_col`, `ev_kind`, `ev_key` per event; `dropped_top`, `dropped_margin`,
+    /// `dropped_unit`, `dropped_floor_reads`, `dropped_floor_lines` counts) and the bytes
+    /// consumed. The last read in `buf` is whole only at `eof`.
+    fn parse<'py>(
+        &self,
+        py: Python<'py>,
+        buf: PyBackedBytes,
+        batch_reads: usize,
+        eof: bool,
+    ) -> PyResult<(Bound<'py, PyDict>, usize)> {
+        let (b, used) = py
+            .detach(|| kfp::DiamondBatch::parse(&self.refs, &self.filter, &buf, batch_reads, eof))
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        dict.set_item("names", b.names)?;
+        dict.set_item("read", b.read.into_pyarray(py))?;
+        dict.set_item("seq", b.seq.into_pyarray(py))?;
+        dict.set_item("score", b.score.into_pyarray(py))?;
+        dict.set_item("start", b.start.into_pyarray(py))?;
+        dict.set_item("end", b.end.into_pyarray(py))?;
+        dict.set_item("reverse", b.reverse.into_pyarray(py))?;
+        dict.set_item("ins", b.ins.into_pyarray(py))?;
+        dict.set_item("shifts", b.shifts.into_pyarray(py))?;
+        dict.set_item("hit", b.hit.into_pyarray(py))?;
+        dict.set_item("col", b.col.into_pyarray(py))?;
+        dict.set_item("qpos", b.qpos.into_pyarray(py))?;
+        dict.set_item("rres", b.rres.into_pyarray(py))?;
+        dict.set_item("sres", b.sres.into_pyarray(py))?;
+        dict.set_item("ev_hit", b.ev_hit.into_pyarray(py))?;
+        dict.set_item("ev_col", b.ev_col.into_pyarray(py))?;
+        dict.set_item("ev_kind", b.ev_kind.into_pyarray(py))?;
+        dict.set_item("ev_key", b.ev_key.into_pyarray(py))?;
+        let d = b.dropped;
+        dict.set_item("dropped_top", d.top)?;
+        dict.set_item("dropped_margin", d.margin)?;
+        dict.set_item("dropped_unit", d.unit)?;
+        dict.set_item("dropped_floor_reads", d.floor_reads)?;
+        dict.set_item("dropped_floor_lines", d.floor_lines)?;
+        Ok((dict, used))
+    }
+}
+
 /// Iterator over FASTA/FASTQ (optionally paired, gzip/zstd) yielding dicts of hit columns.
 #[pyclass(name = "FastxHits")]
 struct PyFastxHits {
@@ -653,5 +736,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(align_identity, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
+    m.add_class::<PyDiamondReader>()?;
     Ok(())
 }

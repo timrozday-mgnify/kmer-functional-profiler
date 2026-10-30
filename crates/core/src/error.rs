@@ -26,6 +26,8 @@ pub enum Error {
     BadOffsets,
     #[error("tree node {0} out of range")]
     NodeOutOfRange(u64),
+    #[error("DIAMOND output: {0}")]
+    DiamondLine(String),
     #[error(transparent)]
     Fastx(#[from] needletail::errors::ParseError),
 }

@@ -18,10 +18,19 @@
 #                         calls, recall by depth, identity and uniqueness bins
 #   results/scores.tsv    per seed; results/<sample>/share<s>/stats.json, trace.tsv: query cost
 # The rule (above) is params q, max_false and max_null: fix it before reading the results.
+# Hit-level re-run (2026-10-23: recall before presence, for a routing threshold):
+#   OUT=results-aai AAI=true sbatch run.sh
+# query --aai lists every hit unit (~8 M rows, ~2-3 GB a profile; 60 profiles, copied out of
+# work/ into $OUT). Read summary.tsv's recall_hit1, recall_hit2 and recall_gathered beside
+# recall, recall_hit1_depth_* and _identity_*, and unspiked_hit*, null_hit* (reference size,
+# chance hits); $OUT/seed<N>/truth.tsv is now published.
+# Since 2026-10-23 PICK keeps members >= 0.9 of the representative's length (--min-member-
+# frac), so runs before then (results, results-aai) are not comparable with later ones.
 source ../common.sh
-STD=../release-tiers/results-standard
-[[ -f $STD/index/meta.json ]] || { echo 'release-tiers has not finished (no results-standard/index)' >&2; exit 1; }
+STD=../release-tiers/results-${TIER:-standard}  # TIER=slim|standard|large, e.g. OUT=results-large AAI=true TIER=large
+[[ -f $STD/index/meta.json ]] || { echo "release-tiers has not finished (no $STD/index)" >&2; exit 1; }
 [[ -s ../pileup-cost/hadza10M_1.fastq.gz ]] || { echo 'no ../pileup-cost/hadza10M_*.fastq.gz: run pileup-cost first' >&2; exit 1; }
-nextflow run "$WF/presence-calibration" -c ../site.config -resume --outdir results \
+nextflow run "$WF/presence-calibration" -c ../site.config -resume --outdir "${OUT:-results}" \
+    --aai "${AAI:-false}" \
     --index "$(realpath "$STD/index")" --store "$(realpath "$STD")/members.bucket*.parquet" \
     --background "$(realpath ../pileup-cost/hadza10M_1.fastq.gz),$(realpath ../pileup-cost/hadza10M_2.fastq.gz)"

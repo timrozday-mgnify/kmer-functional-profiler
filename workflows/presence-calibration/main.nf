@@ -36,6 +36,7 @@ process PICK {
 process SIMULATE {
     tag "seed ${seed}"
     label 'process_low'
+    publishDir params.outdir, mode: 'copy', pattern: 'truth.tsv', saveAs: { "seed${seed}/${it}" }
 
     input:
     path spike
@@ -84,7 +85,7 @@ process QUERY {
     script:
     """
     ${params.kfp} query ${index} ${r1} ${r2} --out profile.tsv --stats stats.json \\
-        --background-share ${share} ${params.query_args}
+        --background-share ${share} ${"${params.aai}" == 'true' ? '--aai' : ''} ${params.query_args}
     """
 }
 

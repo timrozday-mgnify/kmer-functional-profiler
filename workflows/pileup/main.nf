@@ -199,7 +199,7 @@ process CALL {
     def reads = aligner == 'diamond' ? "--reads ${r1} --reads ${r2}" : ''
     """
     ${params.kfp_pileup} call ${ref} pileup ${alignments} --aligner ${aligner} \\
-        --profile ${profile} ${reads} --stats call_stats.json ${opts}
+        --profile ${profile} ${reads} --stats call_stats.json --threads ${task.cpus} ${opts}
     """
 
     stub:
@@ -504,7 +504,9 @@ workflow PILEUP {
         file("${moduleDir}/../../python/kfp_pileup/${it}.py", checkIfExists: true)
     }
     def called = CALL(alignments.join(ref_dirs).join(profiles).join(reads),
-        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel}",
+        "--min-depth ${params.min_depth} --min-freq ${params.min_freq} --novel ${params.novel} " +
+        "--top ${params.call_top} --max-bits-below ${params.call_max_bits_below} " +
+        "--unit-bits-below ${params.call_unit_bits_below} --min-identity ${params.call_min_identity}",
         call_code)
     def pileups = called.pileup
 

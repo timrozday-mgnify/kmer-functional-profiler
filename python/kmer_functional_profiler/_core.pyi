@@ -136,3 +136,17 @@ class FastxHits:
     def n_reads(self) -> int: ...
     @property
     def base_stats(self) -> dict[str, float]: ...
+
+class DiamondReader:
+    def __init__(
+        self,
+        names: Sequence[bytes],
+        seqs: Sequence[bytes],
+        units: NDArray[np.uint32],
+        *,
+        top: float = ...,
+        max_bits_below: float = ...,
+        unit_bits_below: float = ...,
+        min_identity: float = 0.0,
+    ) -> None: ...
+    def parse(self, buf: bytes, batch_reads: int, eof: bool) -> tuple[dict[str, Any], int]: ...
