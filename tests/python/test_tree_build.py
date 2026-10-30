@@ -1,5 +1,5 @@
 """workflows/tree-index/build.py (and partition.py + merge.py): the index holds what it should,
-against brute force; query.py counts it."""
+against brute force; query.py counts it, and report.py reports it."""
 
 import json
 import sys
@@ -13,14 +13,20 @@ from kmer_functional_profiler import _core
 
 BUILD = SCRIPT.with_name("build.py")
 QUERY = SCRIPT.with_name("query.py")
+REPORT = SCRIPT.with_name("report.py")
 PARTITION = SCRIPT.with_name("partition.py")
 MERGE = SCRIPT.with_name("merge.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import build  # noqa: E402
 import phase0 as p0  # noqa: E402
 import query  # noqa: E402
+import report  # noqa: E402
+from scipy.sparse import coo_array  # noqa: E402
+from scipy.sparse.csgraph import connected_components  # noqa: E402
 
-MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2"]
+# phase 1's medium tier: base band, floors and top-ups only, which check_index checks in full
+MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2", "--window", "0",
+          "--ladder", ""]  # fmt: skip
 
 
 def fixture(tmp_path: Path) -> Path:
@@ -126,6 +132,27 @@ def check_query(tmp_path: Path, idx: Path, members_path: Path) -> None:
         expect = (hit.height, int(hit["n"].sum())) if hit.height else None
         assert by_node.get(v) == expect, v
 
+    # evidence: per leaf, the best read's summed key bits less a charge per extra hit
+    index = query.Index(idx)
+    hs = sample["hash"].to_numpy()
+    hs = hs[np.isin(hs, index.keys)]
+    rng = np.random.default_rng(0)
+    pairs = pl.DataFrame({"read": rng.integers(0, 6, len(hs)).astype(np.uint64), "hash": hs})
+    got = query.evidence(index, pairs, 3.0, floor=-1e9)
+    bits = pl.DataFrame({"hash": index.keys, "bits": index.key_bits.astype(np.float64)})
+    want = (
+        held.join(pairs, on="hash")
+        .join(bits, on="hash")
+        .group_by("read", "pos")
+        .agg(score=pl.col("bits").sum() - (pl.len() - 1) * 3.0)
+        .group_by("pos")
+        .agg(pl.col("score").max())
+        .sort("pos")
+    )
+    assert got["pos"].to_list() == want["pos"].to_list()
+    assert np.allclose(got["score"].to_numpy(), want["score"].to_numpy(), atol=1e-3)
+    assert (index.key_bits > 0).all() and np.array_equal(index.keys, np.unique(index.hash))
+
     # with a leaf per protein set, every sampled protein with a position hits its own leaf
     prot = (
         members.select("protein_id")
@@ -135,6 +162,55 @@ def check_query(tmp_path: Path, idx: Path, members_path: Path) -> None:
     own = prot.filter(pl.col("i").is_in(list(range(0, len(members), 3))), pl.col("pos") >= 0)
     assert own.height > 0
     assert own.join(leaves, on="pos", how="anti").height == 0
+    check_report(tmp_path, idx, out, held, own)
+
+
+def check_report(tmp_path: Path, idx: Path, q: Path, held: pl.DataFrame, own: pl.DataFrame) -> None:
+    """report.py: AAI bounds, candidates against brute-force single linkage, gather's
+    assignment."""
+    out = tmp_path / f"r-{idx.name}"
+    run("--index", str(idx), "--query", str(q), "--out", str(out), "--max-neighbours", "4",
+        cwd=tmp_path, script=REPORT)  # fmt: skip
+    leaves = pl.read_parquet(out / "leaves.parquet")
+    assert (leaves["aai_lo"] <= leaves["aai"]).all() and (leaves["aai"] <= leaves["aai_hi"]).all()
+    full = leaves.filter(pl.col("hit_kmers") == pl.col("size"))
+    assert full.height > 0 and (full["aai"] == 1).all()
+
+    # candidates: the seeds and each seed's walk, as ranges; members are their proteins
+    cand = pl.read_parquet(out / "candidates.parquet")
+    pos = np.concatenate([np.arange(lo, hi) for lo, hi in cand.rows()])
+    assert (np.diff(pos) > 0).all() and np.isin(leaves["pos"], pos).all()
+    members = pl.read_parquet(out / "members.parquet")
+    assert np.isin(members["pos"], pos).all()
+    assert members.filter(pl.col("seed"))["pos"].unique().len() == leaves.height
+
+    # each walk, uncapped, is the seed's single-linkage cluster at its radius (brute force:
+    # components of the edges <= radius); capped, the nearest of it in minimax distance
+    n_pos = len(np.load(idx / "pos_len.npy"))
+    tree = report.Spanning(idx, n_pos)
+    a, b, w = (np.load(idx / f"edge_{x}.npy").astype(np.int64) for x in "abw")
+    grown = 0
+    for radius in (0, 5, 20, 80, 10**9):
+        keep = w <= radius
+        graph = coo_array((np.ones(keep.sum()), (a[keep], b[keep])), shape=(n_pos, n_pos))
+        _, comp = connected_components(graph, directed=False)
+        for v in leaves["pos"].to_list():
+            got, cut = tree.cluster(v, radius, n_pos)
+            assert not cut and sorted(got) == np.flatnonzero(comp == comp[v]).tolist()
+            near, cut = tree.cluster(v, radius, 4)
+            assert near == got[:5] and cut == (len(got) > 5)
+            grown += len(got) > 1
+    assert grown > 0
+
+    # gather: groups take disjoint k-mers, together every hit k-mer a seed holds; a group's
+    # range is its common subtree, which holds its leaf. Every sampled protein is a candidate
+    g = pl.read_parquet(out / "gather.parquet")
+    hits = pl.read_parquet(q / "hits.parquet")
+    seed_kmers = held.join(hits, on="hash").filter(pl.col("pos").is_in(leaves["pos"].implode()))
+    assert int(g["kmers"].sum()) == seed_kmers["hash"].n_unique()
+    assert g.filter((pl.col("pos") < pl.col("lo")) | (pl.col("pos") >= pl.col("hi"))).height == 0
+    assert ((g["tied"] > 1) == (g["node"] >= 0)).all()
+    assert np.isin(own["pos"], members["pos"]).all()
 
 
 def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
@@ -175,3 +251,36 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     assert stats["parts"] == len(parts)
     check_index(idx, members)
     check_query(tmp_path, idx, members)
+
+
+def test_window_kmers_match_brute_force() -> None:
+    """build.window_kmers: each sequence's least hash per window (shrunk by min_count)."""
+    rng = np.random.default_rng(2)
+    seqs = [bytes(rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n)) for n in (5, 15, 22, 40, 120, 61)]
+    seqs[4] = seqs[4][:50] + b"X" + seqs[4][51:]  # k-mers over X have no hash
+    for w, min_count in ((4, 0), (20, 0), (20, 4), (10, 8)):
+        seq, h = build.window_kmers(seqs, 11, w, min_count)
+        for j, s in enumerate(seqs):
+            hs = [_core.hash_proteins([s[i : i + 11]], 11)["hash"] for i in range(len(s) - 10)]
+            hs = [int(x[0]) if len(x) else None for x in hs]
+            ww = max(1, min(w, len(hs) // min_count)) if min_count else w
+            wins = [hs[i : i + ww] for i in range(len(hs) - ww + 1)] if len(hs) >= ww else [hs]
+            want = {min(v) for v in ([x for x in win if x is not None] for win in wins) if v}
+            assert {int(x) for x in h[seq == j]} == want, (w, min_count, j)
+
+
+def test_default_modes_query_soundly(tmp_path: Path) -> None:
+    """The default build (standard: spread minimizers, k 7 ladder) and ``--mode recall`` (a
+    Dayhoff layer on every leaf): covers sum to 0 or 1, and the query and report checks hold
+    against brute force, the Dayhoff layer's k-mers included."""
+    members = fixture(tmp_path)
+    for mode in ("standard", "recall"):
+        idx = tmp_path / f"idx-{mode}"
+        run(
+            "--members", str(members), "--out", str(idx), "--mode", mode, cwd=tmp_path, script=BUILD
+        )
+        meta = json.loads((idx / "meta.json").read_text())
+        assert meta["params"]["layers"] == ("dayhoff:7:8:rare" if mode == "recall" else "")
+        codes = set(np.load(idx / "key_k.npy").tolist())
+        assert (71 in codes) == (mode == "recall")  # Dayhoff 7: 7 + 32 x 2
+        check_query(tmp_path, idx, members)

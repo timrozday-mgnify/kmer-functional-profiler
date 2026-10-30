@@ -326,7 +326,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - Checked against a brute-force reconstruction: every sequence's sampled set from its root path equals its own; and against brute-force Fitch on small trees (equal minimum change counts).
    - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
 2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures. *Done 2026-10-30 (`workflows/tree-index/query.py`); see Progress log.*
-3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
+3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI. *Done 2026-10-30 (`workflows/tree-index/report.py`), checked locally; see Progress log. Calibration and the δ sweep are phase 4's.*
 4. **Benchmark against tier 1**, at matched index size and *t*:
    - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
      - nearest-match identity curves for recall and precision, with read-outs at 99, 95, 90 and 80%;
@@ -346,6 +346,11 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the staged build and Fitch pass on all of MGnify (MGnify90 membership only as a check), then the phase-4 benchmark at full size.
 6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
+6b. **Reduced amino-acid alphabets, next to try for the high-recall layer** (the user's request, 2026-10-30). The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
+   - Murphy et al.'s 8, 12 and 15-letter alphabets; the alphabets DIAMOND (11 letters) and MMseqs2 (13) seed with; SE-B(14); and compressed alphabets optimised for alignment sensitivity (Edgar 2004), chosen from BLOSUM62 so classes absorb the most likely substitutions.
+   - *Compare at matched bits per k-mer, not matched k.* At equal bits, a shorter full-alphabet k-mer has so far survived as well as Murphy-10 or Dayhoff. A reduced alphabet only helps if its within-class share of BLOSUM62 substitutions is high for its size. Report that share, p\_eff at 70–85% identity, and the predicted miss rate at 1× (as in the feasibility table above) before any build.
+   - *Then on the benchmark:* `spike.py simulate --substitution blosum62` strains at 70–85% identity, recall at depth > 1, decoy-controlled background seeds, and postings, against L3 and the Dayhoff layer.
+   - *With them:* per-layer decoy bars, so a noisy layer cannot raise the bar for 11-mer seeds; spaced seeds on the best alphabet (PatternHunter/DIAMOND style); and seed verification by ungapped extension (BLOSUM62 along the hit's diagonal against the candidate's representative). The decoys showed that verification is what separates true 70% hits from chance.
 7. **Later:** the placement-style model with adaptive subtree resolution and bounded diameter; posting-list compression in the Fulgor/Mac-dBG manner.
 
 ## Progress log
@@ -700,3 +705,218 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Note:* this build peaked at 4.7 GB, above the 3.4 GB measured earlier for the same configuration. Per 2 M-protein part that is ~36 GB, inside BUILD's 64 GB.
   - **Tier sizes, revised** (release postings × the quarter's ratio; ~9 B per posting + ~35 GB of leaf tables): quick 5.8–7.2 × 10⁹ postings, ~87–100 GB; medium 11.3–13.9 × 10⁹, ~137–160 GB; large 22.8–25.7 × 10⁹, ~240–266 GB.
   - **Switched:** `--topology-tree spanning` is now the default of `survey.py` and `build.py`, so `build.nf` and `hpc/kfp-ablations/tree-index-build` build on it. `--topology-tree merge` keeps phase 0's tree. `survey.json` reports Fitch on both trees per *t\_base*, with timings.
+* **Phase 3: reporting, recall first (2026-10-30, the user's request).**
+  - **Build** now also writes the spanning tree's edges between positions (`edge_a`, `edge_b`, `edge_w`, in dense 8-mer |A Δ B|) and each position's representative length (`pos_len`). `merge.py` offsets the edges. That is 16 B per position, ~90 GB at ~5.7 × 10⁹ leaves in this development format; a compact one would store each leaf's parent edge only (~8 B).
+  - **`query.py`** also writes `hits.parquet`, the sample's k-mers that are keys, for gather.
+  - **`report.py`:**
+    - *AAI* per hit leaf and internal node: containment^(1/k), with a 95% Clopper-Pearson interval on hit k-mers out of |S\_v|. Naive: low depth lowers containment as divergence does. Phase 4 calibrates it against `presence-calibration`'s truth.
+    - *Candidates.* Every leaf with ≥ `--min-hits` hit k-mers (default 1: every hit leaf, as the recall-first pileup takes every hit unit) is a seed. Each adds its single-linkage cluster on the spanning tree at *R\_v* = d(aai\_lo) + d(1 − δ), where d(p) = 2 (len − 7)(1 − p⁸) is the expected dense 8-mer |A Δ B| at identity p. The cluster is walked by Prim from the seed (nearest first in minimax distance), at most `--max-neighbours` (256) leaves beyond it. On the spanning tree a cluster is a connected subtree, not a leaf range (Diff schemes entry above), so this walks edges rather than looking up an ancestor.
+    - Candidates are written as position ranges (`candidates.parquet`) and as proteins (`members.parquet`, with a seed flag), the inputs for round 2 and the pileup's `REFERENCE`. *Not wired:* `kfp-pileup reference` takes a unit profile and the unit store; a tree-index store fetched by range is still to build.
+    - *Gather* over the seed leaves. The score is remaining hit k-mers × windows / |S\_v| (estimated shared windows, as today's gather divides by *t\_g*). Leaves in the best's component that share a remaining k-mer with it and score within `--tie-z` (2) Poisson standard deviations of it are tied. The group is reported as its smallest common subtree, and its k-mers are removed.
+    - *Amended during the run:* ties were first not restricted to the best's component. Groups then spanned components (one covered 260 k of 262 k positions), which is not a subtree.
+  - **Test** (`test_tree_build.py`, single and partitioned builds): AAI bounds, and AAI 1 at full containment. Each walk, uncapped, equals the seed's component under edges ≤ radius (scipy's connected components, five radii); capped, it is the uncapped walk's prefix. Gather's groups take disjoint k-mers that together are every hit k-mer a seed holds, and each group's range contains its leaf. Every sampled protein's leaf is a candidate.
+  - **Local run** (medium tier on the quarter sample, 262,391 proteins; 4 threads):
+
+    | Query | Seeds | Candidates (+ neighbours) | Capped seeds | Ranges | Gather groups (tied) | Report |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 125 k read pairs (SRR1438000) | 384 | 1,017 (+633) | 0 | 143 | 109 (48) | 0.08 s |
+    | 50,000 core proteins as the query | 137,437 | 140,670 (+3,233) | 35,766 | 8,289 | 10,131 (5,963) | 37 s |
+
+    - Of the 50,000, 12,162 have a position in the quarter index. All but one hit their own leaf and are candidates. Gather picks the own leaf itself for 38% and reports it inside a group for 97.8%. The other 2.2% are explained away: a group in another component took their k-mers first (k-mers shared across components are posted in each).
+    - Tie groups: median 2 leaves, p90 21, p99 158, max 1,642. Common subtrees: median 2 positions, p90 35, p99 317. At the medium tier's ~4 base k-mers per protein, near-identical relatives cannot be told apart, so ties are the expected result, not a defect.
+    - The cap binds for a quarter of the protein seeds. A leaf with few k-mers has a wide interval (2 of 2 hit gives aai\_lo ~0.85), so its radius reaches far. That is the rule's intended direction for recall; phase 4 measures what it costs in candidates.
+    - *Ceilings:* the walk is a Python loop per seed (12 s for 137 k seeds), and gather recounts all pairs per pick (24 s for 10 k picks). Both need a kernel before HPC-scale samples.
+  - *Next:* phase 4 (benchmark against tier 1: δ at 0.05, 0.1 and 0.15, AAI calibration, nearest-match identity scoring), after the HPC build of the 1-in-100 tiers.
+* **Candidate recall, measured (2026-10-30, the user's request: recall first, ~100% of proteins at depth > 0.5 into the candidates, since tier 2 is built per sample from them, with few false candidates; explore broadening on the tree, then focus on tier 2).**
+  - **Benchmark** (`workflows/tree-index/recall.py`): 2,000 proteins with a position in the quarter sample's index each carry a strain made by `spike.py simulate`, at identity 1 / 0.98 / 0.95 / 0.9 / 0.85 / 0.8 and lognormal depth (μ 0, σ 1.2). The 125 k real read pairs of SRR1438000 are mixed in as background. A strain counts as recalled when its source protein's position is a candidate. *observable* is the number of the source's 11-mers that occur whole in the strain's own reads. Background-only queries give the false-candidate baseline.
+  - **Frames.** `stopfree` drops every frame with a stop codon, so reads crossing a gene end are lost, and with them most reads of short genes. At 100% identity and depth ≥ 2, 7 of 7 misses were 28–100 aa proteins whose own k-mers were in the reads. `all` frames raised recall at depth > 0.5 from 65% to 74% (medium) and are used below. *For the main query too:* the recall-first path should not use `stopfree`.
+  - **Broadening on the tree is not the lever.** On the medium tier at depth > 0.5: hit leaves 73.6%; gain ranges (a hit k-mer's whole gain range, including leaves that lost it) 74.1%; neighbour rule δ 0.1, cap 256: 77.5%; whole components of the hit leaves, the most any tree walk can add: 77.6%. δ from 0 to 0.3 changed nothing. The cap mattered (16 against 256: +2%).
+  - **Why: density.** A medium leaf holds a median 6–8 k-mers. With 0 of them in the strain, recall is 17%; with 1, 77%; with ≥ 3, ≥ 96%. At 80% identity, 70% of strains share none of the source's indexed k-mers.
+  - **Window minimizers** (`build.py --window W [--window-min M]`): the base band also takes each leaf's least hash, of any value, in every window of W k-mers. With `--window-min` M, the window shrinks to n\_k // M, so short proteins get about 2M minimizers. Window k-mers are diffed by Fitch with the rest of the base band, so relatives share them. A 50-aa read spans 40 k-mers, so W ≤ 40 puts an indexed k-mer in every whole read of an identical protein. Checked against brute force (`test_window_kmers_match_brute_force`). Minimizers first stopped at *t\_cap*, which left ~11% of w10 windows empty; uncapped: +1.6%. The query already keeps keys beyond *t\_cap*.
+  - **Results** (quarter sample, depth > 0.5, 1,538 strains; neighbour rule δ 0.1, cap 256; "short" ≤ 60 aa; bg = leaves hit by the background reads alone):
+
+    | Index | Postings (× medium) | Bytes | bg leaves | Candidates | All | ≥ 95% id | Short, ≥ 95% | > 60 aa, ≥ 95% | observable 8–15 | observable ≥ 16 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | medium | 1 | 20.9 MB | 602 | 65,439 | 0.775 | 0.928 | 0.768 | 0.954 | 0.624 | 0.907 |
+    | large | 1.84 | 30.5 MB | 1,126 | 70,432 | 0.842 | 0.958 | 0.786 | 0.987 | 0.734 | 0.969 |
+    | medium + w20 | 2.79 | 41.4 MB | 1,361 | 73,783 | 0.873 | 0.968 | 0.804 | 0.996 | 0.815 | 0.995 |
+    | medium + w10 | 4.13 | 56.8 MB | 1,705 | 75,297 | 0.901 | 0.977 | 0.839 | 1.0 | 0.925 | 0.998 |
+    | medium + w30, min 8 | 3.62 | 51.0 MB | 1,447 | 75,263 | 0.919 | 0.984 | 0.884 | 1.0 | 0.942 | 0.996 |
+    | medium + w20, min 8 | 3.99 | 55.2 MB | 1,561 | 75,695 | 0.921 | 0.984 | 0.884 | 1.0 | 0.948 | 0.997 |
+    | medium + w10, min 8 | 5.72 | 75.1 MB | 2,336 | 77,160 | 0.932 | 0.984 | 0.884 | 1.0 | 0.988 | 1.0 |
+
+    - Lowering *t\_base* to 0.005 under the windows saved nothing: floors and top-ups grew back (4.16× and 5.9×), with the same recall.
+    - `--min-hits` 2 halves to thirds the background leaves (1,561 → 530 on w20 min 8) but loses 5.7% of recall at depth > 0.5, mostly short and divergent strains. Recall first keeps 1.
+    - *Candidates* here are 26–29% of the quarter's proteins, for 2,000 strains: ~35 leaves per strain, its near-identical relatives. The background alone seeds 0.6–0.9% (1.4–2.3 k leaves from 125 k pairs).
+  - **Reading.**
+    - For proteins over 60 aa at ≥ 95% identity, windows reach 100% (w30 min 8 and up). Whenever the reads hold ≥ 16 source 11-mers, w10 min 8 recalls 100% and w20 min 8 99.7%.
+    - What is left is not reachable by an exact 11-mer index. Of short strains at depth > 0.5, 20% have no source 11-mer in their reads and 51% fewer than 8. At 80% identity, 18% of all strains have none. Depth > 0.5 on a 30–60 aa gene is often one read pair overlapping it by 15–20 aa.
+    - *The user's question (floors for short proteins):* raising them is what `--window-min` does, and it took short proteins with ≥ 8 observable k-mers from 86–90% to 99.1%. Beyond that a higher floor cannot help. A shorter seed for short proteins (k 8–9 or a reduced alphabet) would, at a cost in chance hits; not tried.
+    - *Cost:* w20 min 8 is ~4× medium's postings, ~2.6× its bytes here (per-leaf tables are fixed). At release that is roughly 500 GB against medium's 140–170 GB (estimate from the survey's projection). w30 min 8 is ~3.6× for the same recall at ≥ 95%.
+* **A k ladder for short proteins (2026-10-30, the user's request: try a shorter seed for short proteins first, as low as k 7; the medium tier should be about half of w30 min 8's size).**
+  - **`build.py --ladder k:max_len:w,...`:** leaves shorter than max\_len also hold window minimizers of k-mers of a shorter k, diffed by Fitch with the rest. The query hashes reads at each ladder k and keeps the k-mers that are keys.
+    - *Bug found on the way:* k-mer hashes do not depend on k. A 9-mer shared a hash with 11-mers, which put duplicate (leaf, hash) pairs into the Fitch kernel (a panic in `lca`). Ladder hashes are now moved to their own domain per k by a bijection (`query.salted`).
+  - **Results** (on medium + w30 min 8, depth > 0.5; neighbour rule δ 0.1, cap 256):
+
+    | Ladder | Postings (× medium) | bg hit hashes | bg leaves | All | ≥ 95% id | ≥ 90% id | Short, ≥ 95% | Short, all | observable 0 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | none | 3.62 | 700 | 1,447 | 0.919 | 0.984 | 0.972 | 0.884 | 0.744 | 0.082 |
+    | k 9 < 100 aa (w 4) | 5.45 | 2,089 | 2,613 | 0.949 | 0.991 | 0.987 | 0.938 | 0.843 | 0.342 |
+    | k 9 < 100 aa, k 7 < 60 aa (w 2) | 6.63 | 40,915 | 27,472 | 0.973 | 1.0 | 0.995 | 1.0 | 0.973 | 0.795 |
+    | k 7 < 100 aa (w 2) | 6.79 | 101,439 | 63,521 | 0.976 | 1.0 | 0.995 | 1.0 | 0.973 | 0.849 |
+
+  - **Reading.**
+    - k 7 closes the short-protein gap: 100% at ≥ 95% identity, and 80–85% of strains with no source 11-mer in their reads are found.
+    - But the background reads alone then seed 10–24% of the quarter index's leaves. The cause is read-side chance, not the index: a 7-mer occurs by chance about once per 20⁷ ≈ 1.3 × 10⁹ read windows, so in a 10 M-pair sample (~2 × 10⁹ windows) every indexed 7-mer is expected to be hit about once. At release every leaf holding 7-mers would be seeded in every sample.
+    - k 9 costs +1.8× postings for +3% recall (short proteins 88% to 94% at ≥ 95% identity), with ~1.8× the background seeds. At release, chance single 9-mer hits are ~2 × 10⁹ × keys / 20⁹, which is large too.
+  - **Design proposed (the user's points: the k per leaf from the data at build time, by k-mer count or uniqueness in the database rather than fixed thresholds; promiscuous k-mers removed by an information criterion on the tree rather than a holder cut):**
+    - *Evidence of a hit.* A hit on k-mer x is worth b(x) = −log₂ q₀(x) − log₂ g(x) bits. q₀(x) is the chance probability of x in a protein window, from residue composition, so low-complexity k-mers are worth less. g(x) is x's number of independent gains on the tree (Fitch), so a hit's weight is split over the g unrelated clades it seeds. A clade marker (one gain, however many leaves) keeps all its bits. This replaces the 16-unit cut and the plan's fixed gain cut.
+    - *Seeds by evidence within one read pair:* a leaf is a seed when its hits from one read pair sum to at least B bits. B is set by an expected number of chance seeds per sample: B = log₂(read windows × leaves / chance seeds). It is the one parameter, in units of false candidates, and it holds for every k: one clean 11-mer hit carries ~46 bits, so 7-mers need two or more hits in the same read to count. Seeds then need per-read hit sets (`FastxHits` gives read ids).
+    - *Pruning:* a k-mer is dropped when no read can use it, i.e. when even the most hits of its k that fit in one read alongside it cannot reach B.
+    - *The k per leaf:* going down the ladder (11, 9, 8, 7), a leaf takes the next k only while it has fewer window-covering k-mers with positive evidence than a read overlap needs. Evidence comes from the same Fitch pass, so the rule is set by the database, not by protein length.
+* **Seeds by evidence, the ladder by information, sized for two budgets (2026-10-30, the user's go-ahead on the design above; budgets: large about w30 min 8's ~425–515 GB, medium about half that).**
+  - **Build** writes each key's evidence per hit, b(x) = −log₂ q₀(x) − log₂ g(x) (`keys.npy`, `key_bits.npy`, `key_k.npy`).
+    - q₀ is the chance of the k-mer at a protein window, from the database's residue frequencies; g is the key's number of positive postings (Fitch gains, floors, top-ups).
+    - `merge.py` adds gains across parts exactly: 2^−b = q₀ g, so merged bits are −log₂ Σ 2^−b.
+  - **Ladder by information** (`--ladder k:w,...`, `--min-kmers M`): a leaf takes the next k while it has fewer than M informative k-mers at the k before. Informative means a priori rarer than one chance holder among the N leaves: −log₂ q₀ ≥ log₂ N. Low-complexity leaves therefore descend sooner, at the same length.
+  - **Query seeds by evidence** (`query.py`, reads; `seeds.parquet`, `evidence.parquet`):
+    - A read pair's hits on a leaf score Σ b − (m − 1) log₂(windows per read pair). Each hit after the first had that many places to fall by chance.
+    - Computed with one sweep over (read pair, range endpoints), as the counting sweep. Checked against brute force on the fixture (single and partitioned builds).
+    - The bar B is the least score at which the expected chance seeds, Σ over keys with b ≥ B of (read windows of its k) × 2^−b, are at most `--chance-share` (1%) of the seeds scoring ≥ B. The one parameter is a share of false candidates.
+    - B is relative, so it should hold as sample and index grow together. *Ceiling:* the chance term counts single hits only.
+  - **No pruning by gains was needed.** 7-mers carry 25–35 bits at ~3.5 gains per key: never enough alone (bar ~33–37 bits), but two in one read pair reach ~47 bits. A rule that drops keys unable to contribute removes almost nothing. Size is set by how many minimizers each leaf takes, so that is what the configurations below vary.
+  - **Floors are redundant** once every leaf has spread minimizers: without them (`--n-min 0`), recall was unchanged (M2 against M4, L2 against L3) for 0.23 M fewer postings on the quarter sample.
+  - **Results** (quarter sample, depth > 0.5, all frames; seeds by evidence at 1% chance share, with the neighbour rule δ 0.1, cap 256; bg = seeds from the background reads alone; release size scaled from medium's projection, 107–132 GB of postings plus ~35 GB of leaf tables, without the ~45 GB of spanning-tree edges the neighbour rule needs):
+
+    | Configuration | Postings (× medium) | ~Release | bg seeds | All | ≥ 95% id | ≥ 90% id | Short, ≥ 95% | > 60 aa, ≥ 95% |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | medium (hit leaves, `stopfree`) | 1 | 140–170 GB | 602 | 0.775 | 0.928 | 0.888 | 0.768 | 0.954 |
+    | **M5:** *t\_base* 0.01, no floors, ~6 spread minimizers (`--window 1000 --window-min 3`), k 7 at w 3 for < 32 informative 11-mers | 1.46 | 190–230 GB | 1,124 | 0.846 | 0.971 | 0.939 | 0.920 | 0.979 |
+    | **M4:** *t\_base* 0.02, no floors, ~8 spread minimizers (`--window-min 4`), k 7 at w 2 for < 32 | 2.04 | 255–305 GB | 1,683 | 0.889 | 0.989 | 0.966 | 0.955 | 0.994 |
+    | M2: as M4 with floors (*n\_min* 16, *τ* 0.3) | 2.41 | 290–355 GB | 1,829 | 0.895 | 0.989 | 0.969 | 0.955 | 0.994 |
+    | E0: w30 min 8, no ladder | 3.62 | 425–515 GB | 1,447 | 0.919 | 0.984 | 0.972 | 0.884 | 1.0 |
+    | **L3:** w40 min 8, no floors, k 7 at w 3 for < 48 | 4.09 | 475–575 GB | 2,969 | 0.951 | 1.0 | 0.993 | 1.0 | 1.0 |
+    | L2: as L3 with floors | 4.45 | 510–620 GB | 3,081 | 0.952 | 1.0 | 0.993 | 1.0 | 1.0 |
+    | E7: w30 min 8, floors, k 7 at w 2 for < 64 | 5.64 | 640–780 GB | 6,027 | 0.962 | 1.0 | 0.994 | 1.0 | 1.0 |
+
+    - Without the evidence bar, the same E7 index's hit leaves are seeded 42.6 k times by the background, against 6.0 k with it, for 0.6% less recall (0.941 against 0.935 before the neighbour rule).
+    - The neighbour rule adds 2.5–6% at all-identity recall, mostly divergent strains, for +18–27% candidate members.
+  - **Reading.**
+    - *Large:* L3 meets the target (100% at ≥ 95% identity, short proteins included; 99.3% at ≥ 90%) at ~475–575 GB, ~10% over w30 min 8's budget.
+    - *Medium:* M4 gives 98.9% at ≥ 95% (99.4% over 60 aa, 95.5% for short) at ~255–305 GB. M5 fits ~half the large budget (~190–230 GB) at 97.1%.
+    - The remaining misses at ≥ 95% identity are mostly strains whose reads hold few or no source 11-mers.
+* **Tiers by depth at L3's recall (2026-10-30, the user's request: L3-level recall with large to depth 0.5, medium to 1–1.5, small to 3–4).**
+  - **Second sample** (`sim2`): 3,000 other targets at identity 1 / 0.98 / 0.95 / 0.9, depth lognormal (μ 0.9, σ 0.8), the same background. Pooled with the first sample: 2,991 strains at ≥ 95% identity and 3,998 at ≥ 90% above depth 0.5, and 989 / 1,321 above depth 4.
+  - **Minimizer-only builds** (*t\_base* 0.001, no floors, `--window 1000 --window-min M`: about 2M spread minimizers per protein; k 7 at w 4 for < 16 informative 11-mers) are the efficient frontier at ≥ 90% identity.
+  - **Recall at ≥ 95% / ≥ 90% identity above each depth** (seeds by evidence at 1% chance share plus the neighbour rule; release size scaled as above, without spanning-tree edges):
+
+    | Index | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 1.5 | > 2 | > 3 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S3: *t\_base* 0.01, ~4 minimizers | 0.99 | 140–165 GB | 786 | 0.964 / 0.924 | 0.980 / 0.944 | 0.985 / 0.951 | 0.986 / 0.956 | 0.988 / 0.959 | 0.990 / 0.964 |
+    | M5 | 1.46 | 190–230 GB | 1,124 | 0.987 / 0.961 | 0.996 / 0.975 | 0.998 / 0.978 | 0.999 / 0.983 | 0.999 / 0.984 | 1.000 / 0.986 |
+    | S4: ~8 minimizers | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | – | 0.999 / 0.987 | 0.999 / 0.988 | 0.999 / 0.990 |
+    | **S5:** ~10 minimizers | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 0.999 / 0.990 | 1.000 / 0.994 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | M4 | 2.04 | 255–305 GB | 1,683 | 0.994 / 0.978 | 0.999 / 0.988 | 0.999 / 0.990 | 1.000 / 0.992 | 1.000 / 0.994 | 1.000 / 0.995 |
+    | **S7:** ~14 minimizers | 2.73 | 330–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.994 | 1.000 / 0.996 | 1.000 / 0.997 | – |
+    | **L3** | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 0.999 | 1.000 / 1.000 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - L3's level at depth > 0.5 is 0.999 / 0.993. It is reached by L3 at depth 0.5, by S7 (~14 minimizers) at 1.5, and by S5 (~10) at 2. S4 (~8) reaches 0.999 / 0.988–0.990 at depth 3–4.
+    - *Depth stops paying once the reads cover the protein.* What is left at ≥ 90% identity is proteins whose indexed 11-mers all carry a substitution: at identity p a protein with n indexed 11-mers is missed with probability ~(1 − p¹¹)ⁿ, 0.69ⁿ at 90%, at any depth. ~99.3% at 90% therefore needs n ≈ 14, which is S7.
+    - So tiers separated by depth compress: below ~1.5× (S3) recall at ≥ 90% stalls near 96% even at depth 4. A small tier at L3's ≥ 90% level is not much cheaper than the medium. At ≥ 95% only (miss ~0.43ⁿ), ~8 minimizers suffice from depth 2.
+* **Units above the leaves, the clustered index generalised (2026-10-30, the user's idea: store k-mers only for higher nodes while their members are within ~95% AAI, at higher density; then: pick each node by whether its k-mers can detect it to an AAI, rather than by a radius).**
+  - **Radius units with unions** (`build.py --unit-radius r`). Each spanning-tree component is walked from its root, and a leaf joins its parent's unit while its summed identity distance from the unit's first leaf is ≤ r (edge distance from dense 8-mer weights). Every member holds the union of the members' selected k-mers.
+    - r 0.025: 156,609 units of 261,954 leaves; 31,912 multi-leaf, holding 137,257 leaves (largest 233). r 0.05: 126,755 units, 167,697 leaves in multi-leaf units.
+  - **Detectability units** (`--detect-aai a*`, `--detect-miss ε`). A leaf joins its parent's unit while the unit's members still share N\* = ⌈log ε / log(1 − a\*¹¹)⌉ k-mers (≤ *t\_cap*): N\* is 14 at a\* 0.9 and 8 at 0.95, at ε 0.007. A multi-leaf unit then indexes its 2N\* lowest shared hashes in place of its members' own minimizers; lone leaves keep theirs.
+  - **Results** (both samples pooled; S5's settings, ~10 minimizers per leaf, unless noted; ≥ 95% / ≥ 90% identity):
+
+    | Build | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 2 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S4 (~8 per leaf) | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | 0.999 / 0.987 | 0.999 / 0.990 |
+    | D95 | 1.54 | 200–240 GB | 861 | 0.983 / 0.961 | 0.996 / 0.979 | 1.000 / 0.988 | 1.000 / 0.994 |
+    | S5 | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | U25 (union, r 0.025) | 2.05 | 255–305 GB | 1,088 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | U50 (union, r 0.05) | 2.12 | 260–315 GB | 1,277 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | D90 | 2.19 | 270–325 GB | 1,050 | 0.991 / 0.976 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | D90d (lone leaves ~14) | 2.71 | 325–395 GB | 1,182 | 0.993 / 0.981 | 0.998 / 0.990 | 1.000 / 0.995 | 1.000 / 0.998 |
+    | S7 (~14 per leaf) | 2.73 | 325–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | U25d (union, ~20 per leaf) | 4.11 | 475–580 GB | 2,208 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | L3 | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - Units neither save postings nor add recall. Unions cost +6–9% for identical recall. Detectability units land on the per-leaf curve (D95 ≈ S4; D90d ≈ S7, D90 between S5 and S7), and their candidate members are about the same as per-leaf builds.
+    - *Why:* the tree is already the general clustered index. Fitch posts a k-mer shared by near-identical members once, at their subtree, so per-leaf minimizers of close relatives cost about what a unit's shared set costs. What remains per leaf are k-mers its relatives do not share, and those are exactly the ones a strain diverged from that leaf needs. A union adds relatives' private k-mers, which a strain at 90% to the source does not carry.
+    - Recall at ≥ 90% is set by the indexed k-mers each protein has, ~0.69ⁿ misses as above, whether they are its own or its unit's. At equal n the cost is equal, so a unit cannot buy density.
+    - *Scale:* sharing grows with the number of relatives, so the per-protein cost of any design should fall at release against this quarter sample. The ratios between designs should hold, since every design shares the same way.
+* **Intersections, soft intersections and the tree's own internal states (2026-10-30, the user's follow-ups: intersections instead of unions with denser sampling; then sets weighted toward conserved k-mers; then the internal nodes' diffs themselves).**
+  - **Hard intersections** (`--unit-kmers n`): units grow over dense 11-mer sets while their members still share ≥ n. Each unit indexes ~n of the shared k-mers, spread along its first protein (minimizers restricted to shared k-mers), in place of its members' own.
+  - **Soft intersections** (`--unit-tau τ`): a unit's set is the k-mers held by ≥ τ of its members; a leaf joins while that set keeps ≥ n and the leaf holds ≥ τ of it.
+  - **Cuts on the tree's own states** (`--cut-detect a*`). The cut is the highest node whose Fitch state every leaf below still shares N\* of (as above; the shared count is |state(v)| less the losses on the path, a lower bound), and Fitch's changes below each cut are dropped. Every leaf under a cut then holds the node's state, a parsimony consensus that is a soft intersection taken from the tree with no extra sets. Covers were checked to sum to 0 or 1 (`build.holdings`) on a 20 k subset.
+  - **Results** (both samples pooled; *t\_base* 0.001, no floors, k 7 ladder at w 4 for < 16; ≥ 95% / ≥ 90% identity):
+
+    | Build | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 2 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S4 (~8 per leaf) | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | 0.999 / 0.987 | 0.999 / 0.990 |
+    | I16 (hard, n 16) | 1.60 | 205–245 GB | 897 | 0.983 / 0.962 | 0.993 / 0.977 | 0.998 / 0.987 | 0.999 / 0.992 |
+    | S5 (~10 per leaf) | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | C90 (S5, cuts at 0.9) | 1.94 | 240–290 GB | 887 | identical to S5 | | | |
+    | I24 (hard, n 24) | 1.99 | 250–300 GB | 1,082 | 0.989 / 0.971 | 0.997 / 0.985 | 1.000 / 0.993 | 1.000 / 0.997 |
+    | T60 (soft τ 0.6, n 24) | 1.99 | 250–300 GB | 1,031 | 0.990 / 0.972 | 0.997 / 0.983 | 0.999 / 0.993 | 1.000 / 0.998 |
+    | I32 (hard, n 32) | 2.36 | 290–345 GB | 1,155 | 0.990 / 0.975 | 0.997 / 0.986 | 1.000 / 0.994 | 1.000 / 0.997 |
+    | T80 (soft τ 0.8, n 24) | 2.37 | 290–345 GB | 988 | 0.992 / 0.976 | 0.997 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | S7 (~14 per leaf) | 2.73 | 325–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | C95d (~20 per leaf, cuts at 0.95) | 2.81 | 335–405 GB | 1,582 | 0.993 / 0.980 | 0.998 / 0.988 | 1.000 / 0.995 | 1.000 / 0.998 |
+    | C90d (~20 per leaf, cuts at 0.9) | 3.59 | 420–510 GB | 1,700 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | S10 (~20 per leaf, no cuts) | 3.87 | 450–545 GB | 1,722 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | L3 | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - Hard and soft intersections sit on or slightly below the per-leaf curve: I24 and T60 match S5 at +3%, and I32 and T80 match it at +22%. Their units are tight groups whose shared k-mers the tree already posts once.
+    - *Cuts on the tree's states are the one free saving:* at a\* 0.9 they drop 7% of a dense build's postings (S10 → C90d) with identical recall to three decimals. At S5's density they never bind, since a leaf with ~10 k-mers cannot share 14. Cutting at 0.95 removes 27% but lands back on the curve (C95d ≈ S7).
+    - L3 still beats the ~20-per-leaf builds at ≥ 90% identity (0.993 against 0.988) at similar size. Its k 7 ladder reaches more leaves (< 48 informative 11-mers, w 3, against < 16, w 4), so the ladder's reach matters more than 11-mer density for divergent strains.
+    - *Next, if pursued:* cuts at 0.9 on L3's settings, for an expected ~7% off the large tier at its recall.
+* **Recall at 70–85% identity, reduced alphabets, and false hits by decoys (2026-10-30, the user's request: recall at 70% AAI and 1× would be ideal; then Dayhoff k 7 with something clever for the false hits and the index size; high recall is the objective for now).**
+  - **Divergent samples.** `sim3`: 2,000 targets at identity 0.85 / 0.8 / 0.75 / 0.7, depth lognormal (μ 0.3, σ 0.6), uniform substitutions. `sim4`: the same with `spike.py simulate --substitution blosum62`, new residues weighted 2^(S/2) by BLOSUM62 as in real homologs.
+  - **Recall at depth > 1** (seeds by evidence at 1%, with the neighbour rule; BLOSUM / uniform sample):
+
+    | Build | Postings (× medium) | bg seeds | 85% | 80% | 75% | 70% |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | S5 | 1.94 | 887 | 0.79 / 0.79 | 0.59 / 0.57 | 0.45 / 0.38 | 0.34 / 0.33 |
+    | L3 | 4.09 | 2,969 | 0.92 / 0.92 | 0.77 / 0.79 | 0.62 / 0.61 | 0.47 / 0.46 |
+    | E7 | 5.64 | 6,027 | 0.93 / 0.94 | 0.83 / 0.84 | 0.71 / 0.70 | 0.55 / 0.54 |
+    | R10: S5 + Murphy-10 k 10 minimizers (w 4) on every leaf | 11.74 | 41,775 | 0.97 / 0.94 | 0.92 / 0.88 | 0.87 / 0.79 | 0.79 / 0.71 |
+    | R9: S5 + Murphy-10 k 9 (w 4) | 11.69 | 123,860 | 0.98 / 0.97 | 0.95 / 0.94 | 0.94 / 0.88 | 0.88 / 0.85 |
+
+  - **Feasibility, worked out** (187 aa, 1× ≈ 63% covered, BLOSUM62 substitutions, a protein missed when no indexed k-mer survives):
+    - Under BLOSUM62, 21% of substitutions stay within a Murphy-10 class and 30% within a Dayhoff class, against 9% and 16% under uniform.
+    - At equal bits, a shorter full-alphabet k-mer survives as well as or better than a reduced one: protein k 7 (29 bits) 0.082 against Murphy-10 k 10 (30 bits) 0.068; protein k 8 0.058 against Murphy-10 k 11 0.052.
+    - At 70%, a miss rate ≤ 1% needs k ≤ 7–8 with half of all k-mers indexed, or k 9 with all.
+  - **New tools:**
+    - Ladder steps take an alphabet (`murphy10:k:w`, `dayhoff:k:w`), salted per (alphabet, k), with composition bits from class frequencies.
+    - `:rare` picks each window's rarest k-mer in the database (an exact frequency table, at most 6⁷ entries for Dayhoff 7-mers) rather than its least hash.
+    - `:unit` chooses the step's k-mers on each tree unit's first protein (`--ladder-radius`, default 0.1) and gives them to every member.
+    - `query.py --decoy` seeds the reads reversed (not complemented) as decoys and sets the bar where decoy seeds are ≤ `--chance-share` of the sample's (target-decoy). Per-hit bits are floored at 0 in that mode.
+    - `--ladder-frames` sets the frames for ladder k-mers, and evidence is computed in chunks of read pairs.
+  - **Dayhoff k 7.**
+    - On every leaf (`dayhoff:7:4:rare`): 8.9 M postings (13.9×), 215 k keys (77% of all Dayhoff 7-mers) at 36 postings per key. A query would expand ~2.5 × 10⁹ rows, so it was not run.
+    - Per unit (`dayhoff:7:8:rare:unit`, r 0.1): 5.5 M postings (8.65×), 21 per key. Queried on `sim4` with the decoy bar and stop-free Dayhoff frames: 33 min and 10.4 GB for 135 k read pairs, almost all in Python evidence.
+    - **Decoys score as well as the sample:** at 30 bits, 85 k decoy leaves against 123 k; at 10 bits both cover the whole index. A 1% decoy share needs 63 bits, which also discards single 11-mer seeds (~46 bits). Recall at 70% fell to 0.20 (0.30 with the neighbour rule), below S5 without the layer; at a 10% share, 0.32.
+  - **Reading.**
+    - Exact seeds on a reduced alphabet reach divergent strains (R9: 0.88 at 70%), but their hits from one read pair cannot be told from chance by counting bits. At release scale, where every Dayhoff 7-mer is held by most families, that is worse.
+    - Telling homologs from chance at 70% from a read needs the read aligned: an ungapped extension along the hit's diagonal against the candidate's sequence, as BLAST and DIAMOND do after their seeds. That is the follow-up's alignment stage, not something the k-mer index can do alone.
+    - The bars should also be per layer, so a noisy layer cannot raise the bar for 11-mer seeds.
+* **The standard index restored, and a high-recall mode (2026-10-30, the user's decisions).** Below 200 GB including the neighbour rule's edges (which they judged important), so S3; the per-group sets, intersections and cuts removed for lack of value; Murphy-10/Dayhoff and BLOSUM62 strains kept; Dayhoff on by default in a high-recall mode, not for precision or F1 until tested there. Also agreed: verify reduced-alphabet seeds by ungapped extension, decoy bars per layer, and 80–85% as tier 1's target with 70–75% left to the follow-up's aligner.
+  - **`build.py` defaults are now S3** (`--mode standard`): a leaf per dense 8-mer set on the dense 8-mer spanning tree, Fitch diffs on it.
+    - *t\_base* 0.01, no floors (*n\_min* 0), top-ups to *n\_1* 2.
+    - ~4 spread 11-mer minimizers per protein (`--window 1000 --window-min 2`).
+    - The k 7 ladder at window 4 for leaves with < 32 informative 11-mers (`--ladder 7:4 --min-kmers 32`).
+    - ~140–165 GB at release (estimate, without the ~45 GB of spanning-tree edges). Recall ≥ 95% / ≥ 90% identity at depth > 0.5: 0.964 / 0.924; > 1: 0.980 / 0.944; > 4: 0.990 / 0.964.
+    - *For comparison:* ~6 minimizers per protein (S6m3, `--window-min 3`) measured 1.12× medium, ~155–185 GB, 0.992 / 0.965 at depth > 1.
+  - **`--mode recall`** adds `--layers dayhoff:7:8:rare`: the rarest Dayhoff 7-mer per window of 8 on every leaf. Layers are steps every leaf holds, unlike the ladder, which only leaves short of informative 11-mers take. Its size and decoy-controlled recall are as measured above for Dayhoff; precision and F1 are untested.
+  - **`query.py`:**
+    - `--frames` now defaults to `all` (`stopfree` loses reads across gene ends).
+    - `--mode recall` (default) uses every layer of the index; `--mode precision` uses full-alphabet k-mers only.
+  - **Removed:** `--unit-radius`, `--detect-aai`/`--detect-miss`, `--unit-kmers`/`--unit-tau`, `--cut-detect`, the ladder's `unit` flag and `--ladder-radius`, with their functions. Their results stay recorded above.
+  - **`build.nf`'s tiers** are now `standard` and `recall`. The recall tier's BUILD needs more memory per part: 9.4 GB per 262 k proteins on the quarter sample, so ~70 GB per 2 M-protein part, above BUILD's first 64 GB attempt.
+  - **Tests:** phase 1's medium settings (pinned with `--window 0 --ladder ""`) keep their brute-force checks. `test_default_modes_query_soundly` builds both modes and checks the query's counts and evidence against brute force, Dayhoff keys included.
+* **Plan: reduced amino-acid alphabets next (2026-10-30, the user's request).** Added as phase 6b: a range of reduced alphabets (Murphy 8/12/15, DIAMOND's 11, MMseqs2's 13, SE-B(14), BLOSUM-optimised compressed alphabets) for the high-recall layer, compared at matched bits per k-mer on BLOSUM62 strains with decoy bars. Dayhoff and Murphy-10, the two tried so far, are reduced alphabets too, but small and not chosen for sensitivity.

@@ -142,8 +142,8 @@ Not covered here:
 
 ## Building the tiers (`build.nf`)
 
-`build.nf` builds the three tiers chosen from the per-protein survey (the plan's Progress log)
-from one members table, in parts:
+`build.nf` builds the standard tier and the high-recall one (the plan's Progress log: the
+standard index restored) from one members table, in parts:
 
 ```
 FIXTURE    synthetic members when --members is '' (the test profile)
@@ -151,8 +151,8 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            the pair join, _core.overlap_components) or an equal sequence; components packed
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
-           topology, base band by Fitch on the spanning tree, floors per piece, per-leaf
-           top-ups
+           topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
+           tree, per-leaf top-ups; recall also a Dayhoff 7-mer layer on every leaf
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
 ```
 
@@ -161,9 +161,12 @@ nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixtur
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
 ```
 
-`--tiers` holds `name:build.py options` pairs, `;`-separated. The defaults are quick
-(*t\_base* 0.01, *n\_min* 8, *τ* 0, *n\_1* 1), medium (0.02, 16, 0.3, 2) and large (0.05, 32,
-0.3, 2). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
+`--tiers` holds `name:build.py options` pairs, `;`-separated (options without `:`). The
+defaults are `standard` (`build.py --mode standard`, the defaults: *t\_base* 0.01, no floors,
+~4 spread minimizers per protein, k 7 at window 4 for leaves with < 32 informative 11-mers;
+~140–165 GB at release, estimated) and `recall` (`--mode recall`: also the rarest Dayhoff 7-mer
+per window of 8 on every leaf, for high recall at 70–85% identity; several times the standard
+size, and not yet tested for precision or F1). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
 
@@ -172,3 +175,45 @@ Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITIO
 
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
+
+## Querying and reporting (`query.py`, `report.py`)
+
+```bash
+python workflows/tree-index/query.py --index index-medium --reads r1.fq r2.fq --out q
+python workflows/tree-index/report.py --index index-medium --query q --out r
+```
+
+`query.py` counts hits per leaf position and internal node (phase 2). `report.py` (phase 3)
+adds naive containment AAI with an interval to both, then:
+
+- **candidates** (recall first): every leaf with `--min-hits` hit k-mers (default 1) and its
+  single-linkage cluster on the spanning tree at the neighbour rule's radius (`--delta`, default
+  0.1; at most `--max-neighbours` per seed, nearest first). `candidates.parquet` has them as
+  position ranges and `members.parquet` as proteins, for round 2 and the pileup's reference;
+- **gather** over the hit leaves, with ties within `--tie-z` reported as their smallest common
+  subtree (`gather.parquet`).
+
+The neighbour rule needs an index built with `--leaves proteins` (the default), whose spanning
+tree's edges (`edge_*.npy`) are in dense 8-mer units.
+
+`build.py --window W [--window-min M]` adds window minimizers to the base band (each leaf's least
+hash in every window of W k-mers, the window shrunk to n\_k // M for short leaves), for recall.
+`recall.py` scores candidate recall against `spike-benchmark/spike.py simulate`'s truth:
+
+```bash
+python workflows/tree-index/recall.py targets --members members.parquet --index idx --out targets.fa
+python workflows/spike-benchmark/spike.py simulate --targets targets.fa --present 1 \
+    --identities 1 0.98 0.95 0.9 0.85 0.8 --depth-mu 0 --depth-sigma 1.2 --out sim
+python workflows/tree-index/query.py --index idx --reads sim/reads_1.fq.gz sim/reads_2.fq.gz \
+    --frames all --out q
+python workflows/tree-index/recall.py score --index idx --query q --truth sim/truth.tsv \
+    --reads sim/reads_1.fq.gz sim/reads_2.fq.gz --targets targets.fa --out s
+```
+
+Seeds by evidence: `build.py` writes each key's bits per hit (`key_bits.npy`: −log₂ of its
+chance probability from residue composition, less log₂ of its gains on the tree), and
+`--ladder k:w,... --min-kmers M` gives a leaf shorter-k minimizers while it has fewer than M
+informative k-mers. With reads, `query.py` scores each leaf by its best read pair's hits
+(`seeds.parquet`) and picks the bar at which expected chance seeds are `--chance-share` (1%) of
+the seeds (`evidence.parquet`, `evidence_bits` in `query.json`). `recall.py score` reports these
+as `ev_<share>` strategies.

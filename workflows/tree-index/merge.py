@@ -1,8 +1,9 @@
 """Tree index: merge part indexes (``build.py`` on ``partition.py``'s parts) into one.
 
-Parts are taken in name order. Positions, node ranges, pieces and protein positions are offset
-by the positions before each part; internal nodes are numbered part by part; postings are
-re-sorted by (hash, lo). The result has ``build.py``'s format, so ``query.py`` reads it as is.
+Parts are taken in name order. Positions, node ranges, spanning-tree edges, pieces and protein
+positions are offset by the positions before each part; internal nodes are numbered part by part;
+postings are re-sorted by (hash, lo). The result has ``build.py``'s format, so ``query.py`` reads
+it as is.
 """
 
 import argparse
@@ -14,6 +15,7 @@ import numpy as np
 import polars as pl
 
 ARRAYS = ("hash", "lo", "hi", "sign", "kind")
+TABLES = ("node_level", "pos_size", "node_size", "pos_len", "edge_w")  # concatenated as they are
 
 
 def main() -> None:
@@ -30,16 +32,18 @@ def main() -> None:
     if any(m["params"] != params for m in metas):
         raise ValueError("parts were built with different parameters")
     cols: dict[str, list[np.ndarray]] = {
-        x: [] for x in (*ARRAYS, "node_lo", "node_hi", "node_level", "pos_size", "node_size")
+        x: [] for x in (*ARRAYS, *TABLES, "node_lo", "node_hi", "edge_a", "edge_b")
     }
-    pieces, proteins = [], []
+    pieces, proteins, bits = [], [], []
     off = 0
     for p, m in zip(parts, metas, strict=True):
         load = lambda name: np.load(p / f"{name}.npy")  # noqa: B023, E731
-        for x in ("hash", "sign", "kind", "node_level", "pos_size", "node_size"):
+        for x in ("hash", "sign", "kind", *TABLES):
             cols[x].append(load(x))
-        for x in ("lo", "hi", "node_lo", "node_hi"):
+        for x in ("lo", "hi", "node_lo", "node_hi", "edge_a", "edge_b"):
             cols[x].append(load(x).astype(np.uint64) + off)
+        names = (("hash", "keys"), ("bits", "key_bits"), ("k", "key_k"))
+        bits.append(pl.DataFrame({x: np.load(p / f"{y}.npy") for x, y in names}))
         pieces.append(pl.read_parquet(p / "pieces.parquet").with_columns(pl.col("lo", "hi") + off))
         proteins.append(
             pl.read_parquet(p / "proteins.parquet").with_columns(
@@ -54,9 +58,19 @@ def main() -> None:
     for x in ARRAYS:
         dtype = np.uint32 if x in ("lo", "hi") else merged[x].dtype
         np.save(out / f"{x}.npy", merged[x][order].astype(dtype))
-    for x in ("node_lo", "node_hi", "node_level", "pos_size", "node_size"):
-        dtype = np.uint32 if x in ("node_lo", "node_hi") else merged[x].dtype
+    for x in ("node_lo", "node_hi", "edge_a", "edge_b", *TABLES):
+        dtype = np.uint32 if x in ("node_lo", "node_hi", "edge_a", "edge_b") else merged[x].dtype
         np.save(out / f"{x}.npy", merged[x].astype(dtype))
+    # 2^-bits = q0 g, and q0 is a k-mer's own: gains across parts add
+    keys = (
+        pl.concat(bits)
+        .group_by("hash")
+        .agg(pl.col("k").first(), bits=-(2.0 ** -pl.col("bits").cast(pl.Float64)).sum().log(2))
+        .sort("hash")
+    )
+    np.save(out / "keys.npy", keys["hash"].to_numpy())
+    np.save(out / "key_bits.npy", keys["bits"].to_numpy().astype(np.float32))
+    np.save(out / "key_k.npy", keys["k"].to_numpy())
     pl.concat(pieces).write_parquet(out / "pieces.parquet")
     prot = pl.concat(proteins)
     prot.write_parquet(out / "proteins.parquet")

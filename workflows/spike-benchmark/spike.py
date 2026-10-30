@@ -84,12 +84,23 @@ PRESENT_PROB: Final = 0.5
 INFORMATIVE: Final = 0.1  # sim_sharp_*: intervals at most this wide
 
 
-def mutate(seq: str, identity: float, rng: random.Random, alphabet: str) -> str:
-    """Substitute a (1 - identity) share of the sites, uniformly. Nucleotide sequences are
-    CDS in frame: a substitution that would make a stop codon takes another base (or none),
-    as real genes carry no internal stops."""
+def mutate(
+    seq: str,
+    identity: float,
+    rng: random.Random,
+    alphabet: str,
+    weights: dict[str, tuple[str, list[float]]] | None = None,
+) -> str:
+    """Substitute a (1 - identity) share of the sites, uniformly over sites. The new residue
+    is uniform over the alphabet, or drawn by ``weights`` (residue -> (choices, weights);
+    see :func:`blosum_weights`). Nucleotide sequences are CDS in frame: a substitution that
+    would make a stop codon takes another base (or none), as real genes carry no internal
+    stops."""
     out = list(seq)
     for i in rng.sample(range(len(seq)), round((1 - identity) * len(seq))):
+        if weights and seq[i] in weights:
+            out[i] = rng.choices(*weights[seq[i]])[0]
+            continue
         choices = alphabet.replace(seq[i], "")
         if alphabet == BASES:
             c = i - i % 3
@@ -101,6 +112,19 @@ def mutate(seq: str, identity: float, rng: random.Random, alphabet: str) -> str:
         if choices:
             out[i] = rng.choice(choices)
     return "".join(out)
+
+
+def blosum_weights() -> dict[str, tuple[str, list[float]]]:
+    """Per residue, the other residues weighted 2^(S/2) by BLOSUM62 (half-bit scores, so
+    the target-to-background odds): substitutions as conservative as real homologs'."""
+    from Bio.Align import substitution_matrices
+
+    m = substitution_matrices.load("BLOSUM62")
+    out = {}
+    for a in AMINO:
+        others = AMINO.replace(a, "")
+        out[a] = (others, [2.0 ** (m[a][b] / 2) for b in others])
+    return out
 
 
 SENSE: Final = [c for c, t in zip(CODONS, CODE_11, strict=True) if t != "*"]
@@ -214,12 +238,13 @@ def simulate(args: argparse.Namespace) -> None:
     present = set(rng.sample(names, round(args.present * len(names))))
     present |= {s for s in sorted(sibling_parent) if rng.random() < args.sibling_present}
 
+    weights = blosum_weights() if args.substitution == "blosum62" and not nucleotide else None
     strains = []  # (kind, unit, parent unit, member, identity_bin, sequence)
     for unit in sorted(present):
         member = rng.choice(units[unit])
         ident = rng.choice(args.identities)
         kind = "sibling" if unit in sibling_parent else "strain"
-        seq = mutate(targets[member], ident, rng, alphabet)
+        seq = mutate(targets[member], ident, rng, alphabet, weights)
         strains.append((kind, unit, sibling_parent.get(unit, unit), member, ident, seq))
 
     qual = chr(33 + round(-10 * math.log10(max(args.error, 1e-4))))
@@ -647,6 +672,10 @@ def main() -> None:
     p.add_argument("--identities", type=float, nargs="+", default=[1.0, 0.98, 0.95, 0.9])
     p.add_argument("--siblings", type=Path, help="siblings.tsv of `siblings`")
     p.add_argument("--sibling-present", type=float, default=1.0)
+    p.add_argument(
+        "--substitution", choices=["uniform", "blosum62"], default="uniform",
+        help="protein strains: new residues uniform, or weighted by BLOSUM62",
+    )  # fmt: skip
     p.add_argument("--depth-mu", type=float, default=1.5)
     p.add_argument("--depth-sigma", type=float, default=1.0)
     p.add_argument("--max-depth", type=float, default=100.0)
