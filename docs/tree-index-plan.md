@@ -149,7 +149,7 @@ It may be more efficient at query time: fewer, shorter posting lists for clade k
 
 ## Density
 
-- **No dense global tier.** Every distinct k-mer needs at least one gain, so the tree's postings are at least the distinct k-mer count, ~5 × 10¹¹ dense 11-mers if about half of MGnify's ~10¹² occurrences are distinct (the main plan's guess). With deletions that is ~5–8 TB, ~2× smaller than a flat dense index but ~50× the standard tier.
+- **No dense global tier.** *Measured 2026-10-30 (phase 0): dense distinct over total is 0.14 over the whole release, not the ~0.5 assumed below, so ~1.5 × 10¹¹ distinct dense 11-mers rather than ~5 × 10¹¹; the TB figures below shrink by ~3.5×. A dense global tier is still ~10× the standard tier.* Every distinct k-mer needs at least one gain, so the tree's postings are at least the distinct k-mer count, ~5 × 10¹¹ dense 11-mers if about half of MGnify's ~10¹² occurrences are distinct (the main plan's guess). With deletions that is ~5–8 TB, ~2× smaller than a flat dense index but ~50× the standard tier.
 - **Tier 1 can be somewhat denser at the same size.** Today's postings are ~1.7 units per k-mer; the tree posts a clade's k-mer once. Deletions, the node table and the k-mers today's 16-unit cut drops take part of that back, so the room is ~1.2–2× the sampling rate at matched size (phase 0). The query does not get denser: it already probes every hash ≤ *t\_max* = 0.2, so per-node rates under the cap add hits, not lookups.
 - **Resolution follows density.** At tier 1's rates (effectively ~0.06, with floors), near-identical members share nodes. Dense, almost every sequence is its own node (MGnify is 100%-deduplicated), and only contained fragments collapse. Per-sequence resolution and presence on a candidate's own k-mers therefore still need a dense second tier.
 - **One topology, many densities.** Sampling is uniform, so a tree near-optimal at one rate is near-optimal at another. Dense, near-dense and other-k diffs can be computed along the edges of the tree built once at tier 1's rate (plus dense tie-breaks), as a linear pass over edges with no new spanning tree. Phase 0 checks this against a tree built at the dense rate.
@@ -306,7 +306,7 @@ Without MGnify90 units, "the right unit" is no longer defined, so accuracy is sc
 
 Laptop work runs one job at a time with capped threads; full-scale runs go to HPC as Nextflow (SLURM + Singularity) for the user to run.
 
-0. **Measure, no index (gate for everything after).** *Set up 2026-10-30 (`workflows/tree-index`), not run; see Progress log.* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
+0. **Measure, no index (gate for everything after).** *Run 2026-10-30: **gate failed** on postings (3.8× tier 1 with per-sequence floors; 0.64× without floors); leaves 1.98× units (passes). Stopped here pending a decision on floors; see Progress log.* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
    - spanning tree under |S\_a Δ S\_b| with the virtual empty root: exact (all candidate pairs from the inverted index, Kruskal) at this size, and the staged build (stages 1–4) beside it. Report the staged tree's total weight against the exact one, each stage's candidates, largest signature group, and prefix posting lengths;
    - equal-set and containment collapses;
    - *diff schemes* (Diff schemes): postings and build time for the sequence MST, add-only, majority and Fitch on the same merge tree, on the same sample. **Decision:** Fitch on the merge tree unless the sequence MST is within ~10% of its postings and clearly cheaper to build;
@@ -398,3 +398,140 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - *Not covered* (pending): the sparse-against-dense reach on `presence-calibration`'s misses, which needs a topology over the full index's units (phase 5); how many chunks the spike benchmark's candidate subtrees touch; NN-descent (stage 5); dense tie-breaks.
   - *Fixture only, not evidence:* on synthetic families (60 roots, members at 80–100%, half with fragments), Fitch < add-only < majority < sequence MST with floors (9,686, 10,169, 10,953, 11,831 postings). The postings ratio against tier 1 is 2.9 with floors and 0.93 without, because the fixture's many short fragments raise the floors. The edge-cost curve crosses 1 near 92% identity. The real numbers come from the HPC run.
   - *Amended 2026-10-30 (HPC run: REDUCE killed, exit 137).* One `group_by` held a whole hash range of the release at once, ~2 × 10⁹ rows at 16 ranges. REDUCE is now `workflows/tree-index/reduce.py`. It splits each bucket's file by key into `--reduce_passes` (64) sub-partitions in the task directory, then sums them one at a time. Memory is about one sub-partition (~3 × 10⁷ rows); scratch disk is about the range's input, freed as it goes. Outputs match the old REDUCE on the fixture, apart from the order of tied largest groups. It is a separate script so `phase0.py` is unchanged and `-resume` keeps SAMPLE and STREAM.
+
+* **Phase 0 results (2026-10-30, the user's HPC run of `hpc/kfp-ablations/tree-index-phase0`; REDUCE re-run out of core after exit 137).** Sample: 1 in 5,000 clusters, 308,997 units, 1,067,329 proteins. Tier 1: the standard tier (`tbase02_all16`) built on the same proteins, 1,727,926 postings. MEASURE took 92 s and 8.7 GB on the sample (382 s and 24 GB with the representatives); STREAM about 7–9 min and up to 14 GB per bucket.
+  - **Gate: failed on postings.** Fitch with per-sequence floors: 6,600,680 postings, **3.82×** tier 1 (limit 1.5×). Floors on forest components only: 2.23×. Without floors: **0.64×**. Leaves: 612,857, **1.98×** units (limit 2×, passes narrowly); internal nodes 293,064.
+  - **Why: the floors, not the tree.** By hash band, k-mers at or below *t\_base* (0.02) cost 1,252,535 postings for 988,458 distinct k-mers. That is already below tier 1's total. K-mers above it, held only because of per-sequence floors, cost 5,348,145 postings for 4,552,777 distinct k-mers (1.7 holders each).
+    - Every distinct k-mer needs at least one gain, so no tree can share these away.
+    - Each sequence's floor samples its own ~16 low-hash k-mers. Members of a 90% cluster share only ~p¹¹ of their 11-mers, so most floor k-mers are new.
+    - Tier 1 floors per unit instead: 16 k-mers per floored non-singleton unit (77,242 of them), chosen by *p\_in* / *n\_groups*, so mostly consensus k-mers, plus the base stratum.
+    - The design's "coordinated floors share postings high in the tree" (Variable thresholds) does not hold: near-identical neighbours do share floor k-mers, but most members are not near-identical at 11-mers.
+    - The comparison is therefore not at matched *t*: tier 1's floors are per cluster and selected, the tree's per sequence and complete.
+  - **Without floors the tree is smaller than tier 1, but loses short proteins.** 1,106,270 postings (0.64×), but 166,704 proteins (15.6%) have no k-mer at or below 0.02 and so no leaf. Tier 1's singletons (226,659 of its units) are also unfloored, so it loses many of the same proteins; that overlap was not measured.
+  - **Diff schemes:** Fitch 6.60 M; add-only 1.065×; majority 1.11×; sequence MST 1.16×. Fitch's pass took 0.78 s against 0.06 s for the sequence MST, both negligible. **Decision: Fitch on the merge tree.**
+  - **Staged build:** total weight 1.019× the exact tree's, and Fitch on it 0.4% above. Stage 3: 514,307 candidates, 88% of them false positives; largest signature group 215 in the sample, 35,155 over the whole release. Stage 4: 572,613 representatives, 3.04 M prefix candidates, no capped posting in the sample (88 with the representatives). The exact join on the sample took 3 s (3.3 × 10⁸ probes), so phase 1 needs the staged build only at full scale.
+  - **Collapses:** 2,073 empty sets. Equal sets collapse 13.5% of proteins in the sample and 15.3% over the whole release (largest group 4,314). Contained sets: 308,057 of 920,914 distinct sets. **Only 42.7% of partial proteins are contained** (29.2% of full-length ones), far below the "partials collapse into their containers" the node estimate assumed. Strict containment on the common hash range may be too strict (a tolerance is the open option); the node gate still passes.
+  - **Uninformative k-mers:** dropping k-mers with more than 2, 4 or 8 gains saves 9.8%, 5.1% and 2.4% of postings. The 16-unit cut drops 88 k-mers in a 1-in-5,000 sample, which says nothing about full scale.
+  - **Edge cost by identity:** pairs sharing a stored k-mer have median cost 1 (as costly as storing fresh) at 89–90% identity, not the ~94% estimated from *p*¹¹. Spanning-tree edges stay below 1 down to 80%.
+  - **Density:** distinct over total is 0.26 on the sample at every uniform rate (0.06, 0.2, 1), as expected for uniform sampling. Over the whole release it is 0.14 for all k-mers and 0.34 for stored ones in the sample, 0.19 and 0.37 in the whole release's 0.06 and 0.2 slices. The largest dense holder count in a slice is 494,986 proteins. Stored k-mers over the whole release: 9.15 × 10¹⁰, ~16 per protein.
+  - **One topology, many densities:** on 49,994 proteins at *t* 1, Fitch along the stored-rate tree is 6.1% above a tree built at that rate (k 11), and 7.1% above at k 8. **Passes:** dense and routing diffs can reuse the stored topology.
+  - **Chunking:** at the stored rate, duplicated postings are 2.5% at a budget of 10³ stored k-mers, 0.12% at 10⁴, and 0 from 10⁵ (no component is larger). At *t* 1: 64%, 18%, 2.3% and 0 at 10³–10⁶. Budgets of ≥ 10⁵ dense k-mers per chunk are cheap.
+  - **Sensitive topology: inconclusive at this sample.** It ran on 11,431 component representatives from random clusters, which rarely have relatives in the sample: only 9–809 pairs fall within *R* 0.05–0.3.
+    - The exact k 6 MST is mostly chance edges (205 components, against 9,026 for the seeded graph); the seeded candidates hold only 9% of its edges.
+    - Within *R*, candidate generation loses at most 2.3% of pairs (at *R* 0.3) with exact weights, but sketch weights lose 6–33%. The noise of the *t* 0.25 sketch, not the seeds, is the weak point.
+    - k 11 storage along the sensitive topology (263,239) is no worse than along the storage tree (264,553).
+    - A sample built around families (whole Pfam families, or `presence-calibration`'s misses with their relatives) is needed to decide it.
+  - **Cross-cluster sharing** (`measure-all`; the 10⁶ representatives cap was reached): 55% of spanning-tree edges link different MGnify90 clusters, against 1.7% in the sample alone. Fitch 8.74 M (Fitch without floors 1.85 M) over 1,308,997 units.
+  - **Interpretation.** The tree's encoding works as designed:
+    - Fitch is the cheapest scheme;
+    - the staged build is near-exact;
+    - one topology serves other densities;
+    - chunking is cheap;
+    - without floors it is 0.64× tier 1.
+
+    What fails is per-sequence floors. They multiply distinct k-mers by ~4.6 (988 k to 5.5 M), and no topology can share those. By the phase-0 rule this stops the plan as written. Continuing needs a floor design that is not per sequence, measured against tier 1 at matched sensitivity: for example, floors per subtree (forest component or single-linkage cluster) chosen by consensus as tier 1's are, or a lower per-sequence *n\_min*. That is the user's decision (pending).
+
+* **Forest floors explored (2026-10-30, the user's idea: a forest rather than one tree, so the hierarchy that forces per-sequence floors is not kept).** Local exploration, not a workflow yet. Run on a quarter of phase 0's sample: clusters with `cluster_rep % 20000 == 0`, 77,317 units, 262,391 proteins. On this quarter, tier 1 has 432,440 postings and per-sequence floors 1,642,628 (3.80×, as on the whole sample).
+  - **Design tried.**
+    - The topology is phase 0's exact storage tree, built on floored sets.
+    - Its merge tree is cut into pieces at merge level > *c* (stored-k-mer weight); *c* = ∞ keeps the forest components.
+    - Leaves keep only base-band k-mers (≤ *t\_base*), diffed by Fitch inside each piece.
+    - Each piece gets one floor in tier 1's manner: *t\_p* = max(*t\_base*, min(*t\_cap*, *n\_min* / distinct k-mers of its union)), keeping the *n\_min* candidates above *t\_base* held by most members. These are posted once at the piece's root.
+    - Singleton pieces get no floor, as tier 1's singleton units get none.
+  - **Results** (postings over tier 1's; blind = proteins whose piece has no k-mer at all):
+
+    | Cut *c* | Pieces | With ≥ 2 members | Base Fitch | Piece floors | Total | / tier 1 | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 0 | 151,163 | 30,365 | 497,145 | 301,946 | 799,091 | 1.85× | 22,463 |
+    | 2 | 145,785 | 29,682 | 473,031 | 294,928 | 767,959 | 1.78× | 22,126 |
+    | 4 | 131,199 | 26,829 | 418,021 | 267,960 | 685,981 | 1.59× | 21,062 |
+    | 6 | 117,315 | 24,383 | 377,654 | 243,841 | 621,495 | 1.44× | 19,885 |
+    | 8 | 106,298 | 22,733 | 352,125 | 225,687 | 577,812 | 1.34× | 19,018 |
+    | 16 | 84,565 | 20,452 | 315,185 | 196,217 | 511,402 | 1.18× | 17,213 |
+    | ∞ (components) | 80,880 | 20,647 | 309,853 | 196,385 | 506,238 | **1.17×** | 16,936 |
+    | tier 1 | 77,317 units | 20,648 | | | 432,440 | 1× | 16,075 |
+
+  - **Reading.**
+    - With floors on pieces rather than sequences, the tree comes within 1.17× of tier 1 at almost the same blindness (16,936 against 16,075 proteins), inside the phase-0 limit of 1.5×. It also keeps per-sequence resolution in the base band, which tier 1 does not have.
+    - **Cutting finer does not help.** Every extra piece needs its own floor and loses base-band sharing across the cut, so cost falls monotonically as cuts coarsen. The useful forest is the storage forest (components), with floors at component roots.
+    - The fine cuts (≤ 8) buy finer floor resolution at 1.3–1.9×.
+    - Flooring singleton pieces too (each with its own *n\_min* candidates) costs 562,540 more postings at components (2.47× in all) and leaves no protein blind.
+  - **Caveats.**
+    - Random 1-in-20,000 clusters rarely have relatives in the sample, so components here are close to clusters. At full scale, cross-cluster links (55% of spanning-tree edges in `measure-all`) make fewer, larger components: fewer floors, but coarser ones.
+    - Floor candidates are ranked by holders only; tier 1 also divides by *n\_groups*.
+    - Measured on a quarter sample; the workflow does not yet compute it.
+  - *Next (pending the user's decision):* add piece floors as a variant of `measure` (cut ladder, with and without singleton floors) and re-run phase 0 on HPC, including `measure-all`, to re-check the gate at full sample size.
+  - **Both: the full hierarchy kept, floors lower down (the user, same day: "the hierarchy beyond this might still be useful for neighbours but not for the diffs"; "can I have both?").** Postings and topology are independent.
+    - The whole merge tree and its single leaf order are kept: the neighbour rule's single-linkage clusters at any level, chunks, and reported subtrees are all contiguous ranges of it.
+    - The sparse or sensitive linking of components above the storage forest is kept too.
+    - Only *where postings sit* is restricted. Base-band k-mers are diffed by Fitch over the whole tree; above a component no base-band k-mer is shared anyway, so this costs the same as the forest. Floor k-mers are posted at piece roots at cut *c*.
+    - The two bands hold disjoint k-mers (≤ *t\_base* and > *t\_base*), so the costs add. A floor k-mer chosen in several pieces is counted once per piece, an upper bound.
+    - Merge nodes above the cuts carry no postings, only their N − 1 rows in the node table, which exists anyway.
+
+    | Floor cut *c* | Floor pieces | Base Fitch (whole tree) | Piece floors | Total | / tier 1 | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0 | 151,163 | 309,853 | 301,946 | 611,799 | 1.41× | 22,463 |
+    | 4 | 131,199 | 309,853 | 267,960 | 577,813 | 1.34× | 21,062 |
+    | 8 | 106,298 | 309,853 | 225,687 | 535,540 | 1.24× | 19,018 |
+    | 16 | 84,565 | 309,853 | 196,217 | 506,070 | 1.17× | 17,213 |
+    | ∞ (components) | 80,880 | 309,853 | 196,385 | 506,238 | 1.17× | 16,936 |
+
+    Every cut now passes 1.5×: the cost of finer floors is only the floors themselves. The cut sets floor resolution (and blindness: finer pieces of one member leave short proteins unfloored), not diff cost or neighbour reach.
+  - **Pieces by a metric, not a fixed cut (the user, same day: "can the point the diffs start be based on some metric (e.g. some information metric) rather than an arbitrary threshold").**
+    - Postings alone always choose the coarsest cut (components), so the metric has to value resolution. The natural one is **floor coherence**: the mean share of a piece's floor k-mers that a member holds (the floor's mean *p\_in*), about the chance that a member's reads hit its floor.
+    - Rule: top-down from each component, a node whose floor is at least *τ* coherent is a piece; otherwise its children are tried. Pieces grow where members agree and split where they do not, so the cut level adapts per clade.
+    - *τ* can be set from data rather than chosen: today's tier-1 units have a floor coherence of 0.62 (mean; median 0.625) by the same measure, over 19,187 units with ≥ 2 members on this quarter sample. Quarter sample, base band 309,853 postings over the whole tree:
+
+    | *τ* | Pieces | Floored | Floor postings | Total | / tier 1 | Floored pieces' mean coherence | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 0.3 | 83,471 | 20,284 | 211,822 | 521,675 | 1.21× | 0.66 | 17,127 |
+    | 0.5 | 90,761 | 23,067 | 245,779 | 555,632 | 1.28× | 0.70 | 17,666 |
+    | 0.6 | 97,378 | 24,357 | 263,447 | 573,300 | 1.33× | 0.73 | 18,404 |
+    | 0.7 | 104,986 | 24,250 | 263,742 | 573,595 | 1.33× | 0.77 | 19,629 |
+    | 0.9 | 117,064 | 21,183 | 231,862 | 541,715 | 1.25× | 0.80 | 21,630 |
+    | tier 1 | 77,317 units | 19,187 | | 432,440 | 1× | 0.62 | 16,075 |
+
+    - **Reading.** At *τ* = 0.3, floors are already more coherent than tier 1's (0.66 against 0.62), for 1.21× its postings, with about tier 1's blindness. That beats the fixed cut at level 8 (1.24×, 19,018 blind).
+    - Raising *τ* buys coherence (0.80 at *τ* 0.9) but splits more clades into single members, which get no floor, so blindness rises. Above 0.7 floor postings fall for that reason.
+    - Matching tier 1's coherence (*τ* ≈ 0.6) costs 1.33×. All are within the 1.5× gate.
+    - **Alternatives considered:**
+      - Minimum description length (MDL), counting each member that lacks a floor k-mer as a correction posting. With no weight on the corrections it is the postings-only answer (components); with full weight it is per-sequence floors again (3.8×). It needs a weight, which is *τ* in other units.
+      - A detection-probability rule: *τ* set so that a member's reads give ≥ *m* floor hits with probability *P* at a given depth. Same rule, with *τ* derived from the query's needs.
+    - Floor candidates here are ranked by holders only, and the union's k-mer count is estimated from hashes ≤ *t\_cap*.
+  - **Proteins without a k-mer of their own (the user, same day: "that should never be"; would they still reach tier 2 through a higher node?).** On the quarter sample, 40,199 of 262,391 proteins (15.3%) have no 11-mer at or below *t\_base* 0.02. By how the hierarchy reaches them:
+    - 18,589 sit in a storage component with other leaves. A hit on a relative reaches them by the neighbour rule (its single-linkage cluster at *R\_v*), so a recall-first tier 1 sends them to the sample's dense tier 2 whenever a relative is hit within reach.
+    - 4,174 share a leaf (equal or contained set), so they come with that leaf.
+    - 16,936 are alone: their own component and their own leaf. The storage hierarchy cannot reach them. Linking components above the storage forest (the sparse or sensitive topology, built from more k-mers than are stored, at no posting cost) would, if they have any relative; otherwise only an own k-mer can.
+    - 500 have no leaf at all: no k-mer at or below even *t\_cap* 0.2. Of those, 38 have no valid 11-mer (too short or ambiguous).
+    - Tier 1 today has the same gap: 16,075 proteins on this quarter sample. On the whole sample, 65,004 of 308,997 units (21%) have no posting.
+  - **Guaranteeing own k-mers** (a per-protein bottom-*m* floor: each protein's *m* lowest hashes, coordinated across near-identical proteins). Extra stored k-mers on the quarter sample, an upper bound on their postings:
+
+    | Own k-mers ≥ | Extra | / tier 1 (432,440) | Proteins needing it |
+    | --- | --- | --- | --- |
+    | 1 | 40,161 | +9% | 40,161 |
+    | 2 | 128,107 | +30% | 87,966 |
+    | 4 | 424,518 | +98% | 165,987 |
+    | 8 | 1,294,562 | +299% | 236,950 |
+
+    **≥ 1 own k-mer costs +9%** and leaves only the 38 proteins with no valid 11-mer. Those need a different route (a shorter *k*, or an exact-sequence table). The hierarchy route, together with ≥ 1–2 own k-mers, gives every protein some way into tier 2.
+  - **No unfloored pieces (the user, same day: single-member exceptions make sense for clusters, not for a tree).**
+    - The exception was carried over from tier 1, where singleton units go unfloored to fit memory. It is dropped: every piece gets a floor, single-leaf pieces included.
+    - A single-leaf piece has no one to share its floor with, so each floor k-mer is a fresh posting. The floor size for single leaves (*n\_1*) is therefore the lever.
+    - Quarter sample, total postings over tier 1. Blind proteins become 0 in every column (only the 38 with no valid 11-mer remain):
+
+    | *τ* | Multi-leaf pieces only (blind) | *n\_1* = 16 | 8 | 4 | 2 | 1 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0.3 | 1.21× (17,127) | 2.55× | 2.17× | 1.74× | **1.49×** | **1.35×** |
+    | 0.6 | 1.33× (18,404) | 2.93× | 2.46× | 1.95× | 1.65× | **1.49×** |
+    | 0.9 | 1.25× (21,630) | 3.46× | 2.80× | 2.09× | 1.68× | 1.47× |
+
+    - Within the 1.5× gate, every protein is covered at *τ* 0.3 with *n\_1* ≤ 2, or at *τ* 0.6 with *n\_1* = 1.
+    - These are upper bounds: a single leaf's floor here is up to *n\_1* candidates above *t\_base* even when it has base k-mers already. A top-up rule (floor only to reach *n\_1* stored k-mers in all) is cheaper.
+    - The rule becomes uniform in tree terms: a floor of up to *n\_min* k-mers per piece, chosen by coherence, with a minimum of *n\_1* stored k-mers per leaf.
+  - **Survey set up for HPC (2026-10-30, the user's request).**
+    - `workflows/tree-index/survey.py` implements the design above in the workflow: SURVEY on core and all, TIER1_MATCHED for tier 1 at *t\_base* 0.01 and *n\_min* 8, and INDEX_SIZES for the release's standard-tier file sizes. It reuses the run's cached tasks, since `phase0.py` is unchanged.
+    - **Grid:** *t\_base* {0.01, 0.02} × *n\_min* {8, 16} × *τ* {0, 0.3, 0.6, 0.9} × *n\_single* {0, 2, 4, 16} × *n\_1* {0, 1, 2, 4}.
+    - **Two differences from the exploration scripts:**
+      - Coherence and floors are now per leaf (one representative per leaf) rather than per protein, so pieces of one leaf with several identical proteins count as single-leaf pieces.
+      - Proteins without a leaf (no k-mer up to *t\_cap*) get a leaf of their own under the minimum.
+    - **On the quarter sample** (17 s, 2.1 GB): at components with no single-leaf floor and *n\_1* = 1, **1.10× the standard tier** with only the 38 proteins that have no valid 11-mer uncovered. *n\_1* = 2: 1.19×; *n\_single* = 2 with *n\_1* = 1: 1.35×.
