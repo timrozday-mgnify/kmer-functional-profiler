@@ -722,3 +722,29 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - The cap binds for a quarter of the protein seeds. A leaf with few k-mers has a wide interval (2 of 2 hit gives aai\_lo ~0.85), so its radius reaches far. That is the rule's intended direction for recall; phase 4 measures what it costs in candidates.
     - *Ceilings:* the walk is a Python loop per seed (12 s for 137 k seeds), and gather recounts all pairs per pick (24 s for 10 k picks). Both need a kernel before HPC-scale samples.
   - *Next:* phase 4 (benchmark against tier 1: δ at 0.05, 0.1 and 0.15, AAI calibration, nearest-match identity scoring), after the HPC build of the 1-in-100 tiers.
+* **Candidate recall, measured (2026-10-30, the user's request: recall first, ~100% of proteins at depth > 0.5 into the candidates, since tier 2 is built per sample from them, with few false candidates; explore broadening on the tree, then focus on tier 2).**
+  - **Benchmark** (`workflows/tree-index/recall.py`): 2,000 proteins with a position in the quarter sample's index each carry a strain made by `spike.py simulate`, at identity 1 / 0.98 / 0.95 / 0.9 / 0.85 / 0.8 and lognormal depth (μ 0, σ 1.2). The 125 k real read pairs of SRR1438000 are mixed in as background. A strain counts as recalled when its source protein's position is a candidate. *observable* is the number of the source's 11-mers that occur whole in the strain's own reads. Background-only queries give the false-candidate baseline.
+  - **Frames.** `stopfree` drops every frame with a stop codon, so reads crossing a gene end are lost, and with them most reads of short genes. At 100% identity and depth ≥ 2, 7 of 7 misses were 28–100 aa proteins whose own k-mers were in the reads. `all` frames raised recall at depth > 0.5 from 65% to 74% (medium) and are used below. *For the main query too:* the recall-first path should not use `stopfree`.
+  - **Broadening on the tree is not the lever.** On the medium tier at depth > 0.5: hit leaves 73.6%; gain ranges (a hit k-mer's whole gain range, including leaves that lost it) 74.1%; neighbour rule δ 0.1, cap 256: 77.5%; whole components of the hit leaves, the most any tree walk can add: 77.6%. δ from 0 to 0.3 changed nothing. The cap mattered (16 against 256: +2%).
+  - **Why: density.** A medium leaf holds a median 6–8 k-mers. With 0 of them in the strain, recall is 17%; with 1, 77%; with ≥ 3, ≥ 96%. At 80% identity, 70% of strains share none of the source's indexed k-mers.
+  - **Window minimizers** (`build.py --window W [--window-min M]`): the base band also takes each leaf's least hash, of any value, in every window of W k-mers. With `--window-min` M, the window shrinks to n\_k // M, so short proteins get about 2M minimizers. Window k-mers are diffed by Fitch with the rest of the base band, so relatives share them. A 50-aa read spans 40 k-mers, so W ≤ 40 puts an indexed k-mer in every whole read of an identical protein. Checked against brute force (`test_window_kmers_match_brute_force`). Minimizers first stopped at *t\_cap*, which left ~11% of w10 windows empty; uncapped: +1.6%. The query already keeps keys beyond *t\_cap*.
+  - **Results** (quarter sample, depth > 0.5, 1,538 strains; neighbour rule δ 0.1, cap 256; "short" ≤ 60 aa; bg = leaves hit by the background reads alone):
+
+    | Index | Postings (× medium) | Bytes | bg leaves | Candidates | All | ≥ 95% id | Short, ≥ 95% | > 60 aa, ≥ 95% | observable 8–15 | observable ≥ 16 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | medium | 1 | 20.9 MB | 602 | 65,439 | 0.775 | 0.928 | 0.768 | 0.954 | 0.624 | 0.907 |
+    | large | 1.84 | 30.5 MB | 1,126 | 70,432 | 0.842 | 0.958 | 0.786 | 0.987 | 0.734 | 0.969 |
+    | medium + w20 | 2.79 | 41.4 MB | 1,361 | 73,783 | 0.873 | 0.968 | 0.804 | 0.996 | 0.815 | 0.995 |
+    | medium + w10 | 4.13 | 56.8 MB | 1,705 | 75,297 | 0.901 | 0.977 | 0.839 | 1.0 | 0.925 | 0.998 |
+    | medium + w30, min 8 | 3.62 | 51.0 MB | 1,447 | 75,263 | 0.919 | 0.984 | 0.884 | 1.0 | 0.942 | 0.996 |
+    | medium + w20, min 8 | 3.99 | 55.2 MB | 1,561 | 75,695 | 0.921 | 0.984 | 0.884 | 1.0 | 0.948 | 0.997 |
+    | medium + w10, min 8 | 5.72 | 75.1 MB | 2,336 | 77,160 | 0.932 | 0.984 | 0.884 | 1.0 | 0.988 | 1.0 |
+
+    - Lowering *t\_base* to 0.005 under the windows saved nothing: floors and top-ups grew back (4.16× and 5.9×), with the same recall.
+    - `--min-hits` 2 halves to thirds the background leaves (1,561 → 530 on w20 min 8) but loses 5.7% of recall at depth > 0.5, mostly short and divergent strains. Recall first keeps 1.
+    - *Candidates* here are 26–29% of the quarter's proteins, for 2,000 strains: ~35 leaves per strain, its near-identical relatives. The background alone seeds 0.6–0.9% (1.4–2.3 k leaves from 125 k pairs).
+  - **Reading.**
+    - For proteins over 60 aa at ≥ 95% identity, windows reach 100% (w30 min 8 and up). Whenever the reads hold ≥ 16 source 11-mers, w10 min 8 recalls 100% and w20 min 8 99.7%.
+    - What is left is not reachable by an exact 11-mer index. Of short strains at depth > 0.5, 20% have no source 11-mer in their reads and 51% fewer than 8. At 80% identity, 18% of all strains have none. Depth > 0.5 on a 30–60 aa gene is often one read pair overlapping it by 15–20 aa.
+    - *The user's question (floors for short proteins):* raising them is what `--window-min` does, and it took short proteins with ≥ 8 observable k-mers from 86–90% to 99.1%. Beyond that a higher floor cannot help. A shorter seed for short proteins (k 8–9 or a reduced alphabet) would, at a cost in chance hits; not tried.
+    - *Cost:* w20 min 8 is ~4× medium's postings, ~2.6× its bytes here (per-leaf tables are fixed). At release that is roughly 500 GB against medium's 140–170 GB (estimate from the survey's projection). w30 min 8 is ~3.6× for the same recall at ≥ 95%.

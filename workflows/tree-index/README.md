@@ -192,3 +192,17 @@ adds naive containment AAI with an interval to both, then:
 
 The neighbour rule needs an index built with `--leaves proteins` (the default), whose spanning
 tree's edges (`edge_*.npy`) are in dense 8-mer units.
+
+`build.py --window W [--window-min M]` adds window minimizers to the base band (each leaf's least
+hash in every window of W k-mers, the window shrunk to n\_k // M for short leaves), for recall.
+`recall.py` scores candidate recall against `spike-benchmark/spike.py simulate`'s truth:
+
+```bash
+python workflows/tree-index/recall.py targets --members members.parquet --index idx --out targets.fa
+python workflows/spike-benchmark/spike.py simulate --targets targets.fa --present 1 \
+    --identities 1 0.98 0.95 0.9 0.85 0.8 --depth-mu 0 --depth-sigma 1.2 --out sim
+python workflows/tree-index/query.py --index idx --reads sim/reads_1.fq.gz sim/reads_2.fq.gz \
+    --frames all --out q
+python workflows/tree-index/recall.py score --index idx --query q --truth sim/truth.tsv \
+    --reads sim/reads_1.fq.gz sim/reads_2.fq.gz --targets targets.fa --out s
+```

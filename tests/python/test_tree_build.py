@@ -228,3 +228,19 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     assert stats["parts"] == len(parts)
     check_index(idx, members)
     check_query(tmp_path, idx, members)
+
+
+def test_window_kmers_match_brute_force() -> None:
+    """build.window_kmers: each sequence's least hash per window (shrunk by min_count)."""
+    rng = np.random.default_rng(2)
+    seqs = [bytes(rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n)) for n in (5, 15, 22, 40, 120, 61)]
+    seqs[4] = seqs[4][:50] + b"X" + seqs[4][51:]  # k-mers over X have no hash
+    for w, min_count in ((4, 0), (20, 0), (20, 4), (10, 8)):
+        seq, h = build.window_kmers(seqs, 11, w, min_count)
+        for j, s in enumerate(seqs):
+            hs = [_core.hash_proteins([s[i : i + 11]], 11)["hash"] for i in range(len(s) - 10)]
+            hs = [int(x[0]) if len(x) else None for x in hs]
+            ww = max(1, min(w, len(hs) // min_count)) if min_count else w
+            wins = [hs[i : i + ww] for i in range(len(hs) - ww + 1)] if len(hs) >= ww else [hs]
+            want = {min(v) for v in ([x for x in win if x is not None] for win in wins) if v}
+            assert {int(x) for x in h[seq == j]} == want, (w, min_count, j)

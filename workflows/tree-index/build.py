@@ -6,8 +6,9 @@ sets at the topology rates). Leaves are numbered by their position in its leaf o
 node is a range of positions, ``lo..hi``. Postings are range postings, ``(hash, lo, hi, sign)``:
 a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they sum to 0 or 1).
 
-- **base** (kind 0): each leaf's representative's k-mers with hash <= t\\_base, diffed by Fitch
-  over the whole tree: a gain is +1 over the node's range, a loss -1;
+- **base** (kind 0): each leaf's representative's k-mers with hash <= t\\_base (and with
+  ``--window`` W, its least hash in every window of W k-mers, any hash), diffed by Fitch over
+  the whole tree: a gain is +1 over the node's range, a loss -1;
 - **floor** (kind 1): per piece of two or more leaves (``survey.pieces`` at ``tau``), its
   n\\_min floor k-mers, +1 over the piece. Single-leaf pieces get no floor (*n\\_single* 0);
 - **top-up** (kind 2): each leaf topped up to ``n_1`` k-mers of its own (base, floor k-mers it
@@ -52,10 +53,22 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
     lo_base = U64(_core.max_hash(a.t_base))
     # base band: Fitch's changes over the whole tree
     keep = tree.h <= lo_base
-    pos, h = tree.pos[keep], tree.h[keep]
+    extra_pos, extra_h = np.zeros(0, np.int64), np.zeros(0, U64)
+    if a.window:
+        reps = [tree.seqs[i] for i in tree.rep_by_pos]
+        wp, wh = window_kmers(reps, a.k, a.window, a.window_min)
+        rows = pl.DataFrame({"pos": tree.pos, "h": tree.h}).with_row_index()
+        win = rows.join(pl.DataFrame({"pos": wp, "h": wh}), on=["pos", "h"], how="semi")
+        keep[win["index"].to_numpy()] = True
+        beyond = wh > U64(_core.max_hash(a.t_cap))  # not among the rows, which stop at t_cap
+        extra_pos, extra_h = wp[beyond], wh[beyond]
+    pos = np.concatenate([tree.pos[keep], extra_pos])
+    h = np.concatenate([tree.h[keep], extra_h])
     leaf = lay["order"][pos]
     o = np.lexsort((h, leaf))
-    sets = p0.Sets(p0.csr(leaf[o], h[o], n), h[o], np.zeros(n, np.uint8), np.array([lo_base]))
+    # every hash a leaf does not hold is known absent (no missing data above t_base)
+    top = U64(ALL) if a.window else lo_base
+    sets = p0.Sets(p0.csr(leaf[o], h[o], n), h[o], np.zeros(n, np.uint8), np.array([top]))
     ch = _core.tree_schemes(
         n, f.left, f.right, f.tops, sets.offsets.astype(U64), sets.hashes, sets.level,
         sets.level_hash, emit=True,
@@ -75,7 +88,7 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
     own = np.bincount(pos, minlength=n)  # k-mers each position holds of its own
     # floors per piece; rows above t_base that are not floor k-mers can top a leaf up
     got, _ = survey.pieces(tree, a.t_base, a.n_min, a.tau)
-    spare = tree.h > lo_base
+    spare = ~keep
     rows = []
     for lo, hi, floor, coh in got:
         rows.append((lo, hi, len(floor) if hi - lo > 1 else 0, coh))
@@ -122,6 +135,57 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
         parts.append(topups(hh[take], n + seq[take]))
     table = pl.concat(parts).sort("hash", "lo", "hi")
     return table, pieces, n + len(leafless)
+
+
+def window_kmers(
+    seqs: list[bytes], k: int, w: int, min_count: int = 0
+) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
+    """Distinct (sequence, hash): each sequence's least hash in every window of w_s consecutive
+    k-mers (robust winnowing; the whole sequence when shorter), so every stretch of w_s + k - 1
+    residues holds an indexed k-mer. w_s is ``w``, or with ``min_count`` M, min(w, n_k // M)
+    (at least 1), so a sequence of n_k k-mers gets about M or more."""
+    out_seq, out_h = [], []
+    none = np.iinfo(np.uint64).max
+    for start in range(0, len(seqs), 20_000):
+        batch = seqs[start : start + 20_000]
+        n_k = np.array([max(len(s) - k + 1, 0) for s in batch])
+        # ponytail: each k-mer hashed as its own sequence; a positional kernel at scale
+        o = _core.hash_proteins([s[i : i + k] for s in batch for i in range(len(s) - k + 1)], k)
+        h = np.full(n_k.sum(), none, dtype=np.uint64)
+        h[o["seq"]] = o["hash"]
+        first = np.cumsum(n_k) - n_k
+        w_s = np.clip(n_k // min_count, 1, w) if min_count else np.full(len(batch), w)
+        for ww in np.unique(w_s[n_k > 0]).tolist():
+            sel = np.flatnonzero((w_s == ww) & (n_k > 0))
+            idx = np.concatenate([np.arange(first[i], first[i] + n_k[i]) for i in sel])
+            owner, m = winnow(h[idx], n_k[sel], ww)
+            out_seq.append(sel[owner] + start)
+            out_h.append(m)
+    seq = np.concatenate(out_seq) if out_seq else np.zeros(0, np.int64)
+    hh = np.concatenate(out_h) if out_h else np.zeros(0, np.uint64)
+    pairs = pl.DataFrame({"seq": seq, "h": hh}).filter(pl.col("h") != none).unique()
+    return pairs["seq"].to_numpy().astype(np.int64), pairs["h"].to_numpy()
+
+
+def winnow(
+    h: NDArray[np.uint64], n_k: NDArray[np.int64], w: int
+) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
+    """(sequence, least hash) of every window of ``w`` within each sequence of ``h``
+    (concatenated, ``n_k`` each); a sequence shorter than ``w`` is one window."""
+    owner = np.repeat(np.arange(len(n_k)), n_k)
+    out_o, out_m = [], []
+    if len(h) >= w:
+        m = np.lib.stride_tricks.sliding_window_view(h, w).min(axis=1)
+        i = np.arange(len(m))
+        ok = owner[i] == owner[i + w - 1]
+        out_o.append(owner[i[ok]])
+        out_m.append(m[ok])
+    short = np.flatnonzero(n_k < w)
+    if len(short):
+        whole = np.minimum.reduceat(h, np.cumsum(n_k) - n_k)
+        out_o.append(short)
+        out_m.append(whole[short])
+    return np.concatenate(out_o), np.concatenate(out_m)
 
 
 def topups(h: NDArray[np.uint64], pos: NDArray[np.int64]) -> pl.DataFrame:
@@ -173,6 +237,14 @@ def main() -> None:
     parser.add_argument("--n-min", type=int, default=16)
     parser.add_argument("--tau", type=float, default=0.3)
     parser.add_argument("--n-1", type=int, default=2)
+    parser.add_argument(
+        "--window", type=int, default=0,
+        help="also base: each leaf's least hash in every window of this many k-mers (0: off)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--window-min", type=int, default=0,
+        help="windows shrink to n // this for a leaf of n k-mers, so short ones get more (0: off)",
+    )  # fmt: skip
     parser.add_argument(
         "--leaves", choices=["proteins", "collapsed"], default="proteins",
         help="proteins: a leaf per distinct dense set; collapsed: phase 0's (survey.Tree)",
