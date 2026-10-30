@@ -79,7 +79,7 @@ process MERGE {
 }
 
 workflow {
-    code = ['partition.py', 'build.py', 'merge.py', 'survey.py', 'phase0.py']
+    code = ['partition.py', 'build.py', 'merge.py', 'survey.py', 'phase0.py', 'query.py']
         .collect { file("${projectDir}/${it}") }
     members = params.members ? Channel.fromPath(params.members, checkIfExists: true).collect()
                              : FIXTURE()

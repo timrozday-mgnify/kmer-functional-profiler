@@ -130,6 +130,27 @@ def check_query(tmp_path: Path, idx: Path, members_path: Path) -> None:
         expect = (hit.height, int(hit["n"].sum())) if hit.height else None
         assert by_node.get(v) == expect, v
 
+    # evidence: per leaf, the best read's summed key bits less a charge per extra hit
+    index = query.Index(idx)
+    hs = sample["hash"].to_numpy()
+    hs = hs[np.isin(hs, index.keys)]
+    rng = np.random.default_rng(0)
+    pairs = pl.DataFrame({"read": rng.integers(0, 6, len(hs)).astype(np.uint64), "hash": hs})
+    got = query.evidence(index, pairs, 3.0, floor=-1e9)
+    bits = pl.DataFrame({"hash": index.keys, "bits": index.key_bits.astype(np.float64)})
+    want = (
+        held.join(pairs, on="hash")
+        .join(bits, on="hash")
+        .group_by("read", "pos")
+        .agg(score=pl.col("bits").sum() - (pl.len() - 1) * 3.0)
+        .group_by("pos")
+        .agg(pl.col("score").max())
+        .sort("pos")
+    )
+    assert got["pos"].to_list() == want["pos"].to_list()
+    assert np.allclose(got["score"].to_numpy(), want["score"].to_numpy(), atol=1e-3)
+    assert (index.key_bits > 0).all() and np.array_equal(index.keys, np.unique(index.hash))
+
     # with a leaf per protein set, every sampled protein with a position hits its own leaf
     prot = (
         members.select("protein_id")

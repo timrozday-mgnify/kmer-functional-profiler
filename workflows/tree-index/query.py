@@ -11,7 +11,10 @@
 Writes to ``--out``: ``leaves.parquet`` (pos, size, hit\\_kmers, hits, containment) and
 ``nodes.parquet`` (node, lo, hi, level, size, hit\\_kmers, hits, containment), rows with a hit
 k-mer only; ``hits.parquet`` (hash, n: the sample's k-mers that are keys, for ``report.py``); and
-``query.json`` (counts and timings).
+``query.json`` (counts and timings). With reads and an index with key bits:
+``seeds.parquet`` (pos, score: the best evidence any one read pair gives each leaf, in bits;
+:func:`evidence`), ``evidence.parquet`` (the curve :func:`choose_bits` reads) and the chosen
+``evidence_bits`` in ``query.json``.
 """
 
 import argparse
@@ -44,6 +47,10 @@ class Index:
         self.sketch_max = _core.max_hash(float(self.meta["params"]["t_cap"]))
         tail = np.asarray(self.hash[np.searchsorted(self.hash, self.sketch_max, "right") :])
         self.beyond = np.unique(tail)
+        if (path / "keys.npy").exists():
+            self.keys, self.key_bits, self.key_k = (
+                np.load(path / f"{x}.npy") for x in ("keys", "key_bits", "key_k")
+            )
 
     @property
     def k(self) -> int:
@@ -65,8 +72,79 @@ class Index:
         return h[(h <= self.sketch_max) | hit]
 
 
-def ladder(spec: str) -> list[tuple[int, int, int]]:
-    """``build.py --ladder``'s (k, max_len, window) steps."""
+def read_pairs(
+    index: Index, r1: str, r2: str | None, frames: str
+) -> tuple[pl.DataFrame, dict[int, int], int]:
+    """Distinct (read, hash) of the sample's k-mers that are keys, at the index's k and each
+    ladder k; the read windows hashed per k; and the read pairs."""
+    parts, windows, n_reads = [], {}, 0
+    steps = [(index.k, False)] + [
+        (k, True) for k, _ in ladder(index.meta["params"].get("ladder", ""))
+    ]
+    for k, salt in steps:
+        it = _core.FastxHits(r1, r2, k=k, frames=frames)
+        for b in it:
+            h = salted(b["hash"], k) if salt else b["hash"]
+            windows[k] = windows.get(k, 0) + len(h)
+            hit = np.isin(h, index.keyed(h))
+            parts.append(pl.DataFrame({"read": b["read"][hit], "hash": h[hit]}))
+        n_reads = max(n_reads, it.n_reads)
+    return pl.concat(parts).unique(), windows, n_reads
+
+
+def evidence(index: Index, pairs: pl.DataFrame, log2_windows: float, floor: float) -> pl.DataFrame:
+    """(pos, score): each leaf position's best evidence from one read pair, the read pair's
+    hit k-mers on it summed in bits less log2(windows per read pair) per hit beyond the
+    first (each further hit had that many places to fall by chance); scores >= ``floor``."""
+    h = pairs["hash"].to_numpy()
+    bits = index.key_bits[np.searchsorted(index.keys, h)].astype(np.float64)
+    first = np.searchsorted(index.hash, h, "left")
+    per = np.searchsorted(index.hash, h, "right") - first
+    rows = np.repeat(first - np.cumsum(per) + per, per) + np.arange(per.sum())
+    read = np.repeat(pairs["read"].to_numpy(), per)
+    sign = np.asarray(index.sign[rows], dtype=np.float64)
+    b = np.repeat(bits, per) * sign
+    x = np.concatenate([np.asarray(index.lo[rows]), np.asarray(index.hi[rows])]).astype(np.int64)
+    r = np.concatenate([read, read])
+    o = np.lexsort((x, r))
+    x, r = x[o], r[o]
+    cb = np.cumsum(np.concatenate([b, -b])[o])  # signs balance per k-mer: sums restart per read
+    cm = np.cumsum(np.concatenate([sign, -sign])[o])
+    score = cb - np.maximum(cm - 1, 0) * log2_windows
+    on = np.flatnonzero(
+        (cm[:-1] > 0.5) & (r[1:] == r[:-1]) & (x[1:] > x[:-1]) & (score[:-1] >= floor)
+    )
+    n = x[on + 1] - x[on]
+    pos = np.repeat(x[on] - np.cumsum(n) + n, n) + np.arange(n.sum())
+    seg = pl.DataFrame({"pos": pos, "score": np.repeat(score[on], n)})
+    return seg.group_by("pos").agg(pl.col("score").max()).sort("pos")
+
+
+def choose_bits(
+    index: Index, seeds: pl.DataFrame, windows: dict[int, int], share: float
+) -> tuple[float, list[tuple[float, float, int]]]:
+    """The least evidence B at which the expected chance seeds, sum over keys with bits >= B
+    of (read windows of its k) x 2^-bits, are at most ``share`` of the seeds scoring >= B;
+    and the curve (B, expected chance seeds, seeds). ponytail: chance single hits only;
+    multi-hit chance seeds are fewer by the per-hit window charge."""
+    w = np.array([windows.get(int(k), 0) for k in index.key_k], dtype=np.float64)
+    w[index.key_k == 0] = windows.get(index.k, 0)
+    o = np.argsort(-index.key_bits.astype(np.float64))
+    kb = index.key_bits[o].astype(np.float64)
+    cum = np.cumsum((w[o] * 2.0**-kb)[::-1])[::-1]  # chance seeds from keys with bits >= kb
+    sc = np.sort(seeds["score"].to_numpy())
+    curve = []
+    for bar in np.arange(np.floor(sc.min()) if len(sc) else 0, 120.0, 0.25):
+        at = np.searchsorted(-kb, -bar, "right")  # keys with bits >= bar: the first `at`
+        chance = float(cum[0] - (cum[at] if at < len(cum) else 0.0)) if at else 0.0
+        n = len(sc) - np.searchsorted(sc, bar)
+        curve.append((float(bar), chance, int(n)))
+    ok = [c for c in curve if c[1] <= share * max(c[2], 1)]
+    return (ok[0][0] if ok else curve[-1][0] if curve else 0.0), curve
+
+
+def ladder(spec: str) -> list[tuple[int, int]]:
+    """``build.py --ladder``'s (k, window) steps."""
     return [tuple(int(x) for x in step.split(":")) for step in spec.split(",") if step]  # type: ignore[misc]
 
 
@@ -89,7 +167,7 @@ def sample_counts(batches: Iterable[NDArray[np.uint64]]) -> pl.DataFrame:
 def read_hashes(index: Index, r1: str, r2: str | None, frames: str) -> Iterable[NDArray[Any]]:
     for b in _core.FastxHits(r1, r2, k=index.k, frames=frames, max_hash=index.max_hash):
         yield index.sampled(b["hash"])
-    for k, _, _ in ladder(index.meta["params"].get("ladder", "")):  # every k-mer that is a key
+    for k, _ in ladder(index.meta["params"].get("ladder", "")):  # every k-mer that is a key
         for b in _core.FastxHits(r1, r2, k=k, frames=frames):
             yield index.keyed(salted(b["hash"], k))
 
@@ -108,7 +186,7 @@ def protein_hashes(index: Index, fasta: str) -> Iterable[NDArray[Any]]:
     # one sequence at a time: hash_proteins dedups within a call, so n counts sequences
     for s in seqs:
         h = index.sampled(_core.hash_proteins([s], index.k, max_hash=index.max_hash)["hash"])
-        for k, _, _ in ladder(index.meta["params"].get("ladder", "")):
+        for k, _ in ladder(index.meta["params"].get("ladder", "")):
             h = np.concatenate([h, index.keyed(salted(_core.hash_proteins([s], k)["hash"], k))])
         yield h
 
@@ -183,6 +261,11 @@ def main() -> None:
     src.add_argument("--reads", nargs="+", help="R1 [R2] FASTQ")
     src.add_argument("--proteins", help="protein FASTA")
     parser.add_argument("--frames", default="stopfree")
+    parser.add_argument(
+        "--chance-share", type=float, default=0.01,
+        help="reads: seeds by evidence, at the least bits whose expected chance seeds are at "
+        "most this share of the seeds (seeds.parquet)",
+    )  # fmt: skip
     a = parser.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -201,6 +284,21 @@ def main() -> None:
     at = np.minimum(np.searchsorted(index.hash, h), max(len(index.hash) - 1, 0))
     keyed = index.hash[at] == h if len(index.hash) else np.zeros(len(h), dtype=bool)
     sample.filter(pl.Series(keyed)).write_parquet(out / "hits.parquet")
+    if a.reads and hasattr(index, "keys"):
+        t1 = time.perf_counter()
+        pairs, windows, n_reads = read_pairs(
+            index, a.reads[0], (a.reads[1:] or [None])[0], a.frames
+        )
+        log2_w = float(np.log2(max(windows.get(index.k, 1) / max(n_reads, 1), 2)))
+        seeds = evidence(index, pairs, log2_w, floor=0.0)
+        bar, curve = choose_bits(index, seeds, windows, a.chance_share)
+        seeds.write_parquet(out / "seeds.parquet")
+        pl.DataFrame(curve, schema=["bits", "chance", "seeds"], orient="row").write_parquet(
+            out / "evidence.parquet"
+        )
+        stats |= {"evidence_bits": bar, "seeds": int((seeds["score"] >= bar).sum()),
+                  "read_pairs": n_reads, "windows": windows,
+                  "evidence_s": time.perf_counter() - t1}  # fmt: skip
     stats |= {"lookup_s": lookup_s, "total_s": time.perf_counter() - t0}
     (out / "query.json").write_text(json.dumps(stats, indent=1) + "\n")
     print(json.dumps(stats))

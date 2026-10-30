@@ -206,3 +206,11 @@ python workflows/tree-index/query.py --index idx --reads sim/reads_1.fq.gz sim/r
 python workflows/tree-index/recall.py score --index idx --query q --truth sim/truth.tsv \
     --reads sim/reads_1.fq.gz sim/reads_2.fq.gz --targets targets.fa --out s
 ```
+
+Seeds by evidence: `build.py` writes each key's bits per hit (`key_bits.npy`: −log₂ of its
+chance probability from residue composition, less log₂ of its gains on the tree), and
+`--ladder k:w,... --min-kmers M` gives a leaf shorter-k minimizers while it has fewer than M
+informative k-mers. With reads, `query.py` scores each leaf by its best read pair's hits
+(`seeds.parquet`) and picks the bar at which expected chance seeds are `--chance-share` (1%) of
+the seeds (`evidence.parquet`, `evidence_bits` in `query.json`). `recall.py score` reports these
+as `ev_<share>` strategies.

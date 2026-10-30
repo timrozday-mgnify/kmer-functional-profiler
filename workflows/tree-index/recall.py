@@ -21,7 +21,10 @@ Strategies, each from the leaves with ``min_hits`` hit k-mers (seeds):
 - ``gains``: the seeds, and the whole range of every gain posting of a hit k-mer, including
   leaves below that lost it (a gain is posted where a clade first holds a k-mer);
 - ``nb_<delta>_<cap>``: report.py's neighbour rule;
-- ``component``: every leaf of each seed's tree component (the most any tree walk can add).
+- ``component``: every leaf of each seed's tree component (the most any tree walk can add);
+- ``ev_<share>`` (and ``_nb``, with the last delta and cap's neighbour rule): seeds by
+  evidence from one read pair (query.py's ``seeds.parquet``), at the least bits whose expected
+  chance seeds are at most ``share`` of the seeds.
 """
 
 import argparse
@@ -86,7 +89,12 @@ def gain_ranges(index: query.Index, hashes: NDArray[np.uint64]) -> NDArray[np.in
 
 
 def strategies(
-    path: Path, qdir: Path, min_hits: int, deltas: list[float], caps: list[int]
+    path: Path,
+    qdir: Path,
+    min_hits: int,
+    deltas: list[float],
+    caps: list[int],
+    shares: tuple[float, ...] = (0.001, 0.01, 0.1),
 ) -> dict[str, NDArray[np.int64]]:
     index = query.Index(path)
     k_t = int(index.meta["params"]["topology_k"])
@@ -99,13 +107,30 @@ def strategies(
     out = {"leaves": spos}
     out["gains"] = np.union1d(spos, gain_ranges(index, hits["hash"].to_numpy()))
     tree = report.Spanning(path, n_pos)
-    length = pos_len[spos].astype(np.int64)
-    d_hit = report.topology_distance(seeds["aai_lo"].to_numpy(), length, k_t)
+    aai_lo = dict(zip(leaves["pos"].to_list(), leaves["aai_lo"].to_list(), strict=True))
+
+    def walk(start: NDArray[np.int64], delta: float, cap: int) -> NDArray[np.int64]:
+        length = pos_len[start].astype(np.int64)
+        lo = np.array([aai_lo.get(int(v), 0.0) for v in start])
+        radius = report.topology_distance(lo, length, k_t) + report.topology_distance(
+            np.float64(1 - delta), length, k_t
+        )
+        got = [tree.cluster(v, r, cap)[0] for v, r in zip(start, radius.tolist(), strict=True)]
+        return np.unique(np.concatenate([start, *map(np.array, got)]))
+
     for delta in deltas:
-        radius = d_hit + report.topology_distance(np.float64(1 - delta), length, k_t)
         for cap in caps:
-            got = [tree.cluster(v, r, cap)[0] for v, r in zip(spos, radius.tolist(), strict=True)]
-            out[f"nb_{delta}_{cap}"] = np.unique(np.concatenate([spos, *map(np.array, got)]))
+            out[f"nb_{delta}_{cap}"] = walk(spos, delta, cap)
+    # seeds by evidence (query.py --reads with key bits), at the bar for each chance share
+    if (qdir / "seeds.parquet").exists():
+        ev = pl.read_parquet(qdir / "seeds.parquet")
+        curve = pl.read_parquet(qdir / "evidence.parquet")
+        for share in shares:
+            ok = curve.filter(pl.col("chance") <= share * pl.col("seeds").clip(lower_bound=1))
+            bar = ok["bits"].min() if ok.height else curve["bits"].max()
+            start = ev.filter(pl.col("score") >= bar)["pos"].to_numpy().astype(np.int64)
+            out[f"ev_{share}"] = start
+            out[f"ev_{share}_nb"] = walk(start, deltas[-1], caps[-1])
     a, b = (np.load(path / f"edge_{x}.npy") for x in "ab")
     graph = coo_array((np.ones(len(a)), (a, b)), shape=(n_pos, n_pos))
     _, comp = connected_components(graph, directed=False)

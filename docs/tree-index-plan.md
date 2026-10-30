@@ -769,3 +769,34 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Seeds by evidence within one read pair:* a leaf is a seed when its hits from one read pair sum to at least B bits. B is set by an expected number of chance seeds per sample: B = log₂(read windows × leaves / chance seeds). It is the one parameter, in units of false candidates, and it holds for every k: one clean 11-mer hit carries ~46 bits, so 7-mers need two or more hits in the same read to count. Seeds then need per-read hit sets (`FastxHits` gives read ids).
     - *Pruning:* a k-mer is dropped when no read can use it, i.e. when even the most hits of its k that fit in one read alongside it cannot reach B.
     - *The k per leaf:* going down the ladder (11, 9, 8, 7), a leaf takes the next k only while it has fewer window-covering k-mers with positive evidence than a read overlap needs. Evidence comes from the same Fitch pass, so the rule is set by the database, not by protein length.
+* **Seeds by evidence, the ladder by information, sized for two budgets (2026-10-30, the user's go-ahead on the design above; budgets: large about w30 min 8's ~425–515 GB, medium about half that).**
+  - **Build** writes each key's evidence per hit, b(x) = −log₂ q₀(x) − log₂ g(x) (`keys.npy`, `key_bits.npy`, `key_k.npy`).
+    - q₀ is the chance of the k-mer at a protein window, from the database's residue frequencies; g is the key's number of positive postings (Fitch gains, floors, top-ups).
+    - `merge.py` adds gains across parts exactly: 2^−b = q₀ g, so merged bits are −log₂ Σ 2^−b.
+  - **Ladder by information** (`--ladder k:w,...`, `--min-kmers M`): a leaf takes the next k while it has fewer than M informative k-mers at the k before. Informative means a priori rarer than one chance holder among the N leaves: −log₂ q₀ ≥ log₂ N. Low-complexity leaves therefore descend sooner, at the same length.
+  - **Query seeds by evidence** (`query.py`, reads; `seeds.parquet`, `evidence.parquet`):
+    - A read pair's hits on a leaf score Σ b − (m − 1) log₂(windows per read pair). Each hit after the first had that many places to fall by chance.
+    - Computed with one sweep over (read pair, range endpoints), as the counting sweep. Checked against brute force on the fixture (single and partitioned builds).
+    - The bar B is the least score at which the expected chance seeds, Σ over keys with b ≥ B of (read windows of its k) × 2^−b, are at most `--chance-share` (1%) of the seeds scoring ≥ B. The one parameter is a share of false candidates.
+    - B is relative, so it should hold as sample and index grow together. *Ceiling:* the chance term counts single hits only.
+  - **No pruning by gains was needed.** 7-mers carry 25–35 bits at ~3.5 gains per key: never enough alone (bar ~33–37 bits), but two in one read pair reach ~47 bits. A rule that drops keys unable to contribute removes almost nothing. Size is set by how many minimizers each leaf takes, so that is what the configurations below vary.
+  - **Floors are redundant** once every leaf has spread minimizers: without them (`--n-min 0`), recall was unchanged (M2 against M4, L2 against L3) for 0.23 M fewer postings on the quarter sample.
+  - **Results** (quarter sample, depth > 0.5, all frames; seeds by evidence at 1% chance share, with the neighbour rule δ 0.1, cap 256; bg = seeds from the background reads alone; release size scaled from medium's projection, 107–132 GB of postings plus ~35 GB of leaf tables, without the ~45 GB of spanning-tree edges the neighbour rule needs):
+
+    | Configuration | Postings (× medium) | ~Release | bg seeds | All | ≥ 95% id | ≥ 90% id | Short, ≥ 95% | > 60 aa, ≥ 95% |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | medium (hit leaves, `stopfree`) | 1 | 140–170 GB | 602 | 0.775 | 0.928 | 0.888 | 0.768 | 0.954 |
+    | **M5:** *t\_base* 0.01, no floors, ~6 spread minimizers (`--window 1000 --window-min 3`), k 7 at w 3 for < 32 informative 11-mers | 1.46 | 190–230 GB | 1,124 | 0.846 | 0.971 | 0.939 | 0.920 | 0.979 |
+    | **M4:** *t\_base* 0.02, no floors, ~8 spread minimizers (`--window-min 4`), k 7 at w 2 for < 32 | 2.04 | 255–305 GB | 1,683 | 0.889 | 0.989 | 0.966 | 0.955 | 0.994 |
+    | M2: as M4 with floors (*n\_min* 16, *τ* 0.3) | 2.41 | 290–355 GB | 1,829 | 0.895 | 0.989 | 0.969 | 0.955 | 0.994 |
+    | E0: w30 min 8, no ladder | 3.62 | 425–515 GB | 1,447 | 0.919 | 0.984 | 0.972 | 0.884 | 1.0 |
+    | **L3:** w40 min 8, no floors, k 7 at w 3 for < 48 | 4.09 | 475–575 GB | 2,969 | 0.951 | 1.0 | 0.993 | 1.0 | 1.0 |
+    | L2: as L3 with floors | 4.45 | 510–620 GB | 3,081 | 0.952 | 1.0 | 0.993 | 1.0 | 1.0 |
+    | E7: w30 min 8, floors, k 7 at w 2 for < 64 | 5.64 | 640–780 GB | 6,027 | 0.962 | 1.0 | 0.994 | 1.0 | 1.0 |
+
+    - Without the evidence bar, the same E7 index's hit leaves are seeded 42.6 k times by the background, against 6.0 k with it, for 0.6% less recall (0.941 against 0.935 before the neighbour rule).
+    - The neighbour rule adds 2.5–6% at all-identity recall, mostly divergent strains, for +18–27% candidate members.
+  - **Reading.**
+    - *Large:* L3 meets the target (100% at ≥ 95% identity, short proteins included; 99.3% at ≥ 90%) at ~475–575 GB, ~10% over w30 min 8's budget.
+    - *Medium:* M4 gives 98.9% at ≥ 95% (99.4% over 60 aa, 95.5% for short) at ~255–305 GB. M5 fits ~half the large budget (~190–230 GB) at 97.1%.
+    - The remaining misses at ≥ 95% identity are mostly strains whose reads hold few or no source 11-mers.

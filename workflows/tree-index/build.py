@@ -9,9 +9,9 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
 - **base** (kind 0): each leaf's representative's k-mers with hash <= t\\_base (and with
   ``--window`` W, its least hash in every window of W k-mers, any hash), diffed by Fitch over
   the whole tree: a gain is +1 over the node's range, a loss -1. With ``--ladder``
-  k:max\\_len:w,..., leaves shorter than max\\_len also hold window minimizers of k-mers of that
-  shorter k (hashes salted per k), for reads that overlap a short gene by too little to hold a
-  whole k-mer of the index's k;
+  k:w,..., a leaf with fewer than ``--min-kmers`` informative k-mers (a priori rarer than one
+  chance holder among the leaves: -log2 q0 >= log2 N) at the k before also holds window
+  minimizers of that shorter k (hashes salted per k);
 - **floor** (kind 1): per piece of two or more leaves (``survey.pieces`` at ``tau``), its
   n\\_min floor k-mers, +1 over the piece. Single-leaf pieces get no floor (*n\\_single* 0);
 - **top-up** (kind 2): each leaf topped up to ``n_1`` k-mers of its own (base, floor k-mers it
@@ -25,7 +25,8 @@ Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.np
 (|S\\_v|: k-mers held at each position and each internal node); ``pos_len.npy`` (each
 position's representative's length); ``edge_a.npy``, ``edge_b.npy``, ``edge_w.npy`` (the spanning
 tree's edges between positions, weighed in topology units, for the neighbour rule);
-``pieces.parquet`` (lo, hi, floor,
+``keys.npy``, ``key_bits.npy`` and ``key_k.npy`` (each key's evidence per hit in bits,
+-log2 q0 - log2 g, and its k); ``pieces.parquet`` (lo, hi, floor,
 coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and
 ``meta.json``.
 """
@@ -51,8 +52,11 @@ ALL = 2**64 - 1
 BASE, FLOOR, TOPUP = 0, 1, 2
 
 
-def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl.DataFrame, int]:
-    """Range postings of every kind, the pieces, and positions used (tree's plus leafless)."""
+def postings(
+    tree: survey.Tree, a: argparse.Namespace
+) -> tuple[pl.DataFrame, pl.DataFrame, int, pl.DataFrame]:
+    """Range postings of every kind, the pieces, positions used (tree's plus leafless), and
+    each key's evidence (:func:`key_bits`)."""
     f, lay, n = tree.forest, tree.lay, tree.forest.n
     lo_base = U64(_core.max_hash(a.t_base))
     # base band: Fitch's changes over the whole tree
@@ -66,12 +70,25 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
         keep[win["index"].to_numpy()] = True
         beyond = wh > U64(_core.max_hash(a.t_cap))  # not among the rows, which stop at t_cap
         extra_pos, extra_h = wp[beyond], wh[beyond]
-    lengths = np.array([len(tree.seqs[i]) for i in tree.rep_by_pos])
-    for k, max_len, w in query.ladder(a.ladder):  # short leaves: shorter k-mers too
-        short = np.flatnonzero(lengths < max_len)
-        sp, sh = window_kmers([tree.seqs[i] for i in tree.rep_by_pos[short]], k, w, 0)
-        extra_pos = np.concatenate([extra_pos, short[sp]])
+    # bits of composition per k-mer (-log2 q0), and the ladder: a leaf takes the next k while it
+    # has fewer than min_kmers informative k-mers (a priori rarer than one chance holder among
+    # the leaves) at the k before
+    log_f = residue_log_freq(tree.seqs)
+    reps = [tree.seqs[i] for i in tree.rep_by_pos]
+    info = [kmer_info(tree.seqs, a.k, log_f).with_columns(k=pl.lit(a.k, pl.UInt8))]
+    rare = np.log2(max(n, 2))
+    need = np.flatnonzero(informative(kmer_info(reps, a.k, log_f), n, rare) < a.min_kmers)
+    for k, w in query.ladder(a.ladder):
+        if not len(need):
+            break
+        sub = [reps[i] for i in need]
+        sp, sh = window_kmers(sub, k, w, a.window_min)
+        extra_pos = np.concatenate([extra_pos, need[sp]])
         extra_h = np.concatenate([extra_h, query.salted(sh, k)])
+        got = kmer_info(sub, k, log_f)
+        info.append(got.with_columns(hash=pl.Series(query.salted(got["hash"].to_numpy(), k)),
+                                     k=pl.lit(k, pl.UInt8)))  # fmt: skip
+        need = need[informative(got, len(need), rare) < a.min_kmers]
     pos = np.concatenate([tree.pos[keep], extra_pos])
     h = np.concatenate([tree.h[keep], extra_h])
     leaf = lay["order"][pos]
@@ -144,7 +161,53 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
         take = rank < a.n_1
         parts.append(topups(hh[take], n + seq[take]))
     table = pl.concat(parts).sort("hash", "lo", "hi")
-    return table, pieces, n + len(leafless)
+    return table, pieces, n + len(leafless), key_bits(table, pl.concat(info))
+
+
+def key_bits(table: pl.DataFrame, info: pl.DataFrame) -> pl.DataFrame:
+    """(hash, k, bits) per key: a hit's evidence, -log2 q0 - log2 g, g the key's gains (its
+    positive postings: each an independent region of the tree a hit seeds)."""
+    g = table.filter(pl.col("sign") > 0).group_by("hash").agg(g=pl.len())
+    return (
+        g.join(info.unique("hash"), on="hash", how="left")
+        .with_columns(bits=pl.col("bits0").fill_null(0.0) - pl.col("g").cast(pl.Float64).log(2))
+        .select("hash", pl.col("k").fill_null(0), "bits")
+        .sort("hash")
+    )
+
+
+def residue_log_freq(seqs: list[bytes]) -> NDArray[np.float64]:
+    """log2 of each byte's frequency over the sequences (a floor for unseen bytes)."""
+    counts = np.bincount(np.frombuffer(b"".join(seqs), dtype=np.uint8), minlength=256) + 1e-9
+    return np.log2(counts / counts.sum())
+
+
+def kmer_info(seqs: list[bytes], k: int, log_f: NDArray[np.float64]) -> pl.DataFrame:
+    """(seq, hash, bits0) for every valid k-mer: bits0 = -log2 q0, q0 its chance of occurring
+    at a protein window from residue composition (low complexity: fewer bits)."""
+    parts = []
+    for start in range(0, len(seqs), 20_000):
+        batch = seqs[start : start + 20_000]
+        n_k = np.array([max(len(s) - k + 1, 0) for s in batch])
+        # ponytail: each k-mer hashed as its own sequence; a positional kernel at scale
+        o = _core.hash_proteins([s[i : i + k] for s in batch for i in range(len(s) - k + 1)], k)
+        lf = np.cumsum(np.r_[0, log_f[np.frombuffer(b"".join(batch), dtype=np.uint8)]])
+        first_res = np.cumsum([0] + [len(s) for s in batch])[:-1]
+        within = np.arange(n_k.sum()) - np.repeat(np.cumsum(n_k) - n_k, n_k)
+        at = np.repeat(first_res, n_k) + within  # each k-mer's first residue
+        bits0 = -(lf[at + k] - lf[at])
+        seq = np.repeat(np.arange(len(batch)), n_k) + start
+        parts.append(pl.DataFrame({"seq": seq[o["seq"]], "hash": o["hash"],
+                                   "bits0": bits0[o["seq"]]}))  # fmt: skip
+    return pl.concat(parts).unique(["seq", "hash"])
+
+
+def informative(info: pl.DataFrame, n_seq: int, rare: float) -> NDArray[np.int64]:
+    """Distinct k-mers per sequence with bits0 >= ``rare``."""
+    got = info.filter(pl.col("bits0") >= rare).group_by("seq").agg(pl.len())
+    out = np.zeros(n_seq, dtype=np.int64)
+    out[got["seq"].to_numpy()] = got["len"].to_numpy()
+    return out
 
 
 def window_kmers(
@@ -253,8 +316,10 @@ def main() -> None:
     )  # fmt: skip
     parser.add_argument(
         "--ladder", default="",
-        help="k:max_len:window,...: leaves shorter than max_len also hold window minimizers of k",
+        help="k:window,...: a leaf with fewer than --min-kmers informative k-mers at the k "
+        "before also holds window minimizers of k",
     )  # fmt: skip
+    parser.add_argument("--min-kmers", type=int, default=64)
     parser.add_argument(
         "--window-min", type=int, default=0,
         help="windows shrink to n // this for a leaf of n k-mers, so short ones get more (0: off)",
@@ -274,7 +339,7 @@ def main() -> None:
     members = p0.load_members(a.members)
     tree = survey.Tree(members, a)
     topology_s = time.perf_counter() - t0
-    table, pieces, n_pos = postings(tree, a)
+    table, pieces, n_pos, bits = postings(tree, a)
     for col, dtype in (("hash", U64), ("lo", np.uint32), ("hi", np.uint32), ("sign", np.int8),
                        ("kind", np.uint8)):  # fmt: skip
         np.save(out / f"{col}.npy", table[col].to_numpy().astype(dtype))
@@ -290,6 +355,9 @@ def main() -> None:
     np.save(out / "edge_w.npy", f.mst_w.astype(np.uint32))
     lengths = np.array([len(s) for s in tree.seqs], dtype=np.uint32)
     leafless = np.flatnonzero((tree.leaf_of < 0) & (tree.n_valid > 0)) if a.n_1 else []
+    np.save(out / "keys.npy", bits["hash"].to_numpy())
+    np.save(out / "key_bits.npy", bits["bits"].to_numpy().astype(np.float32))
+    np.save(out / "key_k.npy", bits["k"].to_numpy().astype(np.uint8))
     np.save(out / "pos_len.npy", np.concatenate([lengths[tree.rep_by_pos], lengths[leafless]]))
     # |S_v|: k-mers held at each position and each internal node (Fitch's states)
     rng = (

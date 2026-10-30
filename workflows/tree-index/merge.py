@@ -34,7 +34,7 @@ def main() -> None:
     cols: dict[str, list[np.ndarray]] = {
         x: [] for x in (*ARRAYS, *TABLES, "node_lo", "node_hi", "edge_a", "edge_b")
     }
-    pieces, proteins = [], []
+    pieces, proteins, bits = [], [], []
     off = 0
     for p, m in zip(parts, metas, strict=True):
         load = lambda name: np.load(p / f"{name}.npy")  # noqa: B023, E731
@@ -42,6 +42,8 @@ def main() -> None:
             cols[x].append(load(x))
         for x in ("lo", "hi", "node_lo", "node_hi", "edge_a", "edge_b"):
             cols[x].append(load(x).astype(np.uint64) + off)
+        names = (("hash", "keys"), ("bits", "key_bits"), ("k", "key_k"))
+        bits.append(pl.DataFrame({x: np.load(p / f"{y}.npy") for x, y in names}))
         pieces.append(pl.read_parquet(p / "pieces.parquet").with_columns(pl.col("lo", "hi") + off))
         proteins.append(
             pl.read_parquet(p / "proteins.parquet").with_columns(
@@ -59,6 +61,16 @@ def main() -> None:
     for x in ("node_lo", "node_hi", "edge_a", "edge_b", *TABLES):
         dtype = np.uint32 if x in ("node_lo", "node_hi", "edge_a", "edge_b") else merged[x].dtype
         np.save(out / f"{x}.npy", merged[x].astype(dtype))
+    # 2^-bits = q0 g, and q0 is a k-mer's own: gains across parts add
+    keys = (
+        pl.concat(bits)
+        .group_by("hash")
+        .agg(pl.col("k").first(), bits=-(2.0 ** -pl.col("bits").cast(pl.Float64)).sum().log(2))
+        .sort("hash")
+    )
+    np.save(out / "keys.npy", keys["hash"].to_numpy())
+    np.save(out / "key_bits.npy", keys["bits"].to_numpy().astype(np.float32))
+    np.save(out / "key_k.npy", keys["k"].to_numpy())
     pl.concat(pieces).write_parquet(out / "pieces.parquet")
     prot = pl.concat(proteins)
     prot.write_parquet(out / "proteins.parquet")
