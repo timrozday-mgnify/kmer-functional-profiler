@@ -625,3 +625,41 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - INDEX_SIZES lists every file under the release index, so tier 1's bytes are included.
     - Test profile run locally: 1,152 rows, both modes, matched rows at 0.01/8, 0.02/16 and 0.05/32.
     - *Not included:* tier 1 on core + extra, so `all`'s ratios still compare against core-only tier 1.
+* **Survey with a leaf per protein: results and tier parameters (HPC, 2026-10-30; the user's request: choose the tiers from the results).** `tree-index-phase0.tar.gz`, resumed.
+  - **Run.** SURVEY took 16 min / 12.5 GB on core and 34 min / 43 GB on all. TIER1_MATCHED built today's large tier (0.05/32) on the sample in 2.5 h: 3,546,868 postings.
+  - **INDEX_SIZES gap closed.** The release's tier-1 posting table is the `tier2.*` files (the old name, kept on disk): 90.6 GB of the standard tier's 196 GB. The unit columns are ~105 GB.
+  - **Leaves.** Core's 1,067,329 proteins give 1,065,645 leaves (distinct dense 8-mer sets), 736,282 internal nodes and 329,363 components; all's 2,067,329 give 2,062,934. At release scale that is ~5.7 × 10⁹ leaves. Only the 172 proteins with no valid 11-mer are blind (*n\_1* ≥ 1).
+  - **Cost of a leaf per protein.** 1.25–1.4× the collapsed tree's postings at every setting. Against tier 1 at matched rates (*τ* 0.3 unless noted):
+
+    | Settings | *n\_1* 1 | *n\_1* 2 | *n\_1* 4 |
+    | --- | --- | --- | --- |
+    | 0.01 / 8 (*τ* 0) | 1.64× | 2.12× | 3.64× |
+    | 0.02 / 16 | 1.47× | 1.58× | 1.99× |
+    | 0.05 / 32 | 1.45× | 1.47× | 1.55× |
+
+    - Single-leaf floors stay expensive: at 0.02/16, *n\_single* 2 / 4 / 16 cost +11% / +27% / +79%.
+    - *τ* 0.3 costs +1–2% over components; 0.6 costs +6–8%.
+  - **Release sizes (estimate).** About 9 B per posting (tier 1's measure on the sample: 15.57 MB for 1,727,926 postings; the release's table is ~9.75 B on core scaling). Per-leaf tables add ~35 GB: |S\_v| and merge level at 2 B each per leaf and per gap of the leaf order, the gap standing for the internal node that splits there. The protein-id map (~30 GB) is read only for reported ranges, and is not counted. Postings are projected from all (low) and core (high):
+
+    | Settings | Release postings | ~Size |
+    | --- | --- | --- |
+    | 0.01 / 8, *τ* 0, *n\_1* 1 | 6.2–7.7 × 10⁹ | 90–105 GB |
+    | 0.01 / 8, *τ* 0, *n\_1* 2 | 7.6–9.9 × 10⁹ | 103–124 GB |
+    | 0.02 / 8, *τ* 0.3, *n\_1* 2 | 10.3–11.9 × 10⁹ | 128–142 GB |
+    | 0.02 / 16, *τ* 0.3, *n\_1* 2 | 11.9–14.7 × 10⁹ | 142–167 GB |
+    | 0.05 / 16, *τ* 0.3, *n\_1* 4 | 23.5–25.7 × 10⁹ | 246–266 GB |
+    | 0.05 / 32, *τ* 0.3, *n\_1* 2 | 24.9–28.0 × 10⁹ | 259–287 GB |
+
+    **~64 GB is out of reach with a leaf per protein.** The per-leaf tables alone are ~35 GB, and the cheapest setting with every protein covered needs ~6 × 10⁹ postings.
+  - **Tiers chosen** (all with a leaf per dense 8-mer set, the dense 8-mer topology and *n\_single* 0):
+
+    | Tier | *t\_base* | *n\_min* | *τ* | *n\_1* | ~Size | Against today's tier at its rates (format today) |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | quick | 0.01 | 8 | 0 | 1 | 90–105 GB | 1.64× slim's postings (slim ~91 GB) |
+    | medium | 0.02 | 16 | 0.3 | 2 | 140–170 GB | 1.58× the standard tier's (196 GB) |
+    | large | 0.05 | 32 | 0.3 | 2 | 260–290 GB | 1.47× the large tier's (~310 GB) |
+
+    - *Quick:* the cheapest rates and floors with every protein covered, for a quick profile. It is ~1.5× the 64 GB target because of the per-protein tables.
+    - *Medium:* the standard tier's rates, for a profile followed by the dense tier. *n\_1* 2 lets every protein reach two hits, and *τ* 0.3 gives floors more coherent than tier 1's for +1–2%. If ~128 GB is a hard limit, 0.02/8 (128–142 GB) halves the floors, at the cost in short-protein detection that *n\_min* 16 was chosen to avoid.
+    - *Large:* today's large tier's rates (`tbase05_all`, which calibrates `aai`), so the two compare like for like. 0.05/16 with *n\_1* 4 (246–266 GB) fits 256 GB more closely.
+    - In today's format, each tree tier is about the size of the tier it replaces or smaller, at per-protein resolution.
