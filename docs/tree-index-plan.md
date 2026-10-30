@@ -819,3 +819,27 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - L3's level at depth > 0.5 is 0.999 / 0.993. It is reached by L3 at depth 0.5, by S7 (~14 minimizers) at 1.5, and by S5 (~10) at 2. S4 (~8) reaches 0.999 / 0.988–0.990 at depth 3–4.
     - *Depth stops paying once the reads cover the protein.* What is left at ≥ 90% identity is proteins whose indexed 11-mers all carry a substitution: at identity p a protein with n indexed 11-mers is missed with probability ~(1 − p¹¹)ⁿ, 0.69ⁿ at 90%, at any depth. ~99.3% at 90% therefore needs n ≈ 14, which is S7.
     - So tiers separated by depth compress: below ~1.5× (S3) recall at ≥ 90% stalls near 96% even at depth 4. A small tier at L3's ≥ 90% level is not much cheaper than the medium. At ≥ 95% only (miss ~0.43ⁿ), ~8 minimizers suffice from depth 2.
+* **Units above the leaves, the clustered index generalised (2026-10-30, the user's idea: store k-mers only for higher nodes while their members are within ~95% AAI, at higher density; then: pick each node by whether its k-mers can detect it to an AAI, rather than by a radius).**
+  - **Radius units with unions** (`build.py --unit-radius r`). Each spanning-tree component is walked from its root, and a leaf joins its parent's unit while its summed identity distance from the unit's first leaf is ≤ r (edge distance from dense 8-mer weights). Every member holds the union of the members' selected k-mers.
+    - r 0.025: 156,609 units of 261,954 leaves; 31,912 multi-leaf, holding 137,257 leaves (largest 233). r 0.05: 126,755 units, 167,697 leaves in multi-leaf units.
+  - **Detectability units** (`--detect-aai a*`, `--detect-miss ε`). A leaf joins its parent's unit while the unit's members still share N\* = ⌈log ε / log(1 − a\*¹¹)⌉ k-mers (≤ *t\_cap*): N\* is 14 at a\* 0.9 and 8 at 0.95, at ε 0.007. A multi-leaf unit then indexes its 2N\* lowest shared hashes in place of its members' own minimizers; lone leaves keep theirs.
+  - **Results** (both samples pooled; S5's settings, ~10 minimizers per leaf, unless noted; ≥ 95% / ≥ 90% identity):
+
+    | Build | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 2 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S4 (~8 per leaf) | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | 0.999 / 0.987 | 0.999 / 0.990 |
+    | D95 | 1.54 | 200–240 GB | 861 | 0.983 / 0.961 | 0.996 / 0.979 | 1.000 / 0.988 | 1.000 / 0.994 |
+    | S5 | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | U25 (union, r 0.025) | 2.05 | 255–305 GB | 1,088 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | U50 (union, r 0.05) | 2.12 | 260–315 GB | 1,277 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | D90 | 2.19 | 270–325 GB | 1,050 | 0.991 / 0.976 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | D90d (lone leaves ~14) | 2.71 | 325–395 GB | 1,182 | 0.993 / 0.981 | 0.998 / 0.990 | 1.000 / 0.995 | 1.000 / 0.998 |
+    | S7 (~14 per leaf) | 2.73 | 325–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | U25d (union, ~20 per leaf) | 4.11 | 475–580 GB | 2,208 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | L3 | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - Units neither save postings nor add recall. Unions cost +6–9% for identical recall. Detectability units land on the per-leaf curve (D95 ≈ S4; D90d ≈ S7, D90 between S5 and S7), and their candidate members are about the same as per-leaf builds.
+    - *Why:* the tree is already the general clustered index. Fitch posts a k-mer shared by near-identical members once, at their subtree, so per-leaf minimizers of close relatives cost about what a unit's shared set costs. What remains per leaf are k-mers its relatives do not share, and those are exactly the ones a strain diverged from that leaf needs. A union adds relatives' private k-mers, which a strain at 90% to the source does not carry.
+    - Recall at ≥ 90% is set by the indexed k-mers each protein has, ~0.69ⁿ misses as above, whether they are its own or its unit's. At equal n the cost is equal, so a unit cannot buy density.
+    - *Scale:* sharing grows with the number of relatives, so the per-protein cost of any design should fall at release against this quarter sample. The ratios between designs should hold, since every design shares the same way.

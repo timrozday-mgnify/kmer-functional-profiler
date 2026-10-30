@@ -73,6 +73,7 @@ def postings(
     # bits of composition per k-mer (-log2 q0), and the ladder: a leaf takes the next k while it
     # has fewer than min_kmers informative k-mers (a priori rarer than one chance holder among
     # the leaves) at the k before
+    n_ladder = 0  # ladder rows: the last of extra_*
     log_f = residue_log_freq(tree.seqs)
     reps = [tree.seqs[i] for i in tree.rep_by_pos]
     info = [kmer_info(tree.seqs, a.k, log_f).with_columns(k=pl.lit(a.k, pl.UInt8))]
@@ -85,12 +86,31 @@ def postings(
         sp, sh = window_kmers(sub, k, w, a.window_min)
         extra_pos = np.concatenate([extra_pos, need[sp]])
         extra_h = np.concatenate([extra_h, query.salted(sh, k)])
+        n_ladder += len(sp)
         got = kmer_info(sub, k, log_f)
         info.append(got.with_columns(hash=pl.Series(query.salted(got["hash"].to_numpy(), k)),
                                      k=pl.lit(k, pl.UInt8)))  # fmt: skip
         need = need[informative(got, len(need), rare) < a.min_kmers]
     pos = np.concatenate([tree.pos[keep], extra_pos])
     h = np.concatenate([tree.h[keep], extra_h])
+    if a.detect_aai:  # units by detectability: members share n* k-mers, which replace theirs
+        n_star = int(np.ceil(np.log(a.detect_miss) / np.log(1 - a.detect_aai**a.k)))
+        unit, chosen = detect_units(tree, n_star)
+        multi = np.bincount(unit, minlength=n)[unit] > 1
+        own_k = np.arange(len(h)) < len(h) - n_ladder  # rows of the index's k, not the ladder's
+        drop = (pos < n) & own_k & multi[np.minimum(pos, n - 1)]
+        members = pl.DataFrame({"u": unit, "pos": np.arange(n)}).filter(pl.Series(multi))
+        add = pl.DataFrame(
+            {"u": np.repeat(list(chosen), [len(x) for x in chosen.values()]),
+             "h": np.concatenate(list(chosen.values())) if chosen else np.zeros(0, U64)}
+        ).join(members, on="u")  # fmt: skip
+        pos = np.concatenate([pos[~drop], add["pos"].to_numpy()])
+        h = np.concatenate([h[~drop], add["h"].to_numpy()])
+    if a.unit_radius:  # every leaf of a unit holds the union of its members' k-mers
+        unit = units(tree, a.unit_radius)
+        held = pl.DataFrame({"u": unit[pos], "h": h}).unique()
+        spread = held.join(pl.DataFrame({"u": unit, "pos": np.arange(n)}), on="u")
+        pos, h = spread["pos"].to_numpy(), spread["h"].to_numpy()
     leaf = lay["order"][pos]
     o = np.lexsort((h, leaf))
     # every hash a leaf does not hold is known absent (no missing data above t_base)
@@ -162,6 +182,89 @@ def postings(
         parts.append(topups(hh[take], n + seq[take]))
     table = pl.concat(parts).sort("hash", "lo", "hi")
     return table, pieces, n + len(leafless), key_bits(table, pl.concat(info))
+
+
+def detect_units(
+    tree: survey.Tree, n_star: int
+) -> tuple[NDArray[np.int64], dict[int, NDArray[np.uint64]]]:
+    """Units by detectability: each spanning-tree component walked from its root, a leaf
+    joining its parent's unit while the unit's members still share at least ``n_star``
+    k-mers (hashes <= t_cap), enough to detect each member at the target AAI. Returns each
+    position's unit (a position) and, per multi-leaf unit, its 2 x n_star lowest shared
+    hashes (all if fewer)."""
+    f, n = tree.forest, tree.forest.n
+    pos_of_leaf = np.empty(n, dtype=np.int64)
+    pos_of_leaf[tree.lay["order"]] = np.arange(n)
+    a = pos_of_leaf[np.concatenate([f.mst_a, f.mst_b])]
+    b = pos_of_leaf[np.concatenate([f.mst_b, f.mst_a])]
+    o = np.argsort(a, kind="stable")
+    a, b = a[o], b[o]
+    start = np.searchsorted(a, np.arange(n + 1))
+    held = lambda v: tree.h[tree.row[v] : tree.row[v + 1]]  # noqa: E731
+    unit = np.full(n, -1, dtype=np.int64)
+    shared: dict[int, NDArray[np.uint64]] = {}
+    # ponytail: a Python walk with set intersections; a Rust kernel at release scale
+    for r in pos_of_leaf[f.root_nodes].tolist():
+        unit[r] = r
+        shared[r] = held(r)
+        stack = [r]
+        while stack:
+            v = stack.pop()
+            for c in b[start[v] : start[v + 1]].tolist():
+                if unit[c] >= 0:
+                    continue
+                u = unit[v]
+                both = np.intersect1d(shared[u], held(c), assume_unique=True)
+                if len(both) >= n_star:
+                    unit[c], shared[u] = u, both
+                else:
+                    unit[c], shared[c] = c, held(c)
+                stack.append(c)
+    sizes = np.bincount(unit, minlength=n)
+    chosen = {u: x[: 2 * n_star] for u, x in shared.items() if sizes[u] > 1}
+    return unit, chosen
+
+
+def units(tree: survey.Tree, radius: float) -> NDArray[np.int64]:
+    """Each position's unit: spanning-tree components walked from their roots, a leaf joining
+    its parent's unit while its summed identity distance from the unit's first leaf is at
+    most ``radius``. An edge's distance is 1 - p, from its weight w = |A Δ B| of dense k-mer
+    sets: p^k = 1 - w / (|A| + |B|), set sizes ~ length - k + 1."""
+    f, n = tree.forest, tree.forest.n
+    k = tree.args.topology_k
+    size = np.empty(n, dtype=np.float64)
+    size[tree.lay["order"]] = [max(len(tree.seqs[i]) - k + 1, 1) for i in tree.rep_by_pos]
+    share = np.clip(1 - f.mst_w / (size[f.mst_a] + size[f.mst_b]), 0, 1)
+    dist = 1 - share ** (1 / k)
+    a = np.concatenate([f.mst_a, f.mst_b])
+    b = np.concatenate([f.mst_b, f.mst_a])
+    d = np.concatenate([dist, dist])
+    o = np.argsort(a, kind="stable")
+    a, b, d = a[o], b[o], d[o]
+    start = np.searchsorted(a, np.arange(n + 1))
+    unit = np.full(n, -1, dtype=np.int64)
+    from_rep = np.zeros(n)
+    # ponytail: a Python walk over leaves (~1 s per 10^6); a Rust kernel at release scale
+    for r in f.root_nodes.tolist():
+        unit[r] = r
+        stack = [r]
+        while stack:
+            v = stack.pop()
+            for c, dc in zip(
+                b[start[v] : start[v + 1]].tolist(),
+                d[start[v] : start[v + 1]].tolist(),
+                strict=True,
+            ):
+                if unit[c] >= 0:
+                    continue
+                if from_rep[v] + dc <= radius:
+                    unit[c], from_rep[c] = unit[v], from_rep[v] + dc
+                else:
+                    unit[c], from_rep[c] = c, 0.0
+                stack.append(c)
+    pos_of_leaf = np.empty(n, dtype=np.int64)
+    pos_of_leaf[tree.lay["order"]] = np.arange(n)
+    return pos_of_leaf[unit][tree.lay["order"]]
 
 
 def key_bits(table: pl.DataFrame, info: pl.DataFrame) -> pl.DataFrame:
@@ -320,6 +423,16 @@ def main() -> None:
         "before also holds window minimizers of k",
     )  # fmt: skip
     parser.add_argument("--min-kmers", type=int, default=64)
+    parser.add_argument(
+        "--detect-aai", type=float, default=0.0,
+        help="units by detectability: members share enough k-mers to detect each at this AAI",
+    )  # fmt: skip
+    parser.add_argument("--detect-miss", type=float, default=0.007)
+    parser.add_argument(
+        "--unit-radius", type=float, default=0.0,
+        help="leaves within this identity distance of their unit's first leaf share the "
+        "union of their k-mers (0: a set per leaf)",
+    )  # fmt: skip
     parser.add_argument(
         "--window-min", type=int, default=0,
         help="windows shrink to n // this for a leaf of n k-mers, so short ones get more (0: off)",
