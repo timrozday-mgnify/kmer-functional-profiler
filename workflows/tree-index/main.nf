@@ -94,13 +94,17 @@ process REDUCE {
 
     input:
     tuple val(range), path(parts)
+    val passes  // an input, so -resume reruns when it changes (params are not hashed)
 
     output:
     path "r${range}.hist.parquet", emit: hist
     path "r${range}.top.parquet", emit: top
 
-    script:
-    "${phase0()} reduce --parts ${parts} --prefix r${range}"
+    script:  // reduce.py, not phase0.py: editing it keeps SAMPLE and STREAM cached
+    """
+    ${params.venv}/bin/python ${projectDir}/reduce.py --parts ${parts} --prefix r${range} \
+        --passes ${passes}
+    """
 }
 
 process COMBINE {
@@ -196,7 +200,7 @@ workflow {
         by_range = STREAM.out.parts.flatten()
             .map { f -> [(f.name =~ /\.r(\d+)\.parquet$/)[0][1] as int, f] }
             .groupTuple()
-        REDUCE(by_range)
+        REDUCE(by_range, params.reduce_passes)
         COMBINE(REDUCE.out.hist.collect(), REDUCE.out.top.collect(), STREAM.out.totals.collect())
         extra = EXTRA(STREAM.out.extra.collect())
     }
