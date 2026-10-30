@@ -306,7 +306,7 @@ Without MGnify90 units, "the right unit" is no longer defined, so accuracy is sc
 
 Laptop work runs one job at a time with capped threads; full-scale runs go to HPC as Nextflow (SLURM + Singularity) for the user to run.
 
-0. **Measure, no index (gate for everything after).** *Run 2026-10-30: **gate failed** on postings (3.8× tier 1 with per-sequence floors; 0.64× without floors); leaves 1.98× units (passes). Stopped here pending a decision on floors; see Progress log.* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
+0. **Measure, no index (gate for everything after).** *Run 2026-10-30: **gate failed** on postings (3.8× tier 1 with per-sequence floors; 0.64× without floors); leaves 1.98× units (passes). Stopped here pending a decision on floors; see Progress log. Survey 2026-10-30: with floors per piece and a per-leaf minimum, **passes** on the full sample (1.11× tier 1, every protein with a valid 11-mer covered).* On a sample of MGnify: a few hundred thousand MGnify90 clusters with all their members, plus the representatives that share k-mers with them across clusters (to see cross-cluster sharing). Laptop on a biome subset, HPC for the full-scale sample. At *t\_base* 0.02, *n\_min* 16, k 11, with today's hashing (`crates/core` `protein_kmers`):
    - spanning tree under |S\_a Δ S\_b| with the virtual empty root: exact (all candidate pairs from the inverted index, Kruskal) at this size, and the staged build (stages 1–4) beside it. Report the staged tree's total weight against the exact one, each stage's candidates, largest signature group, and prefix posting lengths;
    - equal-set and containment collapses;
    - *diff schemes* (Diff schemes): postings and build time for the sequence MST, add-only, majority and Fitch on the same merge tree, on the same sample. **Decision:** Fitch on the merge tree unless the sequence MST is within ~10% of its postings and clearly cheaper to build;
@@ -535,3 +535,21 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
       - Coherence and floors are now per leaf (one representative per leaf) rather than per protein, so pieces of one leaf with several identical proteins count as single-leaf pieces.
       - Proteins without a leaf (no k-mer up to *t\_cap*) get a leaf of their own under the minimum.
     - **On the quarter sample** (17 s, 2.1 GB): at components with no single-leaf floor and *n\_1* = 1, **1.10× the standard tier** with only the 38 proteins that have no valid 11-mer uncovered. *n\_1* = 2: 1.19×; *n\_single* = 2 with *n\_1* = 1: 1.35×.
+  - **Survey results (HPC, 2026-10-30).** `tree-index-phase0.tar.gz`: SURVEY on core (1,067,329 proteins, 308,997 units) and all (+10⁶ cross-cluster representatives), TIER1_MATCHED, INDEX_SIZES. SURVEY took 3.3 min / 5.6 GB (core) and 6 min / 21 GB (all).
+    - **Core confirms the quarter sample.** At *t\_base* 0.02, *n\_min* 16, no single-leaf floor (*n\_single* 0), totals over the standard tier (1,727,926):
+
+      | *τ* | *n\_1* = 0 (blind) | 1 | 2 | 4 |
+      | --- | --- | --- | --- | --- |
+      | 0 (components) | 1.06× (91,752) | **1.11×** | 1.20× | 1.49× |
+      | 0.3 | 1.08× (90,434) | **1.12×** | 1.21× | 1.50× |
+      | 0.6 | 1.11× (97,041) | 1.16× | 1.26× | 1.56× |
+      | 0.9 | 0.85× (127,500) | 0.91× | 1.03× | 1.42× |
+
+      With *n\_1* ≥ 1 only 172 proteins stay uncovered (no valid 11-mer). Every *τ* ≤ 0.6 with *n\_1* ≤ 2 passes the 1.5× gate.
+    - *τ* 0.9 is cheaper only because it splits clades into single leaves, which get no floor at *n\_single* 0; the top-up covers them with fewer k-mers. It trades floors for top-ups rather than buying resolution.
+    - **Single-leaf floors are the expensive part.** *n\_single* 2 / 4 / 16 cost 1.36× / 1.63× / 2.47× (τ 0, *n\_1* 1). Only *n\_single* ≤ 2 passes.
+    - **Lower rate.** At *t\_base* 0.01, *n\_min* 8 the tree is 1.23× tier 1 built at the same rate (869,021; *τ* 0, *n\_1* 1), and 0.62× the standard tier. Whether that rate is sensitive enough is phase 4's question.
+    - **All (cross-cluster sharing).** The extra 10⁶ representatives add 0.90 M base postings (+72%) and 41 k floor postings for +94% proteins. Its ratios in `survey.tsv` (1.65× at the settings above) are **not comparable**: the denominator is tier 1 on core only. A matched check needs tier 1 built on core + extra.
+    - **Release scale.** Projected linearly by protein count (5,378× from core): 1.03 × 10¹⁰ postings (τ 0, *n\_1* 1) against 9.3 × 10⁹ for the standard tier on the same scaling; from all (2,776×) 7.9 × 10⁹. Linear scaling ignores the growth of sharing with depth, so these are upper bounds.
+    - **Gap:** `index_sizes.tsv` has no tier-1 file (INDEX_SIZES lists one directory level only), so the release's tier-1 bytes are still unknown.
+    - **Reading.** The phase-0 gate passes on the full sample with floors per piece (components or *τ* 0.3), no single-leaf floor, and *n\_1* = 1: ~1.11× tier 1 with every valid protein covered. Pending the user's decision: proceed to phase 1 on these settings, or first re-run with a tier 1 on core + extra for the matched `all` check.
