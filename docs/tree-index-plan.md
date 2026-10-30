@@ -514,3 +514,17 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     | 8 | 1,294,562 | +299% | 236,950 |
 
     **≥ 1 own k-mer costs +9%** and leaves only the 38 proteins with no valid 11-mer. Those need a different route (a shorter *k*, or an exact-sequence table). The hierarchy route, together with ≥ 1–2 own k-mers, gives every protein some way into tier 2.
+  - **No unfloored pieces (the user, same day: single-member exceptions make sense for clusters, not for a tree).**
+    - The exception was carried over from tier 1, where singleton units go unfloored to fit memory. It is dropped: every piece gets a floor, single-leaf pieces included.
+    - A single-leaf piece has no one to share its floor with, so each floor k-mer is a fresh posting. The floor size for single leaves (*n\_1*) is therefore the lever.
+    - Quarter sample, total postings over tier 1. Blind proteins become 0 in every column (only the 38 with no valid 11-mer remain):
+
+    | *τ* | Multi-leaf pieces only (blind) | *n\_1* = 16 | 8 | 4 | 2 | 1 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0.3 | 1.21× (17,127) | 2.55× | 2.17× | 1.74× | **1.49×** | **1.35×** |
+    | 0.6 | 1.33× (18,404) | 2.93× | 2.46× | 1.95× | 1.65× | **1.49×** |
+    | 0.9 | 1.25× (21,630) | 3.46× | 2.80× | 2.09× | 1.68× | 1.47× |
+
+    - Within the 1.5× gate, every protein is covered at *τ* 0.3 with *n\_1* ≤ 2, or at *τ* 0.6 with *n\_1* = 1.
+    - These are upper bounds: a single leaf's floor here is up to *n\_1* candidates above *t\_base* even when it has base k-mers already. A top-up rule (floor only to reach *n\_1* stored k-mers in all) is cheaper.
+    - The rule becomes uniform in tree terms: a floor of up to *n\_min* k-mers per piece, chosen by coherence, with a minimum of *n\_1* stored k-mers per leaf.
