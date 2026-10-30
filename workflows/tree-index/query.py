@@ -49,6 +49,11 @@ class Index:
     def k(self) -> int:
         return int(self.meta["params"]["k"])
 
+    def keyed(self, h: NDArray[np.uint64]) -> NDArray[np.uint64]:
+        """The hashes that are keys."""
+        at = np.minimum(np.searchsorted(self.hash, h), max(len(self.hash) - 1, 0))
+        return h[np.asarray(self.hash[at]) == h] if len(self.hash) else h[:0]
+
     @property
     def max_hash(self) -> int:
         return int(self.hash[-1]) if len(self.hash) else 0
@@ -58,6 +63,19 @@ class Index:
         at = np.minimum(np.searchsorted(self.beyond, h), max(len(self.beyond) - 1, 0))
         hit = self.beyond[at] == h if len(self.beyond) else np.zeros(len(h), dtype=bool)
         return h[(h <= self.sketch_max) | hit]
+
+
+def ladder(spec: str) -> list[tuple[int, int, int]]:
+    """``build.py --ladder``'s (k, max_len, window) steps."""
+    return [tuple(int(x) for x in step.split(":")) for step in spec.split(",") if step]  # type: ignore[misc]
+
+
+def salted(h: NDArray[np.uint64], k: int) -> NDArray[np.uint64]:
+    """Hashes of a ladder's k moved to their own domain (a bijection per k): k-mer hashes do
+    not depend on k, so a 9-mer can share an 11-mer's hash."""
+    with np.errstate(over="ignore"):
+        x = (h ^ np.uint64(k * 0x9E3779B97F4A7C15 % 2**64)) * np.uint64(0xBF58476D1CE4E5B9)
+    return x ^ (x >> np.uint64(31))
 
 
 def sample_counts(batches: Iterable[NDArray[np.uint64]]) -> pl.DataFrame:
@@ -71,6 +89,9 @@ def sample_counts(batches: Iterable[NDArray[np.uint64]]) -> pl.DataFrame:
 def read_hashes(index: Index, r1: str, r2: str | None, frames: str) -> Iterable[NDArray[Any]]:
     for b in _core.FastxHits(r1, r2, k=index.k, frames=frames, max_hash=index.max_hash):
         yield index.sampled(b["hash"])
+    for k, _, _ in ladder(index.meta["params"].get("ladder", "")):  # every k-mer that is a key
+        for b in _core.FastxHits(r1, r2, k=k, frames=frames):
+            yield index.keyed(salted(b["hash"], k))
 
 
 def protein_hashes(index: Index, fasta: str) -> Iterable[NDArray[Any]]:
@@ -86,7 +107,10 @@ def protein_hashes(index: Index, fasta: str) -> Iterable[NDArray[Any]]:
         seqs.append("".join(cur).encode())
     # one sequence at a time: hash_proteins dedups within a call, so n counts sequences
     for s in seqs:
-        yield index.sampled(_core.hash_proteins([s], index.k, max_hash=index.max_hash)["hash"])
+        h = index.sampled(_core.hash_proteins([s], index.k, max_hash=index.max_hash)["hash"])
+        for k, _, _ in ladder(index.meta["params"].get("ladder", "")):
+            h = np.concatenate([h, index.keyed(salted(_core.hash_proteins([s], k)["hash"], k))])
+        yield h
 
 
 def count(index: Index, sample: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, dict]:

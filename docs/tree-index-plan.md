@@ -748,3 +748,24 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - What is left is not reachable by an exact 11-mer index. Of short strains at depth > 0.5, 20% have no source 11-mer in their reads and 51% fewer than 8. At 80% identity, 18% of all strains have none. Depth > 0.5 on a 30–60 aa gene is often one read pair overlapping it by 15–20 aa.
     - *The user's question (floors for short proteins):* raising them is what `--window-min` does, and it took short proteins with ≥ 8 observable k-mers from 86–90% to 99.1%. Beyond that a higher floor cannot help. A shorter seed for short proteins (k 8–9 or a reduced alphabet) would, at a cost in chance hits; not tried.
     - *Cost:* w20 min 8 is ~4× medium's postings, ~2.6× its bytes here (per-leaf tables are fixed). At release that is roughly 500 GB against medium's 140–170 GB (estimate from the survey's projection). w30 min 8 is ~3.6× for the same recall at ≥ 95%.
+* **A k ladder for short proteins (2026-10-30, the user's request: try a shorter seed for short proteins first, as low as k 7; the medium tier should be about half of w30 min 8's size).**
+  - **`build.py --ladder k:max_len:w,...`:** leaves shorter than max\_len also hold window minimizers of k-mers of a shorter k, diffed by Fitch with the rest. The query hashes reads at each ladder k and keeps the k-mers that are keys.
+    - *Bug found on the way:* k-mer hashes do not depend on k. A 9-mer shared a hash with 11-mers, which put duplicate (leaf, hash) pairs into the Fitch kernel (a panic in `lca`). Ladder hashes are now moved to their own domain per k by a bijection (`query.salted`).
+  - **Results** (on medium + w30 min 8, depth > 0.5; neighbour rule δ 0.1, cap 256):
+
+    | Ladder | Postings (× medium) | bg hit hashes | bg leaves | All | ≥ 95% id | ≥ 90% id | Short, ≥ 95% | Short, all | observable 0 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | none | 3.62 | 700 | 1,447 | 0.919 | 0.984 | 0.972 | 0.884 | 0.744 | 0.082 |
+    | k 9 < 100 aa (w 4) | 5.45 | 2,089 | 2,613 | 0.949 | 0.991 | 0.987 | 0.938 | 0.843 | 0.342 |
+    | k 9 < 100 aa, k 7 < 60 aa (w 2) | 6.63 | 40,915 | 27,472 | 0.973 | 1.0 | 0.995 | 1.0 | 0.973 | 0.795 |
+    | k 7 < 100 aa (w 2) | 6.79 | 101,439 | 63,521 | 0.976 | 1.0 | 0.995 | 1.0 | 0.973 | 0.849 |
+
+  - **Reading.**
+    - k 7 closes the short-protein gap: 100% at ≥ 95% identity, and 80–85% of strains with no source 11-mer in their reads are found.
+    - But the background reads alone then seed 10–24% of the quarter index's leaves. The cause is read-side chance, not the index: a 7-mer occurs by chance about once per 20⁷ ≈ 1.3 × 10⁹ read windows, so in a 10 M-pair sample (~2 × 10⁹ windows) every indexed 7-mer is expected to be hit about once. At release every leaf holding 7-mers would be seeded in every sample.
+    - k 9 costs +1.8× postings for +3% recall (short proteins 88% to 94% at ≥ 95% identity), with ~1.8× the background seeds. At release, chance single 9-mer hits are ~2 × 10⁹ × keys / 20⁹, which is large too.
+  - **Design proposed (the user's points: the k per leaf from the data at build time, by k-mer count or uniqueness in the database rather than fixed thresholds; promiscuous k-mers removed by an information criterion on the tree rather than a holder cut):**
+    - *Evidence of a hit.* A hit on k-mer x is worth b(x) = −log₂ q₀(x) − log₂ g(x) bits. q₀(x) is the chance probability of x in a protein window, from residue composition, so low-complexity k-mers are worth less. g(x) is x's number of independent gains on the tree (Fitch), so a hit's weight is split over the g unrelated clades it seeds. A clade marker (one gain, however many leaves) keeps all its bits. This replaces the 16-unit cut and the plan's fixed gain cut.
+    - *Seeds by evidence within one read pair:* a leaf is a seed when its hits from one read pair sum to at least B bits. B is set by an expected number of chance seeds per sample: B = log₂(read windows × leaves / chance seeds). It is the one parameter, in units of false candidates, and it holds for every k: one clean 11-mer hit carries ~46 bits, so 7-mers need two or more hits in the same read to count. Seeds then need per-read hit sets (`FastxHits` gives read ids).
+    - *Pruning:* a k-mer is dropped when no read can use it, i.e. when even the most hits of its k that fit in one read alongside it cannot reach B.
+    - *The k per leaf:* going down the ladder (11, 9, 8, 7), a leaf takes the next k only while it has fewer window-covering k-mers with positive evidence than a read overlap needs. Evidence comes from the same Fitch pass, so the rule is set by the database, not by protein length.

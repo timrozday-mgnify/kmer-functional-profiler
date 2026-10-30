@@ -8,7 +8,10 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
 
 - **base** (kind 0): each leaf's representative's k-mers with hash <= t\\_base (and with
   ``--window`` W, its least hash in every window of W k-mers, any hash), diffed by Fitch over
-  the whole tree: a gain is +1 over the node's range, a loss -1;
+  the whole tree: a gain is +1 over the node's range, a loss -1. With ``--ladder``
+  k:max\\_len:w,..., leaves shorter than max\\_len also hold window minimizers of k-mers of that
+  shorter k (hashes salted per k), for reads that overlap a short gene by too little to hold a
+  whole k-mer of the index's k;
 - **floor** (kind 1): per piece of two or more leaves (``survey.pieces`` at ``tau``), its
   n\\_min floor k-mers, +1 over the piece. Single-leaf pieces get no floor (*n\\_single* 0);
 - **top-up** (kind 2): each leaf topped up to ``n_1`` k-mers of its own (base, floor k-mers it
@@ -37,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import phase0 as p0
 import polars as pl
+import query
 import survey
 from numpy.typing import NDArray
 
@@ -62,12 +66,18 @@ def postings(tree: survey.Tree, a: argparse.Namespace) -> tuple[pl.DataFrame, pl
         keep[win["index"].to_numpy()] = True
         beyond = wh > U64(_core.max_hash(a.t_cap))  # not among the rows, which stop at t_cap
         extra_pos, extra_h = wp[beyond], wh[beyond]
+    lengths = np.array([len(tree.seqs[i]) for i in tree.rep_by_pos])
+    for k, max_len, w in query.ladder(a.ladder):  # short leaves: shorter k-mers too
+        short = np.flatnonzero(lengths < max_len)
+        sp, sh = window_kmers([tree.seqs[i] for i in tree.rep_by_pos[short]], k, w, 0)
+        extra_pos = np.concatenate([extra_pos, short[sp]])
+        extra_h = np.concatenate([extra_h, query.salted(sh, k)])
     pos = np.concatenate([tree.pos[keep], extra_pos])
     h = np.concatenate([tree.h[keep], extra_h])
     leaf = lay["order"][pos]
     o = np.lexsort((h, leaf))
     # every hash a leaf does not hold is known absent (no missing data above t_base)
-    top = U64(ALL) if a.window else lo_base
+    top = U64(ALL) if a.window or a.ladder else lo_base
     sets = p0.Sets(p0.csr(leaf[o], h[o], n), h[o], np.zeros(n, np.uint8), np.array([top]))
     ch = _core.tree_schemes(
         n, f.left, f.right, f.tops, sets.offsets.astype(U64), sets.hashes, sets.level,
@@ -240,6 +250,10 @@ def main() -> None:
     parser.add_argument(
         "--window", type=int, default=0,
         help="also base: each leaf's least hash in every window of this many k-mers (0: off)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--ladder", default="",
+        help="k:max_len:window,...: leaves shorter than max_len also hold window minimizers of k",
     )  # fmt: skip
     parser.add_argument(
         "--window-min", type=int, default=0,
