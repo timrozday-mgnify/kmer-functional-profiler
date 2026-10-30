@@ -870,3 +870,33 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Cuts on the tree's states are the one free saving:* at a\* 0.9 they drop 7% of a dense build's postings (S10 → C90d) with identical recall to three decimals. At S5's density they never bind, since a leaf with ~10 k-mers cannot share 14. Cutting at 0.95 removes 27% but lands back on the curve (C95d ≈ S7).
     - L3 still beats the ~20-per-leaf builds at ≥ 90% identity (0.993 against 0.988) at similar size. Its k 7 ladder reaches more leaves (< 48 informative 11-mers, w 3, against < 16, w 4), so the ladder's reach matters more than 11-mer density for divergent strains.
     - *Next, if pursued:* cuts at 0.9 on L3's settings, for an expected ~7% off the large tier at its recall.
+* **Recall at 70–85% identity, reduced alphabets, and false hits by decoys (2026-10-30, the user's request: recall at 70% AAI and 1× would be ideal; then Dayhoff k 7 with something clever for the false hits and the index size; high recall is the objective for now).**
+  - **Divergent samples.** `sim3`: 2,000 targets at identity 0.85 / 0.8 / 0.75 / 0.7, depth lognormal (μ 0.3, σ 0.6), uniform substitutions. `sim4`: the same with `spike.py simulate --substitution blosum62`, new residues weighted 2^(S/2) by BLOSUM62 as in real homologs.
+  - **Recall at depth > 1** (seeds by evidence at 1%, with the neighbour rule; BLOSUM / uniform sample):
+
+    | Build | Postings (× medium) | bg seeds | 85% | 80% | 75% | 70% |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | S5 | 1.94 | 887 | 0.79 / 0.79 | 0.59 / 0.57 | 0.45 / 0.38 | 0.34 / 0.33 |
+    | L3 | 4.09 | 2,969 | 0.92 / 0.92 | 0.77 / 0.79 | 0.62 / 0.61 | 0.47 / 0.46 |
+    | E7 | 5.64 | 6,027 | 0.93 / 0.94 | 0.83 / 0.84 | 0.71 / 0.70 | 0.55 / 0.54 |
+    | R10: S5 + Murphy-10 k 10 minimizers (w 4) on every leaf | 11.74 | 41,775 | 0.97 / 0.94 | 0.92 / 0.88 | 0.87 / 0.79 | 0.79 / 0.71 |
+    | R9: S5 + Murphy-10 k 9 (w 4) | 11.69 | 123,860 | 0.98 / 0.97 | 0.95 / 0.94 | 0.94 / 0.88 | 0.88 / 0.85 |
+
+  - **Feasibility, worked out** (187 aa, 1× ≈ 63% covered, BLOSUM62 substitutions, a protein missed when no indexed k-mer survives):
+    - Under BLOSUM62, 21% of substitutions stay within a Murphy-10 class and 30% within a Dayhoff class, against 9% and 16% under uniform.
+    - At equal bits, a shorter full-alphabet k-mer survives as well as or better than a reduced one: protein k 7 (29 bits) 0.082 against Murphy-10 k 10 (30 bits) 0.068; protein k 8 0.058 against Murphy-10 k 11 0.052.
+    - At 70%, a miss rate ≤ 1% needs k ≤ 7–8 with half of all k-mers indexed, or k 9 with all.
+  - **New tools:**
+    - Ladder steps take an alphabet (`murphy10:k:w`, `dayhoff:k:w`), salted per (alphabet, k), with composition bits from class frequencies.
+    - `:rare` picks each window's rarest k-mer in the database (an exact frequency table, at most 6⁷ entries for Dayhoff 7-mers) rather than its least hash.
+    - `:unit` chooses the step's k-mers on each tree unit's first protein (`--ladder-radius`, default 0.1) and gives them to every member.
+    - `query.py --decoy` seeds the reads reversed (not complemented) as decoys and sets the bar where decoy seeds are ≤ `--chance-share` of the sample's (target-decoy). Per-hit bits are floored at 0 in that mode.
+    - `--ladder-frames` sets the frames for ladder k-mers, and evidence is computed in chunks of read pairs.
+  - **Dayhoff k 7.**
+    - On every leaf (`dayhoff:7:4:rare`): 8.9 M postings (13.9×), 215 k keys (77% of all Dayhoff 7-mers) at 36 postings per key. A query would expand ~2.5 × 10⁹ rows, so it was not run.
+    - Per unit (`dayhoff:7:8:rare:unit`, r 0.1): 5.5 M postings (8.65×), 21 per key. Queried on `sim4` with the decoy bar and stop-free Dayhoff frames: 33 min and 10.4 GB for 135 k read pairs, almost all in Python evidence.
+    - **Decoys score as well as the sample:** at 30 bits, 85 k decoy leaves against 123 k; at 10 bits both cover the whole index. A 1% decoy share needs 63 bits, which also discards single 11-mer seeds (~46 bits). Recall at 70% fell to 0.20 (0.30 with the neighbour rule), below S5 without the layer; at a 10% share, 0.32.
+  - **Reading.**
+    - Exact seeds on a reduced alphabet reach divergent strains (R9: 0.88 at 70%), but their hits from one read pair cannot be told from chance by counting bits. At release scale, where every Dayhoff 7-mer is held by most families, that is worse.
+    - Telling homologs from chance at 70% from a read needs the read aligned: an ungapped extension along the hit's diagonal against the candidate's sequence, as BLAST and DIAMOND do after their seeds. That is the follow-up's alignment stage, not something the k-mer index can do alone.
+    - The bars should also be per layer, so a noisy layer cannot raise the bar for 11-mer seeds.

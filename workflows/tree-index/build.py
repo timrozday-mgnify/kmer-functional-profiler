@@ -38,6 +38,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Final
 
 import numpy as np
 import phase0 as p0
@@ -80,18 +81,37 @@ def postings(
     info = [kmer_info(tree.seqs, a.k, log_f).with_columns(k=pl.lit(a.k, pl.UInt8))]
     rare = np.log2(max(n, 2))
     need = np.flatnonzero(informative(kmer_info(reps, a.k, log_f), n, rare) < a.min_kmers)
-    for k, w in query.ladder(a.ladder):
+    for (k, w, alpha, code), flags in zip(
+        query.ladder(a.ladder), query.ladder_flags(a.ladder), strict=True
+    ):
         if not len(need):
             break
-        sub = [reps[i] for i in need]
-        sp, sh = window_kmers(sub, k, w, a.window_min)
-        extra_pos = np.concatenate([extra_pos, need[sp]])
-        extra_h = np.concatenate([extra_h, query.salted(sh, k)])
+        heads = need
+        if "unit" in flags:  # chosen on each unit's first protein, held by every member
+            unit = units(tree, a.ladder_radius)
+            heads = np.unique(unit[need])
+        sub = [reps[i] for i in heads]
+        rank = None
+        if "rare" in flags:  # each k-mer's leaves in the database: windows keep their rarest
+            vc = kmer_info(reps, k, log_f, alpha).group_by("hash").len().sort("hash")
+            rank = (vc["hash"].to_numpy(), vc["len"].to_numpy().astype(np.uint64))
+        sp, sh = window_kmers(sub, k, w, a.window_min, alpha, rank)
+        if "unit" in flags:
+            chosen = pl.DataFrame({"head": heads[sp], "h": sh})
+            members = pl.DataFrame({"head": unit[need], "pos": need})
+            got_rows = chosen.join(members, on="head")
+            sp_pos, sh = got_rows["pos"].to_numpy(), got_rows["h"].to_numpy()
+        else:
+            sp_pos = heads[sp]
+        sp = sp_pos
+        extra_pos = np.concatenate([extra_pos, sp])
+        extra_h = np.concatenate([extra_h, query.salted(sh, code)])
         n_ladder += len(sp)
-        got = kmer_info(sub, k, log_f)
-        info.append(got.with_columns(hash=pl.Series(query.salted(got["hash"].to_numpy(), k)),
-                                     k=pl.lit(k, pl.UInt8)))  # fmt: skip
-        need = need[informative(got, len(need), rare) < a.min_kmers]
+        got = kmer_info(sub, k, log_f, alpha)
+        info.append(got.with_columns(hash=pl.Series(query.salted(got["hash"].to_numpy(), code)),
+                                     k=pl.lit(code, pl.UInt8)))  # fmt: skip
+        if "unit" not in flags:
+            need = need[informative(got, len(need), rare) < a.min_kmers]
     pos = np.concatenate([tree.pos[keep], extra_pos])
     h = np.concatenate([tree.h[keep], extra_h])
     if a.detect_aai or a.unit_kmers:  # units: members share k-mers, which replace theirs
@@ -402,7 +422,27 @@ def residue_log_freq(seqs: list[bytes]) -> NDArray[np.float64]:
     return np.log2(counts / counts.sum())
 
 
-def kmer_info(seqs: list[bytes], k: int, log_f: NDArray[np.float64]) -> pl.DataFrame:
+CLASSES: Final = {
+    "murphy10": ("LVIM", "C", "A", "G", "ST", "P", "FYW", "EDNQ", "KR", "H"),
+    "dayhoff": ("AGPST", "C", "DENQ", "HKR", "ILMV", "FWY"),
+}  # crates/core/src/alphabet.rs
+
+
+def class_log_freq(log_f: NDArray[np.float64], alphabet: str) -> NDArray[np.float64]:
+    """Per byte, log2 of its class's frequency under a reduced alphabet (``log_f`` itself
+    for protein)."""
+    if alphabet == "protein":
+        return log_f
+    out = log_f.copy()
+    for group in CLASSES[alphabet]:
+        idx = np.frombuffer(group.encode(), dtype=np.uint8)
+        out[idx] = np.log2((2.0 ** log_f[idx]).sum())
+    return out
+
+
+def kmer_info(
+    seqs: list[bytes], k: int, log_f: NDArray[np.float64], alphabet: str = "protein"
+) -> pl.DataFrame:
     """(seq, hash, bits0) for every valid k-mer: bits0 = -log2 q0, q0 its chance of occurring
     at a protein window from residue composition (low complexity: fewer bits)."""
     parts = []
@@ -410,8 +450,13 @@ def kmer_info(seqs: list[bytes], k: int, log_f: NDArray[np.float64]) -> pl.DataF
         batch = seqs[start : start + 20_000]
         n_k = np.array([max(len(s) - k + 1, 0) for s in batch])
         # ponytail: each k-mer hashed as its own sequence; a positional kernel at scale
-        o = _core.hash_proteins([s[i : i + k] for s in batch for i in range(len(s) - k + 1)], k)
-        lf = np.cumsum(np.r_[0, log_f[np.frombuffer(b"".join(batch), dtype=np.uint8)]])
+        ks = [s[i : i + k] for s in batch for i in range(len(s) - k + 1)]
+        o = _core.hash_proteins(ks, k, alphabet=alphabet)
+        lf = np.cumsum(
+            np.r_[
+                0, class_log_freq(log_f, alphabet)[np.frombuffer(b"".join(batch), dtype=np.uint8)]
+            ]
+        )
         first_res = np.cumsum([0] + [len(s) for s in batch])[:-1]
         within = np.arange(n_k.sum()) - np.repeat(np.cumsum(n_k) - n_k, n_k)
         at = np.repeat(first_res, n_k) + within  # each k-mer's first residue
@@ -431,27 +476,44 @@ def informative(info: pl.DataFrame, n_seq: int, rare: float) -> NDArray[np.int64
 
 
 def window_kmers(
-    seqs: list[bytes], k: int, w: int, min_count: int = 0
+    seqs: list[bytes],
+    k: int,
+    w: int,
+    min_count: int = 0,
+    alphabet: str = "protein",
+    rank: tuple[NDArray[np.uint64], NDArray[np.uint64]] | None = None,
 ) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
     """Distinct (sequence, hash): each sequence's least hash in every window of w_s consecutive
     k-mers (robust winnowing; the whole sequence when shorter), so every stretch of w_s + k - 1
     residues holds an indexed k-mer. w_s is ``w``, or with ``min_count`` M, min(w, n_k // M)
-    (at least 1), so a sequence of n_k k-mers gets about M or more."""
+    (at least 1), so a sequence of n_k k-mers gets about M or more. With ``rank`` (sorted
+    hashes and their counts in the database), each window keeps its rarest k-mer (ties: the
+    leftmost) instead of its least hash."""
     out_seq, out_h = [], []
     none = np.iinfo(np.uint64).max
     for start in range(0, len(seqs), 20_000):
         batch = seqs[start : start + 20_000]
         n_k = np.array([max(len(s) - k + 1, 0) for s in batch])
         # ponytail: each k-mer hashed as its own sequence; a positional kernel at scale
-        o = _core.hash_proteins([s[i : i + k] for s in batch for i in range(len(s) - k + 1)], k)
+        ks = [s[i : i + k] for s in batch for i in range(len(s) - k + 1)]
+        o = _core.hash_proteins(ks, k, alphabet=alphabet)
         h = np.full(n_k.sum(), none, dtype=np.uint64)
         h[o["seq"]] = o["hash"]
+        vals = h
+        if rank is not None:  # (count, position) packed, so a window's least is its rarest
+            at = np.minimum(np.searchsorted(rank[0], h), len(rank[0]) - 1)
+            c = np.where(rank[0][at] == h, rank[1][at], np.uint64(2**31))
+            vals = (c << np.uint64(32)) | np.arange(len(h), dtype=np.uint64)
+            vals[h == none] = none
         first = np.cumsum(n_k) - n_k
         w_s = np.clip(n_k // min_count, 1, w) if min_count else np.full(len(batch), w)
         for ww in np.unique(w_s[n_k > 0]).tolist():
             sel = np.flatnonzero((w_s == ww) & (n_k > 0))
             idx = np.concatenate([np.arange(first[i], first[i] + n_k[i]) for i in sel])
-            owner, m = winnow(h[idx], n_k[sel], ww)
+            owner, m = winnow(vals[idx], n_k[sel], ww)
+            if rank is not None:
+                got = m != none
+                m = np.where(got, h[(m & np.uint64(2**32 - 1)).astype(np.int64) * got], none)
             out_seq.append(sel[owner] + start)
             out_h.append(m)
     seq = np.concatenate(out_seq) if out_seq else np.zeros(0, np.int64)
@@ -536,10 +598,17 @@ def main() -> None:
     )  # fmt: skip
     parser.add_argument(
         "--ladder", default="",
-        help="k:window,...: a leaf with fewer than --min-kmers informative k-mers at the k "
-        "before also holds window minimizers of k",
+        help="[alphabet:]k:window,...: a leaf with fewer than --min-kmers informative k-mers at "
+        "the step before also holds window minimizers of this step (alphabet: protein, "
+        "murphy10 or dayhoff)",
     )  # fmt: skip
     parser.add_argument("--min-kmers", type=int, default=64)
+    parser.add_argument(
+        "--ladder-radius",
+        type=float,
+        default=0.1,
+        help="ladder steps flagged unit: the identity radius of their units (see units())",
+    )
     parser.add_argument(
         "--detect-aai", type=float, default=0.0,
         help="units by detectability: members share enough k-mers to detect each at this AAI",
