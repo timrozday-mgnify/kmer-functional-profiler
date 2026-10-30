@@ -36,6 +36,7 @@ import json
 import resource
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -93,9 +94,21 @@ def postings(
         need = need[informative(got, len(need), rare) < a.min_kmers]
     pos = np.concatenate([tree.pos[keep], extra_pos])
     h = np.concatenate([tree.h[keep], extra_h])
-    if a.detect_aai:  # units by detectability: members share n* k-mers, which replace theirs
-        n_star = int(np.ceil(np.log(a.detect_miss) / np.log(1 - a.detect_aai**a.k)))
-        unit, chosen = detect_units(tree, n_star)
+    if a.detect_aai or a.unit_kmers:  # units: members share k-mers, which replace theirs
+        if a.unit_kmers:  # dense intersections, n spread shared k-mers per unit
+            dense = kmer_info(reps, a.k, log_f).sort("seq", "hash")
+            d_row = np.searchsorted(dense["seq"].to_numpy(), np.arange(n + 1))
+            d_h = dense["hash"].to_numpy()
+            held = lambda v: d_h[d_row[v] : d_row[v + 1]]  # noqa: E731
+            if a.unit_tau < 1:
+                unit, shared = soft_units(tree, a.unit_kmers, a.unit_tau, held)
+            else:
+                unit, shared = detect_units(tree, a.unit_kmers, held)
+            chosen = {u: spread_shared(reps[u], a.k, x, a.unit_kmers) for u, x in shared.items()}
+        else:
+            n_star = int(np.ceil(np.log(a.detect_miss) / np.log(1 - a.detect_aai**a.k)))
+            unit, shared = detect_units(tree, n_star)
+            chosen = {u: x[: 2 * n_star] for u, x in shared.items()}
         multi = np.bincount(unit, minlength=n)[unit] > 1
         own_k = np.arange(len(h)) < len(h) - n_ladder  # rows of the index's k, not the ladder's
         drop = (pos < n) & own_k & multi[np.minimum(pos, n - 1)]
@@ -120,6 +133,10 @@ def postings(
         n, f.left, f.right, f.tops, sets.offsets.astype(U64), sets.hashes, sets.level,
         sets.level_hash, emit=True,
     )  # fmt: skip
+    if a.cut_detect:  # leaves below a detectable node hold its state: drop the diffs below
+        n_star = int(np.ceil(np.log(a.detect_miss) / np.log(1 - a.cut_detect**a.k)))
+        keep_ch = ~below_cuts(f, ch["change_node"], ch["change_gain"], n_star)
+        ch = {x: v[keep_ch] for x, v in ch.items() if x.startswith("change_")}
     node = ch["change_node"]
     parts = [
         pl.DataFrame(
@@ -184,14 +201,67 @@ def postings(
     return table, pieces, n + len(leafless), key_bits(table, pl.concat(info))
 
 
-def detect_units(
-    tree: survey.Tree, n_star: int
+def spread_shared(seq: bytes, k: int, shared: NDArray[np.uint64], n_sel: int) -> NDArray[np.uint64]:
+    """About ``n_sel`` of ``shared`` spread along ``seq``: the least shared hash in each
+    window of n_k // (n_sel / 2) k-mers (robust winnowing restricted to shared k-mers)."""
+    ks = [seq[i : i + k] for i in range(len(seq) - k + 1)]
+    o = _core.hash_proteins(ks, k)
+    none = np.iinfo(np.uint64).max
+    h = np.full(len(ks), none, dtype=np.uint64)
+    h[o["seq"]] = o["hash"]
+    h[~np.isin(h, shared)] = none
+    _, m = winnow(h, np.array([len(h)]), max(1, 2 * len(h) // max(n_sel, 1)))
+    return np.unique(m[m != none])
+
+
+def below_cuts(
+    f: p0.Forest, node: NDArray[np.uint32], gain: NDArray[np.bool_], n_star: int
+) -> NDArray[np.bool_]:
+    """Per change, whether its node lies strictly below a cut. A cut is the highest node v
+    whose every leaf shares at least ``n_star`` of v's Fitch state: |state(v)| less the
+    losses on the path from v to the leaf (a k-mer gained and lost below v counted too, so
+    the share is a lower bound). Leaves below a cut then hold its state."""
+    n, m = f.n, len(f.left)
+    total = n + m
+    parent = np.full(total, -1, dtype=np.int64)
+    parent[f.left] = np.arange(n, total)
+    parent[f.right] = np.arange(n, total)
+    node = node.astype(np.int64)
+    g_at = np.bincount(node[gain], minlength=total)
+    l_at = np.bincount(node[~gain], minlength=total)
+    size = np.zeros(total, dtype=np.int64)
+    lost = np.zeros(total, dtype=np.int64)
+    # ponytail: Python loops over nodes (~1 s per 10^6); vectorised by level at scale
+    for v in range(total - 1, -1, -1):  # parents have larger ids: top down
+        p = parent[v]
+        size[v] = (size[p] if p >= 0 else 0) + g_at[v] - l_at[v]
+        lost[v] = (lost[p] if p >= 0 else 0) + l_at[v]
+    most = lost.copy()  # most losses from the root to any leaf below
+    for i in range(m):  # children have smaller ids: bottom up
+        most[n + i] = max(most[f.left[i]], most[f.right[i]])
+    ok = most - lost <= size - n_star
+    cut = np.zeros(total, dtype=bool)
+    stack = [int(t) for t in f.tops]
+    while stack:
+        v = stack.pop()
+        if v >= n and ok[v]:
+            cut[v] = True
+        elif v >= n:
+            stack += [int(f.left[v - n]), int(f.right[v - n])]
+    inner = np.zeros(total, dtype=bool)
+    for v in range(total - 1, -1, -1):
+        p = parent[v]
+        inner[v] = p >= 0 and (cut[p] or inner[p])
+    return inner[node]
+
+
+def soft_units(
+    tree: survey.Tree, n_sel: int, tau: float, held: Callable[[int], NDArray[np.uint64]]
 ) -> tuple[NDArray[np.int64], dict[int, NDArray[np.uint64]]]:
-    """Units by detectability: each spanning-tree component walked from its root, a leaf
-    joining its parent's unit while the unit's members still share at least ``n_star``
-    k-mers (hashes <= t_cap), enough to detect each member at the target AAI. Returns each
-    position's unit (a position) and, per multi-leaf unit, its 2 x n_star lowest shared
-    hashes (all if fewer)."""
+    """Units on conserved k-mers: as :func:`detect_units`, but a unit's set is the k-mers held
+    by at least ``tau`` of its members, not by all. A leaf joins its parent's unit while that
+    set keeps at least ``n_sel`` k-mers and the leaf holds at least ``tau`` of it, so every
+    member stays covered. Returns each position's unit and each multi-leaf unit's set."""
     f, n = tree.forest, tree.forest.n
     pos_of_leaf = np.empty(n, dtype=np.int64)
     pos_of_leaf[tree.lay["order"]] = np.arange(n)
@@ -200,7 +270,55 @@ def detect_units(
     o = np.argsort(a, kind="stable")
     a, b = a[o], b[o]
     start = np.searchsorted(a, np.arange(n + 1))
-    held = lambda v: tree.h[tree.row[v] : tree.row[v + 1]]  # noqa: E731
+    unit = np.full(n, -1, dtype=np.int64)
+    counts: dict[int, tuple[NDArray[np.uint64], NDArray[np.int64], int]] = {}
+    # ponytail: a Python walk merging count arrays; a Rust kernel at release scale
+    for r in pos_of_leaf[f.root_nodes].tolist():
+        unit[r] = r
+        counts[r] = (held(r), np.ones(len(held(r)), np.int64), 1)
+        stack = [r]
+        while stack:
+            v = stack.pop()
+            for c in b[start[v] : start[v + 1]].tolist():
+                if unit[c] >= 0:
+                    continue
+                u = unit[v]
+                hs, cs, m = counts[u]
+                hc = held(c)
+                cur = hs[cs >= tau * m]
+                allh = np.concatenate([hs, hc])
+                keys, inv = np.unique(allh, return_inverse=True)
+                new = np.bincount(inv, weights=np.concatenate([cs, np.ones(len(hc))])).astype(
+                    np.int64
+                )
+                kept = keys[new >= tau * (m + 1)]
+                if len(kept) >= n_sel and (np.isin(cur, hc).mean() if len(cur) else 1.0) >= tau:
+                    unit[c], counts[u] = u, (keys, new, m + 1)
+                else:
+                    unit[c], counts[c] = c, (hc, np.ones(len(hc), np.int64), 1)
+                stack.append(c)
+    sizes = np.bincount(unit, minlength=n)
+    return unit, {u: hs[cs >= tau * m] for u, (hs, cs, m) in counts.items() if sizes[u] > 1}
+
+
+def detect_units(
+    tree: survey.Tree, n_star: int, held: Callable[[int], NDArray[np.uint64]] | None = None
+) -> tuple[NDArray[np.int64], dict[int, NDArray[np.uint64]]]:
+    """Units by detectability: each spanning-tree component walked from its root, a leaf
+    joining its parent's unit while the unit's members still share at least ``n_star``
+    k-mers (hashes <= t_cap), enough to detect each member at the target AAI. Returns each
+    position's unit (a position) and, per multi-leaf unit, its shared hashes. ``held``
+    gives a position's set (default: its hashes <= t_cap)."""
+    f, n = tree.forest, tree.forest.n
+    pos_of_leaf = np.empty(n, dtype=np.int64)
+    pos_of_leaf[tree.lay["order"]] = np.arange(n)
+    a = pos_of_leaf[np.concatenate([f.mst_a, f.mst_b])]
+    b = pos_of_leaf[np.concatenate([f.mst_b, f.mst_a])]
+    o = np.argsort(a, kind="stable")
+    a, b = a[o], b[o]
+    start = np.searchsorted(a, np.arange(n + 1))
+    if held is None:
+        held = lambda v: tree.h[tree.row[v] : tree.row[v + 1]]  # noqa: E731
     unit = np.full(n, -1, dtype=np.int64)
     shared: dict[int, NDArray[np.uint64]] = {}
     # ponytail: a Python walk with set intersections; a Rust kernel at release scale
@@ -221,8 +339,7 @@ def detect_units(
                     unit[c], shared[c] = c, held(c)
                 stack.append(c)
     sizes = np.bincount(unit, minlength=n)
-    chosen = {u: x[: 2 * n_star] for u, x in shared.items() if sizes[u] > 1}
-    return unit, chosen
+    return unit, {u: x for u, x in shared.items() if sizes[u] > 1}
 
 
 def units(tree: survey.Tree, radius: float) -> NDArray[np.int64]:
@@ -428,6 +545,22 @@ def main() -> None:
         help="units by detectability: members share enough k-mers to detect each at this AAI",
     )  # fmt: skip
     parser.add_argument("--detect-miss", type=float, default=0.007)
+    parser.add_argument(
+        "--cut-detect", type=float, default=0.0,
+        help="drop the diffs below each highest node whose state still detects every leaf below "
+        "at this AAI (n* shared k-mers, from --detect-miss); 0: off",
+    )  # fmt: skip
+    parser.add_argument(
+        "--unit-tau",
+        type=float,
+        default=1.0,
+        help="with --unit-kmers: a unit's set is the k-mers held by this share of its members",
+    )
+    parser.add_argument(
+        "--unit-kmers", type=int, default=0,
+        help="units on dense intersections: members share at least this many k-mers, and the "
+        "unit indexes about this many of them, spread (0: off)",
+    )  # fmt: skip
     parser.add_argument(
         "--unit-radius", type=float, default=0.0,
         help="leaves within this identity distance of their unit's first leaf share the "

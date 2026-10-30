@@ -843,3 +843,30 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Why:* the tree is already the general clustered index. Fitch posts a k-mer shared by near-identical members once, at their subtree, so per-leaf minimizers of close relatives cost about what a unit's shared set costs. What remains per leaf are k-mers its relatives do not share, and those are exactly the ones a strain diverged from that leaf needs. A union adds relatives' private k-mers, which a strain at 90% to the source does not carry.
     - Recall at ≥ 90% is set by the indexed k-mers each protein has, ~0.69ⁿ misses as above, whether they are its own or its unit's. At equal n the cost is equal, so a unit cannot buy density.
     - *Scale:* sharing grows with the number of relatives, so the per-protein cost of any design should fall at release against this quarter sample. The ratios between designs should hold, since every design shares the same way.
+* **Intersections, soft intersections and the tree's own internal states (2026-10-30, the user's follow-ups: intersections instead of unions with denser sampling; then sets weighted toward conserved k-mers; then the internal nodes' diffs themselves).**
+  - **Hard intersections** (`--unit-kmers n`): units grow over dense 11-mer sets while their members still share ≥ n. Each unit indexes ~n of the shared k-mers, spread along its first protein (minimizers restricted to shared k-mers), in place of its members' own.
+  - **Soft intersections** (`--unit-tau τ`): a unit's set is the k-mers held by ≥ τ of its members; a leaf joins while that set keeps ≥ n and the leaf holds ≥ τ of it.
+  - **Cuts on the tree's own states** (`--cut-detect a*`). The cut is the highest node whose Fitch state every leaf below still shares N\* of (as above; the shared count is |state(v)| less the losses on the path, a lower bound), and Fitch's changes below each cut are dropped. Every leaf under a cut then holds the node's state, a parsimony consensus that is a soft intersection taken from the tree with no extra sets. Covers were checked to sum to 0 or 1 (`build.holdings`) on a 20 k subset.
+  - **Results** (both samples pooled; *t\_base* 0.001, no floors, k 7 ladder at w 4 for < 16; ≥ 95% / ≥ 90% identity):
+
+    | Build | Postings (× medium) | ~Release | bg seeds | > 0.5 | > 1 | > 2 | > 4 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | S4 (~8 per leaf) | 1.53 | 200–235 GB | 725 | 0.986 / 0.964 | 0.995 / 0.978 | 0.999 / 0.987 | 0.999 / 0.990 |
+    | I16 (hard, n 16) | 1.60 | 205–245 GB | 897 | 0.983 / 0.962 | 0.993 / 0.977 | 0.998 / 0.987 | 0.999 / 0.992 |
+    | S5 (~10 per leaf) | 1.94 | 245–290 GB | 887 | 0.991 / 0.975 | 0.998 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | C90 (S5, cuts at 0.9) | 1.94 | 240–290 GB | 887 | identical to S5 | | | |
+    | I24 (hard, n 24) | 1.99 | 250–300 GB | 1,082 | 0.989 / 0.971 | 0.997 / 0.985 | 1.000 / 0.993 | 1.000 / 0.997 |
+    | T60 (soft τ 0.6, n 24) | 1.99 | 250–300 GB | 1,031 | 0.990 / 0.972 | 0.997 / 0.983 | 0.999 / 0.993 | 1.000 / 0.998 |
+    | I32 (hard, n 32) | 2.36 | 290–345 GB | 1,155 | 0.990 / 0.975 | 0.997 / 0.986 | 1.000 / 0.994 | 1.000 / 0.997 |
+    | T80 (soft τ 0.8, n 24) | 2.37 | 290–345 GB | 988 | 0.992 / 0.976 | 0.997 / 0.987 | 1.000 / 0.994 | 1.000 / 0.998 |
+    | S7 (~14 per leaf) | 2.73 | 325–395 GB | 1,247 | 0.994 / 0.982 | 0.998 / 0.991 | 1.000 / 0.996 | 1.000 / 0.998 |
+    | C95d (~20 per leaf, cuts at 0.95) | 2.81 | 335–405 GB | 1,582 | 0.993 / 0.980 | 0.998 / 0.988 | 1.000 / 0.995 | 1.000 / 0.998 |
+    | C90d (~20 per leaf, cuts at 0.9) | 3.59 | 420–510 GB | 1,700 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | S10 (~20 per leaf, no cuts) | 3.87 | 450–545 GB | 1,722 | 0.996 / 0.988 | 0.998 / 0.993 | 1.000 / 0.997 | 1.000 / 0.998 |
+    | L3 | 4.09 | 475–575 GB | 2,969 | 0.999 / 0.993 | 1.000 / 0.997 | 1.000 / 0.999 | 1.000 / 1.000 |
+
+  - **Reading.**
+    - Hard and soft intersections sit on or slightly below the per-leaf curve: I24 and T60 match S5 at +3%, and I32 and T80 match it at +22%. Their units are tight groups whose shared k-mers the tree already posts once.
+    - *Cuts on the tree's states are the one free saving:* at a\* 0.9 they drop 7% of a dense build's postings (S10 → C90d) with identical recall to three decimals. At S5's density they never bind, since a leaf with ~10 k-mers cannot share 14. Cutting at 0.95 removes 27% but lands back on the curve (C95d ≈ S7).
+    - L3 still beats the ~20-per-leaf builds at ≥ 90% identity (0.993 against 0.988) at similar size. Its k 7 ladder reaches more leaves (< 48 informative 11-mers, w 3, against < 16, w 4), so the ladder's reach matters more than 11-mer density for divergent strains.
+    - *Next, if pursued:* cuts at 0.9 on L3's settings, for an expected ~7% off the large tier at its recall.
