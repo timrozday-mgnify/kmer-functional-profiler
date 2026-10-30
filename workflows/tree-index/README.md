@@ -154,6 +154,12 @@ BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the 
            topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
            tree, per-leaf top-ups; recall also a Dayhoff 7-mer layer on every leaf
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
+TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
+SIMULATE   spike.py simulate: one strain per target at 85/80/75/70% identity, BLOSUM62
+           substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
+QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed
+SCORE      recall.py score per tier
+SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
 ```
 
 ```bash
@@ -161,7 +167,9 @@ nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixtur
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
 ```
 
-`--tiers` holds `name:build.py options` pairs, `;`-separated (options without `:`). The
+`--tiers` holds `name:build.py options` pairs, `;`-separated (split at each tier's first `:`,
+so options may name layers such as `--layers seb8:8:8:rare`). `--bench false` skips the
+benchmark. The
 defaults are `standard` (`build.py --mode standard`, the defaults: *t\_base* 0.01, no floors,
 ~4 spread minimizers per protein, k 7 at window 4 for leaves with < 32 informative 11-mers;
 ~140–165 GB at release, estimated) and `recall` (`--mode recall`: also the rarest Dayhoff 7-mer
@@ -216,4 +224,15 @@ chance probability from residue composition, less log₂ of its gains on the tre
 informative k-mers. With reads, `query.py` scores each leaf by its best read pair's hits
 (`seeds.parquet`) and picks the bar at which expected chance seeds are `--chance-share` (1%) of
 the seeds (`evidence.parquet`, `evidence_bits` in `query.json`). `recall.py score` reports these
-as `ev_<share>` strategies.
+as `ev_<share>` strategies, and `recall.py summary --root DIR` tabulates builds side by side
+(`idx-<name>` or `index-<name>`, `q-<name>`, `s-<name>` under DIR).
+
+### Reduced alphabets (`alphabets.py`)
+
+Layer and ladder steps take an alphabet (`<alphabet>:k:w[:rare]`): `protein`, `murphy10`,
+`dayhoff`, or one of `alphabets.py`'s `REDUCED` (Murphy 8/12/15, DIAMOND's 11, Edgar's SE-B
+6/8/10/14, SE-V 10, Li-A/B 10, and `opt4`–`opt14`), which `crates/core/src/alphabet.rs`
+mirrors. `alphabets.py --members m.parquet` reports, before any build, each alphabet's share of
+BLOSUM62 substitutions kept within a class, its chance-match bits per residue
+(−log₂ Σ Q\_c²), the k that meets each bit budget, and the predicted miss rate at 70–85%
+identity. `opt<n>` alphabets maximise survival at 70% identity per chance bit.

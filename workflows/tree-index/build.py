@@ -37,8 +37,9 @@ import resource
 import sys
 import time
 from pathlib import Path
-from typing import Any, Final
+from typing import Any
 
+import alphabets
 import numpy as np
 import phase0 as p0
 import polars as pl
@@ -77,7 +78,7 @@ def postings(
     # the leaves) at the k before
     log_f = residue_log_freq(tree.seqs)
     reps = [tree.seqs[i] for i in tree.rep_by_pos]
-    info = [kmer_info(tree.seqs, a.k, log_f).with_columns(k=pl.lit(a.k, pl.UInt8))]
+    info = [kmer_info(tree.seqs, a.k, log_f).with_columns(k=pl.lit(a.k, pl.UInt16))]
     rare = np.log2(max(n, 2))
     need = np.flatnonzero(informative(kmer_info(reps, a.k, log_f), n, rare) < a.min_kmers)
     for step, rare_first in zip(query.ladder(a.ladder), query.ladder_flags(a.ladder), strict=True):
@@ -188,7 +189,7 @@ def add_step(
     extra["h"].append(query.salted(sh, code))
     got = kmer_info(sub, k, log_f, alpha)
     info.append(got.with_columns(hash=pl.Series(query.salted(got["hash"].to_numpy(), code)),
-                                 k=pl.lit(code, pl.UInt8)))  # fmt: skip
+                                 k=pl.lit(code, pl.UInt16)))  # fmt: skip
     return got
 
 
@@ -210,19 +211,13 @@ def residue_log_freq(seqs: list[bytes]) -> NDArray[np.float64]:
     return np.log2(counts / counts.sum())
 
 
-CLASSES: Final = {
-    "murphy10": ("LVIM", "C", "A", "G", "ST", "P", "FYW", "EDNQ", "KR", "H"),
-    "dayhoff": ("AGPST", "C", "DENQ", "HKR", "ILMV", "FWY"),
-}  # crates/core/src/alphabet.rs
-
-
 def class_log_freq(log_f: NDArray[np.float64], alphabet: str) -> NDArray[np.float64]:
     """Per byte, log2 of its class's frequency under a reduced alphabet (``log_f`` itself
     for protein)."""
     if alphabet == "protein":
         return log_f
     out = log_f.copy()
-    for group in CLASSES[alphabet]:
+    for group in alphabets.CLASSES[alphabet]:
         idx = np.frombuffer(group.encode(), dtype=np.uint8)
         out[idx] = np.log2((2.0 ** log_f[idx]).sum())
     return out
@@ -388,7 +383,7 @@ def main() -> None:
         "--ladder", default="7:4",
         help="[alphabet:]k:window,...: a leaf with fewer than --min-kmers informative k-mers at "
         "the step before also holds window minimizers of this step (alphabet: protein, "
-        "murphy10 or dayhoff)",
+        "murphy10, dayhoff or alphabets.REDUCED's)",
     )  # fmt: skip
     parser.add_argument("--min-kmers", type=int, default=32)
     parser.add_argument(
@@ -440,7 +435,7 @@ def main() -> None:
     leafless = np.flatnonzero((tree.leaf_of < 0) & (tree.n_valid > 0)) if a.n_1 else []
     np.save(out / "keys.npy", bits["hash"].to_numpy())
     np.save(out / "key_bits.npy", bits["bits"].to_numpy().astype(np.float32))
-    np.save(out / "key_k.npy", bits["k"].to_numpy().astype(np.uint8))
+    np.save(out / "key_k.npy", bits["k"].to_numpy().astype(np.uint16))
     np.save(out / "pos_len.npy", np.concatenate([lengths[tree.rep_by_pos], lengths[leafless]]))
     # |S_v|: k-mers held at each position and each internal node (Fitch's states)
     rng = (

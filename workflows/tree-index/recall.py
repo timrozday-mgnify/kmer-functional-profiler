@@ -14,6 +14,7 @@ Subcommands:
   recall the source of a strain with none. Writes
   ``strains.parquet`` (per strain and strategy), ``recall.tsv`` (per strategy, identity and
   depth bin) and ``strategies.tsv`` (per strategy: candidates, and recall at depth > 0.5).
+- ``summary``: one row per build (postings, decoy bar, recall by identity), across builds.
 
 Strategies, each from the leaves with ``min_hits`` hit k-mers (seeds):
 
@@ -196,6 +197,45 @@ def score(a: argparse.Namespace) -> None:
         print(table)
 
 
+def summary(a: argparse.Namespace) -> None:
+    """One row per build under ``--root`` (``idx-<name>`` or ``index-<name>``, ``q-<name>``,
+    ``s-<name>``): its
+    layers, postings (and over ``--base``'s), the query's bar and decoy seeds, and recall at
+    depth > ``--depth`` per identity for ``--strategy``, with its candidates."""
+    root = Path(a.root)
+    rows = []
+    for sdir in sorted(root.glob("s-*")):
+        name = sdir.name[2:]
+        idx = root / f"idx-{name}"
+        idx = idx if idx.exists() else root / f"index-{name}"
+        meta = json.loads((idx / "meta.json").read_text())
+        q = json.loads((root / f"q-{name}" / "query.json").read_text())
+        per = pl.read_parquet(sdir / "strains.parquet").filter(pl.col("depth") > a.depth)
+        cand = pl.read_csv(sdir / "strategies.tsv", separator="\t")
+        row = {
+            "name": name,
+            "layers": meta["params"].get("layers") or "",
+            "postings": meta["stats"]["postings"],
+            "bytes": meta["stats"]["bytes"],
+            "bar": q.get("evidence_bits"),
+            "decoy_seeds": q.get("decoy_seeds"),
+            "query_s": round(q["total_s"]),
+            "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
+        }
+        for ident, got in per.group_by("identity_bin").agg(pl.col(a.strategy).mean()).iter_rows():
+            row[f"r{ident}"] = got
+        rows.append(row)
+    table = pl.DataFrame(rows)
+    if a.base in table["name"]:
+        base = table.filter(pl.col("name") == a.base)["postings"].item()
+        table = table.with_columns(x_base=pl.col("postings") / base)
+    recall = sorted((c for c in table.columns if c.startswith("r0")), reverse=True)
+    table = table.select(*(c for c in table.columns if c not in recall), *recall).sort("r0.7")
+    table.write_csv(Path(a.out), separator="\t", float_precision=3)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=250, float_precision=3):
+        print(table)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -215,8 +255,14 @@ def main() -> None:
     p.add_argument("--min-hits", type=int, default=1)
     p.add_argument("--deltas", type=float, nargs="+", default=[0.0, 0.05, 0.1, 0.15, 0.3])
     p.add_argument("--caps", type=int, nargs="+", default=[16, 256])
+    p = sub.add_parser("summary")
+    p.add_argument("--root", required=True, help="holds idx-<name>, q-<name> and s-<name>")
+    p.add_argument("--strategy", default="ev_0.01_nb")
+    p.add_argument("--depth", type=float, default=1.0)
+    p.add_argument("--base", default="S3", help="postings are also given over this build's")
+    p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"targets": targets, "score": score}[a.command](a)
+    {"targets": targets, "score": score, "summary": summary}[a.command](a)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Final
 
+import alphabets
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
@@ -200,7 +201,7 @@ def choose_bits(
     return (ok[0][0] if ok else curve[-1][0] if curve else 0.0), curve
 
 
-ALPHABETS: Final = ("protein", "murphy10", "dayhoff")
+ALPHABETS: Final = ("protein", "murphy10", "dayhoff", *alphabets.REDUCED)
 
 
 def ladder(spec: str) -> list[tuple[int, int, str, int]]:

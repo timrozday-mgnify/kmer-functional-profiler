@@ -19,7 +19,7 @@ mod translate;
 mod tree;
 
 pub use align::{identities, identity};
-pub use alphabet::Alphabet;
+pub use alphabet::{Alphabet, REDUCED};
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use components::components;
 pub use diamond::{DiamondBatch, DiamondRefs, Dropped, HitFilter};

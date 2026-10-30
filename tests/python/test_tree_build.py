@@ -284,3 +284,19 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         codes = set(np.load(idx / "key_k.npy").tolist())
         assert (71 in codes) == (mode == "recall")  # Dayhoff 7: 7 + 32 x 2
         check_query(tmp_path, idx, members)
+
+
+def test_reduced_alphabets_match_rust() -> None:
+    """alphabets.py's classes are the Rust kernel's: residues of a class hash alike, classes
+    apart, for every alphabet a layer can name."""
+    import alphabets
+
+    for name, spec in (alphabets.BUILTIN | alphabets.REDUCED).items():
+        groups = spec.split()
+        first = [(g[0] * 3).encode() for g in groups]
+        last = [(g[-1] * 3).encode() for g in groups]
+        got = _core.hash_proteins(first + last, 3, alphabet=name)
+        h = dict(zip(got["seq"].tolist(), got["hash"].tolist(), strict=True))
+        m = len(groups)
+        assert [h[i] for i in range(m)] == [h[i + m] for i in range(m)], name
+        assert len({h[i] for i in range(m)}) == m, name
