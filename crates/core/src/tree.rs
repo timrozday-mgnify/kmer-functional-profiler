@@ -212,7 +212,7 @@ pub struct Kruskal {
 }
 
 /// Minimum spanning forest of nodes `0..n` under edges (`u`, `v`, `w`), lightest first and
-/// ties in input order, with its merge forest.
+/// ties by node pair (so input order does not matter), with its merge forest.
 pub fn kruskal(n: usize, u: &[u32], v: &[u32], w: &[u32]) -> Result<Kruskal, Error> {
     if u.len() != v.len() || u.len() != w.len() {
         return Err(Error::LengthMismatch);
@@ -222,7 +222,10 @@ pub fn kruskal(n: usize, u: &[u32], v: &[u32], w: &[u32]) -> Result<Kruskal, Err
     }
     let size = u32::try_from(n).map_err(|_| Error::NodeOutOfRange(n as u64))?;
     let mut by_weight: Vec<u32> = (0..u.len() as u32).collect();
-    by_weight.sort_by_key(|&e| w[e as usize]);
+    by_weight.sort_by_key(|&e| {
+        let e = e as usize;
+        (w[e], u[e].min(v[e]), u[e].max(v[e]))
+    });
     let mut parent: Vec<u32> = (0..size).collect();
     let mut node: Vec<u32> = (0..size).collect(); // merge-tree node of each union-find root
     let mut out = Kruskal {
@@ -336,6 +339,12 @@ pub struct Schemes {
     pub majority: Vec<u32>,
     /// Add-only (ProPhyle): one posting per largest subtree whose leaves all hold it.
     pub add_only: Vec<u32>,
+    /// With `emit`: Fitch's changes in that assignment, one row each (the k-mer's hash, the
+    /// node, gain or loss). A leaf holds a k-mer iff the nearest change on its root path is a
+    /// gain, so as leaf ranges, gains minus losses covering a leaf is 1 or 0.
+    pub change_hash: Vec<u64>,
+    pub change_node: Vec<u32>,
+    pub change_gain: Vec<bool>,
 }
 
 // Fitch state sets: bit 0 "absent", bit 1 "present"; 0 is missing data ("?").
@@ -428,10 +437,18 @@ struct Virtual {
     end: u32,
     /// The set at the top of the chain (the virtual parent's child, or the top).
     head: u8,
+    /// That node: the chain's top.
+    stop: u32,
 }
 
-/// Postings of one k-mer held at the sorted leaf positions `holders`, at level `l`.
-fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
+/// Postings of one k-mer held at the sorted leaf positions `holders`, at level `l`; Fitch's
+/// changes (node, gain) are appended to `emitted`.
+fn kmer_postings(
+    tree: &Tree<'_>,
+    holders: &[u32],
+    l: usize,
+    emitted: &mut Vec<(u32, bool)>,
+) -> [u32; 4] {
     let leaf = |p: u32| tree.layout.order[p as usize];
     let mut nodes: Vec<u32> = holders.iter().map(|&p| leaf(p)).collect();
     nodes.extend(
@@ -477,6 +494,7 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
             start: 0,
             end: 0,
             head: 0,
+            stop: 0,
         })
         .collect();
     let mut kids: Vec<Vec<u32>> = vec![Vec::new(); v.len()];
@@ -499,6 +517,7 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
         }
         v[i].end = chain.len() as u32;
         v[i].head = s;
+        v[i].stop = stop;
         cost
     };
     let mut chain: Vec<(u32, u8)> = Vec::new();
@@ -532,10 +551,11 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
     }
     // top-down (ids descending: parents first), from an absent root above each top
     let (mut changes, mut gains) = (0u32, 0u32);
-    let mut change = |from: u8, to: u8| {
+    let mut change = |from: u8, to: u8, node: u32| {
         if from != to {
             changes += 1;
             gains += u32::from(to == PRESENT);
+            emitted.push((node, to == PRESENT));
         }
     };
     for i in (0..v.len()).rev() {
@@ -547,7 +567,7 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
         let mut state = above;
         if v[i].head == ABSENT {
             // the chain's top (or the part above its last record) is absent
-            change(state, ABSENT);
+            change(state, ABSENT, v[i].stop);
             state = ABSENT;
         }
         for (r, &(_, s)) in records.iter().enumerate().rev() {
@@ -555,15 +575,15 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
                 continue; // the head, counted above
             }
             let next = pick(state, s);
-            change(state, next);
+            change(state, next, records[r].0);
             state = next;
             let below = if r == 0 { v[i].node } else { records[r - 1].0 };
             if state == PRESENT && off(tree.sibling(below)) == ABSENT {
-                change(PRESENT, ABSENT);
+                change(PRESENT, ABSENT, tree.sibling(below));
             }
         }
         let next = pick(state, v[i].fitch);
-        change(state, next);
+        change(state, next, v[i].node);
         v[i].state = next;
         if next == PRESENT && (v[i].node as usize) >= tree.n {
             let (cl, cr) = tree.children(v[i].node);
@@ -572,7 +592,7 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
                     .iter()
                     .any(|&k| tree.is_ancestor(c, v[k as usize].node));
                 if !has_kid && off(c) == ABSENT {
-                    change(PRESENT, ABSENT);
+                    change(PRESENT, ABSENT, c);
                 }
             }
         }
@@ -634,7 +654,8 @@ fn kmer_postings(tree: &Tree<'_>, holders: &[u32], l: usize) -> [u32; 4] {
 ///
 /// Leaf `i` has level `leaf_level[i]`: it could hold a hash `h` iff
 /// `h <= level_hash[leaf_level[i]]`; otherwise it is missing data for that k-mer.
-/// `level_hash` is ascending. Leaves no top reaches are ignored.
+/// `level_hash` is ascending. Leaves no top reaches are ignored. With `emit`, Fitch's changes
+/// are returned too.
 #[allow(clippy::too_many_arguments)]
 pub fn schemes(
     n: usize,
@@ -645,6 +666,7 @@ pub fn schemes(
     hashes: &[u64],
     leaf_level: &[u8],
     level_hash: &[u64],
+    emit: bool,
 ) -> Result<Schemes, Error> {
     if check_sets(offsets, hashes)? != n || leaf_level.len() != n || level_hash.is_empty() {
         return Err(Error::LengthMismatch);
@@ -722,13 +744,23 @@ pub fn schemes(
                 scope.spawn(move || {
                     let mut out = Schemes::default();
                     let mut holders: Vec<u32> = Vec::new();
+                    let mut emitted: Vec<(u32, bool)> = Vec::new();
                     for k in first..(first + per_thread).min(n_kmers) {
                         let run = &inverted[starts[k]..starts[k + 1]];
                         let h = run[0].0;
                         holders.clear();
                         holders.extend(run.iter().map(|&(_, p)| p));
                         let l = level_hash.partition_point(|&x| x < h).min(levels - 1);
-                        let [fitch, gains, majority, add_only] = kmer_postings(tree, &holders, l);
+                        emitted.clear();
+                        let [fitch, gains, majority, add_only] =
+                            kmer_postings(tree, &holders, l, &mut emitted);
+                        if emit {
+                            for &(node, gain) in &emitted {
+                                out.change_hash.push(h);
+                                out.change_node.push(node);
+                                out.change_gain.push(gain);
+                            }
+                        }
                         out.hash.push(h);
                         out.holders.push(holders.len() as u32);
                         out.fitch.push(fitch);
@@ -750,6 +782,9 @@ pub fn schemes(
         out.gains.extend(p.gains);
         out.majority.extend(p.majority);
         out.add_only.extend(p.add_only);
+        out.change_hash.extend(p.change_hash);
+        out.change_node.extend(p.change_node);
+        out.change_gain.extend(p.change_gain);
     }
     Ok(out)
 }
@@ -873,8 +908,10 @@ mod tests {
                 &hashes,
                 &leaf_level,
                 &level_hash,
+                true,
             )
             .unwrap();
+            let lay = layout(n, &left, &right, &roots).unwrap();
             for (k, &h) in got.hash.iter().enumerate() {
                 let held: Vec<bool> = sets.iter().map(|s| s.contains(&h)).collect();
                 let could: Vec<bool> = leaf_level
@@ -893,6 +930,28 @@ mod tests {
                 assert_eq!(got.majority[k], majority, "majority, hash {h}");
                 assert_eq!(got.add_only[k], add_only, "add-only, hash {h}");
                 assert!(got.gains[k] >= 1 && got.gains[k] <= got.fitch[k]);
+                // the emitted changes: as many as Fitch's, and they rebuild every leaf that
+                // could hold the k-mer (nearest change above it, or absent)
+                let mine: Vec<(u32, bool)> = (0..got.change_hash.len())
+                    .filter(|&c| got.change_hash[c] == h)
+                    .map(|c| (got.change_node[c], got.change_gain[c]))
+                    .collect();
+                assert_eq!(mine.len() as u32, got.fitch[k], "changes, hash {h}");
+                for leaf in (0..n).filter(|&i| could[i]) {
+                    let mut x = leaf as u32;
+                    let mut state = false;
+                    loop {
+                        if let Some(&(_, g)) = mine.iter().find(|&&(node, _)| node == x) {
+                            state = g;
+                            break;
+                        }
+                        match lay.parent[x as usize] {
+                            NONE => break,
+                            p => x = p,
+                        }
+                    }
+                    assert_eq!(state, held[leaf], "leaf {leaf}, hash {h}");
+                }
             }
         }
     }

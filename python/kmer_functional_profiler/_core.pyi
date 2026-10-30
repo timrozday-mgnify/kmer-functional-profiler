@@ -105,7 +105,9 @@ def tree_schemes(
     hashes: NDArray[np.uint64],
     leaf_level: NDArray[np.uint8],
     level_hash: NDArray[np.uint64],
-) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32]]: ...
+    *,
+    emit: bool = False,
+) -> dict[str, NDArray[np.uint64] | NDArray[np.uint32] | NDArray[np.bool_]]: ...
 def align_identity(
     a: Sequence[bytes], b: Sequence[bytes]
 ) -> dict[str, NDArray[np.float32] | NDArray[np.uint32]]: ...
