@@ -27,6 +27,7 @@ projections) and ``survey.json`` (hierarchy reach of proteins without own base k
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,13 @@ class Tree:
             a, b, w, root = pairs["a"], pairs["b"], pairs["weight"], col.leaves.size
         else:
             leaf_of, n, a, b, w, root = protein_leaves(seqs, args)
-        self.forest = p0.spanning_forest(n, a, b, w, root)
+        self.merge = p0.spanning_forest(n, a, b, w, root)
+        self.kruskal_s = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self.spanning = spanning_tree(self.merge)
+        self.spanning_tree_s = time.perf_counter() - t1
+        tree_of = {"merge": self.merge, "spanning": self.spanning}
+        self.forest = tree_of[getattr(args, "topology_tree", "spanning")]
         self.build_s = time.perf_counter() - t0
         f = self.forest
         self.lay = _core.tree_layout(f.n, f.left, f.right, f.tops)
@@ -121,9 +128,63 @@ def protein_leaves(
     return leaf_of, len(first), a.astype(np.int64), b.astype(np.int64), w, sets.size
 
 
-def base_postings(tree: Tree, t_base: float) -> tuple[int, int, NDArray[np.int64]]:
-    """Fitch postings and distinct k-mers of the base band over the whole tree; and each
-    leaf position's base size."""
+def spanning_tree(f: p0.Forest) -> p0.Forest:
+    """The spanning tree itself as a binary tree for Fitch, in place of Kruskal's merge tree.
+
+    Each component is rooted at its node with the root edge. A node's subtree is the node as a
+    leaf, joined to its children's subtrees one at a time, lightest edge first; each join's
+    level is that edge's weight. Fitch on it costs at most the sequence-MST scheme (internal
+    states are free, so each may take its node's set), and it keeps the spanning tree's
+    adjacency, which the merge tree loses when it joins whole clusters. A single-linkage
+    cluster is still a connected subtree, but no longer always one leaf range.
+    """
+    n = f.n
+    a = np.concatenate([f.mst_a, f.mst_b])
+    b = np.concatenate([f.mst_b, f.mst_a])
+    w = np.concatenate([f.mst_w, f.mst_w])
+    o = np.lexsort((b, w, a))
+    a, b, w = a[o], b[o], w[o]
+    start = np.searchsorted(a, np.arange(n + 1))
+    parent = np.full(n, -1, dtype=np.int64)
+    order: list[int] = []
+    for r in f.root_nodes.tolist():  # depth first from each component's root
+        parent[r] = r
+        stack = [r]
+        while stack:
+            v = stack.pop()
+            order.append(v)
+            for c in b[start[v] : start[v + 1]].tolist():
+                if parent[c] < 0:
+                    parent[c] = v
+                    stack.append(c)
+    # ponytail: a Python loop over nodes (~1 s per 10^6); a Rust kernel at release scale
+    top = np.arange(n, dtype=np.int64)
+    left: list[int] = []
+    right: list[int] = []
+    level: list[int] = []
+    for v in reversed(order):  # children before parents; their tops exist already
+        lo, hi = start[v], start[v + 1]
+        for c, cw in zip(b[lo:hi].tolist(), w[lo:hi].tolist(), strict=True):
+            if parent[c] == v and c != v:
+                left.append(int(top[v]))
+                right.append(int(top[c]))
+                level.append(cw)
+                top[v] = n + len(left) - 1
+    u32 = np.uint32
+    return replace(
+        f,
+        left=np.array(left, u32),
+        right=np.array(right, u32),
+        level=np.array(level, u32),
+        tops=np.sort(top[f.root_nodes]).astype(u32),
+    )
+
+
+def base_postings(tree: Tree, t_base: float) -> tuple[int, int, NDArray[np.int64], dict[str, Any]]:
+    """Fitch postings and distinct k-mers of the base band over the whole tree, each leaf
+    position's base size, and every diff scheme's postings and time on the tree in use
+    (``phase0.tree_postings``: Fitch, majority, add-only, sequence MST,
+    flat); and Fitch on each of Kruskal's merge tree and the spanning tree."""
     mh = U64(_core.max_hash(t_base))
     keep = tree.h <= mh
     pos, h = tree.pos[keep], tree.h[keep]
@@ -132,9 +193,14 @@ def base_postings(tree: Tree, t_base: float) -> tuple[int, int, NDArray[np.int64
     o = np.lexsort((h, leaf))
     leaf, h = leaf[o], h[o]
     sets = p0.Sets(p0.csr(leaf, h, n), h, np.zeros(n, np.uint8), np.array([mh], dtype=U64))
-    fitch = int(p0.schemes(tree.forest, sets)["fitch"].sum())
+    _, schemes = p0.tree_postings(tree.forest, sets)
+    for name in ("merge", "spanning"):
+        t0 = time.perf_counter()
+        fitch = int(p0.schemes(getattr(tree, name), sets)["fitch"].sum())
+        schemes[f"fitch_on_{name}_tree"] = fitch
+        schemes[f"fitch_on_{name}_tree_s"] = time.perf_counter() - t0
     size_by_pos = np.bincount(pos, minlength=n)
-    return fitch, len(np.unique(h)), size_by_pos
+    return schemes["fitch"], len(np.unique(h)), size_by_pos, schemes
 
 
 def pieces(
@@ -170,7 +236,7 @@ def pieces(
 
 def configuration(
     tree: Tree,
-    base: tuple[int, int, NDArray[np.int64]],
+    base: tuple[int, int, NDArray[np.int64], dict[str, Any]],
     t_base: float,
     n_min: int,
     tau: float,
@@ -179,7 +245,7 @@ def configuration(
 ) -> list[dict[str, Any]]:
     """Rows for one piece set: each single-leaf floor size (``n_single``, at most n_min) and
     leaf minimum (``n_1``)."""
-    fitch, base_keys, base_size = base
+    fitch, base_keys, base_size, _ = base
     t0 = time.perf_counter()
     got, evaluated = pieces(tree, t_base, n_min, tau)
     lo_base = U64(_core.max_hash(t_base))
@@ -332,6 +398,10 @@ def main() -> None:
     parser.add_argument("--levels", type=int, default=8)
     parser.add_argument("--topology-t-base", type=float, default=0.02)
     parser.add_argument("--topology-n-min", type=int, default=16)
+    parser.add_argument(
+        "--topology-tree", choices=["spanning", "merge"], default="spanning",
+        help="the tree diffs and pieces use: the spanning tree itself, or Kruskal's merge tree",
+    )  # fmt: skip
     parser.add_argument("--topology-k", type=int, default=8, help="proteins mode: dense k")
     parser.add_argument("--topology-t", type=float, default=1.0, help="proteins mode: its rate")
     parser.add_argument(
@@ -377,11 +447,15 @@ def main() -> None:
             "leaves": tree.forest.n,
             "internal_nodes": len(tree.forest.left),
             "components": len(tree.forest.tops),
+            "topology_tree": args.topology_tree,
             "topology_build_s": tree.build_s,
+            "kruskal_s": tree.kruskal_s,
+            "spanning_tree_s": tree.spanning_tree_s,
             "reach": {},
         }
         for t_base in args.t_bases:
             base = base_postings(tree, t_base)
+            summary["trees"][mode].setdefault("schemes", {})[str(t_base)] = base[3]
             summary["trees"][mode]["reach"][str(t_base)] = reach(tree, t_base)
             for n_min in args.n_mins:
                 key = f"{t_base}/{n_min}"

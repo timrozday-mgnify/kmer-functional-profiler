@@ -174,6 +174,7 @@ def main() -> None:
         "--leaves", choices=["proteins", "collapsed"], default="proteins",
         help="proteins: a leaf per distinct dense set; collapsed: phase 0's (survey.Tree)",
     )  # fmt: skip
+    parser.add_argument("--topology-tree", choices=["spanning", "merge"], default="spanning")
     parser.add_argument("--topology-k", type=int, default=8)
     parser.add_argument("--topology-t", type=float, default=1.0)
     parser.add_argument("--topology-max-holders", type=int, default=0)
@@ -229,6 +230,8 @@ def main() -> None:
             "bytes": sum(files.values()),
             "bytes_per_posting": sum(files.values()) / max(table.height, 1),
             "topology_s": topology_s,
+            "kruskal_s": tree.kruskal_s,
+            "spanning_tree_s": tree.spanning_tree_s,
             "build_s": time.perf_counter() - t0,
             "peak_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
         },

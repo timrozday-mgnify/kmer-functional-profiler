@@ -5,7 +5,8 @@
 // FIXTURE    synthetic members when --members is '' (the test profile)
 // PARTITION  proteins -> parts of ~--part_proteins (k 11 storage components and equal
 //            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py)
-// BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology)
+// BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology,
+//            diffs and pieces on the spanning tree itself)
 // MERGE      per tier: the parts -> index-<tier>/ (merge.py), query.py's format
 
 nextflow.enable.dsl = 2
