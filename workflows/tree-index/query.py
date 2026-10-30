@@ -10,7 +10,8 @@
 
 Writes to ``--out``: ``leaves.parquet`` (pos, size, hit\\_kmers, hits, containment) and
 ``nodes.parquet`` (node, lo, hi, level, size, hit\\_kmers, hits, containment), rows with a hit
-k-mer only; and ``query.json`` (counts and timings).
+k-mer only; ``hits.parquet`` (hash, n: the sample's k-mers that are keys, for ``report.py``); and
+``query.json`` (counts and timings).
 """
 
 import argparse
@@ -172,6 +173,10 @@ def main() -> None:
     leaves, nodes, stats = count(index, sample)
     leaves.write_parquet(out / "leaves.parquet")
     nodes.write_parquet(out / "nodes.parquet")
+    h = sample["hash"].to_numpy()
+    at = np.minimum(np.searchsorted(index.hash, h), max(len(index.hash) - 1, 0))
+    keyed = index.hash[at] == h if len(index.hash) else np.zeros(len(h), dtype=bool)
+    sample.filter(pl.Series(keyed)).write_parquet(out / "hits.parquet")
     stats |= {"lookup_s": lookup_s, "total_s": time.perf_counter() - t0}
     (out / "query.json").write_text(json.dumps(stats, indent=1) + "\n")
     print(json.dumps(stats))

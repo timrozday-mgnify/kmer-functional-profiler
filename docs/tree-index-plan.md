@@ -326,7 +326,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - Checked against a brute-force reconstruction: every sequence's sampled set from its root path equals its own; and against brute-force Fitch on small trees (equal minimum change counts).
    - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
 2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures. *Done 2026-10-30 (`workflows/tree-index/query.py`); see Progress log.*
-3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI.
+3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI. *Done 2026-10-30 (`workflows/tree-index/report.py`), checked locally; see Progress log. Calibration and the δ sweep are phase 4's.*
 4. **Benchmark against tier 1**, at matched index size and *t*:
    - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
      - nearest-match identity curves for recall and precision, with read-outs at 99, 95, 90 and 80%;
@@ -700,3 +700,25 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - *Note:* this build peaked at 4.7 GB, above the 3.4 GB measured earlier for the same configuration. Per 2 M-protein part that is ~36 GB, inside BUILD's 64 GB.
   - **Tier sizes, revised** (release postings × the quarter's ratio; ~9 B per posting + ~35 GB of leaf tables): quick 5.8–7.2 × 10⁹ postings, ~87–100 GB; medium 11.3–13.9 × 10⁹, ~137–160 GB; large 22.8–25.7 × 10⁹, ~240–266 GB.
   - **Switched:** `--topology-tree spanning` is now the default of `survey.py` and `build.py`, so `build.nf` and `hpc/kfp-ablations/tree-index-build` build on it. `--topology-tree merge` keeps phase 0's tree. `survey.json` reports Fitch on both trees per *t\_base*, with timings.
+* **Phase 3: reporting, recall first (2026-10-30, the user's request).**
+  - **Build** now also writes the spanning tree's edges between positions (`edge_a`, `edge_b`, `edge_w`, in dense 8-mer |A Δ B|) and each position's representative length (`pos_len`). `merge.py` offsets the edges. That is 16 B per position, ~90 GB at ~5.7 × 10⁹ leaves in this development format; a compact one would store each leaf's parent edge only (~8 B).
+  - **`query.py`** also writes `hits.parquet`, the sample's k-mers that are keys, for gather.
+  - **`report.py`:**
+    - *AAI* per hit leaf and internal node: containment^(1/k), with a 95% Clopper-Pearson interval on hit k-mers out of |S\_v|. Naive: low depth lowers containment as divergence does. Phase 4 calibrates it against `presence-calibration`'s truth.
+    - *Candidates.* Every leaf with ≥ `--min-hits` hit k-mers (default 1: every hit leaf, as the recall-first pileup takes every hit unit) is a seed. Each adds its single-linkage cluster on the spanning tree at *R\_v* = d(aai\_lo) + d(1 − δ), where d(p) = 2 (len − 7)(1 − p⁸) is the expected dense 8-mer |A Δ B| at identity p. The cluster is walked by Prim from the seed (nearest first in minimax distance), at most `--max-neighbours` (256) leaves beyond it. On the spanning tree a cluster is a connected subtree, not a leaf range (Diff schemes entry above), so this walks edges rather than looking up an ancestor.
+    - Candidates are written as position ranges (`candidates.parquet`) and as proteins (`members.parquet`, with a seed flag), the inputs for round 2 and the pileup's `REFERENCE`. *Not wired:* `kfp-pileup reference` takes a unit profile and the unit store; a tree-index store fetched by range is still to build.
+    - *Gather* over the seed leaves. The score is remaining hit k-mers × windows / |S\_v| (estimated shared windows, as today's gather divides by *t\_g*). Leaves in the best's component that share a remaining k-mer with it and score within `--tie-z` (2) Poisson standard deviations of it are tied. The group is reported as its smallest common subtree, and its k-mers are removed.
+    - *Amended during the run:* ties were first not restricted to the best's component. Groups then spanned components (one covered 260 k of 262 k positions), which is not a subtree.
+  - **Test** (`test_tree_build.py`, single and partitioned builds): AAI bounds, and AAI 1 at full containment. Each walk, uncapped, equals the seed's component under edges ≤ radius (scipy's connected components, five radii); capped, it is the uncapped walk's prefix. Gather's groups take disjoint k-mers that together are every hit k-mer a seed holds, and each group's range contains its leaf. Every sampled protein's leaf is a candidate.
+  - **Local run** (medium tier on the quarter sample, 262,391 proteins; 4 threads):
+
+    | Query | Seeds | Candidates (+ neighbours) | Capped seeds | Ranges | Gather groups (tied) | Report |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 125 k read pairs (SRR1438000) | 384 | 1,017 (+633) | 0 | 143 | 109 (48) | 0.08 s |
+    | 50,000 core proteins as the query | 137,437 | 140,670 (+3,233) | 35,766 | 8,289 | 10,131 (5,963) | 37 s |
+
+    - Of the 50,000, 12,162 have a position in the quarter index. All but one hit their own leaf and are candidates. Gather picks the own leaf itself for 38% and reports it inside a group for 97.8%. The other 2.2% are explained away: a group in another component took their k-mers first (k-mers shared across components are posted in each).
+    - Tie groups: median 2 leaves, p90 21, p99 158, max 1,642. Common subtrees: median 2 positions, p90 35, p99 317. At the medium tier's ~4 base k-mers per protein, near-identical relatives cannot be told apart, so ties are the expected result, not a defect.
+    - The cap binds for a quarter of the protein seeds. A leaf with few k-mers has a wide interval (2 of 2 hit gives aai\_lo ~0.85), so its radius reaches far. That is the rule's intended direction for recall; phase 4 measures what it costs in candidates.
+    - *Ceilings:* the walk is a Python loop per seed (12 s for 137 k seeds), and gather recounts all pairs per pick (24 s for 10 k picks). Both need a kernel before HPC-scale samples.
+  - *Next:* phase 4 (benchmark against tier 1: δ at 0.05, 0.1 and 0.15, AAI calibration, nearest-match identity scoring), after the HPC build of the 1-in-100 tiers.

@@ -18,7 +18,10 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
 Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8) and
 ``kind.npy`` (u8), sorted by (hash, lo); ``node_lo.npy``, ``node_hi.npy``, ``node_level.npy``
 (internal node i of the merge tree, by positions); ``pos_size.npy`` and ``node_size.npy``
-(|S\\_v|: k-mers held at each position and each internal node); ``pieces.parquet`` (lo, hi, floor,
+(|S\\_v|: k-mers held at each position and each internal node); ``pos_len.npy`` (each
+position's representative's length); ``edge_a.npy``, ``edge_b.npy``, ``edge_w.npy`` (the spanning
+tree's edges between positions, weighed in topology units, for the neighbour rule);
+``pieces.parquet`` (lo, hi, floor,
 coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and
 ``meta.json``.
 """
@@ -193,6 +196,15 @@ def main() -> None:
     np.save(out / "node_lo.npy", lay["lo"][n:])
     np.save(out / "node_hi.npy", lay["hi"][n:])
     np.save(out / "node_level.npy", tree.forest.level)
+    pos_of_leaf = np.empty(n, dtype=np.int64)
+    pos_of_leaf[lay["order"]] = np.arange(n)
+    f = tree.forest
+    np.save(out / "edge_a.npy", pos_of_leaf[f.mst_a].astype(np.uint32))
+    np.save(out / "edge_b.npy", pos_of_leaf[f.mst_b].astype(np.uint32))
+    np.save(out / "edge_w.npy", f.mst_w.astype(np.uint32))
+    lengths = np.array([len(s) for s in tree.seqs], dtype=np.uint32)
+    leafless = np.flatnonzero((tree.leaf_of < 0) & (tree.n_valid > 0)) if a.n_1 else []
+    np.save(out / "pos_len.npy", np.concatenate([lengths[tree.rep_by_pos], lengths[leafless]]))
     # |S_v|: k-mers held at each position and each internal node (Fitch's states)
     rng = (
         table["lo"].to_numpy(),

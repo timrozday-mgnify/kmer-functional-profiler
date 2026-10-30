@@ -172,3 +172,23 @@ Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITIO
 
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
+
+## Querying and reporting (`query.py`, `report.py`)
+
+```bash
+python workflows/tree-index/query.py --index index-medium --reads r1.fq r2.fq --out q
+python workflows/tree-index/report.py --index index-medium --query q --out r
+```
+
+`query.py` counts hits per leaf position and internal node (phase 2). `report.py` (phase 3)
+adds naive containment AAI with an interval to both, then:
+
+- **candidates** (recall first): every leaf with `--min-hits` hit k-mers (default 1) and its
+  single-linkage cluster on the spanning tree at the neighbour rule's radius (`--delta`, default
+  0.1; at most `--max-neighbours` per seed, nearest first). `candidates.parquet` has them as
+  position ranges and `members.parquet` as proteins, for round 2 and the pileup's reference;
+- **gather** over the hit leaves, with ties within `--tie-z` reported as their smallest common
+  subtree (`gather.parquet`).
+
+The neighbour rule needs an index built with `--leaves proteins` (the default), whose spanning
+tree's edges (`edge_*.npy`) are in dense 8-mer units.

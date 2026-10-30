@@ -1,5 +1,5 @@
 """workflows/tree-index/build.py (and partition.py + merge.py): the index holds what it should,
-against brute force; query.py counts it."""
+against brute force; query.py counts it, and report.py reports it."""
 
 import json
 import sys
@@ -13,12 +13,16 @@ from kmer_functional_profiler import _core
 
 BUILD = SCRIPT.with_name("build.py")
 QUERY = SCRIPT.with_name("query.py")
+REPORT = SCRIPT.with_name("report.py")
 PARTITION = SCRIPT.with_name("partition.py")
 MERGE = SCRIPT.with_name("merge.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import build  # noqa: E402
 import phase0 as p0  # noqa: E402
 import query  # noqa: E402
+import report  # noqa: E402
+from scipy.sparse import coo_array  # noqa: E402
+from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2"]
 
@@ -135,6 +139,55 @@ def check_query(tmp_path: Path, idx: Path, members_path: Path) -> None:
     own = prot.filter(pl.col("i").is_in(list(range(0, len(members), 3))), pl.col("pos") >= 0)
     assert own.height > 0
     assert own.join(leaves, on="pos", how="anti").height == 0
+    check_report(tmp_path, idx, out, held, own)
+
+
+def check_report(tmp_path: Path, idx: Path, q: Path, held: pl.DataFrame, own: pl.DataFrame) -> None:
+    """report.py: AAI bounds, candidates against brute-force single linkage, gather's
+    assignment."""
+    out = tmp_path / f"r-{idx.name}"
+    run("--index", str(idx), "--query", str(q), "--out", str(out), "--max-neighbours", "4",
+        cwd=tmp_path, script=REPORT)  # fmt: skip
+    leaves = pl.read_parquet(out / "leaves.parquet")
+    assert (leaves["aai_lo"] <= leaves["aai"]).all() and (leaves["aai"] <= leaves["aai_hi"]).all()
+    full = leaves.filter(pl.col("hit_kmers") == pl.col("size"))
+    assert full.height > 0 and (full["aai"] == 1).all()
+
+    # candidates: the seeds and each seed's walk, as ranges; members are their proteins
+    cand = pl.read_parquet(out / "candidates.parquet")
+    pos = np.concatenate([np.arange(lo, hi) for lo, hi in cand.rows()])
+    assert (np.diff(pos) > 0).all() and np.isin(leaves["pos"], pos).all()
+    members = pl.read_parquet(out / "members.parquet")
+    assert np.isin(members["pos"], pos).all()
+    assert members.filter(pl.col("seed"))["pos"].unique().len() == leaves.height
+
+    # each walk, uncapped, is the seed's single-linkage cluster at its radius (brute force:
+    # components of the edges <= radius); capped, the nearest of it in minimax distance
+    n_pos = len(np.load(idx / "pos_len.npy"))
+    tree = report.Spanning(idx, n_pos)
+    a, b, w = (np.load(idx / f"edge_{x}.npy").astype(np.int64) for x in "abw")
+    grown = 0
+    for radius in (0, 5, 20, 80, 10**9):
+        keep = w <= radius
+        graph = coo_array((np.ones(keep.sum()), (a[keep], b[keep])), shape=(n_pos, n_pos))
+        _, comp = connected_components(graph, directed=False)
+        for v in leaves["pos"].to_list():
+            got, cut = tree.cluster(v, radius, n_pos)
+            assert not cut and sorted(got) == np.flatnonzero(comp == comp[v]).tolist()
+            near, cut = tree.cluster(v, radius, 4)
+            assert near == got[:5] and cut == (len(got) > 5)
+            grown += len(got) > 1
+    assert grown > 0
+
+    # gather: groups take disjoint k-mers, together every hit k-mer a seed holds; a group's
+    # range is its common subtree, which holds its leaf. Every sampled protein is a candidate
+    g = pl.read_parquet(out / "gather.parquet")
+    hits = pl.read_parquet(q / "hits.parquet")
+    seed_kmers = held.join(hits, on="hash").filter(pl.col("pos").is_in(leaves["pos"].implode()))
+    assert int(g["kmers"].sum()) == seed_kmers["hash"].n_unique()
+    assert g.filter((pl.col("pos") < pl.col("lo")) | (pl.col("pos") >= pl.col("hi"))).height == 0
+    assert ((g["tied"] > 1) == (g["node"] >= 0)).all()
+    assert np.isin(own["pos"], members["pos"]).all()
 
 
 def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
