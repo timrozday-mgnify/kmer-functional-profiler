@@ -675,3 +675,28 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - `test_partitioned_build_is_sound`: fixture in ≥ 3 parts, built and merged. The merged index passes the single build's brute-force checks: positions one-to-one with dense 8-mer sets, base band, floors, coverage, and leaf and node query counts.
     - `build.nf`'s test profile runs locally: 5 parts × 3 tiers merged.
   - **HPC:** `hpc/kfp-ablations/tree-index-build/run.sh` builds quick, medium and large from `lin100-dense/members.parquet` into `results/index-<tier>/`.
+* **Diff schemes on the per-protein design; the spanning tree replaces the merge tree (2026-10-30, the user's request: evaluate the diff schemes while the tiers build; then switch, and estimate the build cost).**
+  - **Schemes on the base band** (survey's `schemes`, phase 0's core sample, 1,067,329 proteins), relative to Fitch on Kruskal's merge tree, the same at *t\_base* 0.01, 0.02 and 0.05:
+
+    | Scheme | Collapsed leaves | A leaf per dense 8-mer set |
+    | --- | --- | --- |
+    | Fitch on the merge tree (phase 0's choice) | 1 | 1 |
+    | **Fitch on the spanning tree** | **0.973** | **0.875** |
+    | Sequence MST | 1.13–1.15 | 0.94 |
+    | Add-only | 1.09–1.10 | 1.26–1.27 |
+    | Majority | 1.15 | 1.17 |
+    | Flat | 1.63–1.64 | 2.43–2.44 |
+
+    - With a leaf per protein, the sequence MST beats Fitch on the merge tree. Fitch is optimal on its tree, so the merge tree loses something: it joins whole clusters at each Kruskal step and forgets which proteins the edge connected, and chains of fragments and close relatives pay for that.
+    - Fitch on the spanning tree itself keeps that adjacency. It can cost no more than the sequence MST (its internal states may take each node's own set), and it is the cheapest scheme everywhere.
+  - **The spanning tree as a binary tree** (`survey.spanning_tree`). Each component is rooted at its node with the root edge. A node's subtree is the node as a leaf, joined to its children's subtrees one at a time, lightest edge first; a join's level is that edge's weight.
+    - Same leaves, internal-node count and components as the merge tree. Mean node range 33.5 leaves against 37.7 (quarter sample).
+    - *Cost:* a single-linkage cluster is still a connected subtree, but no longer always one leaf range, so the neighbour rule's candidates become a few ranges rather than one.
+  - **Whole tiers** (quarter sample, survey with both trees):
+    - Spanning over merge: quick 0.938, medium 0.947, large 0.917.
+    - The base band is −11.6%. At *τ* 0.3 floors rise 0.5–5.7% and top-ups 1–9%, because the spanning tree's nodes are less coherent groupings. At *τ* 0 floors and top-ups are unchanged, since the components are the same.
+    - Every surveyed setting is cheaper except 0.01/32 at *τ* 0.3 (+2%), which no tier uses.
+  - **Build cost** (quarter sample, medium tier): unchanged. 70.3 s against 70.4 s, peak RSS 4.66 GB against 4.67 GB. The spanning tree takes 0.4 s per 262 k proteins (~3.5 s per 2 M-protein part, a Python loop; a Rust kernel at release scale), and its Fitch pass takes as long as the merge tree's. The index is 3.7% smaller in bytes and has 5.3% fewer postings.
+    - *Note:* this build peaked at 4.7 GB, above the 3.4 GB measured earlier for the same configuration. Per 2 M-protein part that is ~36 GB, inside BUILD's 64 GB.
+  - **Tier sizes, revised** (release postings × the quarter's ratio; ~9 B per posting + ~35 GB of leaf tables): quick 5.8–7.2 × 10⁹ postings, ~87–100 GB; medium 11.3–13.9 × 10⁹, ~137–160 GB; large 22.8–25.7 × 10⁹, ~240–266 GB.
+  - **Switched:** `--topology-tree spanning` is now the default of `survey.py` and `build.py`, so `build.nf` and `hpc/kfp-ablations/tree-index-build` build on it. `--topology-tree merge` keeps phase 0's tree. `survey.json` reports Fitch on both trees per *t\_base*, with timings.

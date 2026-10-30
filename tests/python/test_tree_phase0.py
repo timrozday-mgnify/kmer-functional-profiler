@@ -53,3 +53,12 @@ def test_survey_invariants(tmp_path: Path) -> None:
         assert postings == sorted(postings)  # a larger leaf minimum only adds postings
         # every protein with a valid k-mer is covered once each leaf holds one
         assert all(b == 0 for b, n in zip(blind, n_1, strict=True) if n >= 1)
+    # Fitch on the spanning tree can only improve on the sequence-MST scheme (same tree, free
+    # internal states); on any tree, Fitch is the cheapest of the tree's schemes
+    trees = json.loads((tmp_path / "s" / "survey.json").read_text())["trees"]
+    for tree in trees.values():
+        for sc in tree["schemes"].values():
+            assert sc["fitch_on_spanning_tree"] <= sc["sequence_mst"]
+            # the survey's tree is the spanning tree by default
+            assert sc["fitch"] == sc["fitch_on_spanning_tree"]
+            assert sc["distinct_kmers"] <= sc["fitch"] <= min(sc["majority"], sc["add_only"])

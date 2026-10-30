@@ -91,9 +91,23 @@ mode is kept whole: the storage tree on per-sequence floored sets. Its leaves (`
   containment collapses, each stored as its longest member's k-mers;
 - `proteins`: a leaf per distinct dense set (every 8-mer, `--topology-k`, at rate 1,
   `--topology-t`), so proteins share a leaf only when those sets are equal. There is no
-  containment collapse, and each leaf stores its own k-mers. The topology is the storage tree
-  (Kruskal with the virtual empty root) under |A Δ B| of the dense sets, from an exact pair
-  join (`--topology-max-holders` caps common k-mers, then weighs pairs exactly).
+  containment collapse, and each leaf stores its own k-mers. The topology is the storage
+  spanning tree (Kruskal with the virtual empty root) under |A Δ B| of the dense sets, from an
+  exact pair join (`--topology-max-holders` caps common k-mers, then weighs pairs exactly).
+
+Diffs and pieces use one of two binary trees over the same spanning tree
+(`--topology-tree`):
+
+- `spanning` (default): the spanning tree itself. Each component is rooted at its node with
+  the root edge, and a node's subtree is the node as a leaf, joined to its children's subtrees
+  one at a time, lightest edge first. It keeps which proteins each edge connects.
+- `merge`: Kruskal's merge tree (single-linkage dendrogram), phase 0's. It joins whole
+  clusters, so every single-linkage cluster is one leaf range.
+
+On phase 0's core sample with a leaf per protein, Fitch on the spanning tree needs 12.5% fewer
+base-band postings than on the merge tree (2.7% with collapsed leaves). `survey.json` reports
+every scheme's base-band postings per *t\_base* (`schemes`): Fitch, majority, add-only, the
+sequence MST and flat on the tree in use, and Fitch on each tree.
 
 On each tree, each configuration stores:
 
@@ -137,7 +151,8 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            the pair join, _core.overlap_components) or an equal sequence; components packed
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
-           topology, base band by Fitch, floors per piece, per-leaf top-ups
+           topology, base band by Fitch on the spanning tree, floors per piece, per-leaf
+           top-ups
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
 ```
 
