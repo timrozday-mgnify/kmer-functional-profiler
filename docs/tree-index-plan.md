@@ -461,3 +461,19 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - Floor candidates are ranked by holders only; tier 1 also divides by *n\_groups*.
     - Measured on a quarter sample; the workflow does not yet compute it.
   - *Next (pending the user's decision):* add piece floors as a variant of `measure` (cut ladder, with and without singleton floors) and re-run phase 0 on HPC, including `measure-all`, to re-check the gate at full sample size.
+  - **Both: the full hierarchy kept, floors lower down (the user, same day: "the hierarchy beyond this might still be useful for neighbours but not for the diffs"; "can I have both?").** Postings and topology are independent.
+    - The whole merge tree and its single leaf order are kept: the neighbour rule's single-linkage clusters at any level, chunks, and reported subtrees are all contiguous ranges of it.
+    - The sparse or sensitive linking of components above the storage forest is kept too.
+    - Only *where postings sit* is restricted. Base-band k-mers are diffed by Fitch over the whole tree; above a component no base-band k-mer is shared anyway, so this costs the same as the forest. Floor k-mers are posted at piece roots at cut *c*.
+    - The two bands hold disjoint k-mers (≤ *t\_base* and > *t\_base*), so the costs add. A floor k-mer chosen in several pieces is counted once per piece, an upper bound.
+    - Merge nodes above the cuts carry no postings, only their N − 1 rows in the node table, which exists anyway.
+
+    | Floor cut *c* | Floor pieces | Base Fitch (whole tree) | Piece floors | Total | / tier 1 | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0 | 151,163 | 309,853 | 301,946 | 611,799 | 1.41× | 22,463 |
+    | 4 | 131,199 | 309,853 | 267,960 | 577,813 | 1.34× | 21,062 |
+    | 8 | 106,298 | 309,853 | 225,687 | 535,540 | 1.24× | 19,018 |
+    | 16 | 84,565 | 309,853 | 196,217 | 506,070 | 1.17× | 17,213 |
+    | ∞ (components) | 80,880 | 309,853 | 196,385 | 506,238 | 1.17× | 16,936 |
+
+    Every cut now passes 1.5×: the cost of finer floors is only the floors themselves. The cut sets floor resolution (and blindness: finer pieces of one member leave short proteins unfloored), not diff cost or neighbour reach.
