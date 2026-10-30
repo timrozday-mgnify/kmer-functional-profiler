@@ -430,3 +430,34 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - without floors it is 0.64× tier 1.
 
     What fails is per-sequence floors. They multiply distinct k-mers by ~4.6 (988 k to 5.5 M), and no topology can share those. By the phase-0 rule this stops the plan as written. Continuing needs a floor design that is not per sequence, measured against tier 1 at matched sensitivity: for example, floors per subtree (forest component or single-linkage cluster) chosen by consensus as tier 1's are, or a lower per-sequence *n\_min*. That is the user's decision (pending).
+
+* **Forest floors explored (2026-10-30, the user's idea: a forest rather than one tree, so the hierarchy that forces per-sequence floors is not kept).** Local exploration, not a workflow yet. Run on a quarter of phase 0's sample: clusters with `cluster_rep % 20000 == 0`, 77,317 units, 262,391 proteins. On this quarter, tier 1 has 432,440 postings and per-sequence floors 1,642,628 (3.80×, as on the whole sample).
+  - **Design tried.**
+    - The topology is phase 0's exact storage tree, built on floored sets.
+    - Its merge tree is cut into pieces at merge level > *c* (stored-k-mer weight); *c* = ∞ keeps the forest components.
+    - Leaves keep only base-band k-mers (≤ *t\_base*), diffed by Fitch inside each piece.
+    - Each piece gets one floor in tier 1's manner: *t\_p* = max(*t\_base*, min(*t\_cap*, *n\_min* / distinct k-mers of its union)), keeping the *n\_min* candidates above *t\_base* held by most members. These are posted once at the piece's root.
+    - Singleton pieces get no floor, as tier 1's singleton units get none.
+  - **Results** (postings over tier 1's; blind = proteins whose piece has no k-mer at all):
+
+    | Cut *c* | Pieces | With ≥ 2 members | Base Fitch | Piece floors | Total | / tier 1 | Blind proteins |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 0 | 151,163 | 30,365 | 497,145 | 301,946 | 799,091 | 1.85× | 22,463 |
+    | 2 | 145,785 | 29,682 | 473,031 | 294,928 | 767,959 | 1.78× | 22,126 |
+    | 4 | 131,199 | 26,829 | 418,021 | 267,960 | 685,981 | 1.59× | 21,062 |
+    | 6 | 117,315 | 24,383 | 377,654 | 243,841 | 621,495 | 1.44× | 19,885 |
+    | 8 | 106,298 | 22,733 | 352,125 | 225,687 | 577,812 | 1.34× | 19,018 |
+    | 16 | 84,565 | 20,452 | 315,185 | 196,217 | 511,402 | 1.18× | 17,213 |
+    | ∞ (components) | 80,880 | 20,647 | 309,853 | 196,385 | 506,238 | **1.17×** | 16,936 |
+    | tier 1 | 77,317 units | 20,648 | | | 432,440 | 1× | 16,075 |
+
+  - **Reading.**
+    - With floors on pieces rather than sequences, the tree comes within 1.17× of tier 1 at almost the same blindness (16,936 against 16,075 proteins), inside the phase-0 limit of 1.5×. It also keeps per-sequence resolution in the base band, which tier 1 does not have.
+    - **Cutting finer does not help.** Every extra piece needs its own floor and loses base-band sharing across the cut, so cost falls monotonically as cuts coarsen. The useful forest is the storage forest (components), with floors at component roots.
+    - The fine cuts (≤ 8) buy finer floor resolution at 1.3–1.9×.
+    - Flooring singleton pieces too (each with its own *n\_min* candidates) costs 562,540 more postings at components (2.47× in all) and leaves no protein blind.
+  - **Caveats.**
+    - Random 1-in-20,000 clusters rarely have relatives in the sample, so components here are close to clusters. At full scale, cross-cluster links (55% of spanning-tree edges in `measure-all`) make fewer, larger components: fewer floors, but coarser ones.
+    - Floor candidates are ranked by holders only; tier 1 also divides by *n\_groups*.
+    - Measured on a quarter sample; the workflow does not yet compute it.
+  - *Next (pending the user's decision):* add piece floors as a variant of `measure` (cut ladder, with and without singleton floors) and re-run phase 0 on HPC, including `measure-all`, to re-check the gate at full sample size.
