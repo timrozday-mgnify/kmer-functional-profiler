@@ -325,3 +325,31 @@ def test_reduced_alphabets_match_rust() -> None:
         m = len(groups)
         assert [h[i] for i in range(m)] == [h[i + m] for i in range(m)], name
         assert len({h[i] for i in range(m)}) == m, name
+
+
+def test_gather_takes_reads_greedily() -> None:
+    # leaf 0: reads 1-3; leaf 1 shares reads 1-2 with it, plus read 5; leaf 2: read 4 alone
+    ev = pl.DataFrame(
+        {"pos": [0, 0, 0, 1, 1, 1, 2], "read": [1, 2, 3, 1, 2, 5, 4],
+         "score": [10.0, 10, 10, 12, 12, 3, 5]}
+    )  # fmt: skip
+    got = query.gather(ev, floor=1.0)
+    assert got.rows() == [(0, 30.0), (2, 5.0), (1, 3.0)]  # leaf 1's gain falls from 27 to 3
+    assert query.gather(ev, floor=4.0)["pos"].to_list() == [0, 2]
+
+
+def test_layer_on_reps() -> None:
+    pos = np.array([0, 0, 1, 1, 1, 2, 3])
+    h = np.array([1, 2, 1, 2, 3, 2, 9], dtype=np.uint64)
+    for rule, want, rep in (
+        ("medoid", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),  # leaf 1 shares the most in group 0
+        ("longest", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),
+        ("central", {(2, 2), (3, 9)}, 2),  # leaf 2's one k-mer is held by all three
+        ("composite:0.5", {(1, 1), (1, 2), (3, 9)}, 1),  # k-mers on at least 2 of the 3
+        ("composite:0", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),
+        ("composite:0.5:central", {(2, 1), (2, 2), (3, 9)}, 2),
+    ):
+        group = np.array([0, 0, 0, 3])
+        p, hh = build.on_reps(group, pos, h, rule)
+        assert set(zip(p.tolist(), hh.tolist(), strict=True)) == want, rule
+        assert group.tolist() == [rep, rep, rep, 3]

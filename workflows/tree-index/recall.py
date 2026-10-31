@@ -132,6 +132,17 @@ def strategies(
             start = ev.filter(pl.col("score") >= bar)["pos"].to_numpy().astype(np.int64)
             out[f"ev_{share}"] = start
             out[f"ev_{share}_nb"] = walk(start, deltas[-1], caps[-1])
+    for f in sorted(qdir.glob("cand_*.npy")):  # query.py --decoy's candidates
+        start = np.load(f).astype(np.int64)
+        out[f.stem[5:]] = start
+        out[f"{f.stem[5:]}_nb"] = walk(start, deltas[-1], caps[-1])
+    if (path / "layer_group.npy").exists():  # a layer on representatives: each seeds its group
+        group = np.load(path / "layer_group.npy").astype(np.int64)
+        o = np.argsort(group, kind="stable")
+        first = np.searchsorted(group[o], np.arange(len(group) + 1))
+        reps = lambda p: p[group[p] == p]  # noqa: E731
+        out = {s: np.union1d(p, np.concatenate([o[first[r] : first[r + 1]] for r in reps(p)]
+                                                 or [p[:0]])) for s, p in out.items()}  # fmt: skip
     a, b = (np.load(path / f"edge_{x}.npy") for x in "ab")
     graph = coo_array((np.ones(len(a)), (a, b)), shape=(n_pos, n_pos))
     _, comp = connected_components(graph, directed=False)

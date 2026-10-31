@@ -42,6 +42,8 @@ def main() -> None:
             cols[x].append(load(x))
         for x in ("lo", "hi", "node_lo", "node_hi", "edge_a", "edge_b"):
             cols[x].append(load(x).astype(np.uint64) + off)
+        if (p / "layer_group.npy").exists():
+            cols.setdefault("layer_group", []).append(load("layer_group").astype(np.uint64) + off)
         names = (("hash", "keys"), ("bits", "key_bits"), ("k", "key_k"))
         bits.append(pl.DataFrame({x: np.load(p / f"{y}.npy") for x, y in names}))
         pieces.append(pl.read_parquet(p / "pieces.parquet").with_columns(pl.col("lo", "hi") + off))
@@ -58,8 +60,9 @@ def main() -> None:
     for x in ARRAYS:
         dtype = np.uint32 if x in ("lo", "hi") else merged[x].dtype
         np.save(out / f"{x}.npy", merged[x][order].astype(dtype))
-    for x in ("node_lo", "node_hi", "edge_a", "edge_b", *TABLES):
-        dtype = np.uint32 if x in ("node_lo", "node_hi", "edge_a", "edge_b") else merged[x].dtype
+    offset = ("node_lo", "node_hi", "edge_a", "edge_b", "layer_group")
+    for x in (*offset[:4], *TABLES, *(x for x in offset[4:] if x in merged)):
+        dtype = np.uint32 if x in offset else merged[x].dtype
         np.save(out / f"{x}.npy", merged[x].astype(dtype))
     # 2^-bits = q0 g, and q0 is a k-mer's own: gains across parts add
     keys = (

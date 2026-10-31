@@ -47,6 +47,8 @@ import polars as pl
 import query
 import survey
 from numpy.typing import NDArray
+from scipy.sparse import coo_array
+from scipy.sparse.csgraph import connected_components
 
 from kmer_functional_profiler import _core
 
@@ -56,10 +58,12 @@ BASE, FLOOR, TOPUP = 0, 1, 2
 
 
 def postings(
-    tree: survey.Tree, a: argparse.Namespace
+    tree: survey.Tree, a: argparse.Namespace, group: NDArray[np.int64] | None = None
 ) -> tuple[pl.DataFrame, pl.DataFrame, int, pl.DataFrame]:
     """Range postings of every kind, the pieces, positions used (tree's plus leafless), and
-    each key's evidence (:func:`key_bits`)."""
+    each key's evidence (:func:`key_bits`). With ``group`` (each position's group, numbered by
+    its representative's position, :func:`layer_groups`), layers go on representatives only
+    (:func:`on_reps`)."""
     f, lay, n = tree.forest, tree.lay, tree.forest.n
     lo_base = U64(_core.max_hash(a.t_base))
     # base band: Fitch's changes over the whole tree
@@ -90,6 +94,10 @@ def postings(
     every = np.arange(n)  # layers: every leaf, whatever its 11-mers
     for step, rare_first in zip(query.ladder(a.layers), query.ladder_flags(a.layers), strict=True):
         add_step(reps, every, step, "rare" in rare_first, a.window_min, log_f, extra, info)
+        if group is not None:
+            extra["pos"][-1], extra["h"][-1] = on_reps(
+                group, extra["pos"][-1], extra["h"][-1], a.layer_rep
+            )
     pos = np.concatenate([tree.pos[keep], *extra["pos"]])
     h = np.concatenate([tree.h[keep], *extra["h"]])
     leaf = lay["order"][pos]
@@ -163,6 +171,68 @@ def postings(
         parts.append(topups(hh[take], n + seq[take]))
     table = pl.concat(parts).sort("hash", "lo", "hi")
     return table, pieces, n + len(leafless), key_bits(table, pl.concat(info))
+
+
+def layer_groups(tree: survey.Tree, members: pl.DataFrame, spec: str) -> NDArray[np.int64]:
+    """Each leaf position's group for layers on representatives, as the group's first position
+    (:func:`on_reps` picks the representative):
+
+    - ``units``: its representative protein's MGnify90 unit;
+    - ``tree:<d>``: single linkage over the spanning tree's edges whose dense-set distance,
+      |A Δ B| / (|A| + |B|) with |A| ~ length - topology_k + 1, is at most d (0.34 ~ 95%
+      identity, 0.57 ~ 90%, as 1 - identity^topology_k).
+    """
+    n = tree.forest.n
+    pos_of_leaf = np.empty(n, dtype=np.int64)
+    pos_of_leaf[tree.lay["order"]] = np.arange(n)
+    if spec == "units":
+        unit = members["cluster_rep"].to_numpy()[tree.rep_by_pos]
+        _, label = np.unique(unit, return_inverse=True)
+    else:
+        d = float(spec.split(":")[1])
+        f = tree.forest
+        size = np.array([len(tree.seqs[i]) for i in tree.rep_by_pos]) - tree.args.topology_k + 1
+        a, b = pos_of_leaf[f.mst_a], pos_of_leaf[f.mst_b]
+        ok = f.mst_w <= d * np.maximum(size[a] + size[b], 1)
+        graph = coo_array((np.ones(int(ok.sum())), (a[ok], b[ok])), shape=(n, n))
+        _, label = connected_components(graph, directed=False)
+    first = np.full(int(label.max(initial=-1)) + 1, n, dtype=np.int64)
+    np.minimum.at(first, label, np.arange(n))
+    return first[label]
+
+
+PICKS: Final = {  # a group's representative: the member with the highest score
+    "medoid": pl.col("c").sum(),  # its layer k-mers most shared (sum of members holding each)
+    "central": pl.col("c").mean(),  # its k-mers shared on average (favours the typical)
+    "longest": pl.len(),  # the most layer k-mers of its own
+}
+
+
+def on_reps(
+    group: NDArray[np.int64], pos: NDArray[np.int64], h: NDArray[np.uint64], rule: str
+) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
+    """A layer's (position, hash) moved onto one representative per group, picked by
+    :data:`PICKS` (ties: the first). ``<pick>``: the representative's own k-mers;
+    ``composite:<f>[:<pick>]``: every k-mer held by at least a share f of the group's members
+    (0: the union), on the representative (default pick: medoid). Returns the new (position,
+    hash); records the representative as each position's group in place."""
+    kind, *args = rule.split(":")
+    pick = args[1] if kind == "composite" and len(args) > 1 else "medoid" if args else kind
+    df = pl.DataFrame({"pos": pos, "h": h, "g": group[pos]})
+    held = df.join(df.group_by("g", "h").agg(c=pl.len()), on=["g", "h"])
+    score = held.group_by("pos", "g").agg(s=PICKS[pick]).sort("s", "pos", descending=[True, False])
+    best = score.unique("g", keep="first")
+    rep = np.arange(len(group))
+    rep[best["g"].to_numpy()] = best["pos"].to_numpy()
+    rep_of = pl.col("g").replace_strict(best["g"], best["pos"])
+    if kind == "composite":
+        size = pl.DataFrame({"g": group}).group_by("g").agg(m=pl.len())
+        got = held.unique(["g", "h"]).join(size, on="g")
+        out = got.filter(pl.col("c") >= float(args[0]) * pl.col("m")).select(pos=rep_of, h="h")
+    else:
+        out = df.filter(pl.col("pos") == rep_of).select("pos", "h")
+    group[:] = rep[group]
+    return out["pos"].to_numpy().astype(np.int64), out["h"].to_numpy()
 
 
 def add_step(
@@ -435,6 +505,17 @@ def main() -> None:
     parser.add_argument("--topology-k", type=int, default=8)
     parser.add_argument("--topology-t", type=float, default=1.0)
     parser.add_argument("--topology-max-holders", type=int, default=0)
+    parser.add_argument(
+        "--layer-groups", default="",
+        help="layers on one representative per group, not every leaf: units (MGnify90) or "
+        "tree:<d> (spanning-tree single linkage at dense-set distance d); writes layer_group.npy",
+    )  # fmt: skip
+    parser.add_argument(
+        "--layer-rep", default="medoid",
+        help="with --layer-groups: medoid, central or longest (build.PICKS: that member's own "
+        "k-mers) or composite:<f>[:<pick>] (k-mers of at least a share f of the group's "
+        "members, on the pick)",
+    )  # fmt: skip
     parser.set_defaults(**MODES[parser.parse_known_args()[0].mode])
     a = parser.parse_args()
     out = Path(a.out)
@@ -444,7 +525,10 @@ def main() -> None:
     a.layers = a.layers.replace("{k}", str(layer_k(a.database_proteins or members.height)))
     tree = survey.Tree(members, a)
     topology_s = time.perf_counter() - t0
-    table, pieces, n_pos, bits = postings(tree, a)
+    group = layer_groups(tree, members, a.layer_groups) if a.layer_groups and a.layers else None
+    table, pieces, n_pos, bits = postings(tree, a, group)
+    if group is not None:  # leafless positions are their own groups
+        np.save(out / "layer_group.npy", np.r_[group, np.arange(len(group), n_pos)])
     for col, dtype in (("hash", U64), ("lo", np.uint32), ("hi", np.uint32), ("sign", np.int8),
                        ("kind", np.uint8)):  # fmt: skip
         np.save(out / f"{col}.npy", table[col].to_numpy().astype(dtype))

@@ -187,6 +187,19 @@ layers, which are not yet tested for precision or F1. Each `index-<tier>/` is in
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
 
+Being tried (docs/tree-index-plan.md, Progress log: per-layer bars, gather, layer
+representatives and rough alignment), not yet in the tiers:
+
+- `build.py --layer-groups tree:0.57 --layer-rep composite:0.25`: layers on one representative
+  per spanning-tree group (or MGnify90 unit, `units`), a composite of its members' k-mers;
+  `layer_group.npy` maps each position to its representative, and `recall.py` expands a
+  representative's seed to its group;
+- `query.py --decoy` writes `cand_fam_<share>.npy`, seeds at a decoy bar per key family (base,
+  each layer);
+- `verify.py`: ungapped BLOSUM62 alignment of each (read pair, leaf) with evidence against the
+  leaf's representative, decoy-calibrated (`cand_verify_<share>.npy`). Representatives at
+  window 32 with it reach 0.91 at 80% and 0.73 at 70% at ~2.5× S3's postings.
+
 Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITION 37 s and
 2.6 GB (~2.4 KB per protein); BUILD 68 s and 3.4 GB per 262 k proteins (the medium tier).
 
