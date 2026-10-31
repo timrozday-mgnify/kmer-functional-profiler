@@ -293,11 +293,11 @@ def test_rare_windows_break_ties_by_hash() -> None:
 
 def test_default_modes_query_soundly(tmp_path: Path) -> None:
     """The tiers (slim: one posting per leaf where possible; standard and large: a protein
-    layer on every leaf, k from the database's size): covers sum to 0 or 1, and the query and
-    report checks hold against brute force, the layer's k-mers included."""
+    layer on spanning-tree groups' composites, k from the database's size): covers sum to 0 or
+    1, and the query and report checks hold against brute force, the layer's k-mers included."""
     assert [build.layer_k(n) for n in (320, 262_391, 53_000_000)] == [5, 6, 8]
     members = fixture(tmp_path)
-    layers = {"slim": "", "standard": "protein:5:8:rare", "large": "protein:5:4:rare"}
+    layers = {"slim": "", "standard": "protein:5:64:rare", "large": "protein:5:16:rare"}
     for mode, want in layers.items():
         idx = tmp_path / f"idx-{mode}"
         run(
@@ -306,6 +306,7 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         meta = json.loads((idx / "meta.json").read_text())
         assert meta["params"]["layers"] == want
         assert meta["params"]["n_1"] == (1 if mode == "slim" else 2)
+        assert (idx / "layer_group.npy").exists() == bool(want)
         codes = set(np.load(idx / "key_k.npy").tolist())
         assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
         check_query(tmp_path, idx, members)

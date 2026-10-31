@@ -152,15 +152,18 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
            topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
-           tree, per-leaf top-ups; standard and large also a protein layer on every leaf,
-           its k from the whole database's size (partition.json's proteins)
+           tree, per-leaf top-ups; standard and large also a protein layer on one composite
+           per spanning-tree group, its k from the whole database's size (partition.json's
+           proteins)
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
 TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
 SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM62
            substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
-QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed
+QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed; then
+           verify.py: candidates aligned ungapped, their own decoy bar
 SCORE      recall.py score per tier
 SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
+           (verify_0.01_nb)
 ```
 
 ```bash
@@ -177,8 +180,8 @@ sample):
 | Tier | `build.py` | Recall at depth > 1 (quarter sample) | ~Release |
 | --- | --- | --- | --- |
 | `slim` | `--mode slim`: *n\_1* 1, ~2 spread minimizers, k 7 for < 16 informative 11-mers | 0.93 at 100%, 0.81 at 95%, 0.62 at 90% | 120–130 GB (75–90 GB without the neighbour rule's edges) |
-| `standard` | `--mode standard`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the rarest protein k-mer per window of 8 on every leaf (`protein:{k}:8:rare`) | 0.98 at 90%, 0.94 at 85%, 0.84 at 80% | ~1.0–1.2 TB |
-| `large` | `--mode large`: the layer at window 4 | 0.92 at 80%, 0.87 at 75%, 0.75 at 70% | ~1.4–1.7 TB |
+| `standard` | `--mode standard`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the rarest protein k-mer per window of 64 (`protein:{k}:64:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), then `verify.py` | 0.84 at 80%, 0.75 at 75%, 0.64 at 70% | ~280–330 GB |
+| `large` | `--mode large`: the layer at window 16 | 0.95 at 80%, 0.91 at 75%, 0.83 at 70% | ~470–560 GB |
 
 `{k}` in `--layers` is `build.layer_k`: ~24 chance bits on the quarter sample (k 6) plus log2 of
 the database's size over it, so k 8 on the 1-in-100 subset. `--mode standard --layers ''` is
@@ -187,18 +190,13 @@ layers, which are not yet tested for precision or F1. Each `index-<tier>/` is in
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
 
-Being tried (docs/tree-index-plan.md, Progress log: per-layer bars, gather, layer
-representatives and rough alignment), not yet in the tiers:
-
-- `build.py --layer-groups tree:0.57 --layer-rep composite:0.25`: layers on one representative
-  per spanning-tree group (or MGnify90 unit, `units`), a composite of its members' k-mers;
-  `layer_group.npy` maps each position to its representative, and `recall.py` expands a
-  representative's seed to its group;
-- `query.py --decoy` writes `cand_fam_<share>.npy`, seeds at a decoy bar per key family (base,
-  each layer);
-- `verify.py`: ungapped BLOSUM62 alignment of each (read pair, leaf) with evidence against the
-  leaf's representative, decoy-calibrated (`cand_verify_<share>.npy`). Representatives at
-  window 32 with it reach 0.91 at 80% and 0.73 at 70% at ~2.5× S3's postings.
+Layers on representatives (docs/tree-index-plan.md, Progress log: per-layer bars, gather,
+layer representatives and rough alignment): `layer_group.npy` maps each position to its
+group's representative, and `recall.py` expands a representative's seed to its group.
+`query.py --decoy` also writes `cand_fam_<share>.npy`, seeds at a decoy bar per key family
+(base, each layer). `verify.py` aligns each (read pair, leaf) with evidence ungapped (BLOSUM62)
+against the leaf's longest protein, decoy-calibrated (`cand_verify_<share>.npy`). The old
+standard (window 8 on every leaf, ~1.0–1.2 TB) is `--layers protein:{k}:8:rare --layer-groups ''`.
 
 Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITION 37 s and
 2.6 GB (~2.4 KB per protein); BUILD 68 s and 3.4 GB per 262 k proteins (the medium tier).

@@ -7,13 +7,16 @@
 //            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py)
 // BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology,
 //            spread minimizers and the k 7 ladder diffed on the spanning tree; standard and
-//            large add a protein layer on every leaf, its k from the whole database's size)
+//            large add a protein layer on spanning-tree groups' composites, its k from the whole
+//            database's size)
 // MERGE      per tier: the parts -> index-<tier>/ (merge.py), query.py's format
 // TARGETS    --bench_targets proteins with an index position (recall.py targets)  (--bench false: skip)
 // SIMULATE   one strain per target at 100-70% identity, BLOSUM62 substitutions (spike.py simulate)
-// QUERY      per tier: the strains' reads, chance seeds counted on reversed reads (query.py --decoy)
+// QUERY      per tier: the strains' reads, chance seeds counted on reversed reads (query.py --decoy),
+//            then the candidates' rough alignment, decoy-calibrated (verify.py)
 // SCORE      per tier: candidate recall against the truth (recall.py score)
-// SUMMARY    -> bench.tsv: per tier, postings, decoy bar and recall by identity (recall.py summary)
+// SUMMARY    -> bench.tsv: per tier, postings, decoy bar and recall by identity (recall.py summary,
+//            verify_0.01_nb: aligned at a 1% decoy bar, neighbour rule)
 
 nextflow.enable.dsl = 2
 
@@ -126,13 +129,18 @@ process QUERY {
 
     input:
     tuple val(tier), path(index, stageAs: 'index'), path(sim)
+    path members, stageAs: 'members/*'
     path code, stageAs: 'code/*'
 
     output:
     tuple val(tier), path("q-${tier}")
 
     script:
-    "${py()} code/query.py --index index --reads ${sim}/reads_1.fq.gz ${sim}/reads_2.fq.gz --decoy --out q-${tier}"
+    def reads = "${sim}/reads_1.fq.gz ${sim}/reads_2.fq.gz"
+    """
+    ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
+    ${py()} code/verify.py --index index --members members/* --reads ${reads} --query q-${tier}
+    """
 }
 
 process SCORE {
@@ -166,12 +174,12 @@ process SUMMARY {
     path 'runs/[qs]-*', includeInputs: true
 
     script:
-    "${py()} code/recall.py summary --root runs --base base --out bench.tsv"
+    "${py()} code/recall.py summary --root runs --base base --strategy verify_0.01_nb --out bench.tsv"
 }
 
 workflow {
     code = ['partition.py', 'build.py', 'merge.py', 'survey.py', 'phase0.py', 'query.py',
-            'alphabets.py', 'recall.py', 'report.py', '../spike-benchmark/spike.py']
+            'alphabets.py', 'recall.py', 'verify.py', 'report.py', '../spike-benchmark/spike.py']
         .collect { file("${projectDir}/${it}") }
     members = params.members ? Channel.fromPath(params.members, checkIfExists: true).collect()
                              : FIXTURE()
@@ -183,7 +191,7 @@ workflow {
         index = MERGE.out.map { [it.name - 'index-', it] }
         TARGETS(members, index.first().map { it[1] }, code)
         sim = SIMULATE(TARGETS.out, code)
-        QUERY(index.combine(sim), code)
+        QUERY(index.combine(sim), members.collect(), code)
         SCORE(index.join(QUERY.out).combine(sim), code)
         // index-<tier>, q-<tier>, s-<tier> side by side
         SUMMARY(MERGE.out.mix(QUERY.out.map { it[1] }, SCORE.out.map { it[1] }).collect(), code)
