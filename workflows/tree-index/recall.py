@@ -229,8 +229,8 @@ def summary(a: argparse.Namespace) -> None:
     if a.base in table["name"]:
         base = table.filter(pl.col("name") == a.base)["postings"].item()
         table = table.with_columns(x_base=pl.col("postings") / base)
-    recall = sorted((c for c in table.columns if c.startswith("r0")), reverse=True)
-    table = table.select(*(c for c in table.columns if c not in recall), *recall).sort("r0.7")
+    recall = sorted((c for c in table.columns if c[0] == "r" and c[1:2].isdigit()), reverse=True)
+    table = table.select(*(c for c in table.columns if c not in recall), *recall).sort(recall[-1])
     table.write_csv(Path(a.out), separator="\t", float_precision=3)
     with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=250, float_precision=3):
         print(table)

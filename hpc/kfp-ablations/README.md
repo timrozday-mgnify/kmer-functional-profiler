@@ -91,8 +91,9 @@ cd kfp-ablations/presence-calibration && sbatch run.sh
 # tree index, phase 0 (docs/tree-index-plan.md): trees on a 1-in-5,000 cluster sample,
 # whole-release streaming counts, and the gate against today's standard tier:
 cd kfp-ablations/tree-index-phase0 && sbatch run.sh
-# tree index on the 1-in-100 subset, built in parts: the standard tier and 13 reduced-alphabet
-# layers at ~28 chance bits each, each benchmarked on BLOSUM62 strains (results/bench.tsv):
+# tree index on the 1-in-100 subset, built in parts: the slim, standard and large tiers (plus
+# base, no layer, and std-w16), each benchmarked on BLOSUM62 strains at 100-70% identity
+# (results/bench.tsv):
 cd kfp-ablations/tree-index-build && sbatch run.sh
 ```
 

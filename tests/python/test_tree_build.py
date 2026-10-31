@@ -26,7 +26,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 # phase 1's medium tier: base band, floors and top-ups only, which check_index checks in full
 MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2", "--window", "0",
-          "--ladder", ""]  # fmt: skip
+          "--ladder", "", "--layers", ""]  # fmt: skip
 
 
 def fixture(tmp_path: Path) -> Path:
@@ -256,7 +256,10 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
 def test_window_kmers_match_brute_force() -> None:
     """build.window_kmers: each sequence's least hash per window (shrunk by min_count)."""
     rng = np.random.default_rng(2)
-    seqs = [bytes(rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n)) for n in (5, 15, 22, 40, 120, 61)]
+    seqs = [
+        rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n).astype(np.uint8).tobytes()
+        for n in (5, 15, 22, 40, 120, 61)
+    ]
     seqs[4] = seqs[4][:50] + b"X" + seqs[4][51:]  # k-mers over X have no hash
     for w, min_count in ((4, 0), (20, 0), (20, 4), (10, 8)):
         seq, h = build.window_kmers(seqs, 11, w, min_count)
@@ -269,20 +272,42 @@ def test_window_kmers_match_brute_force() -> None:
             assert {int(x) for x in h[seq == j]} == want, (w, min_count, j)
 
 
+def test_rare_windows_break_ties_by_hash() -> None:
+    """Rarest per window: with equal counts it is plain winnowing (not near-dense, as ties by
+    position were); a rarer k-mer wins its windows."""
+    rng = np.random.default_rng(3)
+    seqs = [
+        rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n).astype(np.uint8).tobytes()
+        for n in (30, 120, 200)
+    ]
+    ks = [s[i : i + 6] for s in seqs for i in range(len(s) - 5)]
+    hs = np.unique(_core.hash_proteins(ks, 6)["hash"])
+    plain = build.window_kmers(seqs, 6, 16)
+    tied = build.window_kmers(seqs, 6, 16, rank=(hs, np.ones(len(hs), np.uint64)))
+    assert sorted(zip(*map(list, plain), strict=True)) == sorted(zip(*map(list, tied), strict=True))
+    rare = _core.hash_proteins([seqs[2][100:106]], 6)["hash"][0]
+    counts = np.where(hs == rare, 1, 2).astype(np.uint64)
+    seq, h = build.window_kmers(seqs, 6, 16, rank=(hs, counts))
+    assert rare in h[seq == 2]
+
+
 def test_default_modes_query_soundly(tmp_path: Path) -> None:
-    """The default build (standard: spread minimizers, k 7 ladder) and ``--mode recall`` (a
-    Dayhoff layer on every leaf): covers sum to 0 or 1, and the query and report checks hold
-    against brute force, the Dayhoff layer's k-mers included."""
+    """The tiers (slim: one posting per leaf where possible; standard and large: a protein
+    layer on every leaf, k from the database's size): covers sum to 0 or 1, and the query and
+    report checks hold against brute force, the layer's k-mers included."""
+    assert [build.layer_k(n) for n in (320, 262_391, 53_000_000)] == [5, 6, 8]
     members = fixture(tmp_path)
-    for mode in ("standard", "recall"):
+    layers = {"slim": "", "standard": "protein:5:8:rare", "large": "protein:5:4:rare"}
+    for mode, want in layers.items():
         idx = tmp_path / f"idx-{mode}"
         run(
             "--members", str(members), "--out", str(idx), "--mode", mode, cwd=tmp_path, script=BUILD
         )
         meta = json.loads((idx / "meta.json").read_text())
-        assert meta["params"]["layers"] == ("dayhoff:7:8:rare" if mode == "recall" else "")
+        assert meta["params"]["layers"] == want
+        assert meta["params"]["n_1"] == (1 if mode == "slim" else 2)
         codes = set(np.load(idx / "key_k.npy").tolist())
-        assert (71 in codes) == (mode == "recall")  # Dayhoff 7: 7 + 32 x 2
+        assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
         check_query(tmp_path, idx, members)
 
 

@@ -227,11 +227,10 @@ def ladder_flags(spec: str) -> list[set[str]]:
 
 def steps(index: Index, mode: str = "recall") -> list[tuple[int, int, str, int]]:
     """The index's ladder and layer steps a query uses: all of them in ``recall`` mode; in
-    ``precision`` mode only full-alphabet ones (reduced alphabets are not yet tested for
-    precision or F1)."""
+    ``precision`` mode the ladder only (layers are not yet tested for precision or F1)."""
     params = index.meta["params"]
-    got = ladder(params.get("ladder", "")) + ladder(params.get("layers", "") or "")
-    return [s for s in got if mode == "recall" or s[2] == "protein"]
+    layers = ladder(params.get("layers", "") or "") if mode == "recall" else []
+    return ladder(params.get("ladder", "")) + layers
 
 
 def salted(h: NDArray[np.uint64], k: int) -> NDArray[np.uint64]:
@@ -358,8 +357,8 @@ def main() -> None:
     parser.add_argument("--ladder-frames", help="frames for ladder k-mers (default: --frames)")
     parser.add_argument(
         "--mode", choices=["recall", "precision"], default="recall",
-        help="recall: every layer of the index (Dayhoff included); precision: full-alphabet "
-        "k-mers only (reduced alphabets are not yet tested for precision or F1)",
+        help="recall: every layer of the index; precision: the ladder only, no layers "
+        "(layers are not yet tested for precision or F1)",
     )  # fmt: skip
     parser.add_argument(
         "--decoy", action="store_true",

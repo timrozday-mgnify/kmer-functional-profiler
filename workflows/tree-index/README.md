@@ -142,8 +142,8 @@ Not covered here:
 
 ## Building the tiers (`build.nf`)
 
-`build.nf` builds the standard tier and the high-recall one (the plan's Progress log: the
-standard index restored) from one members table, in parts:
+`build.nf` builds the slim, standard and large tiers (the plan's Progress log: tiers by
+identity) from one members table, in parts:
 
 ```
 FIXTURE    synthetic members when --members is '' (the test profile)
@@ -152,10 +152,11 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
            topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
-           tree, per-leaf top-ups; recall also a Dayhoff 7-mer layer on every leaf
+           tree, per-leaf top-ups; standard and large also a protein layer on every leaf,
+           its k from the whole database's size (partition.json's proteins)
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
 TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
-SIMULATE   spike.py simulate: one strain per target at 85/80/75/70% identity, BLOSUM62
+SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM62
            substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
 QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed
 SCORE      recall.py score per tier
@@ -170,11 +171,19 @@ nextflow run workflows/tree-index/build.nf -profile slurm --members /path/member
 `--tiers` holds `name:build.py options` pairs, `;`-separated (split at each tier's first `:`,
 so options may name layers such as `--layers seb8:8:8:rare`). `--bench false` skips the
 benchmark. The
-defaults are `standard` (`build.py --mode standard`, the defaults: *t\_base* 0.01, no floors,
-~4 spread minimizers per protein, k 7 at window 4 for leaves with < 32 informative 11-mers;
-~140–165 GB at release, estimated) and `recall` (`--mode recall`: also the rarest Dayhoff 7-mer
-per window of 8 on every leaf, for high recall at 70–85% identity; several times the standard
-size, and not yet tested for precision or F1). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
+defaults are `build.py`'s three modes (sizes at release are estimates, scaled from the quarter
+sample):
+
+| Tier | `build.py` | Recall at depth > 1 (quarter sample) | ~Release |
+| --- | --- | --- | --- |
+| `slim` | `--mode slim`: *n\_1* 1, ~2 spread minimizers, k 7 for < 16 informative 11-mers | 0.93 at 100%, 0.81 at 95%, 0.62 at 90% | 120–130 GB (75–90 GB without the neighbour rule's edges) |
+| `standard` | `--mode standard`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the rarest protein k-mer per window of 8 on every leaf (`protein:{k}:8:rare`) | 0.98 at 90%, 0.94 at 85%, 0.84 at 80% | ~1.0–1.2 TB |
+| `large` | `--mode large`: the layer at window 4 | 0.92 at 80%, 0.87 at 75%, 0.75 at 70% | ~1.4–1.7 TB |
+
+`{k}` in `--layers` is `build.layer_k`: ~24 chance bits on the quarter sample (k 6) plus log2 of
+the database's size over it, so k 8 on the 1-in-100 subset. `--mode standard --layers ''` is
+the old standard tier without a layer (S3, ~185–210 GB). `query.py --mode precision` skips
+layers, which are not yet tested for precision or F1. Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
 

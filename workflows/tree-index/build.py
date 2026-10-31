@@ -33,11 +33,12 @@ coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no va
 
 import argparse
 import json
+import math
 import resource
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import alphabets
 import numpy as np
@@ -271,7 +272,7 @@ def window_kmers(
     residues holds an indexed k-mer. w_s is ``w``, or with ``min_count`` M, min(w, n_k // M)
     (at least 1), so a sequence of n_k k-mers gets about M or more. With ``rank`` (sorted
     hashes and their counts in the database), each window keeps its rarest k-mer (ties: the
-    leftmost) instead of its least hash."""
+    least hash) instead of its least hash."""
     out_seq, out_h = [], []
     none = np.iinfo(np.uint64).max
     for start in range(0, len(seqs), 20_000):
@@ -283,20 +284,24 @@ def window_kmers(
         h = np.full(n_k.sum(), none, dtype=np.uint64)
         h[o["seq"]] = o["hash"]
         vals = h
-        if rank is not None:  # (count, position) packed, so a window's least is its rarest
+        if rank is not None:  # (count, hash) packed, so a window's least is its rarest; ties
+            # go by hash as in plain winnowing (by position, a window of tied singletons
+            # moves its pick at every step and the layer is near dense)
             at = np.minimum(np.searchsorted(rank[0], h), len(rank[0]) - 1)
-            c = np.where(rank[0][at] == h, rank[1][at], np.uint64(2**31))
-            vals = (c << np.uint64(32)) | np.arange(len(h), dtype=np.uint64)
+            c = np.where(rank[0][at] == h, rank[1][at], np.uint64(2**20 - 1))
+            vals = (np.minimum(c, np.uint64(2**20 - 1)) << np.uint64(44)) | (h >> np.uint64(20))
             vals[h == none] = none
+            order = np.argsort(vals)
         first = np.cumsum(n_k) - n_k
         w_s = np.clip(n_k // min_count, 1, w) if min_count else np.full(len(batch), w)
         for ww in np.unique(w_s[n_k > 0]).tolist():
             sel = np.flatnonzero((w_s == ww) & (n_k > 0))
             idx = np.concatenate([np.arange(first[i], first[i] + n_k[i]) for i in sel])
             owner, m = winnow(vals[idx], n_k[sel], ww)
-            if rank is not None:
+            if rank is not None:  # back to the hash (44 of its bits identify it in a batch)
                 got = m != none
-                m = np.where(got, h[(m & np.uint64(2**32 - 1)).astype(np.int64) * got], none)
+                at = order[np.minimum(np.searchsorted(vals[order], m), len(order) - 1)]
+                m = np.where(got, h[at], none)
             out_seq.append(sel[owner] + start)
             out_h.append(m)
     seq = np.concatenate(out_seq) if out_seq else np.zeros(0, np.int64)
@@ -362,6 +367,22 @@ def holdings(index: Path) -> pl.DataFrame:
     return cover.filter(pl.col("sign") == 1).select("hash", "pos").sort("pos", "hash")
 
 
+# Tiers (docs/tree-index-plan.md, Progress log 2026-10-31): options a --mode sets unless given.
+# standard and large add one layer of the rarest protein k-mer per window on every leaf.
+MODES: Final[dict[str, dict[str, Any]]] = {
+    "slim": {"n_1": 1, "window_min": 1, "min_kmers": 16, "layers": ""},
+    "standard": {"layers": "protein:{k}:8:rare"},
+    "large": {"layers": "protein:{k}:4:rare"},
+}
+
+
+def layer_k(n_proteins: int) -> int:
+    """The protein layer's k: ~24 chance bits per k-mer on the quarter sample (262 k proteins,
+    k 6), plus log2 of a larger database's size, at protein's 4.07 bits per residue.
+    ponytail: a log-size rule; set it from the HPC subset's benchmark once measured."""
+    return max(5, round((24 + math.log2(max(n_proteins, 1) / 262_391)) / 4.07))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--members", nargs="+", required=True)
@@ -387,14 +408,20 @@ def main() -> None:
     )  # fmt: skip
     parser.add_argument("--min-kmers", type=int, default=32)
     parser.add_argument(
-        "--layers", default=None,
-        help="[alphabet:]k:window[:rare],...: steps every leaf holds (default: none, or "
-        "dayhoff:7:8:rare with --mode recall)",
+        "--layers", default="",
+        help="[alphabet:]k:window[:rare],...: steps every leaf holds ({k}: layer_k of the "
+        "members' proteins)",
     )  # fmt: skip
     parser.add_argument(
-        "--mode", choices=["standard", "recall"], default="standard",
-        help="standard: the standard tier; recall: also a Dayhoff layer on every leaf, for "
-        "high recall at low identity (not tested for precision or F1)",
+        "--database-proteins", type=int, default=0,
+        help="proteins in the whole database, for {k} in --layers when building one part "
+        "(default: --members')",
+    )  # fmt: skip
+    parser.add_argument(
+        "--mode", choices=list(MODES), default="standard",
+        help="slim: one posting per leaf where possible, no layer (~100-130 GB at release); "
+        "standard: a protein layer at window 8 (recall to ~80%% identity); large: at window 4 "
+        "(to ~70%%). Options given explicitly win",
     )  # fmt: skip
     parser.add_argument(
         "--window-min", type=int, default=2,
@@ -408,13 +435,13 @@ def main() -> None:
     parser.add_argument("--topology-k", type=int, default=8)
     parser.add_argument("--topology-t", type=float, default=1.0)
     parser.add_argument("--topology-max-holders", type=int, default=0)
+    parser.set_defaults(**MODES[parser.parse_known_args()[0].mode])
     a = parser.parse_args()
-    if a.layers is None:
-        a.layers = "dayhoff:7:8:rare" if a.mode == "recall" else ""
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     members = p0.load_members(a.members)
+    a.layers = a.layers.replace("{k}", str(layer_k(a.database_proteins or members.height)))
     tree = survey.Tree(members, a)
     topology_s = time.perf_counter() - t0
     table, pieces, n_pos, bits = postings(tree, a)
