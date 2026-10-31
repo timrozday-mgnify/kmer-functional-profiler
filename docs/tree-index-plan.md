@@ -346,7 +346,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the staged build and Fitch pass on all of MGnify (MGnify90 membership only as a check), then the phase-4 benchmark at full size.
 6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
-6b. **Reduced amino-acid alphabets, next to try for the high-recall layer** (the user's request, 2026-10-30). The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
+6b. **Reduced amino-acid alphabets for the high-recall layer** (the user's request, 2026-10-30). *Status: measured locally (Progress log, 2026-10-31); at matched bits the full alphabet wins, so the layer becomes `protein:6:8:rare`; HPC run at ~28 bits prepared, per-layer bars and ungapped verification still to do.* The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
    - Murphy et al.'s 8, 12 and 15-letter alphabets; the alphabets DIAMOND (11 letters) and MMseqs2 (13) seed with; SE-B(14); and compressed alphabets optimised for alignment sensitivity (Edgar 2004), chosen from BLOSUM62 so classes absorb the most likely substitutions.
    - *Compare at matched bits per k-mer, not matched k.* At equal bits, a shorter full-alphabet k-mer has so far survived as well as Murphy-10 or Dayhoff. A reduced alphabet only helps if its within-class share of BLOSUM62 substitutions is high for its size. Report that share, p\_eff at 70–85% identity, and the predicted miss rate at 1× (as in the feasibility table above) before any build.
    - *Then on the benchmark:* `spike.py simulate --substitution blosum62` strains at 70–85% identity, recall at depth > 1, decoy-controlled background seeds, and postings, against L3 and the Dayhoff layer.
@@ -920,3 +920,65 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - **`build.nf`'s tiers** are now `standard` and `recall`. The recall tier's BUILD needs more memory per part: 9.4 GB per 262 k proteins on the quarter sample, so ~70 GB per 2 M-protein part, above BUILD's first 64 GB attempt.
   - **Tests:** phase 1's medium settings (pinned with `--window 0 --ladder ""`) keep their brute-force checks. `test_default_modes_query_soundly` builds both modes and checks the query's counts and evidence against brute force, Dayhoff keys included.
 * **Plan: reduced amino-acid alphabets next (2026-10-30, the user's request).** Added as phase 6b: a range of reduced alphabets (Murphy 8/12/15, DIAMOND's 11, MMseqs2's 13, SE-B(14), BLOSUM-optimised compressed alphabets) for the high-recall layer, compared at matched bits per k-mer on BLOSUM62 strains with decoy bars. Dayhoff and Murphy-10, the two tried so far, are reduced alphabets too, but small and not chosen for sensitivity.
+* **Phase 6b: reduced alphabets as the high-recall layer (2026-10-31).** Seventeen reduced alphabets added to `alphabet.rs` (`REDUCED`) and `alphabets.py`:
+  - Murphy 8/12/15, DIAMOND's 11, SE-B 6/8/10/14, SE-V 10, Li A/B 10 (Edgar 2004);
+  - `opt4`–`opt14`, found by `alphabets.py` (greedy merges, then single-residue moves) to maximise log *p*\_0.7 per chance bit under spike.py's BLOSUM62 substitutions.
+  - MMseqs2's 13 letters are not included; they are recomputed per database.
+  - **Analytic** (`alphabets.py`, quarter sample): ranked by survival lost at 70% identity per chance bit (`cost_0.7`):
+    - protein 0.126, opt14 0.128, opt12 and opt10 0.130–0.132, SE-B(14) 0.133, Li A 0.134, Murphy-15 0.139;
+    - Murphy-10 0.142, SE-B(8) 0.147, opt4 0.154;
+    - Dayhoff 0.159, DIAMOND-11 0.161.
+    - The full alphabet loses least per bit, as the feasibility table suggested.
+    - The predicted miss rate at 1× is ≈ 0 for every alphabet at 15–20 bits, so survival of whole k-mers is not what limits recall.
+  - **Measured.**
+    - *Set-up:* S3 plus one layer, `<alphabet>:k:8:rare` on every leaf, *k* = round(20 / bits).
+    - *Strains:* `sim4`, 2,000 strains at 85/80/75/70% identity under BLOSUM62.
+    - *Scoring:* the decoy bar at a 1% chance share plus the neighbour rule (`ev_0.01_nb`), with recall at depth > 1.
+    - *Tooling:* `recall.py summary` collects the runs.
+    - *Run limits:* one run at a time, 2 threads, a 12 GB watchdog.
+
+    | layer | bits/k-mer | postings ×S3 | decoy bar | candidates | query s | r 85% | r 80% | r 75% | r 70% |
+    |---|---|---|---|---|---|---|---|---|---|
+    | none (S3) | — | 1.0 | 158 | 403 | 30 | 0.02 | 0.01 | 0.00 | 0.00 |
+    | protein k 6 | 24.4 | 15.0 | 79 | 75 k | 91 | 0.97 | **0.90** | **0.84** | **0.72** |
+    | opt12 k 7 | 24.1 | 14.2 | 81 | 74 k | 97 | 0.95 | 0.86 | 0.78 | 0.65 |
+    | protein k 5 | 20.4 | 8.7 | 65 | 75 k | 549 | **0.97** | 0.85 | 0.77 | 0.64 |
+    | SE-B(14) k 6 | 20.5 | 9.3 | 71 | 73 k | 400 | 0.94 | 0.83 | 0.74 | 0.62 |
+    | Murphy-15 k 6 | 18.9 | 9.7 | 74 | 74 k | 507 | 0.94 | 0.85 | 0.75 | 0.62 |
+    | Murphy-10 k 9 | 24.6 | 17.3 | 94 | 72 k | 64 | 0.94 | 0.82 | 0.72 | 0.59 |
+    | Murphy-12 k 7 | 20.6 | 10.9 | 83 | 72 k | 224 | 0.93 | 0.82 | 0.72 | 0.57 |
+    | opt12 k 6 | 20.6 | 8.6 | 70 | 71 k | 437 | 0.94 | 0.79 | 0.70 | 0.57 |
+    | Li B(10) k 7 | 20.7 | 9.6 | 80 | 71 k | 288 | 0.92 | 0.77 | 0.65 | 0.56 |
+    | DIAMOND-11 k 9 | 21.0 | 13.6 | 97 | 68 k | 251 | 0.90 | 0.78 | 0.65 | 0.55 |
+    | opt8 k 7 | 20.7 | 8.1 | 67 | 71 k | 698 | 0.89 | 0.73 | 0.59 | 0.53 |
+    | SE-B(8) k 10 | 24.9 | 17.1 | 101 | 70 k | 63 | 0.92 | 0.78 | 0.68 | 0.53 |
+    | Murphy-10 k 7 | 19.1 | 9.7 | 83 | 70 k | 579 | 0.89 | 0.78 | 0.64 | 0.52 |
+    | SE-V(10) k 8 | 20.7 | 11.2 | 92 | 69 k | 250 | 0.90 | 0.74 | 0.65 | 0.51 |
+    | SE-B(10) k 7 | 19.1 | 9.7 | 82 | 69 k | 704 | 0.89 | 0.78 | 0.61 | 0.50 |
+    | Li A(10) k 6 | 19.1 | 8.4 | 69 | 70 k | 1,264 | 0.90 | 0.75 | 0.61 | 0.50 |
+    | opt10 k 6 | 19.6 | 8.0 | 63 | 69 k | 1,042 | 0.91 | 0.76 | 0.62 | 0.49 |
+    | SE-B(8) k 8 | 19.9 | 10.0 | 92 | 65 k | 635 | 0.86 | 0.70 | 0.55 | 0.46 |
+    | opt14 k 5 | 18.5 | 8.2 | 65 | 68 k | 2,178 | 0.90 | 0.73 | 0.57 | 0.45 |
+    | Murphy-8 k 8 | 20.5 | 10.2 | 91 | 67 k | 344 | 0.88 | 0.74 | 0.56 | 0.44 |
+    | opt6 k 8 | 19.9 | 8.4 | 73 | 65 k | 900 | 0.85 | 0.72 | 0.53 | 0.44 |
+    | Dayhoff k 12 | 25.5 | 17.8 | 122 | 62 k | 72 | 0.86 | 0.71 | 0.54 | 0.41 |
+    | Dayhoff k 9 | 19.1 | 9.5 | 92 | 61 k | 1,566 | 0.83 | 0.65 | 0.46 | 0.38 |
+    | SE-B(6) k 9 | 19.2 | 9.8 | 103 | 59 k | 940 | 0.77 | 0.60 | 0.47 | 0.36 |
+    | opt4 k 11 | 20.1 | 9.1 | 101 | 56 k | 648 | 0.73 | 0.51 | 0.39 | 0.30 |
+
+    - Dayhoff k 7 (~15 bits, the old recall mode) did not finish: its query ran ~5.5 h and was killed by the watchdog at ~9.7 GB.
+  - **Reading.**
+    - *At matched bits the full alphabet is best.* At ~20 bits, protein k 5 beats every reduced alphabet at every identity: 0.64 at 70% against SE-B(14) and Murphy-15's 0.62. Below them, recall falls with alphabet size, and Dayhoff, SE-B(6) and opt4 are worst (0.30–0.38).
+    - *The opt alphabets do not deliver what their objective predicts.* opt14 and opt10 rank just behind protein on `cost_0.7` but measure 0.45–0.49, below SE-B(14), Murphy-15 and Murphy-12. Survival per chance bit is not the binding constraint. With misses predicted ≈ 0, recall is lost to evidence against the decoy bar. That depends on how the layer's hits spread across the tree and the bar, which the substitution model does not capture.
+    - *More bits help, unlike the decoy-free expectation.* From ~20 to ~24 bits, protein goes from 0.64 to 0.72 at 70% and 0.85 to 0.90 at 80%. The query is 6× faster (91 s against 549 s), because fewer chance seeds expand. Postings rise from 8.7× to 15×, since longer rarest k-mers are shared by fewer leaves. opt12 (0.57 → 0.65) and Murphy-10 (0.52 → 0.59) gain the same way. ~20 bits was too few locally, which supports the HPC run's ~28 bits, the local ~24 plus the subset's 200×.
+    - *Cost.* Every layer costs 8–18× S3's postings, against the standard tier's < 200 GB. A layer belongs in a separate high-recall index, not the standard one.
+    - *Choice for the high-recall layer:* the full alphabet, `protein:6:8:rare` locally (`protein:7` at HPC scale), in place of Dayhoff 7. Kept as alternatives on the HPC run: SE-B(14) and Murphy-15. Dropped: Dayhoff, DIAMOND-11, SE-B(6) and opt4 for this use.
+  - **HPC run** (`hpc/kfp-ablations/tree-index-build/run.sh`, the user's run):
+    - Tiers: standard plus 13 layer tiers at ~28 bits (protein 7, opt12 8, SE-B(14) 8, opt10 9, Murphy-15 9, opt8 9, Murphy-10 10, SE-B(8) 11, Murphy-8 11, opt6 11, DIAMOND-11 12, Dayhoff 13, opt4 15), on the 1-in-100 subset.
+    - `build.nf` benchmarks each tier: 2,000 BLOSUM62 strains, the decoy-bar query and `recall.py summary` to `bench.tsv`.
+    - It should show whether protein's lead holds at 200× the proteins.
+  - **Next:**
+    - verify layer seeds by ungapped extension;
+    - give each layer its own decoy bar;
+    - then precision and F1 for the high-recall mode;
+    - switch `--mode recall` to the protein layer once the HPC run agrees.
