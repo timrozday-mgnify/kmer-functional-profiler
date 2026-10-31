@@ -18,8 +18,8 @@ mod route;
 mod translate;
 mod tree;
 
-pub use align::{identities, identity};
-pub use alphabet::Alphabet;
+pub use align::{identities, identity, ungapped, ungapped_many};
+pub use alphabet::{Alphabet, REDUCED};
 pub use bloom::{BLOCK_BYTES, bloom_contains, bloom_insert};
 pub use components::components;
 pub use diamond::{DiamondBatch, DiamondRefs, Dropped, HitFilter};
@@ -41,9 +41,14 @@ pub use tree::{
     overlap_pairs, pair_weights, schemes,
 };
 
-/// Worker threads for the parallel kernels: the CPUs this process may use.
+/// Worker threads for the parallel kernels: `RAYON_NUM_THREADS` when set, else the CPUs this
+/// process may use.
 pub(crate) fn threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
 /// Crate version, re-exported to Python as `_core.__version__`.

@@ -346,7 +346,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the staged build and Fitch pass on all of MGnify (MGnify90 membership only as a check), then the phase-4 benchmark at full size.
 6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
-6b. **Reduced amino-acid alphabets, next to try for the high-recall layer** (the user's request, 2026-10-30). The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
+6b. **Reduced amino-acid alphabets for the high-recall layer** (the user's request, 2026-10-30). *Status: measured locally (Progress log, 2026-10-31); at matched bits the full alphabet wins. The layer is now protein, in `build.py --mode standard` and `--mode large` (Progress log: tiers by identity, which also corrects 6b's window labels and S3 baseline). Per-layer bars and ungapped verification are still to do.* The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
    - Murphy et al.'s 8, 12 and 15-letter alphabets; the alphabets DIAMOND (11 letters) and MMseqs2 (13) seed with; SE-B(14); and compressed alphabets optimised for alignment sensitivity (Edgar 2004), chosen from BLOSUM62 so classes absorb the most likely substitutions.
    - *Compare at matched bits per k-mer, not matched k.* At equal bits, a shorter full-alphabet k-mer has so far survived as well as Murphy-10 or Dayhoff. A reduced alphabet only helps if its within-class share of BLOSUM62 substitutions is high for its size. Report that share, p\_eff at 70–85% identity, and the predicted miss rate at 1× (as in the feasibility table above) before any build.
    - *Then on the benchmark:* `spike.py simulate --substitution blosum62` strains at 70–85% identity, recall at depth > 1, decoy-controlled background seeds, and postings, against L3 and the Dayhoff layer.
@@ -920,3 +920,126 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - **`build.nf`'s tiers** are now `standard` and `recall`. The recall tier's BUILD needs more memory per part: 9.4 GB per 262 k proteins on the quarter sample, so ~70 GB per 2 M-protein part, above BUILD's first 64 GB attempt.
   - **Tests:** phase 1's medium settings (pinned with `--window 0 --ladder ""`) keep their brute-force checks. `test_default_modes_query_soundly` builds both modes and checks the query's counts and evidence against brute force, Dayhoff keys included.
 * **Plan: reduced amino-acid alphabets next (2026-10-30, the user's request).** Added as phase 6b: a range of reduced alphabets (Murphy 8/12/15, DIAMOND's 11, MMseqs2's 13, SE-B(14), BLOSUM-optimised compressed alphabets) for the high-recall layer, compared at matched bits per k-mer on BLOSUM62 strains with decoy bars. Dayhoff and Murphy-10, the two tried so far, are reduced alphabets too, but small and not chosen for sensitivity.
+* **Phase 6b: reduced alphabets as the high-recall layer (2026-10-31).** Seventeen reduced alphabets added to `alphabet.rs` (`REDUCED`) and `alphabets.py`:
+  - Murphy 8/12/15, DIAMOND's 11, SE-B 6/8/10/14, SE-V 10, Li A/B 10 (Edgar 2004);
+  - `opt4`–`opt14`, found by `alphabets.py` (greedy merges, then single-residue moves) to maximise log *p*\_0.7 per chance bit under spike.py's BLOSUM62 substitutions.
+  - MMseqs2's 13 letters are not included; they are recomputed per database.
+  - **Analytic** (`alphabets.py`, quarter sample): ranked by survival lost at 70% identity per chance bit (`cost_0.7`):
+    - protein 0.126, opt14 0.128, opt12 and opt10 0.130–0.132, SE-B(14) 0.133, Li A 0.134, Murphy-15 0.139;
+    - Murphy-10 0.142, SE-B(8) 0.147, opt4 0.154;
+    - Dayhoff 0.159, DIAMOND-11 0.161.
+    - The full alphabet loses least per bit, as the feasibility table suggested.
+    - The predicted miss rate at 1× is ≈ 0 for every alphabet at 15–20 bits, so survival of whole k-mers is not what limits recall.
+  - **Measured.**
+    - *Set-up:* S3 plus one layer, `<alphabet>:k:8:rare` on every leaf, *k* = round(20 / bits).
+    - *Strains:* `sim4`, 2,000 strains at 85/80/75/70% identity under BLOSUM62.
+    - *Scoring:* the decoy bar at a 1% chance share plus the neighbour rule (`ev_0.01_nb`), with recall at depth > 1.
+    - *Tooling:* `recall.py summary` collects the runs.
+    - *Run limits:* one run at a time, 2 threads, a 12 GB watchdog.
+
+    | layer | bits/k-mer | postings ×S3 | decoy bar | candidates | query s | r 85% | r 80% | r 75% | r 70% |
+    |---|---|---|---|---|---|---|---|---|---|
+    | none (S3) | — | 1.0 | 158 | 403 | 30 | 0.02 | 0.01 | 0.00 | 0.00 |
+    | protein k 6 | 24.4 | 15.0 | 79 | 75 k | 91 | 0.97 | **0.90** | **0.84** | **0.72** |
+    | opt12 k 7 | 24.1 | 14.2 | 81 | 74 k | 97 | 0.95 | 0.86 | 0.78 | 0.65 |
+    | protein k 5 | 20.4 | 8.7 | 65 | 75 k | 549 | **0.97** | 0.85 | 0.77 | 0.64 |
+    | SE-B(14) k 6 | 20.5 | 9.3 | 71 | 73 k | 400 | 0.94 | 0.83 | 0.74 | 0.62 |
+    | Murphy-15 k 6 | 18.9 | 9.7 | 74 | 74 k | 507 | 0.94 | 0.85 | 0.75 | 0.62 |
+    | Murphy-10 k 9 | 24.6 | 17.3 | 94 | 72 k | 64 | 0.94 | 0.82 | 0.72 | 0.59 |
+    | Murphy-12 k 7 | 20.6 | 10.9 | 83 | 72 k | 224 | 0.93 | 0.82 | 0.72 | 0.57 |
+    | opt12 k 6 | 20.6 | 8.6 | 70 | 71 k | 437 | 0.94 | 0.79 | 0.70 | 0.57 |
+    | Li B(10) k 7 | 20.7 | 9.6 | 80 | 71 k | 288 | 0.92 | 0.77 | 0.65 | 0.56 |
+    | DIAMOND-11 k 9 | 21.0 | 13.6 | 97 | 68 k | 251 | 0.90 | 0.78 | 0.65 | 0.55 |
+    | opt8 k 7 | 20.7 | 8.1 | 67 | 71 k | 698 | 0.89 | 0.73 | 0.59 | 0.53 |
+    | SE-B(8) k 10 | 24.9 | 17.1 | 101 | 70 k | 63 | 0.92 | 0.78 | 0.68 | 0.53 |
+    | Murphy-10 k 7 | 19.1 | 9.7 | 83 | 70 k | 579 | 0.89 | 0.78 | 0.64 | 0.52 |
+    | SE-V(10) k 8 | 20.7 | 11.2 | 92 | 69 k | 250 | 0.90 | 0.74 | 0.65 | 0.51 |
+    | SE-B(10) k 7 | 19.1 | 9.7 | 82 | 69 k | 704 | 0.89 | 0.78 | 0.61 | 0.50 |
+    | Li A(10) k 6 | 19.1 | 8.4 | 69 | 70 k | 1,264 | 0.90 | 0.75 | 0.61 | 0.50 |
+    | opt10 k 6 | 19.6 | 8.0 | 63 | 69 k | 1,042 | 0.91 | 0.76 | 0.62 | 0.49 |
+    | SE-B(8) k 8 | 19.9 | 10.0 | 92 | 65 k | 635 | 0.86 | 0.70 | 0.55 | 0.46 |
+    | opt14 k 5 | 18.5 | 8.2 | 65 | 68 k | 2,178 | 0.90 | 0.73 | 0.57 | 0.45 |
+    | Murphy-8 k 8 | 20.5 | 10.2 | 91 | 67 k | 344 | 0.88 | 0.74 | 0.56 | 0.44 |
+    | opt6 k 8 | 19.9 | 8.4 | 73 | 65 k | 900 | 0.85 | 0.72 | 0.53 | 0.44 |
+    | Dayhoff k 12 | 25.5 | 17.8 | 122 | 62 k | 72 | 0.86 | 0.71 | 0.54 | 0.41 |
+    | Dayhoff k 9 | 19.1 | 9.5 | 92 | 61 k | 1,566 | 0.83 | 0.65 | 0.46 | 0.38 |
+    | SE-B(6) k 9 | 19.2 | 9.8 | 103 | 59 k | 940 | 0.77 | 0.60 | 0.47 | 0.36 |
+    | opt4 k 11 | 20.1 | 9.1 | 101 | 56 k | 648 | 0.73 | 0.51 | 0.39 | 0.30 |
+
+    - Dayhoff k 7 (~15 bits, the old recall mode) did not finish: its query ran ~5.5 h and was killed by the watchdog at ~9.7 GB.
+  - **Reading.**
+    - *At matched bits the full alphabet is best.* At ~20 bits, protein k 5 beats every reduced alphabet at every identity: 0.64 at 70% against SE-B(14) and Murphy-15's 0.62. Below them, recall falls with alphabet size, and Dayhoff, SE-B(6) and opt4 are worst (0.30–0.38).
+    - *The opt alphabets do not deliver what their objective predicts.* opt14 and opt10 rank just behind protein on `cost_0.7` but measure 0.45–0.49, below SE-B(14), Murphy-15 and Murphy-12. Survival per chance bit is not the binding constraint. With misses predicted ≈ 0, recall is lost to evidence against the decoy bar. That depends on how the layer's hits spread across the tree and the bar, which the substitution model does not capture.
+    - *More bits help, unlike the decoy-free expectation.* From ~20 to ~24 bits, protein goes from 0.64 to 0.72 at 70% and 0.85 to 0.90 at 80%. The query is 6× faster (91 s against 549 s), because fewer chance seeds expand. Postings rise from 8.7× to 15×, since longer rarest k-mers are shared by fewer leaves. opt12 (0.57 → 0.65) and Murphy-10 (0.52 → 0.59) gain the same way. ~20 bits was too few locally, which supports the HPC run's ~28 bits, the local ~24 plus the subset's 200×.
+    - *Cost.* Every layer costs 8–18× S3's postings, against the standard tier's < 200 GB. A layer belongs in a separate high-recall index, not the standard one.
+    - *Choice for the high-recall layer:* the full alphabet, `protein:6:8:rare` locally (`protein:7` at HPC scale), in place of Dayhoff 7. Kept as alternatives on the HPC run: SE-B(14) and Murphy-15. Dropped: Dayhoff, DIAMOND-11, SE-B(6) and opt4 for this use.
+  - **HPC run** (`hpc/kfp-ablations/tree-index-build/run.sh`, the user's run):
+    - Tiers: standard plus 13 layer tiers at ~28 bits (protein 7, opt12 8, SE-B(14) 8, opt10 9, Murphy-15 9, opt8 9, Murphy-10 10, SE-B(8) 11, Murphy-8 11, opt6 11, DIAMOND-11 12, Dayhoff 13, opt4 15), on the 1-in-100 subset.
+    - `build.nf` benchmarks each tier: 2,000 BLOSUM62 strains, the decoy-bar query and `recall.py summary` to `bench.tsv`.
+    - It should show whether protein's lead holds at 200× the proteins.
+  - **Next:**
+    - verify layer seeds by ungapped extension;
+    - give each layer its own decoy bar;
+    - then precision and F1 for the high-recall mode;
+    - switch `--mode recall` to the protein layer once the HPC run agrees.
+* **Tiers by identity: slim, standard and large (2026-10-31, the user's request: switch the layer to the protein alphabet; standard with good recall to ~80% AAI, large to ~70%, slim with good recall at ~100 GB).**
+  - **Two corrections to phase 6b above.**
+    - *Rarest-per-window ties.* `build.window_kmers` with `rank` broke ties between equally rare k-mers by position. Most protein 6-mers occur in one leaf, so as a window slid its pick moved at almost every step, and every `:rare` layer was near dense whatever its window. Ties now go by hash, as in plain winnowing, and `test_rare_windows_break_ties_by_hash` checks it. `test_window_kmers_match_brute_force` had built its sequences from raw int64 bytes (mostly invalid residues); it now uses real residues and still passes. Phase 6b's layers were all denser than their window says, at similar postings (8–10× S3) across alphabets, so its ranking was at roughly matched cost. Its window labels are wrong, and the opt alphabets' shortfall may partly be this.
+    - *Decoy bar on a divergent-only sample.* The bar is relative to the sample's own seeds. On `sim4` (every strain ≤ 85%) S3 finds so few true seeds that no bar keeps decoys under 1% of them, and it hits the 158-bit cap. Phase 6b's S3 row (0.02 at 85%) is that artefact. On `sim1` the same index has a 33-bit bar and 0.63 at 85%. Benchmarks now pool `sim1` and `sim4`: 4,000 strains at 100/98/95/90/85/80/75/70%, depth lognormal μ 0.3 σ 0.6, 272 k read pairs. `build.nf` simulates the same spread.
+  - **Results** (quarter sample, pooled strains, decoy bar at 1% chance share, recall at depth > 1 with the neighbour rule; without it in brackets for slim). Release sizes are estimates:
+    - Scaled linearly: S3's postings at release are ~106–131 GB, at ~9 B per posting. Added to that are ~35 GB of per-leaf tables, and ~45 GB of spanning-tree edges at ~8 B per leaf for the neighbour rule.
+    - Upper bounds, since sharing grows with relatives at scale.
+
+    | Build | Postings ×S3 | per leaf | bar | r 100% | r 98% | r 95% | r 90% | r 85% | r 80% | r 75% | r 70% | ~Release |
+    |---|---|---|---|---|---|---|---|---|---|---|---|---|
+    | SL6: *n\_1* 1, `--window-min 1`, ladder for < 16 | 0.40 | 1.0 | 29 | 0.93 (0.89) | 0.86 (0.82) | 0.81 (0.72) | 0.62 (0.52) | 0.43 | 0.36 | 0.31 | 0.29 | 120–130 GB (75–90 without edges) |
+    | SL5: *n\_1* 1, `--window-min 1` | 0.63 | 1.5 | 34 | 0.93 | 0.89 | 0.83 | 0.66 | 0.48 | 0.39 | 0.34 | 0.30 | 145–165 GB |
+    | SL1: `--window-min 1` | 0.85 | 2.1 | 33 | 0.97 | 0.95 | 0.88 | 0.76 | 0.58 | 0.43 | 0.37 | 0.34 | 170–190 GB |
+    | SL2: *t\_base* 0.005 | 0.96 | 2.3 | 33 | 1.00 | 0.97 | 0.95 | 0.82 | 0.63 | 0.50 | 0.40 | 0.36 | 180–205 GB |
+    | S3 (and SL4, *n\_1* 1 alone: identical) | 1.00 | 2.4 | 33 | 1.00 | 0.97 | 0.95 | 0.82 | 0.63 | 0.50 | 0.40 | 0.37 | 185–210 GB |
+    | S3 + `protein:6:64:rare` | 3.45 | 8.3 | 64 | 1.00 | 0.96 | 0.94 | 0.80 | 0.62 | 0.47 | 0.41 | 0.37 | 445–530 GB |
+    | S3 + `protein:6:32:rare` | 4.36 | 10.5 | 67 | 0.99 | 0.97 | 0.96 | 0.86 | 0.70 | 0.55 | 0.48 | 0.42 | 540–650 GB |
+    | S3 + `protein:6:16:rare` | 5.96 | 14.4 | 66 | 1.00 | 0.98 | 0.99 | 0.92 | 0.85 | 0.71 | 0.60 | 0.52 | 715–865 GB |
+    | **S3 + `protein:6:8:rare`** | 8.63 | 20.9 | 66 | 1.00 | 0.98 | 1.00 | 0.98 | 0.94 | 0.84 | 0.77 | 0.64 | 1.0–1.2 TB |
+    | **S3 + `protein:6:4:rare`** | 12.57 | 30.4 | 72 | 1.00 | 1.00 | 1.00 | 0.99 | 0.98 | 0.92 | 0.87 | 0.75 | 1.4–1.7 TB |
+
+  - **Reading.**
+    - *A layer doubles the bar.* With any protein layer, the decoy bar goes from ~33 to 64–72 bits, because the layer's chance hits count against one shared bar. 11-mer seeds that cleared 33 bits then fall short. So a sparse layer (window 64) buys nothing over S3, and the layer has to be dense before it pays. Per-layer bars, already planned, should fix this. With them, a sparse layer would add to S3's recall rather than replace it, and standard's 80% target may need far less than window 8.
+    - *Slim is bounded by the leaves.* At ~5.7 × 10⁹ leaves, the per-leaf tables (~35 GB) and the spanning-tree edges (~45 GB) are fixed, and one posting per leaf is ~50 GB more. S3's postings are almost all base k-mers, not top-ups: *n\_1* 1 alone changes nothing. They fall only with fewer minimizers (`--window-min 1`) as well. SL6 is the smallest tested, and the neighbour rule is worth ~4–10 points there at 90–100%, so its edges are kept. With a compact edge encoding (4 B per leaf), slim is ~100–110 GB.
+    - *Sizes are linear from the quarter sample.* They should fall at release, where relatives share more postings. The HPC run on the 1-in-100 subset (~200× the quarter) measures that.
+  - **Tiers chosen** (`build.py --mode`; explicit options still win):
+    - **slim:** SL6, `--n-1 1 --window-min 1 --min-kmers 16`, no layer. ~120–130 GB, or ~100–110 GB with compact edges. Recall 0.93 / 0.81 / 0.62 at 100 / 95 / 90%.
+    - **standard:** S3 plus `protein:{k}:8:rare`. ~1.0–1.2 TB as measured with one bar. Recall 0.98 / 0.94 / 0.84 at 90 / 85 / 80%.
+    - **large:** S3 plus `protein:{k}:4:rare`. ~1.4–1.7 TB. Recall 0.92 / 0.87 / 0.75 at 80 / 75 / 70%.
+    - `{k}` is `build.layer_k(n)`: round((24 + log2(n / 262,391)) / 4.07), at least 5, so k 6 on the quarter sample, 8 on the 1-in-100 subset and ~9 at release. That is ~24 chance bits locally plus the database's growth. `build.py --database-proteins` gives the whole database's size to a part's build, and `build.nf` passes partition.json's count.
+    - `--mode recall` and the Dayhoff layer are removed. `query.py --mode precision` now skips layers.
+  - **HPC** (`hpc/kfp-ablations/tree-index-build/run.sh`): base (S3), slim, standard, large and std-w16 (the layer at window 16) on the 1-in-100 subset, each benchmarked on 2,000 strains at 100–70%. It measures sizes at 200× the quarter and whether k 8 holds the recall.
+  - **Next:** per-layer decoy bars, then ungapped verification of layer seeds. Both should shrink standard and large, which then need re-measuring at matched recall.
+
+* **Per-layer bars, gather, layer representatives and rough alignment (2026-10-31, the user's request: lower the bar where false hits are acceptable, keep tier 2's targets under control, perhaps by a greedy gather; layers on optimal representatives picked with the spanning tree, or composites of their members; trial ungapped verification for speed and payoff).** Quarter sample, the pooled strains, recall at depth > 1 with the neighbour rule; postings over S3's.
+  - **Per-layer bars** (`query.py --decoy`, `cand_fam_<share>.npy`): a bar per key family (base and ladder; each layer) from that family's own seeds and decoys, so a layer's chance seeds no longer raise the bar on the 11-mers (P6w32: 33 / 67 bits for base / layer). Modest gain: P6w32 at 1% goes from 0.55 to 0.61 at 80%. At a 10% share, the layer's bar falls to ~43 bits and P6w32 reaches 0.76 at 80%.
+  - **Gather over k-mer evidence fails** and is dropped from `query.py`. Greedy gather over every read pair's evidence (exclusive reads, picks by summed bits) picks as many leaves from the decoys as from the sample at every gain. Each protein 6-mer of a layer is hit ~8 times by chance in 272 k read pairs (2^27 read 6-mer windows against ~2^-24 per k-mer), so a leaf with 16–50 keys collects 100+ chance read pairs, and short leaves with keys common in reads collect 5,000–13,000. The sum is mostly chance. None of the following fixed it: subtracting log2(windows) per read pair, key bits corrected by the decoys' per-key hit rate (half the decoys estimate, half calibrate), or each leaf's decoy background subtracted. At release-size samples (~100× the reads) it is worse. `query.gather` stays for aligned read pairs (below).
+  - **Layer representatives** (`build.py --layer-groups`, `--layer-rep`; `layer_group.npy`, and `recall.py` expands a representative's seed to its group):
+    - Groups: `units` (MGnify90), or `tree:<d>`, single linkage over spanning-tree edges at dense-set distance |A Δ B| / (|A| + |B|) ≤ d (0.34 ~ 95% identity, 0.57 ~ 90%, 0.83 ~ 80%, as 1 − identity^8). On the quarter sample, `tree:0.57` gives 85 k groups for 262 k leaves (median 1, 99th percentile 35, largest 1,661, a large family that MGnify90 also keeps as one unit of 1,662).
+    - Picks (`build.PICKS`): `medoid` (the member whose layer k-mers are most shared in its group, sum of holders), `central` (most shared on average), `longest` (most layer k-mers). Composites: `composite:<f>[:<pick>]`, every k-mer held by at least a share f of the group's members, on the pick.
+    - At window 8, `tree:0.57` (the 10% bar, `fam_0.1_nb`; 80 / 75 / 70%): medoid 5.76×, 0.87 / 0.79 / 0.69; longest 5.80×, 0.86 / 0.79 / 0.68; central 4.86×, 0.82 / 0.71 / 0.62; composite 0 (union) 6.71×, 0.87 / 0.81 / 0.69; composite 0.25 5.83×, 0.87 / 0.81 / 0.70; composite 0.5 5.37×, 0.86 / 0.77 / 0.68; composite 0.75 4.68×, 0.79 / 0.69 / 0.60; composite 0.5 on central 5.37×, as composite 0.5. Medoid and longest tie; central saves postings by picking short members and loses recall; composite 0.25 is the best per posting.
+    - Groups (window 8, composite 0.25): `units` 5.35×, 0.86 / 0.79 / 0.68; `tree:0.83` 5.76×, 0.87 / 0.81 / 0.70; `tree:0.57` 5.83×, as above; `tree:0.34` 6.49×, 0.90 / 0.82 / 0.72. The grouping matters less than the window.
+    - Against the shared layer at matched postings: representatives at window 16 (3.67×) get 0.82 / 0.71 / 0.60, shared window 64 (3.45×) 0.70 / 0.60 / 0.54 and shared window 32 (4.36×) 0.76 / 0.67 / 0.59. Fitch already shares much of a shared layer between close leaves, so representatives cut a window-8 layer's postings by only ~40%; the gain is that a denser window fits the same size.
+  - **Rough alignment** (`verify.py`, a trial; `_core.align_ungapped`): every (read pair, leaf) with evidence ≥ 8 bits is scored by the best ungapped BLOSUM62 diagonal of the read pair's translated frames that hold a key against the leaf's representative, in bits (λ 0.3176, K 0.134), with the decoys scored alike for the bar. Brute force over every diagonal: ~12 k pairs a second on 2 threads (~2.7 × 10^9 cells a second, ~230 k cells a pair). 1% bar, neighbour rule:
+
+    | Build | Postings ×S3 | ~Release | Pairs aligned | Align (2 threads) | Candidates | r 90% | r 85% | r 80% | r 75% | r 70% |
+    |---|---|---|---|---|---|---|---|---|---|---|
+    | S3 | 1.00 | 185–210 GB | 0.66 M | 5 s | 79 k | 0.83 | 0.64 | 0.53 | 0.42 | 0.40 |
+    | S3 + reps, window 64 (`tree:0.57`, composite 0.25) | 1.90 | 280–330 GB | 2.5 M | 2 min | 94 k | 0.97 | 0.92 | 0.84 | 0.75 | 0.64 |
+    | S3 + reps, window 32 | 2.48 | 345–405 GB | 3.7 M | 4 min | 98 k | 0.97 | 0.95 | 0.91 | 0.82 | 0.73 |
+    | S3 + reps, window 16 | 3.67 | 470–560 GB | 6.4 M | 9 min | 101 k | 0.99 | 0.98 | 0.95 | 0.91 | 0.83 |
+    | S3 + shared window 32 | 4.36 | 540–650 GB | 22 M | 31 min | 102 k | 0.98 | 0.96 | 0.92 | 0.83 | 0.76 |
+    | S3 + reps, window 8 (`tree:0.34`) | 6.49 | 770–930 GB | 15.6 M | 22 min | 105 k | 1.00 | 0.99 | 0.97 | 0.95 | 0.91 |
+    | *without alignment:* standard (shared window 8) | 8.63 | 1.0–1.2 TB | | | 97 k | 0.98 | 0.94 | 0.84 | 0.77 | 0.64 |
+    | *without alignment:* large (shared window 4) | 12.57 | 1.4–1.7 TB | | | 100 k | 0.99 | 0.98 | 0.92 | 0.87 | 0.75 |
+
+    - Alignment is the lever. Representatives at window 64 plus alignment match today's standard at ~30% of its size, and window 32 plus alignment matches today's large at ~25%. S3 alone gains nothing from it: its 11-mer seeds already clear their bar, and alignment rescues the layer's weak seeds.
+    - Gather over the aligned read pairs above the bar (`cand_vgather_<share>.npy`) takes S3's candidates from 79 k to 57 k, with recall down ~10 points before the neighbour rule, which then returns the same 79 k leaves. Tier 2's count is better cut after the neighbour rule than by gather.
+    - Speed at release: a 20 M read-pair sample is ~75× this one, so reps at window 32 would align ~275 M pairs, ~6 h on 2 threads and ~1 h on 12. Brute force is the worst case: aligning only along each seed's diagonal (sketching the k-mer order in the index, so seeds carry positions) should cost ~100× less, at some index size.
+  - **Not yet changed:** `build.py --mode`'s tiers and the HPC run (`hpc/kfp-ablations/tree-index-build/run.sh`) still use the shared layers. Proposed: standard = S3 + representatives at window 64 with alignment (~280–330 GB, 0.84 at 80%), large = window 32 (~345–405 GB, 0.73 at 70%) or window 16 (~470–560 GB, 0.83 at 70%); slim unchanged. Sizes are linear upper bounds from the quarter sample.
+  - **Next:** settle the tiers; alignment along seed diagonals (k-mer order sketched in the index), with its speed and index cost measured; the layer's k and group distance on the 1-in-100 subset.

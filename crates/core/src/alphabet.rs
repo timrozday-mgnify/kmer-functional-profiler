@@ -17,6 +17,8 @@ pub enum Alphabet {
     Murphy10,
     /// Dayhoff 6-letter alphabet, 3 bits per residue.
     Dayhoff,
+    /// One of [`REDUCED`]'s alphabets, by its index.
+    Reduced(u8),
     /// Nucleotides A, C, G, T (U read as T), 2 bits per base. Sequences are hashed as
     /// canonical k-mers without translation (see [`crate::dna_kmers`]).
     Dna,
@@ -28,6 +30,40 @@ const PROTEIN: [u8; 256] = classes(&[
 ]);
 const MURPHY10: [u8; 256] = classes(&["LVIM", "C", "A", "G", "ST", "P", "FYW", "EDNQ", "KR", "H"]);
 const DAYHOFF: [u8; 256] = classes(&["AGPST", "C", "DENQ", "HKR", "ILMV", "FWY"]);
+/// Further reduced alphabets for distant seeds (docs/tree-index-plan.md, phase 6b), by name;
+/// workflows/tree-index/alphabets.py keeps the same classes. `opt<n>`: n classes maximising
+/// k-mer survival at 70% identity per chance-match bit under BLOSUM62 substitutions.
+#[rustfmt::skip]
+pub const REDUCED: [(&str, &[&str]); 17] = [
+    ("murphy8", &["LVIMC", "AG", "ST", "P", "FYW", "EDNQ", "KR", "H"]),
+    ("murphy12", &["LVIM", "C", "A", "G", "ST", "P", "FY", "W", "EQ", "DN", "KR", "H"]),
+    ("murphy15", &["LVIM", "C", "A", "G", "S", "T", "P", "FY", "W", "E", "Q", "D", "N", "KR", "H"]),
+    ("diamond11", &["KREDQN", "C", "G", "H", "ILV", "M", "F", "Y", "W", "P", "STA"]),
+    ("seb6", &["AST", "CP", "DEHKNQR", "FWY", "G", "ILMV"]),
+    ("seb8", &["AST", "C", "DHN", "EKQR", "FWY", "G", "ILMV", "P"]),
+    ("seb10", &["AST", "C", "DN", "EQ", "FY", "G", "HW", "ILMV", "KR", "P"]),
+    ("seb14", &["A", "C", "D", "EQ", "FY", "G", "H", "IV", "KR", "LM", "N", "P", "ST", "W"]),
+    ("sev10", &["AST", "C", "DEN", "FY", "G", "H", "ILMV", "KQR", "P", "W"]),
+    ("lia10", &["AC", "DE", "FWY", "G", "HN", "IV", "KQR", "LM", "P", "ST"]),
+    ("lib10", &["AST", "C", "DEQ", "FWY", "G", "HN", "IV", "KR", "LM", "P"]),
+    ("opt4", &["CFILMVWY", "DEHKNQR", "PST", "AG"]),
+    ("opt6", &["FHWY", "ILMV", "ACT", "DEQ", "GNS", "KPR"]),
+    ("opt8", &["FHWY", "DEQ", "KNR", "AC", "GS", "IV", "LM", "PT"]),
+    ("opt10", &["FHWY", "AC", "DN", "EQ", "IV", "KR", "LM", "PT", "G", "S"]),
+    ("opt12", &["FWY", "AC", "EQ", "HN", "IV", "KR", "LM", "D", "G", "P", "S", "T"]),
+    ("opt14", &["FWY", "AC", "EQ", "HN", "LM", "D", "G", "I", "K", "P", "R", "S", "T", "V"]),
+];
+
+const REDUCED_TABLES: [[u8; 256]; REDUCED.len()] = {
+    let mut out = [[INVALID; 256]; REDUCED.len()];
+    let mut i = 0;
+    while i < REDUCED.len() {
+        out[i] = classes(REDUCED[i].1);
+        i += 1;
+    }
+    out
+};
+
 // Complement is 3 - code (A <-> T, C <-> G), which canonical k-mers rely on.
 const DNA: [u8; 256] = classes(&["A", "C", "G", "TU"]);
 
@@ -55,6 +91,7 @@ impl Alphabet {
             Self::Protein => 5,
             Self::Murphy10 => 4,
             Self::Dayhoff => 3,
+            Self::Reduced(i) => (REDUCED[i as usize].1.len() as u32 - 1).ilog2() + 1,
             Self::Dna => 2,
         }
     }
@@ -76,6 +113,7 @@ impl Alphabet {
             Self::Protein => &PROTEIN,
             Self::Murphy10 => &MURPHY10,
             Self::Dayhoff => &DAYHOFF,
+            Self::Reduced(i) => &REDUCED_TABLES[i as usize],
             Self::Dna => &DNA,
         };
         let code = table[aa as usize];
@@ -87,12 +125,17 @@ impl FromStr for Alphabet {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Error> {
-        match s.to_ascii_lowercase().as_str() {
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
             "protein" => Ok(Self::Protein),
             "murphy10" => Ok(Self::Murphy10),
             "dayhoff" => Ok(Self::Dayhoff),
             "dna" => Ok(Self::Dna),
-            _ => Err(Error::UnknownAlphabet(s.to_owned())),
+            _ => REDUCED
+                .iter()
+                .position(|(name, _)| *name == lower)
+                .map(|i| Self::Reduced(i as u8))
+                .ok_or_else(|| Error::UnknownAlphabet(s.to_owned())),
         }
     }
 }
@@ -103,7 +146,11 @@ mod tests {
 
     #[test]
     fn encodes_every_standard_residue_in_range() {
-        for alphabet in [Alphabet::Protein, Alphabet::Murphy10, Alphabet::Dayhoff] {
+        let reduced = (0..REDUCED.len()).map(|i| Alphabet::Reduced(i as u8));
+        for alphabet in [Alphabet::Protein, Alphabet::Murphy10, Alphabet::Dayhoff]
+            .into_iter()
+            .chain(reduced)
+        {
             let n = 1u8 << alphabet.bits();
             for &aa in b"ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwy" {
                 assert!(
@@ -142,5 +189,19 @@ mod tests {
             Alphabet::Protein.encode(b'L'),
             Alphabet::Protein.encode(b'I')
         );
+        let seb14: Alphabet = "SEB14".parse().unwrap();
+        assert_eq!(seb14.encode(b'I'), seb14.encode(b'V'));
+        assert_ne!(seb14.encode(b'I'), seb14.encode(b'L'));
+        assert_eq!(seb14.bits(), 4);
+        assert_eq!("opt4".parse::<Alphabet>().unwrap().bits(), 2);
+    }
+
+    #[test]
+    fn reduced_alphabets_partition_the_twenty() {
+        for (name, groups) in REDUCED {
+            let mut all: Vec<u8> = groups.concat().into_bytes();
+            all.sort_unstable();
+            assert_eq!(all, b"ACDEFGHIKLMNPQRSTVWY", "{name}");
+        }
     }
 }

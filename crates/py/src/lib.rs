@@ -758,6 +758,23 @@ fn align_identity<'py>(
     Ok(dict)
 }
 
+/// Best ungapped local alignment score of each pair (`a[i]`, `b[i]`) over every diagonal,
+/// residue pairs scored by `matrix` (65536 i8, `a`'s byte << 8 | `b`'s).
+#[pyfunction]
+fn align_ungapped<'py>(
+    py: Python<'py>,
+    a: Vec<PyBackedBytes>,
+    b: Vec<PyBackedBytes>,
+    matrix: PyReadonlyArray1<'py, i8>,
+) -> PyResult<Bound<'py, PyArray1<i32>>> {
+    let matrix = matrix.as_slice()?;
+    if a.len() != b.len() || matrix.len() != 1 << 16 {
+        return Err(to_py_err(Error::LengthMismatch));
+    }
+    let got = py.detach(|| kfp::ungapped_many(&a, &b, matrix));
+    Ok(got.into_pyarray(py))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", kfp::VERSION)?;
@@ -782,6 +799,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree_layout, m)?)?;
     m.add_function(wrap_pyfunction!(tree_schemes, m)?)?;
     m.add_function(wrap_pyfunction!(align_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(align_ungapped, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     m.add_class::<PyDiamondReader>()?;

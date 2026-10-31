@@ -19,12 +19,14 @@ k-mer only; ``hits.parquet`` (hash, n: the sample's k-mers that are keys, for ``
 
 import argparse
 import gzip
+import heapq
 import json
 import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Final
 
+import alphabets
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
@@ -101,7 +103,13 @@ def read_pairs(
 
 
 def evidence_chunked(
-    index: Index, pairs: pl.DataFrame, log2_windows: float, clamp: bool, chunk: int = 20_000
+    index: Index,
+    pairs: pl.DataFrame,
+    log2_windows: float,
+    clamp: bool,
+    chunk: int = 20_000,
+    per_read: bool = False,
+    floor: float = 0.0,
 ) -> pl.DataFrame:
     """:func:`evidence` over read pairs ``chunk`` at a time (memory bounded; the same result,
     since evidence is per read pair)."""
@@ -110,19 +118,96 @@ def evidence_chunked(
     for lo in range(0, int(reads.max(initial=0)) + 1, chunk):
         sub = pairs.filter((pl.col("read") >= lo) & (pl.col("read") < lo + chunk))
         if sub.height:
-            parts.append(evidence(index, sub, log2_windows, floor=0.0, clamp=clamp))
+            parts.append(evidence(index, sub, log2_windows, floor, clamp, per_read))
     if not parts:
-        return pl.DataFrame(schema={"pos": pl.Int64, "score": pl.Float64})
+        schema = {"pos": pl.Int64, "score": pl.Float64} | ({"read": pl.Int64} if per_read else {})
+        return pl.DataFrame(schema=schema)
+    if per_read:
+        return pl.concat(parts)
     return pl.concat(parts).group_by("pos").agg(pl.col("score").max()).sort("pos")
 
 
+def families(index: Index) -> NDArray[np.int64]:
+    """Per key, its family for per-layer bars: 0 the base and ladder, i the i-th layer."""
+    fam = np.zeros(len(index.keys), dtype=np.int64)
+    for i, (*_, code) in enumerate(ladder(index.meta["params"].get("layers", "") or ""), 1):
+        fam[index.key_k == code] = i
+    return fam
+
+
+def gather(ev: pl.DataFrame, floor: float) -> pl.DataFrame:
+    """Greedy gather over (pos, score, read): (pos, score) in pick order, each pick the leaf
+    whose read pairs not yet taken score the most in sum (its gain), whose read pairs are then
+    taken; until no leaf gains ``floor``. Gains never rise, so a bar on them keeps a prefix.
+    ponytail: a Python lazy-greedy heap, ~10^5 picks a second or so; a kernel at scale."""
+    ev = ev.sort("pos", "read")
+    pos, read, sc = (ev[c].to_numpy() for c in ("pos", "read", "score"))
+    leaf, start = np.unique(pos, return_index=True)
+    end = np.r_[start[1:], len(pos)]
+    _, read = np.unique(read, return_inverse=True)
+    taken = np.zeros(int(read.max(initial=-1)) + 1, dtype=bool)
+    total = np.add.reduceat(sc, start) if len(start) else np.zeros(0)
+    heap = [(-g, i) for i, g in enumerate(total.tolist()) if g >= floor]
+    heapq.heapify(heap)
+    picks: list[tuple[int, float]] = []
+    while heap:
+        _, i = heapq.heappop(heap)
+        s, e = start[i], end[i]
+        free = ~taken[read[s:e]]
+        gain = float(sc[s:e][free].sum())
+        if gain < floor:
+            continue
+        if heap and gain < -heap[0][0]:  # stale: back in at its current gain
+            heapq.heappush(heap, (-gain, i))
+            continue
+        picks.append((int(leaf[i]), gain))
+        taken[read[s:e]] = True
+    return pl.DataFrame(picks, schema={"pos": pl.Int64, "score": pl.Float64}, orient="row")
+
+
+def candidates(
+    index: Index, pairs: pl.DataFrame, d_pairs: pl.DataFrame, log2_w: float, shares: list[float]
+) -> tuple[dict[str, NDArray[np.int64]], dict[str, Any]]:
+    """``fam_<share>``: seeds by one read pair's evidence at each decoy share, a bar per key
+    family (:func:`families`) from that family's hits alone, so a layer's chance seeds do not
+    raise the bar on the base's. (Gather over k-mer evidence was tried and dropped: each layer
+    key is hit by chance many times per sample, so summed evidence is mostly chance; see
+    verify.py for gather over aligned read pairs.)"""
+    fam = families(index)
+    of = lambda p: fam[np.searchsorted(index.keys, p["hash"].to_numpy())]  # noqa: E731
+    f, df = of(pairs), of(d_pairs)
+    per = [
+        (
+            evidence_chunked(index, pairs.filter(pl.Series(f == i)), log2_w, clamp=True),
+            evidence_chunked(index, d_pairs.filter(pl.Series(df == i)), log2_w, clamp=True),
+        )
+        for i in range(int(fam.max(initial=0)) + 1)
+    ]
+    out, info = {}, {}
+    for s in shares:
+        got, bars = [], []
+        for sd, dd in per:
+            bar, _ = decoy_bar(sd, dd, s)
+            bars.append(bar)
+            got.append(sd.filter(pl.col("score") >= bar)["pos"].to_numpy())
+        out[f"fam_{s}"] = np.unique(np.concatenate(got)).astype(np.int64)
+        info[f"fam_{s}_bars"] = bars
+    return out, info
+
+
 def evidence(
-    index: Index, pairs: pl.DataFrame, log2_windows: float, floor: float, clamp: bool = False
+    index: Index,
+    pairs: pl.DataFrame,
+    log2_windows: float,
+    floor: float,
+    clamp: bool = False,
+    per_read: bool = False,
 ) -> pl.DataFrame:
     """(pos, score): each leaf position's best evidence from one read pair, the read pair's
     hit k-mers on it summed in bits less log2(windows per read pair) per hit beyond the
     first (each further hit had that many places to fall by chance); scores >= ``floor``.
-    ``clamp``: a hit's bits are at least 0 (common k-mers add nothing rather than subtract)."""
+    ``clamp``: a hit's bits are at least 0 (common k-mers add nothing rather than subtract).
+    ``per_read``: (pos, score, read) for every read pair, not each leaf's best."""
     h = pairs["hash"].to_numpy()
     bits = index.key_bits[np.searchsorted(index.keys, h)].astype(np.float64)
     if clamp:
@@ -146,6 +231,8 @@ def evidence(
     n = x[on + 1] - x[on]
     pos = np.repeat(x[on] - np.cumsum(n) + n, n) + np.arange(n.sum())
     seg = pl.DataFrame({"pos": pos, "score": np.repeat(score[on], n)})
+    if per_read:
+        return seg.with_columns(read=np.repeat(r[on], n))
     return seg.group_by("pos").agg(pl.col("score").max()).sort("pos")
 
 
@@ -164,13 +251,14 @@ def reversed_reads(paths: list[str], out: Path) -> list[str]:
 
 
 def decoy_bar(
-    seeds: pl.DataFrame, decoys: pl.DataFrame, share: float
+    seeds: pl.DataFrame, decoys: pl.DataFrame, share: float, hi: float = 160.0
 ) -> tuple[float, list[tuple[float, float, int]]]:
-    """The least score at which leaves seeded by decoy reads are at most ``share`` of the
-    leaves seeded by the sample (target-decoy); and the curve (score, decoy seeds, seeds)."""
+    """The least score below ``hi`` at which leaves seeded by decoy reads are at most
+    ``share`` of the leaves seeded by the sample (target-decoy); and the curve (score, decoy
+    seeds, seeds)."""
     sc, dc = np.sort(seeds["score"].to_numpy()), np.sort(decoys["score"].to_numpy())
     curve = []
-    for bar in np.arange(0.0, 160.0, 0.25):
+    for bar in np.arange(0.0, hi, 0.25):
         n, d = len(sc) - np.searchsorted(sc, bar), len(dc) - np.searchsorted(dc, bar)
         curve.append((float(bar), float(d), int(n)))
     ok = [c for c in curve if c[1] <= share * max(c[2], 1)]
@@ -200,7 +288,7 @@ def choose_bits(
     return (ok[0][0] if ok else curve[-1][0] if curve else 0.0), curve
 
 
-ALPHABETS: Final = ("protein", "murphy10", "dayhoff")
+ALPHABETS: Final = ("protein", "murphy10", "dayhoff", *alphabets.REDUCED)
 
 
 def ladder(spec: str) -> list[tuple[int, int, str, int]]:
@@ -226,11 +314,10 @@ def ladder_flags(spec: str) -> list[set[str]]:
 
 def steps(index: Index, mode: str = "recall") -> list[tuple[int, int, str, int]]:
     """The index's ladder and layer steps a query uses: all of them in ``recall`` mode; in
-    ``precision`` mode only full-alphabet ones (reduced alphabets are not yet tested for
-    precision or F1)."""
+    ``precision`` mode the ladder only (layers are not yet tested for precision or F1)."""
     params = index.meta["params"]
-    got = ladder(params.get("ladder", "")) + ladder(params.get("layers", "") or "")
-    return [s for s in got if mode == "recall" or s[2] == "protein"]
+    layers = ladder(params.get("layers", "") or "") if mode == "recall" else []
+    return ladder(params.get("ladder", "")) + layers
 
 
 def salted(h: NDArray[np.uint64], k: int) -> NDArray[np.uint64]:
@@ -357,12 +444,16 @@ def main() -> None:
     parser.add_argument("--ladder-frames", help="frames for ladder k-mers (default: --frames)")
     parser.add_argument(
         "--mode", choices=["recall", "precision"], default="recall",
-        help="recall: every layer of the index (Dayhoff included); precision: full-alphabet "
-        "k-mers only (reduced alphabets are not yet tested for precision or F1)",
+        help="recall: every layer of the index; precision: the ladder only, no layers "
+        "(layers are not yet tested for precision or F1)",
     )  # fmt: skip
     parser.add_argument(
         "--decoy", action="store_true",
         help="count chance seeds on the reads reversed (target-decoy) instead of modelling them",
+    )  # fmt: skip
+    parser.add_argument(
+        "--shares", default="0.01,0.05,0.1",
+        help="--decoy: decoy shares for cand_fam_<share>.npy (per-layer bars)",
     )  # fmt: skip
     a = parser.parse_args()
     out = Path(a.out)
@@ -396,6 +487,11 @@ def main() -> None:
             decoys.write_parquet(out / "decoy_seeds.parquet")
             bar, curve = decoy_bar(seeds, decoys, a.chance_share)
             stats["decoy_seeds"] = int((decoys["score"] >= bar).sum())
+            shares = [float(x) for x in a.shares.split(",")]
+            cand, info = candidates(index, pairs, d_pairs, log2_w, shares)
+            for name, got in cand.items():
+                np.save(out / f"cand_{name}.npy", got)
+            stats |= info | {f"{name}_n": len(got) for name, got in cand.items()}
         else:
             bar, curve = choose_bits(index, seeds, windows, a.chance_share)
         seeds.write_parquet(out / "seeds.parquet")

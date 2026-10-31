@@ -99,9 +99,62 @@ pub fn identities<S: AsRef<[u8]> + Sync>(a: &[S], b: &[S]) -> (Vec<f32>, Vec<u32
     (ident, cols)
 }
 
+/// Best ungapped local alignment score of `a` against `b` over every diagonal (the maximum
+/// segment sum along each), residue pairs scored by `matrix` (256 x 256 by byte, row `a`'s).
+pub fn ungapped(a: &[u8], b: &[u8], matrix: &[i8]) -> i32 {
+    let mut best = 0;
+    for start in 0..a.len() + b.len() {
+        // diagonals from the top row (a from 0, b from start - a.len()) then down the first
+        // column (a from start, b from 0)
+        let (mut i, mut j) = if start < a.len() {
+            (a.len() - 1 - start, 0)
+        } else {
+            (0, start - a.len())
+        };
+        let mut run = 0i32;
+        while i < a.len() && j < b.len() {
+            run = (run + i32::from(matrix[usize::from(a[i]) << 8 | usize::from(b[j])])).max(0);
+            best = best.max(run);
+            i += 1;
+            j += 1;
+        }
+    }
+    best
+}
+
+/// [`ungapped`] for each pair `(a[i], b[i])`, over the configured threads.
+pub fn ungapped_many<S: AsRef<[u8]> + Sync>(a: &[S], b: &[S], matrix: &[i8]) -> Vec<i32> {
+    let n = a.len().min(b.len());
+    let mut out = vec![0i32; n];
+    let per_thread = n.div_ceil(threads()).max(1);
+    std::thread::scope(|scope| {
+        for (t, chunk) in out.chunks_mut(per_thread).enumerate() {
+            scope.spawn(move || {
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    let i = t * per_thread + k;
+                    *o = ungapped(a[i].as_ref(), b[i].as_ref(), matrix);
+                }
+            });
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ungapped_finds_the_best_diagonal() {
+        let mut m = vec![-1i8; 1 << 16];
+        for c in b'A'..=b'Z' {
+            m[usize::from(c) << 8 | usize::from(c)] = 2;
+        }
+        assert_eq!(ungapped(b"MKVLAT", b"MKVLAT", &m), 12);
+        assert_eq!(ungapped(b"QQMKVLQQ", b"MKVL", &m), 8); // the shifted diagonal
+        assert_eq!(ungapped(b"MKXVL", b"MKAVL", &m), 7); // through a mismatch: 2+2-1+2+2
+        assert_eq!(ungapped(b"", b"MK", &m), 0);
+    }
 
     #[test]
     fn identity_of_simple_pairs() {
