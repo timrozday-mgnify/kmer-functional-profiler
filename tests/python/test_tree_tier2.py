@@ -40,3 +40,15 @@ def test_em_gives_shared_reads_to_the_supported_leaf() -> None:
 def test_budget_splits_memory() -> None:
     residues, pairs = tier2.budget(3.0)
     assert residues * tier2.RESIDUE_BYTES == pairs * tier2.PAIR_BYTES == 2**30
+
+
+def test_read_scoring_pools_small_depth_bins() -> None:
+    import recall
+
+    # 10+40 reach 30; 5+30 do; the short tail (3) joins the last full pool
+    pools = recall.merge_bins([10, 40, 5, 30, 3], 30)
+    assert pools == [0, 0, 1, 1, 1]
+    assert [recall.span(pools, p) for p in (0, 1)] == ["0-1", "1-"]
+    assert recall.merge_bins([5, 5], 30) == [0, 0]  # too few anywhere: one pool
+    m, lo, hi = recall.mean_ci(np.array([0.0, 1.0] * 50))
+    assert m == 0.5 and lo < 0.5 < hi

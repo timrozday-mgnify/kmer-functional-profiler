@@ -231,9 +231,9 @@ process SCORE {
     ${py()} code/recall.py score --index index --query ${q} --truth ${sim}/truth.tsv \
         --out s-${tier} --caps 256 --deltas 0.1
     ${py()} code/recall.py reads --index index --query ${q} --truth ${sim}/truth.tsv \
-        --reads ${sim}/reads_1.fq.gz ${fam} --out s-${tier}
+        --read-truth ${sim}/reads.parquet ${fam} --out s-${tier}
     ${py()} code/recall.py reads --index index --query ${q}/tier2 --truth ${sim}/truth.tsv \
-        --reads ${sim}/reads_1.fq.gz ${fam} --out s-${tier}/tier2
+        --read-truth ${sim}/reads.parquet ${fam} --out s-${tier}/tier2
     """
 }
 

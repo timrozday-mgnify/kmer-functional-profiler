@@ -164,8 +164,10 @@ QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed
            against each group's representative, their own decoy bar; each read pair's best
            leaves and a read-level bar; then tier2.py: each routed read aligned to every
            leaf of its groups, chunk by chunk along the tree (tier 2)
-SCORE      recall.py score per tier; recall.py reads: candidate and read precision by leaf,
-           group, unit (and Pfam with --pfam), read sensitivity; the same for tier 2's calls
+SCORE      recall.py score per tier; recall.py reads on tier 1's and tier 2's calls: read
+           recall and precision (a read right when any tied best hit is the source's: unit,
+           group, leaf, Pfam with --pfam), per-strain means with 95% intervals, strain
+           detection by depth x identity, and the same by each pair's coding share
 SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
            (verify_0.01_nb)
 ```
