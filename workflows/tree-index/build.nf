@@ -2,7 +2,11 @@
 // by identity), built in parts. See README.md; on HPC,
 // hpc/kfp-ablations/tree-index-build/run.sh. Run as: nextflow run workflows/tree-index/build.nf
 //
-// FIXTURE    synthetic members when --members is '' (the test profile)
+// FIXTURE    synthetic members when --members and --slice_store are '' (the test profile)
+// FAMILIES   with --slice_store: --slice_families random Pfam families of --slice_min_proteins
+//            to --slice_max_proteins proteins from --slice_pfam (slice.py families)
+// TAKE       per members bucket: every member of each cluster holding one of their proteins
+// SLICE      the buckets' takes -> members.parquet: every unit of the families, whole
 // PARTITION  proteins -> parts of ~--part_proteins (k 11 storage components and equal
 //            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py)
 // BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology,
@@ -14,13 +18,22 @@
 // SIMULATE   one strain per target at 100-70% identity, BLOSUM62 substitutions (spike.py simulate)
 // QUERY      per tier: the strains' reads, chance seeds counted on reversed reads (query.py --decoy),
 //            then the candidates' rough alignment, decoy-calibrated (verify.py)
-// SCORE      per tier: candidate recall against the truth (recall.py score)
+// SCORE      per tier: candidate recall against the truth (recall.py score); precision and
+//            read classification (recall.py reads; by Pfam with --pfam or the slice's families)
 // SUMMARY    -> bench.tsv: per tier, postings, decoy bar and recall by identity (recall.py summary,
 //            verify_0.01_nb: aligned at a 1% decoy bar, neighbour rule)
 
 nextflow.enable.dsl = 2
 
 params.members       = ''         // members parquet (absolute path or glob), '' = fixture
+params.pfam          = ''         // protein_id, pfam_accession parquet for Pfam precision
+// a family-complete slice instead of --members (docs/tree-index-plan.md, Progress log:
+// precision and read classification): members buckets (glob) and the release's Pfam table
+params.slice_store        = ''
+params.slice_pfam         = ''
+params.slice_families     = 40
+params.slice_min_proteins = 20000
+params.slice_max_proteins = 150000
 params.part_proteins = 2000000    // proteins per part
 // name:build.py options, ';'-separated (split at each tier's first ':')
 params.tiers         = 'slim:--mode slim;standard:--mode standard;large:--mode large'
@@ -40,6 +53,58 @@ process FIXTURE {
 
     script:
     "${py()} ${projectDir}/phase0.py fixture --families 40 --members 8 --buckets 1"
+}
+
+process FAMILIES {
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy', pattern: 'families.*'
+
+    input:
+    path pfam, stageAs: 'release_pfam.parquet'
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'fam/chosen.parquet', emit: chosen
+    path 'fam/pfam.parquet', emit: pfam
+    path 'families.*'
+
+    script:
+    """
+    ${py()} code/slice.py families --pfam ${pfam} --families ${params.slice_families} \
+        --min-proteins ${params.slice_min_proteins} --max-proteins ${params.slice_max_proteins} \
+        --threads ${task.cpus} --out fam
+    cp fam/families.tsv fam/families.json .
+    """
+}
+
+process TAKE {
+    tag "${bucket.baseName}"
+    label 'process_medium'
+
+    input:
+    tuple path(bucket), path(chosen)
+    path code, stageAs: 'code/*'
+
+    output:
+    path "take.${bucket.baseName}.parquet"
+
+    script:
+    "${py()} code/slice.py take --members ${bucket} --chosen ${chosen} --threads ${task.cpus} --out take.${bucket.baseName}.parquet"
+}
+
+process SLICE {
+    label 'process_medium'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path takes, stageAs: 'takes/*'
+    path code, stageAs: 'code/*'
+
+    output:
+    path 'members.parquet'
+
+    script:
+    "${py()} code/slice.py concat --parts takes/* --out members.parquet"
 }
 
 process PARTITION {
@@ -149,15 +214,19 @@ process SCORE {
 
     input:
     tuple val(tier), path(index, stageAs: 'index'), path(q), path(sim)
+    path pfam, stageAs: 'pfam/*'
     path code, stageAs: 'code/*'
 
     output:
     tuple val(tier), path("s-${tier}")
 
     script:
+    def fam = pfam ? "--pfam ${pfam[0]}" : ''
     """
     ${py()} code/recall.py score --index index --query ${q} --truth ${sim}/truth.tsv \
         --out s-${tier} --caps 256 --deltas 0.1
+    ${py()} code/recall.py reads --index index --query ${q} --truth ${sim}/truth.tsv \
+        --reads ${sim}/reads_1.fq.gz ${fam} --out s-${tier}
     """
 }
 
@@ -179,10 +248,20 @@ process SUMMARY {
 
 workflow {
     code = ['partition.py', 'build.py', 'merge.py', 'survey.py', 'phase0.py', 'query.py',
-            'alphabets.py', 'recall.py', 'verify.py', 'report.py', '../spike-benchmark/spike.py']
+            'alphabets.py', 'recall.py', 'verify.py', 'report.py', 'slice.py',
+            '../spike-benchmark/spike.py']
         .collect { file("${projectDir}/${it}") }
-    members = params.members ? Channel.fromPath(params.members, checkIfExists: true).collect()
-                             : FIXTURE()
+    pfam = params.pfam ? Channel.fromPath(params.pfam, checkIfExists: true).collect()
+                       : Channel.value([])
+    if (params.slice_store) {
+        FAMILIES(Channel.fromPath(params.slice_pfam, checkIfExists: true).first(), code)
+        TAKE(Channel.fromPath(params.slice_store, checkIfExists: true).combine(FAMILIES.out.chosen), code)
+        members = SLICE(TAKE.out.collect(), code).collect()
+        pfam = FAMILIES.out.pfam.collect()
+    } else {
+        members = params.members ? Channel.fromPath(params.members, checkIfExists: true).collect()
+                                 : FIXTURE()
+    }
     PARTITION(members, code, params.part_proteins)
     tiers = Channel.fromList(params.tiers.tokenize(';')*.trim().collect { it.split(':', 2) as List })
     BUILD(tiers.combine(PARTITION.out.parts.flatten()), PARTITION.out[1].first(), code)
@@ -192,7 +271,7 @@ workflow {
         TARGETS(members, index.first().map { it[1] }, code)
         sim = SIMULATE(TARGETS.out, code)
         QUERY(index.combine(sim), members.collect(), code)
-        SCORE(index.join(QUERY.out).combine(sim), code)
+        SCORE(index.join(QUERY.out).combine(sim), pfam, code)
         // index-<tier>, q-<tier>, s-<tier> side by side
         SUMMARY(MERGE.out.mix(QUERY.out.map { it[1] }, SCORE.out.map { it[1] }).collect(), code)
     }

@@ -160,11 +160,20 @@ TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index pos
 SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM62
            substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
 QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed; then
-           verify.py: candidates aligned ungapped, their own decoy bar
-SCORE      recall.py score per tier
+           verify.py: candidates aligned (anchored ungapped scans, tandem repeats masked)
+           against each group's representative, their own decoy bar; each read pair's best
+           leaves and a read-level bar
+SCORE      recall.py score per tier; recall.py reads: candidate and read precision by leaf,
+           group, unit (and Pfam with --pfam), read sensitivity
 SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
            (verify_0.01_nb)
 ```
+
+With `--slice_store` (members buckets) and `--slice_pfam` (the release's Pfam table), FAMILIES,
+TAKE and SLICE (`slice.py`) build the members first: every MGnify90 cluster holding a protein
+of `--slice_families` random Pfam families (`--slice_min_proteins`–`--slice_max_proteins`
+proteins each), so near units are present and read precision by unit means something (a
+cluster sample almost never holds a protein's neighbouring units).
 
 ```bash
 nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts

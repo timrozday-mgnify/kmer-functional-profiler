@@ -14,7 +14,17 @@ Subcommands:
   recall the source of a strain with none. Writes
   ``strains.parquet`` (per strain and strategy), ``recall.tsv`` (per strategy, identity and
   depth bin) and ``strategies.tsv`` (per strategy: candidates, and recall at depth > 0.5).
-- ``summary``: one row per build (postings, decoy bar, recall by identity), across builds.
+- ``reads``: precision and read classification from ``verify.py``'s output. Candidates
+  (``cand_verify_<share>``, groups expanded): the share that are a source protein's leaf or
+  in a source's MGnify90 unit (``cluster_rep``), and of their units, the share that are a
+  source's. Reads: each read pair's best leaves (``reads.parquet``, ties shared) at the
+  read-level bar (``verify.json``'s ``read_bar_<share>``), against its strain (read names
+  ``s<strain>_<n>``; others, ``spike.py``'s background, counted apart): sensitivity (called
+  to the source's unit, over the strain's reads) and precision by leaf, layer group, unit
+  and, with ``--pfam``, Pfam family (the called leaf's and the source's accessions overlap).
+  Writes ``reads.tsv`` (per identity bin) and ``reads.json``.
+- ``summary``: one row per build (postings, decoy bar, recall by identity; with ``reads``'s
+  output, candidate unit precision and read sensitivity and precision), across builds.
 
 Strategies, each from the leaves with ``min_hits`` hit k-mers (seeds):
 
@@ -233,6 +243,14 @@ def summary(a: argparse.Namespace) -> None:
             "query_s": round(q["total_s"]),
             "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
         }
+        if (sdir / "reads.json").exists():  # recall.py reads
+            r = json.loads((sdir / "reads.json").read_text())
+            row |= {
+                "unit_precision": r["cand_unit_precision"],
+                "read_sensitivity": r["sensitivity"],
+                "read_precision_unit": r["precision_unit"],
+                "read_precision_pfam": r.get("precision_pfam"),
+            }
         for ident, got in per.group_by("identity_bin").agg(pl.col(a.strategy).mean()).iter_rows():
             row[f"r{ident}"] = got
         rows.append(row)
@@ -245,6 +263,101 @@ def summary(a: argparse.Namespace) -> None:
     table.write_csv(Path(a.out), separator="\t", float_precision=3)
     with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=250, float_precision=3):
         print(table)
+
+
+def reads(a: argparse.Namespace) -> None:
+    path, qdir, out = Path(a.index), Path(a.query), Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    prot = pl.read_parquet(path / "proteins.parquet").filter(pl.col("pos") >= 0)
+    n_pos = int(prot["pos"].max()) + 1
+    gfile = path / "layer_group.npy"
+    group = np.load(gfile).astype(np.int64) if gfile.exists() else np.arange(n_pos)
+    truth = pl.read_csv(a.truth, separator="\t", columns=["strain", "member", "identity_bin"])
+    truth = truth.join(
+        prot.select(member="protein_id", typos="pos", unit="cluster_rep"), on="member", how="left"
+    )
+    units = prot.group_by("pos").agg(units=pl.col("cluster_rep").unique())
+    info: dict[str, float | int] = {}
+    # candidates, each representative's group expanded
+    cand = np.load(qdir / f"cand_verify_{a.share}.npy").astype(np.int64)
+    cand = np.flatnonzero(np.isin(group[:n_pos], cand) | np.isin(np.arange(n_pos), cand))
+    cu = units.filter(pl.col("pos").is_in(pl.Series(cand).implode()))
+    true_units = set(truth["unit"].drop_nulls().to_list())
+    cand_units = set(cu.explode("units")["units"].to_list())
+    info |= {
+        "candidates": len(cand),
+        "cand_leaf_precision": float(np.isin(cand, truth["typos"].drop_nulls().to_numpy()).mean()),
+        "cand_in_unit_precision": float(
+            cu["units"].list.eval(pl.element().is_in(list(true_units))).list.any().mean() or 0
+        ),
+        "cand_units": len(cand_units),
+        "cand_unit_precision": len(cand_units & true_units) / max(len(cand_units), 1),
+        "unit_recall": len(cand_units & true_units) / max(len(true_units), 1),
+    }
+    # read pairs: names in file order (s<strain>_<n>; anything else is background, -1)
+    with gzip.open(a.reads, "rt") as f:
+        names = [
+            int(line[2:].split("_")[0]) if line.startswith("@s") else -1
+            for i, line in enumerate(f) if i % 4 == 0
+        ]  # fmt: skip
+    strain = pl.DataFrame({"read": np.arange(len(names)), "strain": names})
+    bar = json.loads((qdir / "verify.json").read_text())[f"read_bar_{a.share}"]
+    calls = pl.read_parquet(qdir / "reads.parquet").filter(pl.col("score") >= bar)
+    calls = calls.join(strain, on="read")
+    info |= {
+        "read_bar": bar,
+        "background_reads": int((strain["strain"] < 0).sum()),
+        "background_called": calls.filter(pl.col("strain") < 0)["read"].n_unique(),
+    }
+    calls = calls.join(truth, on="strain").join(units, on="pos", how="left")
+    tp = calls["typos"].fill_null(-1).to_numpy()
+    calls = calls.with_columns(
+        leaf=(pl.col("pos") == pl.col("typos")).fill_null(False),
+        group=pl.Series((tp >= 0) & (group[calls["pos"].to_numpy()] == group[np.maximum(tp, 0)])),
+        unit=pl.col("units").list.contains(pl.col("unit")).fill_null(False),
+    )
+    levels = ["leaf", "group", "unit"]
+    if a.pfam:
+        fam = pl.read_parquet(a.pfam, columns=["protein_id", "pfam_accession"]).unique()
+        leaf_fam = prot.join(fam, on="protein_id").group_by("pos").agg(lf=pl.col("pfam_accession"))
+        src_fam = fam.group_by(member="protein_id").agg(sf=pl.col("pfam_accession"))
+        calls = calls.join(leaf_fam, on="pos", how="left").join(src_fam, on="member", how="left")
+        calls = calls.with_columns(
+            pfam=pl.when(pl.col("sf").is_null())
+            .then(None)
+            .otherwise(pl.col("lf").list.set_intersection("sf").list.len().fill_null(0) > 0)
+        )
+        levels.append("pfam")
+    per = calls.group_by("read", "identity_bin").agg(
+        ties=pl.len(), **{x: pl.col(x).cast(pl.Float64).mean() for x in levels}
+    )
+    n = strain.join(truth, on="strain").group_by("identity_bin").agg(reads=pl.len())
+    table = (
+        n.join(
+            per.group_by("identity_bin").agg(
+                called=pl.len(),
+                ties=pl.col("ties").mean(),
+                right_unit=pl.col("unit").sum(),
+                **{f"precision_{x}": pl.col(x).mean() for x in levels},
+            ),
+            on="identity_bin",
+            how="left",
+        )  # fmt: skip
+        .with_columns(sensitivity=pl.col("right_unit") / pl.col("reads"))
+        .drop("right_unit")
+        .sort("identity_bin", descending=True)
+    )
+    info |= {
+        "reads": int(n["reads"].sum()),
+        "called": per.height,
+        "sensitivity": float(per["unit"].sum() / max(n["reads"].sum(), 1)),
+        **{f"precision_{x}": float(per[x].mean() or 0) for x in levels},
+    }
+    table.write_csv(out / "reads.tsv", separator="\t", float_precision=4)
+    (out / "reads.json").write_text(json.dumps(info, indent=1) + "\n")
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200, float_precision=3):
+        print(table)
+    print(json.dumps(info))
 
 
 def main() -> None:
@@ -266,6 +379,14 @@ def main() -> None:
     p.add_argument("--min-hits", type=int, default=1)
     p.add_argument("--deltas", type=float, nargs="+", default=[0.0, 0.05, 0.1, 0.15, 0.3])
     p.add_argument("--caps", type=int, nargs="+", default=[16, 256])
+    p = sub.add_parser("reads")
+    p.add_argument("--index", required=True)
+    p.add_argument("--query", required=True, help="query.py and verify.py's --out")
+    p.add_argument("--truth", required=True)
+    p.add_argument("--reads", required=True, help="the sample's R1 (read names)")
+    p.add_argument("--pfam", help="protein_id, pfam_accession parquet (Pfam precision)")
+    p.add_argument("--share", default="0.01", help="the verify.py bar's share")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("summary")
     p.add_argument("--root", required=True, help="holds idx-<name>, q-<name> and s-<name>")
     p.add_argument("--strategy", default="ev_0.01_nb")
@@ -273,7 +394,7 @@ def main() -> None:
     p.add_argument("--base", default="S3", help="postings are also given over this build's")
     p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"targets": targets, "score": score, "summary": summary}[a.command](a)
+    {"targets": targets, "score": score, "reads": reads, "summary": summary}[a.command](a)
 
 
 if __name__ == "__main__":

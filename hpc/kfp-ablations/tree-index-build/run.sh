@@ -50,4 +50,5 @@ tiers=(
 )
 TIERS=$(IFS=';'; echo "${tiers[*]}")
 nextflow run "$WF/tree-index/build.nf" -c ../site.config -resume --outdir results \
-    --members "$(realpath "$SUBSET/members.parquet")" --tiers "$TIERS"
+    --members "$(realpath "$SUBSET/members.parquet")" --pfam "$(realpath "$SUBSET/pfam.parquet")" \
+    --tiers "$TIERS"
