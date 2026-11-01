@@ -21,7 +21,9 @@ same way, for target-decoy bars at each ``--shares``:
   fewest leaves that explain every verified read pair (fewer targets for tier 2).
 
 Writes ``cand_verify_<share>.npy`` and ``cand_vgather_<share>.npy`` into ``--query`` (for
-``recall.py score``), ``aligned.parquet`` (pos, read, score: the sample's pairs),
+``recall.py score``), ``aligned.parquet`` (pos, read, score: the sample's pairs; the decoys'
+in ``aligned_decoy.parquet``, and both sides' read frames in ``frames_<sample|decoy>.parquet``,
+for ``tier2.py``),
 ``reads.parquet`` (read, pos, score: each sample read pair's best leaves, ties kept, for
 ``recall.py reads``) and ``verify.json`` (pairs, time, pairs per second, leaf bars and
 ``read_bar_<share>``: the read-level bars, decoy reads called at most ``share`` of the
@@ -166,12 +168,18 @@ def main() -> None:
         ev = ev.filter(pl.col("pos").is_in(list(reps)))  # leafless positions: none here
         frames = read_frames(index, *reads)
         got[name], took = scored(ev, frames, reps, matrix, a.method)
+        # the aligned reads' frames, for tier2.py (recomputing them is its largest cost)
+        r = np.unique(ev["read"].to_numpy())
+        pl.DataFrame({"read": r, "frames": [frames[i] for i in r.tolist()]}).write_parquet(
+            qdir / f"frames_{name}.parquet"
+        )
         cells = sum(len(frames[r]) * len(reps[q]) for r, q in ev.select("read", "pos").iter_rows())
         info |= {f"{name}_pairs": ev.height, f"{name}_align_s": took,
                  f"{name}_pairs_per_s": ev.height / max(took, 1e-9),
                  f"{name}_cells_per_s": cells / max(took, 1e-9),
                  f"{name}_total_s": time.perf_counter() - t0}  # fmt: skip
     got["sample"].write_parquet(qdir / "aligned.parquet")
+    got["decoy"].write_parquet(qdir / "aligned_decoy.parquet")  # tier2.py's decoy work list
     # each read pair's best leaves (ties kept), and a read-level bar per share
     top = {
         n: g.filter(pl.col("score") == pl.col("score").max().over("read")) for n, g in got.items()

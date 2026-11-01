@@ -17,7 +17,8 @@
 // TARGETS    --bench_targets proteins with an index position (recall.py targets)  (--bench false: skip)
 // SIMULATE   one strain per target at 100-70% identity, BLOSUM62 substitutions (spike.py simulate)
 // QUERY      per tier: the strains' reads, chance seeds counted on reversed reads (query.py --decoy),
-//            then the candidates' rough alignment, decoy-calibrated (verify.py)
+//            then the candidates' rough alignment, decoy-calibrated (verify.py); tier 2: each
+//            read aligned to every leaf of its routed groups, chunk by chunk (tier2.py)
 // SCORE      per tier: candidate recall against the truth (recall.py score); precision and
 //            read classification (recall.py reads; by Pfam with --pfam or the slice's families)
 // SUMMARY    -> bench.tsv: per tier, postings, decoy bar and recall by identity (recall.py summary,
@@ -205,6 +206,8 @@ process QUERY {
     """
     ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
     ${py()} code/verify.py --index index --members members/* --reads ${reads} --query q-${tier}
+    ${py()} code/tier2.py --index index --members members/* --reads ${reads} --query q-${tier} \
+        --out q-${tier}/tier2
     """
 }
 
@@ -227,6 +230,8 @@ process SCORE {
         --out s-${tier} --caps 256 --deltas 0.1
     ${py()} code/recall.py reads --index index --query ${q} --truth ${sim}/truth.tsv \
         --reads ${sim}/reads_1.fq.gz ${fam} --out s-${tier}
+    ${py()} code/recall.py reads --index index --query ${q}/tier2 --truth ${sim}/truth.tsv \
+        --reads ${sim}/reads_1.fq.gz ${fam} --out s-${tier}/tier2
     """
 }
 
@@ -248,7 +253,7 @@ process SUMMARY {
 
 workflow {
     code = ['partition.py', 'build.py', 'merge.py', 'survey.py', 'phase0.py', 'query.py',
-            'alphabets.py', 'recall.py', 'verify.py', 'report.py', 'slice.py',
+            'alphabets.py', 'recall.py', 'verify.py', 'tier2.py', 'report.py', 'slice.py',
             '../spike-benchmark/spike.py']
         .collect { file("${projectDir}/${it}") }
     pfam = params.pfam ? Channel.fromPath(params.pfam, checkIfExists: true).collect()

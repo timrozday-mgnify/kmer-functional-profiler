@@ -251,6 +251,15 @@ def summary(a: argparse.Namespace) -> None:
                 "read_precision_unit": r["precision_unit"],
                 "read_precision_pfam": r.get("precision_pfam"),
             }
+        if (sdir / "tier2" / "reads.json").exists():  # tier2.py's calls, scored the same way
+            r = json.loads((sdir / "tier2" / "reads.json").read_text())
+            row |= {
+                "t2_unit_precision": r["cand_unit_precision"],
+                "t2_unit_recall": r["unit_recall"],
+                "t2_read_sensitivity": r["sensitivity"],
+                "t2_read_precision_leaf": r["precision_leaf"],
+                "t2_read_precision_pfam": r.get("precision_pfam"),
+            }
         for ident, got in per.group_by("identity_bin").agg(pl.col(a.strategy).mean()).iter_rows():
             row[f"r{ident}"] = got
         rows.append(row)

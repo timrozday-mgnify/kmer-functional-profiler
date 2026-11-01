@@ -162,9 +162,10 @@ SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM6
 QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed; then
            verify.py: candidates aligned (anchored ungapped scans, tandem repeats masked)
            against each group's representative, their own decoy bar; each read pair's best
-           leaves and a read-level bar
+           leaves and a read-level bar; then tier2.py: each routed read aligned to every
+           leaf of its groups, chunk by chunk along the tree (tier 2)
 SCORE      recall.py score per tier; recall.py reads: candidate and read precision by leaf,
-           group, unit (and Pfam with --pfam), read sensitivity
+           group, unit (and Pfam with --pfam), read sensitivity; the same for tier 2's calls
 SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
            (verify_0.01_nb)
 ```
@@ -213,6 +214,28 @@ Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITIO
 
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
+
+## Tier 2 (`tier2.py`)
+
+A per-sample database over tier 1's candidates, for presence and read classification. Tier 1
+routes each read pair to groups (its aligned pairs within `--route-below` bits of the
+read-level bar); tier 2 aligns it, with `verify.py`'s anchored masked scan, to every leaf of
+those groups, so it reaches the closest member, not only the group's composite. Candidate
+leaves are packed in leaf order (tier 1's tree, so relatives are adjacent and a group is one
+range) into chunks of at most `--chunk-residues`; one streaming pass writes their sequences in
+leaf order, and each chunk reads its range. Scores spill per chunk and are merged per read;
+decoys set the read bar. Outputs match `verify.py`'s names (`reads.parquet`, `verify.json`,
+`cand_verify_<share>.npy`), so `recall.py reads` scores them. Chunking changes memory, not
+results (checked: identical calls at 11 chunks and at one).
+
+```bash
+python workflows/tree-index/tier2.py --index index --members members.parquet \
+    --reads r1.fq.gz r2.fq.gz --query q --out q/tier2
+```
+
+Memory is one chunk's sequences, one batch of pairs (`--batch-pairs`) and the routed reads'
+frames, which `verify.py` saves (`frames_*.parquet`); without them tier 2 recomputes every
+read's frames, its peak (7.6 GB against 0.33 GB on the quarter sample).
 
 ## Querying and reporting (`query.py`, `report.py`)
 
