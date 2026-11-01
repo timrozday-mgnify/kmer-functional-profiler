@@ -14,7 +14,8 @@ leaves apart, so ties are shared, not broken.
    routes every read pair itself: all its twelve frames vote, by protein ``--route-k``-mer
    seeds on one diagonal band (``_core.route_reads``, the candidates' k-mers held more than
    ``--route-max-occ`` times dropped), for its ``--route-top`` leaves with at least
-   ``--route-votes``, joined with tier 1's own routed pairs; ``--route tier1`` uses tier 1's
+   ``--route-votes`` (k and votes from the candidates' size by default: :func:`route_k`), joined
+   with tier 1's own routed pairs; ``--route tier1`` uses tier 1's
    pairs alone, each leaf expanded to its group.
 2. **Chunks along the tree.** Candidate leaves in leaf order (tier 1's merge-tree order, so
    relatives are adjacent and a chunk is a contiguous range) are packed into chunks of at most
@@ -64,6 +65,8 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import query
 import store as leaf_store_mod
 import verify
@@ -185,33 +188,43 @@ def routed_frames(
 
 def all_frames(reads: list[str], dst: Path, batch: int = 100_000) -> int:
     """Every read pair's twelve frames (both mates' six), masked and joined by stops, to
-    ``dst`` (read, frames), streamed in batches; returns the read pairs."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    writer, n, rows = None, 0, []
+    ``dst`` (read, frames), a batch at a time (``_core.pair_frames``, in parallel); returns the
+    read pairs."""
+    writer, n, m1, m2 = None, 0, [], []
 
     def flush() -> None:
-        nonlocal writer
-        t = pa.table({"read": pa.array([r for r, _ in rows], pa.int64()),
-                      "frames": pa.array([f for _, f in rows], pa.binary())})  # fmt: skip
+        nonlocal writer, n
+        frames = _core.pair_frames(m1, m2)
+        t = pa.table({"read": pa.array(np.arange(n, n + len(frames)), pa.int64()),
+                      "frames": pa.array(frames, pa.binary())})  # fmt: skip
         writer = writer or pq.ParquetWriter(dst, t.schema)
         writer.write_table(t)
-        rows.clear()
+        n += len(frames)
+        m1.clear()
+        m2.clear()
 
     with gzip.open(reads[0], "rb") as f, gzip.open(reads[1], "rb") as g:
         for i, (x, y) in enumerate(zip(f, g, strict=True)):
             if i % 4 == 1:
-                fr = _core.translate_frames(x.strip()) + _core.translate_frames(y.strip())
-                rows.append((n, verify.mask(b"*".join(fr))))
-                n += 1
-                if len(rows) >= batch:
+                m1.append(x.strip())
+                m2.append(y.strip())
+                if len(m1) >= batch:
                     flush()
-    if rows or writer is None:
+    if m1 or writer is None:
         flush()
     if writer:
         writer.close()
     return n
+
+
+ROUTE_CHANCE = 5_000  # chance seed hits per read routing aims at (the quarter sample's, k 5)
+
+
+def route_k(residues: int, read_kmers: int = 600) -> int:
+    """The routing k for a candidate database: chance seed hits per read, read_kmers x residues
+    / 20^k, near :data:`ROUTE_CHANCE` (k 5 at the quarter sample's 2.5 x 10^7 residues, 6 at
+    6 x 10^8), as ``build.layer_k`` sizes tier 1's layer."""
+    return int(np.clip(round(math.log(read_kmers * max(residues, 1) / ROUTE_CHANCE, 20)), 4, 7))
 
 
 def dense_pairs(
@@ -340,8 +353,9 @@ def main() -> None:
     p.add_argument("--method", choices=["anchored", "gapped"], default="gapped")
     p.add_argument("--route", choices=["dense", "tier1"], default="dense",
                    help="dense: every read by seed votes; tier1: its pairs")  # fmt: skip
-    p.add_argument("--route-k", type=int, default=5)
-    p.add_argument("--route-votes", type=int, default=4)
+    p.add_argument("--route-k", type=int, default=0, help="0: from the candidates' size")
+    p.add_argument("--route-votes", type=int, default=0,
+                   help="0: 4 at k <= 5, 3 at k >= 6 (a longer seed survives less)")  # fmt: skip
     p.add_argument("--route-top", type=int, default=16)
     p.add_argument("--route-max-occ", type=int, default=2000)
     p.add_argument("--read-batch", type=int, default=200_000)
@@ -393,6 +407,11 @@ def main() -> None:
         "residues": int(length[leaves].sum()),
         "route_floor": floor,
     }
+    if not a.route_k:
+        a.route_k = route_k(int(length[leaves].sum()))
+    if not a.route_votes:  # fresh sample at k 6: 3 votes keep 0.60 at 70%, 4 drop it to 0.55
+        a.route_votes = 4 if a.route_k <= 5 else 3
+    info |= {"route_k": a.route_k, "route_votes": a.route_votes}
     # sequences: the index's leaf-ordered store (store.py) read by position, else one streaming
     # pass over the members writing the candidates' in leaf order
     if a.store:

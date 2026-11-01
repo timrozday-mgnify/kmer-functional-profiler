@@ -52,3 +52,7 @@ def test_read_scoring_pools_small_depth_bins() -> None:
     assert recall.merge_bins([5, 5], 30) == [0, 0]  # too few anywhere: one pool
     m, lo, hi = recall.mean_ci(np.array([0.0, 1.0] * 50))
     assert m == 0.5 and lo < 0.5 < hi
+
+
+def test_route_k_grows_with_the_candidates() -> None:
+    assert [tier2.route_k(int(r)) for r in (2.5e7, 6e8, 1e12)] == [5, 6, 7]

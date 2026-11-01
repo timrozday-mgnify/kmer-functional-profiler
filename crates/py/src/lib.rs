@@ -886,6 +886,30 @@ fn route_reads<'py>(
     Ok((r.into_pyarray(py), l.into_pyarray(py), v.into_pyarray(py)))
 }
 
+/// Each read pair's twelve frames (both mates' six), tandem repeats masked, joined by stops
+/// (kfp::pair_frames), in parallel.
+#[pyfunction]
+#[pyo3(signature = (r1, r2, genetic_code = 11))]
+fn pair_frames<'py>(
+    py: Python<'py>,
+    r1: Vec<PyBackedBytes>,
+    r2: Vec<PyBackedBytes>,
+    genetic_code: u8,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    if r1.len() != r2.len() {
+        return Err(to_py_err(Error::LengthMismatch));
+    }
+    let code = genetic_code.try_into().map_err(to_py_err)?;
+    let got = py.detach(|| kfp::pair_frames(&r1, &r2, code));
+    Ok(got.iter().map(|f| PyBytes::new(py, f)).collect())
+}
+
+/// Tandem repeats masked as `x` (kfp::mask_repeats; tier 1's `verify.mask`).
+#[pyfunction]
+fn mask_repeats<'py>(py: Python<'py>, seq: &[u8]) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &kfp::mask_repeats(seq))
+}
+
 /// Features each representative's sketch stores (as `pseudo_align` builds it).
 #[pyfunction]
 #[pyo3(signature = (reps, method, k, classes, sketch=(1, 1, 1), gap=(8, 1)))]
@@ -931,6 +955,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pseudo_align, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_sketch_sizes, m)?)?;
     m.add_function(wrap_pyfunction!(route_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_frames, m)?)?;
+    m.add_function(wrap_pyfunction!(mask_repeats, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     m.add_class::<PyDiamondReader>()?;

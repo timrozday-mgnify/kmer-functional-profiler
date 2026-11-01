@@ -1229,3 +1229,15 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 
     At 6.7% of the store the scan is fastest (the per-row decode, ~3–4 µs, dominates the stores); at release candidates are ~0.04% of the leaves, where a scan reads everything, parquet every row group a candidate falls in (cheap only when candidates cluster) and flat only the candidates' own pages. Flat is the default (~1× the residues on disk, ~1.6 TB at release; parquet ~0.55×).
   - Checked: on the quarter sample `verify.rep_seqs` returns the same 20,000 representatives from a flat store as from the members; the test profile's `bench.tsv` is unchanged through the store (both formats).
+- **Tier 2 speed-ups (2026-11-01, the user's request).**
+  - **Frames in Rust:** `_core.pair_frames` (both mates' six frames, `_core.mask_repeats`, joined by stops, in parallel) and `verify.mask` now calls `_core.mask_repeats`. Identical to the Python on 100 k real read pairs and 20,000 repeat-heavy sequences; 12× faster (0.24 s against 2.8 s per 100 k pairs, 2 threads); tier 2's frames step on the pooled sample 9.3 → 1.4 s per side.
+  - **Routing k and votes from the candidates' size** (`tier2.route_k`, `--route-k 0`, `--route-votes 0`): chance seed hits per read, ~600 × residues / 20^k, held near the quarter sample's ~5,000 (k 5 at 2.5 × 10⁷ residues, 6 at 6 × 10⁸, 7 beyond); 4 votes at k ≤ 5, 3 at k ≥ 6. Measured by forcing k 6 on the quarter sample (where auto gives 5): pooled sample routing 65 → 17 s, pairs 6.0 → 3.9 M, the run 388 → 188 s, read recall 0.823 → 0.809; fresh sample, by identity (100 / 90 / 80 / 75 / 70%):
+
+    | Routing | Read recall | Precision | by identity | Routing time |
+    | --- | --- | --- | --- | --- |
+    | k 5, 4 votes | 0.840 | 0.996 | 0.97 / 0.91 / 0.76 / 0.66 / 0.63 | 5.7 s |
+    | k 6, 4 votes | 0.821 | 0.996 | 0.98 / 0.90 / 0.76 / 0.61 / 0.55 | 3.1 s |
+    | k 6, 3 votes | 0.832 | 0.997 | 0.97 / 0.91 / 0.76 / 0.64 / 0.60 | 3.0 s |
+
+    At 6 × 10⁸ residues, 3 chance votes in one (leaf, band) cell is ~5 × 10⁻⁶ per read.
+  - **Estimate for a real sample** (10 M read pairs, 2 M candidate leaves, ~6 × 10⁸ residues, so k 6 and 3 votes; linear from the quarter sample, not measured): store read seconds to minutes (flat); frames ~1 min per side (gzip line reading in Python now dominates); routing ~240 µs per read on 2 threads at the quarter's k-5 chance level, ~80 min for both sides, ~5 min on 32 cores; gapped alignment ~1.5 × 10⁸ pairs at ~22 k pairs/s per 2 threads, ~2 h, ~8 min on 32 cores. In all ~15–20 min on 32 cores (~3–4 h on 2 threads), against ~1–2.5 h on 32 cores before (k 5 routing and a full members scan). Alignment is now the largest part: anchored first, gapped near the bar, is the next saving.

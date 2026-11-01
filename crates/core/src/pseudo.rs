@@ -320,6 +320,71 @@ pub fn pseudo_scores<S: AsRef<[u8]> + Sync>(
     out
 }
 
+/// `seq` with tandem repeats masked as `x`: at each position the shortest period (1-3) with at
+/// least four copies there, all its copies (leftmost first, as the regex
+/// `(.{1,3}?)\1{3,}` substitutes; tier 1's `verify.mask`).
+pub fn mask_repeats(seq: &[u8]) -> Vec<u8> {
+    let mut out = seq.to_vec();
+    let mut i = 0;
+    while i < seq.len() {
+        let mut run = 0;
+        for u in 1..=3 {
+            if i + 4 * u > seq.len() {
+                break;
+            }
+            let mut copies = 1;
+            while i + (copies + 1) * u <= seq.len()
+                && seq[i + copies * u..i + (copies + 1) * u] == seq[i..i + u]
+            {
+                copies += 1;
+            }
+            if copies >= 4 {
+                run = copies * u;
+                break;
+            }
+        }
+        if run > 0 {
+            out[i..i + run].fill(b'x');
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A read pair's twelve frames (each mate's six, forward then reverse), masked and joined by
+/// stops, for each pair (`r1[i]`, `r2[i]`), in parallel: what tier 2 aligns and routes.
+pub fn pair_frames<S: AsRef<[u8]> + Sync>(
+    r1: &[S],
+    r2: &[S],
+    code: crate::GeneticCode,
+) -> Vec<Vec<u8>> {
+    let n = r1.len().min(r2.len());
+    let mut out = vec![Vec::new(); n];
+    let per_thread = n.div_ceil(threads()).max(1);
+    std::thread::scope(|scope| {
+        for (t, chunk) in out.chunks_mut(per_thread).enumerate() {
+            scope.spawn(move || {
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    let i = t * per_thread + k;
+                    let mut joined = Vec::new();
+                    for mate in [r1[i].as_ref(), r2[i].as_ref()] {
+                        for f in crate::six_frames(mate, code) {
+                            if !joined.is_empty() {
+                                joined.push(b'*');
+                            }
+                            joined.extend_from_slice(&f);
+                        }
+                    }
+                    *o = mask_repeats(&joined);
+                }
+            });
+        }
+    });
+    out
+}
+
 /// Dense routing for tier 2 (Progress log: tier 2, dense routing): every read's candidate
 /// leaves by seed votes. `leaves`' k-mers (all of them, `p`'s k and classes) are indexed,
 /// those held more than `max_occ` times dropped; each read votes, each of its positions once
@@ -464,6 +529,10 @@ mod tests {
         let one = |method| pseudo_scores(&[del], &[long], &[0], &[0], &params(method), &m)[0];
         assert_eq!(one(Method::Anchored), 20); // the longer side only
         assert_eq!(one(Method::Gapped), 2 * 19 - 12);
+        // repeats: the shortest period with four copies, as verify.mask
+        assert_eq!(mask_repeats(b"MKVLTHTHTHTHAQ"), b"MKVLxxxxxxxxAQ");
+        assert_eq!(mask_repeats(b"MKVAAAAGCVCVCVCVQ"), b"MKVxxxxGxxxxxxxxQ");
+        assert_eq!(mask_repeats(b"GCVCVCVCQ"), b"GCVCVCVCQ");
         // dense routing: the read votes for the leaf sharing its diagonal, not the other
         let (r, l, v) = route_votes(&[read], &[other, rep], &params(Method::Diag), 2, 4, 100);
         assert_eq!((r, l, v), (vec![0], vec![1], vec![6]));

@@ -53,8 +53,9 @@ AMINO = b"ACDEFGHIKLMNPQRSTVWY"
 
 
 def mask(seq: bytes) -> bytes:
-    """``seq`` with tandem repeats (period 1-3, >= 4 copies) as ``x`` (no class, -20)."""
-    return REPEAT.sub(lambda m: b"x" * len(m.group(0)), seq)
+    """``seq`` with tandem repeats (period 1-3, >= 4 copies) as ``x`` (no class, -20): the
+    Rust kernel's (``_core.mask_repeats``), which substitutes as :data:`REPEAT` does."""
+    return _core.mask_repeats(seq)
 
 
 def protein_classes() -> bytes:
