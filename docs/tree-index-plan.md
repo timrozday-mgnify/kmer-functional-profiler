@@ -1126,3 +1126,38 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - `verify.py`: tandem repeats masked (`verify.mask`) in frames and representatives; `--method anchored` (default; protein 4-mers, minimizers of 8, two bands) or `full`; representatives are each layer group's (`layer_group.npy`); writes `reads.parquet` (each read pair's best leaves) and `read_bar_<share>`. On the quarter sample it reproduces the trial: standard 0.87 / 0.82 / 0.71 / 0.64 / 0.58 at 90–70% (182 k pairs/s, 2 threads), large 1.00 / 0.98 / 0.95 / 0.90 / 0.82, slim 0.62 / 0.43 / 0.35 / 0.31 / 0.29; masking costs no leaf-level recall.
   - `recall.py reads`: candidate precision (leaf, in-unit, units), read sensitivity and precision by leaf, group, unit and Pfam (`--pfam`); `build.nf`'s SCORE runs it and `bench.tsv` carries `unit_precision`, `read_sensitivity`, `read_precision_unit`, `read_precision_pfam`. Quarter sample: read sensitivity slim 0.21, standard 0.58, large 0.86 (all identities); unit precision 0.999; candidate units 62% / 70% / 58% true.
   - `slice.py` and `build.nf --slice_store --slice_pfam`: FAMILIES (40 Pfam families of 20 k–150 k proteins, a seeded hash order), TAKE per members bucket (whole clusters holding one of their proteins), SLICE. HPC run: `hpc/kfp-ablations/tree-index-slice/run.sh` (release-tiers' buckets and `pfam.parquet`). `tree-index-build/run.sh` now passes the 1-in-100 subset's Pfam table. Both paths pass the test profile.
+- **Tree-aware sampling: where layer keys go (2026-11-01, the user's request).** Quarter sample, verify.py (anchored, masked), recall at depth > 1 (`verify_0.01_nb`), read sensitivity from `recall.py reads`.
+  - **Where postings go** (standard, slim base + window 64): the layer is 64% (448 k of 700 k), 99.8% of it single positions (group representatives, ~5.3 keys each, 20–30 bits); the base is ~1 posting per leaf, 76% private, ≥ 40 bits. Pruning low-bit base keys could save < 8% of the base; the layer is the lever.
+  - **A detection model.** A strain is detected when one of its reads holds a surviving key: expected seed events ≈ K × depth × identity^k (K keys on its group's composite, k 6), so P(detect) ≈ 1 − e^(−K d x^k). Standard: K 5.3, x 0.8, d 1 → 0.75 predicted, 0.71 measured. Detection depends on the count K, not density, so a fixed window spends keys in proportion to length; read classification needs density.
+  - **Options considered** (tree structure and detection limits):
+    1. per-group key counts from the detection model (`count:<K>`: K from a target identity, depth and detection probability);
+    2. per-group counts weighted by the group's size m (the chance a sample's strain falls in the group, under a prior over proteins): K_g ∝ 1 + ln m, ∝ sqrt m;
+    3. the composite taken from a dense window, then thinned (members' rarest k-mers agree more in short windows);
+    4. layer k from survival against chance (k 5 survives more, 5× pairs to align);
+    5. pruning keys whose bits cannot pass a bar alone (base: < 8% of postings, not tried);
+    6. adaptive group cuts by an information criterion (merge where a composite still serves members at the target identity; `tree:0.83` against `0.57` showed no saving, not pursued);
+    7. clade-cost sampling of the base (a key gained at a clade of m leaves costs 1/m per leaf: rates rising with m; the base is ~1 per leaf, not pursued).
+  - **Trials** (layer keys thinned post hoc from a window-16 composite, `thin.py`, or built with `build.py --layer-keys`):
+
+    | Layer | ×S3 | r 90% | r 85% | r 80% | r 75% | r 70% | read sens. | at 90 / 80 / 70% |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | window 64 (standard until now) | 1.11 | 0.87 | 0.82 | 0.71 | 0.64 | 0.58 | 0.58 | 0.68 / 0.44 / 0.26 |
+    | window 64, k 5 | 1.02 | 0.89 | 0.84 | 0.74 | 0.68 | 0.64 | 0.62 | 0.70 / 0.52 / 0.32 (5× pairs) |
+    | w16 thinned: uniform | 1.13 | 0.93 | 0.86 | 0.78 | 0.68 | 0.63 | 0.66 | 0.80 / 0.53 / 0.32 |
+    | w16: fixed K | 1.13 | 0.94 | 0.88 | 0.78 | 0.65 | 0.60 | 0.52 | 0.65 / 0.38 / 0.17 |
+    | w16: K ∝ 1 + ln m | 1.13 | 0.97 | 0.90 | 0.86 | 0.73 | 0.67 | 0.66 | 0.82 / 0.55 / 0.28 |
+    | w16: K ∝ sqrt m (built, `sqrt:5.27`) | 1.11 | 0.97 | 0.90 | 0.85 | 0.74 | 0.67 | 0.70 | 0.84 / 0.61 / 0.37 |
+    | w16: uniform, half | 0.77 | 0.85 | 0.78 | 0.69 | 0.58 | 0.54 | 0.53 | 0.66 / 0.37 / 0.19 |
+    | w16: fixed K, half | 0.77 | 0.87 | 0.75 | 0.65 | 0.52 | 0.49 | 0.40 | 0.49 / 0.25 / 0.10 |
+    | w16: log, half | 0.77 | 0.91 | 0.82 | 0.72 | 0.60 | 0.58 | 0.52 | 0.66 / 0.37 / 0.17 |
+    | w16: `sqrt:2.0` | 0.67 | 0.88 | 0.78 | 0.67 | 0.58 | 0.54 | 0.53 | 0.67 / 0.40 / 0.20 |
+    | **w16: `sqrt:2.63`** | **0.75** | 0.91 | 0.82 | 0.73 | 0.62 | 0.58 | 0.57 | 0.72 / 0.45 / 0.25 |
+    | w16: `count:9` (detection target 80%, depth 1, 0.9) | 1.40 | 0.96 | 0.91 | 0.84 | 0.73 | 0.66 | 0.59 | 0.74 / 0.45 / 0.22 |
+    | w16: `sqrt:10.5` | 1.81 | 0.99 | 0.96 | 0.92 | 0.86 | 0.77 | 0.80 | 0.92 / 0.75 / 0.50 |
+    | w16: `sqrt:14` | 2.28 | 1.00 | 0.97 | 0.93 | 0.88 | 0.81 | 0.84 | 0.93 / 0.80 / 0.55 |
+    | **w8: `sqrt:14`** | **2.28** | 1.00 | 0.99 | 0.94 | 0.91 | 0.86 | 0.85 | 0.93 / 0.81 / 0.61 |
+    | w16, no thinning (slim base) | 3.05 | 1.00 | 0.97 | 0.93 | 0.90 | 0.82 | 0.86 | 0.94 / 0.83 / 0.57 |
+    | w16 on S3's base (large until now) | 3.67 | 1.00 | 0.98 | 0.95 | 0.90 | 0.82 | 0.86 | 0.94 / 0.84 / 0.58 |
+
+  - Reading: (3) composite-then-thin beats a wide window at equal postings by 4–7 points; (2) weighting by group size gains another 5–8 at 80–70% (sqrt best, also for reads); fixed K helps detection at high identity but loses read sensitivity (long proteins too sparse), as the model says. The benchmark's targets are uniform over proteins, so groups are hit in proportion to m: the weighting fits this prior by construction; real samples are skewed towards abundant families (likely larger groups), untested. k 5 gains 3–6 points at 5× pairs aligned.
+  - **Tiers, one size down (the user's choice: keep the scores, smaller indexes).** `--mode standard`: slim's base + `protein:{k}:16:rare` on `tree:0.57` composites + `--layer-keys sqrt:2.6` (0.75×; the previous standard's scores at two-thirds of its postings; ~195–215 GB at release with `layer_group` and offsets). `--mode large`: the same at window 8 + `sqrt:14` (2.28×; the previous large's scores, +4 at 70%, at 62% of its postings; ~360–415 GB). Slim unchanged. `build.py --layer-keys <rule>:<mean>` (`build.allocate`); the HPC run keeps prev-std and prev-large to compare.

@@ -92,7 +92,7 @@ cd kfp-ablations/presence-calibration && sbatch run.sh
 # whole-release streaming counts, and the gate against today's standard tier:
 cd kfp-ablations/tree-index-phase0 && sbatch run.sh
 # tree index on the 1-in-100 subset, built in parts: the slim, standard and large tiers (plus
-# base, no layer, the previous standard and the first), each benchmarked on BLOSUM62 strains
+# base, no layer, and the previous standard and large), each benchmarked on BLOSUM62 strains
 # at 100-70% identity, aligned (results/bench.tsv; Pfam precision from the subset's table):
 cd kfp-ablations/tree-index-build && sbatch run.sh
 # the tiers on a family-complete slice (every unit of 40 Pfam families; needs release-tiers'

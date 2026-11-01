@@ -190,12 +190,12 @@ store, which alignment reads):
 | Tier | `build.py` | Recall at depth > 1 (quarter sample) | ~Release |
 | --- | --- | --- | --- |
 | `slim` | `--mode slim`: *n\_1* 1, ~2 spread minimizers, k 7 for < 16 informative 11-mers | 0.93 at 100%, 0.81 at 95%, 0.62 at 90% | 120–130 GB (75–90 GB without the neighbour rule's edges) |
-| `standard` | `--mode standard`: slim's base plus the rarest protein k-mer per window of 64 (`protein:{k}:64:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), then `verify.py` | 0.87 at 90%, 0.71 at 80%, 0.58 at 70% | ~235–260 GB |
-| `large` | `--mode large`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the layer at window 16 | 0.99 at 90%, 0.95 at 80%, 0.82 at 70% | ~505–600 GB |
+| `standard` | `--mode standard`: slim's base plus the rarest protein k-mer per window of 16 (`protein:{k}:16:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), thinned to ~2.6 keys per group in proportion to the square root of its members (`--layer-keys sqrt:2.6`), then `verify.py` | 0.91 at 90%, 0.73 at 80%, 0.58 at 70% | ~195–215 GB |
+| `large` | `--mode large`: the layer at window 8, ~14 keys per group (`sqrt:14`) | 1.00 at 90%, 0.94 at 80%, 0.86 at 70% | ~360–415 GB |
 
 `{k}` in `--layers` is `build.layer_k`: ~24 chance bits on the quarter sample (k 6) plus log2 of
-the database's size over it, so k 8 on the 1-in-100 subset. `--mode large --layers ''` is
-the old standard tier without a layer (S3, ~185–210 GB). `query.py --mode precision` skips
+the database's size over it, so k 8 on the 1-in-100 subset. `--mode standard --layers '' --n-1 2 --window-min 2 --min-kmers 32`
+is the old standard tier without a layer (S3, ~185–210 GB). `query.py --mode precision` skips
 layers, which are not yet tested for precision or F1. Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.

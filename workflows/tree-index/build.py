@@ -98,6 +98,10 @@ def postings(
             extra["pos"][-1], extra["h"][-1] = on_reps(
                 group, extra["pos"][-1], extra["h"][-1], a.layer_rep
             )
+            if a.layer_keys:
+                extra["pos"][-1], extra["h"][-1] = allocate(
+                    group, extra["pos"][-1], extra["h"][-1], a.layer_keys
+                )
     pos = np.concatenate([tree.pos[keep], *extra["pos"]])
     h = np.concatenate([tree.h[keep], *extra["h"]])
     leaf = lay["order"][pos]
@@ -233,6 +237,37 @@ def on_reps(
         out = df.filter(pl.col("pos") == rep_of).select("pos", "h")
     group[:] = rep[group]
     return out["pos"].to_numpy().astype(np.int64), out["h"].to_numpy()
+
+
+ALLOC: Final = ("uniform", "fixed", "log", "sqrt")
+
+
+def allocate(
+    group: NDArray[np.int64], pos: NDArray[np.int64], h: NDArray[np.uint64], spec: str
+) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
+    """A layer's keys on representatives thinned to ``<rule>:<mean>`` keys per group (Progress
+    log: tree-aware sampling): each representative keeps K_g of its n_g keys, the least
+    hashes (at random), K_g in proportion to n_g (``uniform``), 1 (``fixed``), 1 + ln m_g
+    (``log``) or sqrt m_g (``sqrt``), m_g the group's members, scaled so the K_g average
+    ``mean``; a representative with fewer keys than its share passes the rest on."""
+    rule, mean = spec.split(":")
+    o = np.lexsort((h, pos))
+    pos, h = pos[o], h[o]
+    reps, first, n = np.unique(pos, return_index=True, return_counts=True)
+    m = np.bincount(group, minlength=len(group))[reps].astype(np.float64)
+    w = {"uniform": n.astype(np.float64), "fixed": np.ones_like(m), "log": 1 + np.log(m),
+         "sqrt": np.sqrt(m)}[rule]  # fmt: skip
+    budget = float(mean) * len(reps)
+    want = w * budget / w.sum()
+    for _ in range(20):  # capped representatives' spare goes to the rest, by weight
+        free = want < n
+        spare = budget - np.minimum(want, n).sum()
+        if spare < 1 or not free.any():
+            break
+        want = np.where(free, want + spare * w / w[free].sum(), n)
+    k = np.minimum(n, np.floor(want + np.random.default_rng(1).random(len(n)))).astype(np.int64)
+    keep = (np.arange(len(pos)) - np.repeat(first, n)) < np.repeat(k, n)
+    return pos[keep], h[keep]
 
 
 def add_step(
@@ -441,20 +476,26 @@ def holdings(index: Path) -> pl.DataFrame:
 # standard and large add one layer of the rarest protein k-mer per window on every leaf.
 MODES: Final[dict[str, dict[str, Any]]] = {
     "slim": {"n_1": 1, "window_min": 1, "min_kmers": 16, "layers": ""},
-    # layers on spanning-tree groups' composites (Progress log: layer representatives, a
-    # middle tier), for query.py then verify.py (rough alignment); standard on slim's base
+    # slim's base plus a layer on spanning-tree groups' composites, each group's keys thinned
+    # in proportion to sqrt of its members (Progress log: tree-aware sampling), for query.py
+    # then verify.py (rough alignment)
     "standard": {
         "n_1": 1,
         "window_min": 1,
         "min_kmers": 16,
-        "layers": "protein:{k}:64:rare",
-        "layer_groups": "tree:0.57",
-        "layer_rep": "composite:0.25",
-    },
-    "large": {
         "layers": "protein:{k}:16:rare",
         "layer_groups": "tree:0.57",
         "layer_rep": "composite:0.25",
+        "layer_keys": "sqrt:2.6",
+    },
+    "large": {
+        "n_1": 1,
+        "window_min": 1,
+        "min_kmers": 16,
+        "layers": "protein:{k}:8:rare",
+        "layer_groups": "tree:0.57",
+        "layer_rep": "composite:0.25",
+        "layer_keys": "sqrt:14",
     },
 }
 
@@ -503,10 +544,10 @@ def main() -> None:
     parser.add_argument(
         "--mode", choices=list(MODES), default="standard",
         help="slim: one posting per leaf where possible, no layer (~100-130 GB at release); "
-        "standard: slim's base plus a protein layer at window 64 on group composites (tree:0.57, "
-        "composite:0.25), with verify.py ~0.71 recall at 80%% identity (~235-260 GB); large: "
-        "the n_1 2 base plus the layer at window 16 (~0.83 at 70%%, ~505-600 GB). Options given "
-        "explicitly win",
+        "standard: slim's base plus a protein layer (window 16) on group composites (tree:0.57, "
+        "composite:0.25), ~2.6 keys per group by sqrt of its members; with verify.py ~0.73 "
+        "recall at 80%% identity (~195-215 GB); large: the layer at window 8, ~14 keys per "
+        "group (~0.94 at 80%%, ~0.86 at 70%%; ~360-415 GB). Options given explicitly win",
     )  # fmt: skip
     parser.add_argument(
         "--window-min", type=int, default=2,
@@ -530,6 +571,12 @@ def main() -> None:
         help="with --layer-groups: medoid, central or longest (build.PICKS: that member's own "
         "k-mers) or composite:<f>[:<pick>] (k-mers of at least a share f of the group's "
         "members, on the pick)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--layer-keys", default="",
+        help="with --layer-groups: <rule>:<mean>, each group's layer keys thinned to an "
+        "average of mean, K_g by rule (build.ALLOC: uniform, fixed, log or sqrt of the "
+        "group's members); '' keeps all",
     )  # fmt: skip
     parser.set_defaults(**MODES[parser.parse_known_args()[0].mode])
     a = parser.parse_args()

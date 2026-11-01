@@ -292,13 +292,13 @@ def test_rare_windows_break_ties_by_hash() -> None:
 
 
 def test_default_modes_query_soundly(tmp_path: Path) -> None:
-    """The tiers (slim: one posting per leaf where possible; standard: that plus a protein
-    layer on spanning-tree groups' composites; large: the n_1 2 base and a denser layer; k from
-    the database's size): covers sum to 0 or 1, and the query and report checks hold against
+    """The tiers (slim: one posting per leaf where possible; standard and large: that plus a
+    protein layer on spanning-tree groups' composites, thinned by group size; k from the
+    database's size): covers sum to 0 or 1, and the query and report checks hold against
     brute force, the layer's k-mers included."""
     assert [build.layer_k(n) for n in (320, 262_391, 53_000_000)] == [5, 6, 8]
     members = fixture(tmp_path)
-    layers = {"slim": "", "standard": "protein:5:64:rare", "large": "protein:5:16:rare"}
+    layers = {"slim": "", "standard": "protein:5:16:rare", "large": "protein:5:8:rare"}
     for mode, want in layers.items():
         idx = tmp_path / f"idx-{mode}"
         run(
@@ -306,7 +306,7 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         )
         meta = json.loads((idx / "meta.json").read_text())
         assert meta["params"]["layers"] == want
-        assert meta["params"]["n_1"] == (2 if mode == "large" else 1)
+        assert meta["params"]["n_1"] == 1
         assert (idx / "layer_group.npy").exists() == bool(want)
         codes = set(np.load(idx / "key_k.npy").tolist())
         assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
@@ -355,3 +355,19 @@ def test_layer_on_reps() -> None:
         p, hh = build.on_reps(group, pos, h, rule)
         assert set(zip(p.tolist(), hh.tolist(), strict=True)) == want, rule
         assert group.tolist() == [rep, rep, rep, 3]
+
+
+def test_allocate_layer_keys() -> None:
+    """Each representative keeps its least hashes; the K_g average the mean, follow the rule
+    (sqrt: more to bigger groups) and never exceed a representative's keys (the spare moves)."""
+    group = np.array([0, 0, 0, 0, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5])  # reps 0 (m 4), 4 (1), 5 (9)
+    pos = np.repeat([0, 4, 5], [10, 2, 10])
+    h = np.arange(22, dtype=np.uint64)[::-1].copy()
+    got_pos, got_h = build.allocate(group, pos, h, "sqrt:4")
+    k = np.bincount(got_pos, minlength=6)[[0, 4, 5]]
+    assert k.sum() == 12 and k[1] <= 2 and k[2] > k[0] > k[1]
+    for r in (0, 4, 5):  # the least hashes of each
+        mine = np.sort(h[pos == r])
+        assert set(got_h[got_pos == r]) == set(mine[: k[[0, 4, 5].index(r)]])
+    k = np.bincount(build.allocate(group, pos, h, "fixed:4")[0], minlength=6)[[0, 4, 5]]
+    assert k.tolist() == [5, 2, 5]  # rep 4 holds 2: its spare split between the others
