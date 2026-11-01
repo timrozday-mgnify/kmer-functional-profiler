@@ -56,3 +56,20 @@ def test_read_scoring_pools_small_depth_bins() -> None:
 
 def test_route_k_grows_with_the_candidates() -> None:
     assert [tier2.route_k(int(r)) for r in (2.5e7, 6e8, 1e12)] == [5, 6, 7]
+
+
+def test_two_stage_rescores_only_the_pairs_that_matter() -> None:
+    import verify
+
+    long = b"MKVLATWQPRGHEWRSPQDNCEFYKLMNRSTV" * 2  # rep
+    deleted = long[:32] + long[33:]  # a residue missing mid-read: gapped bridges it
+    other = b"HHHHPPPPGGGG" * 3  # nothing in common: under the floor
+    frames = {0: deleted, 1: other}
+    seqs = {7: long}
+    pairs = pl.DataFrame({"read": [0, 1], "pos": [7, 7]})
+    m = verify.blosum62()
+    two = tier2.align_chunk(pairs, frames, seqs, m, 100, "two-stage").sort("read")
+    gapped = tier2.align_chunk(pairs, frames, seqs, m, 100, "gapped").sort("read")
+    anchored = tier2.align_chunk(pairs, frames, seqs, m, 100, "anchored").sort("read")
+    assert two["score"][0] == gapped["score"][0] > anchored["score"][0]
+    assert two["score"][1] <= gapped["score"][1]  # below the floor: a lower bound, not rescored

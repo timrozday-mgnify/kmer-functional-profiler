@@ -24,9 +24,10 @@ leaves apart, so ties are shared, not broken.
    without one from one streaming pass over ``--members`` that writes them in leaf order. A
    layer group is a single-linkage cluster of the tree, so one contiguous range: the work list
    splits by chunk once, each group in one chunk or two.
-3. **Alignment per chunk** (``--method``: ``gapped``, the default, banded
-   Smith-Waterman with affine gaps around the anchored seeds, or ``anchored``, ungapped and ~4x
-   faster), in batches of at most
+3. **Alignment per chunk** (``--method``: ``two-stage``, the default: every pair ``anchored``,
+   ungapped, then ``gapped``, banded Smith-Waterman with affine gaps around the same seeds, for
+   the pairs at least ``--gapped-floor`` bits and within ``--gapped-margin`` of their read's
+   best; or either alone), in batches of at most
    ``--batch-pairs`` pairs, each batch's scores spilled to ``--out``/spill/; then a read-level
    bar at each ``--shares`` where decoy reads called are at most that share of the sample's.
 4. **Read classification, ambiguity kept.** A read pair's hits within ``--ambiguous-bits`` of
@@ -242,6 +243,29 @@ def dense_pairs(
     return pl.DataFrame({"read": frames["read"].to_numpy()[r], "pos": pos[leaf]})
 
 
+def _raw(
+    b: pl.DataFrame,
+    frames: dict[int, bytes],
+    seqs: dict[int, bytes],
+    matrix: NDArray[np.int8],
+    method: str,
+) -> NDArray[np.float64]:
+    """Raw scores of each (read, pos) of ``b`` by ``method`` (anchored or gapped), passing the
+    kernel only these reads' frames and leaves' sequences."""
+    reads, ri = np.unique(b["read"].to_numpy(), return_inverse=True)
+    pos, pi = np.unique(b["pos"].to_numpy(), return_inverse=True)
+    return _core.pseudo_align(
+        [frames[r] for r in reads], [seqs[p] for p in pos.tolist()],
+        ri.astype(np.uint32), pi.astype(np.uint32), method, 4, verify.protein_classes(),
+        matrix, sketch=(8, 1, 8), band=8, gap=(8, 1), top=2,
+    ).astype(np.float64)  # fmt: skip
+
+
+def bits(raw: NDArray[np.float64] | pl.Expr, gapped: bool) -> NDArray[np.float64] | pl.Expr:
+    lam, k = (GAPPED_LAMBDA, GAPPED_K) if gapped else (verify.LAMBDA, verify.K)
+    return (lam * raw - math.log(k)) / math.log(2)
+
+
 def align_chunk(
     pairs: pl.DataFrame,
     frames: dict[int, bytes],
@@ -249,23 +273,30 @@ def align_chunk(
     matrix: NDArray[np.int8],
     batch: int,
     method: str = "anchored",
+    floor: float = 20.0,
+    margin: float = 6.0,
 ) -> pl.DataFrame:
-    """(read, pos, score) for a chunk's pairs, ``batch`` pairs at a time: each batch passes
-    only its own reads' frames and leaves' sequences to the kernel."""
-    lam, k = (GAPPED_LAMBDA, GAPPED_K) if method == "gapped" else (verify.LAMBDA, verify.K)
+    """(read, pos, score: bits) for a chunk's pairs, ``batch`` pairs at a time. ``two-stage``:
+    every pair anchored (ungapped, ~4x faster), then gapped for the pairs that could matter
+    (anchored at least ``floor`` bits and within ``margin`` of the read's best in the batch);
+    all on the gapped statistics, so one scale: a gapped raw score is never below the ungapped
+    one, so an anchored pair's gapped bits from its ungapped raw score are a lower bound."""
     out = []
     pairs = pairs.sort("pos", "read")  # one sketch per run of a leaf
     for start in range(0, pairs.height, batch):
-        b = pairs.slice(start, batch)
-        reads, ri = np.unique(b["read"].to_numpy(), return_inverse=True)
-        pos, pi = np.unique(b["pos"].to_numpy(), return_inverse=True)
-        s = _core.pseudo_align(
-            [frames[r] for r in reads], [seqs[p] for p in pos.tolist()],
-            ri.astype(np.uint32), pi.astype(np.uint32), method, 4, verify.protein_classes(),
-            matrix, sketch=(8, 1, 8), band=8, gap=(8, 1), top=2,
-        )  # fmt: skip
-        bits = (lam * s.astype(np.float64) - math.log(k)) / math.log(2)
-        out.append(b.select("read", "pos").with_columns(score=bits))
+        b = pairs.slice(start, batch).select("read", "pos")
+        if method != "two-stage":
+            raw = _raw(b, frames, seqs, matrix, method)
+            out.append(b.with_columns(score=bits(raw, method == "gapped")))
+            continue
+        b = b.with_columns(raw=_raw(b, frames, seqs, matrix, "anchored"))
+        anchored = bits(pl.col("raw"), False)
+        hot = (anchored >= floor) & (anchored >= anchored.max().over("read") - margin)
+        again = b.filter(hot)
+        if again.height:
+            again = again.with_columns(raw=_raw(again, frames, seqs, matrix, "gapped"))
+        got = pl.concat([b.filter(~hot), again]).with_columns(score=bits(pl.col("raw"), True))
+        out.append(got.drop("raw"))
     return pl.concat(out) if out else pairs.select("read", "pos").with_columns(score=pl.lit(0.0))
 
 
@@ -350,7 +381,11 @@ def main() -> None:
                    help="route tier-1 pairs within this many bits of its read bar")  # fmt: skip
     p.add_argument("--neighbours", type=float, default=0.83,
                    help="also route to spanning-tree neighbour groups this close")  # fmt: skip
-    p.add_argument("--method", choices=["anchored", "gapped"], default="gapped")
+    p.add_argument("--method", choices=["two-stage", "anchored", "gapped"], default="two-stage")
+    p.add_argument("--gapped-floor", type=float, default=20.0,
+                   help="two-stage: anchored bits a pair needs for a gapped rescore")  # fmt: skip
+    p.add_argument("--gapped-margin", type=float, default=6.0,
+                   help="two-stage: and within this many bits of its read's best")  # fmt: skip
     p.add_argument("--route", choices=["dense", "tier1"], default="dense",
                    help="dense: every read by seed votes; tier1: its pairs")  # fmt: skip
     p.add_argument("--route-k", type=int, default=0, help="0: from the candidates' size")
@@ -456,7 +491,16 @@ def main() -> None:
             t1_pairs = part.join(mine.select("g", "pos"), on="g").select("read", "pos")
             if not dense:
                 if t1_pairs.height:
-                    got = align_chunk(t1_pairs, frames, seqs, matrix, batch_pairs, a.method)
+                    got = align_chunk(
+                        t1_pairs,
+                        frames,
+                        seqs,
+                        matrix,
+                        batch_pairs,
+                        a.method,
+                        a.gapped_floor,
+                        a.gapped_margin,
+                    )
                     got.write_parquet(spill / f"{name}.{c:05d}.parquet")
                     n_pairs += t1_pairs.height
                 continue
@@ -470,7 +514,9 @@ def main() -> None:
                 if not pairs.height:
                     continue
                 fr = dict(zip(batch["read"].to_list(), batch["frames"].to_list(), strict=True))
-                got = align_chunk(pairs, fr, seqs, matrix, batch_pairs, a.method)
+                got = align_chunk(
+                    pairs, fr, seqs, matrix, batch_pairs, a.method, a.gapped_floor, a.gapped_margin
+                )
                 got.write_parquet(spill / f"{name}.{c:05d}.{b:05d}.parquet")
                 n_pairs += pairs.height
         info |= {f"{name}_pairs": n_pairs, f"{name}_route_s": route_s,

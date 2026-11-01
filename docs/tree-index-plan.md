@@ -1241,3 +1241,15 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 
     At 6 × 10⁸ residues, 3 chance votes in one (leaf, band) cell is ~5 × 10⁻⁶ per read.
   - **Estimate for a real sample** (10 M read pairs, 2 M candidate leaves, ~6 × 10⁸ residues, so k 6 and 3 votes; linear from the quarter sample, not measured): store read seconds to minutes (flat); frames ~1 min per side (gzip line reading in Python now dominates); routing ~240 µs per read on 2 threads at the quarter's k-5 chance level, ~80 min for both sides, ~5 min on 32 cores; gapped alignment ~1.5 × 10⁸ pairs at ~22 k pairs/s per 2 threads, ~2 h, ~8 min on 32 cores. In all ~15–20 min on 32 cores (~3–4 h on 2 threads), against ~1–2.5 h on 32 cores before (k 5 routing and a full members scan). Alignment is now the largest part: anchored first, gapped near the bar, is the next saving.
+- **Two-stage alignment in tier 2 (2026-11-01, the user's request).** `--method two-stage` (the default): every routed pair anchored (ungapped), then gapped only for pairs with anchored ≥ `--gapped-floor` (20) bits and within `--gapped-margin` (6) of their read's best in the batch. All scores on the gapped statistics: a gapped raw score is never below the ungapped, so an un-rescored pair's gapped bits from its ungapped raw score are a lower bound.
+  - A first version scored rescored pairs with gapped λ, K and the rest with ungapped ones: for a long alignment without indels gapped bits run up to ~30 below ungapped for the same raw score, so un-rescored pairs outranked the read's best and leaf precision fell 0.92 → 0.72. One scale fixed it.
+
+    | Sample | Alignment | Align s (sample + decoys) | Read recall | Precision | Leaf precision | Top leaf | Units true / recall |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | pooled | gapped | 257 | 0.823 | 0.998 | 0.916 | 0.389 | 0.870 / 0.638 |
+    | pooled | two-stage, 10 bits / 15 | 211 | 0.823 | 0.998 | 0.913 | 0.391 | 0.869 / 0.638 |
+    | pooled | **two-stage, 6 bits / 20** | **168** | 0.824 | 0.998 | 0.912 | 0.394 | 0.868 / 0.638 |
+    | fresh | gapped | 54 | 0.840 | 0.996 | 0.912 | 0.418 | — |
+    | fresh | **two-stage, 6 / 20** | **39** | 0.840 | 0.996 | 0.907 | 0.412 | — |
+
+    Read recall by identity is unchanged in every bin (fresh: 0.97 … 0.63). The saving is 28–36%, not 4×: most routed pairs are true homologues scoring close to their read's best, so most are rescored. The alignment is still tier 2's largest part (the estimate for a 10 M-pair sample goes from ~8 to ~5–6 min of alignment on 32 cores); fewer pairs (e.g. one alignment per distinct sequence among near-identical leaves) or a vectorised kernel would be the next levers.
