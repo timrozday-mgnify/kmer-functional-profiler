@@ -1090,3 +1090,19 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 
   - The group/leaf ratio (0.33) should hold at release: the sample takes whole MGnify90 clusters, and `tree:0.57` groups (85 k) are close to its units (77 k). Postings are linear upper bounds (sharing grows with scale).
   - Not stored in the index if alignment reads representatives from the MGnify sequence store that tier 2 (DIAMOND) needs anyway: the index then keeps an offset per group (~14 GB at 8 B). Untested: coarser sequence groups (`tree:0.83`), fewer sequences at some cost to recall.
+- **A middle tier, with the favoured alignment (2026-11-01).** Alignment reads representatives from the MGnify protein store (the user's decision), so the index adds only an offset per sequence: ~14 GB per group, ~44 GB per leaf where there are no groups. Every build is scored with anchored ungapped scans on protein 4-mers at minimizer window 8 against each layer group's representative (`anch-k4-w8q8@group`, 1% decoy bar, neighbour rule; quarter sample, depth > 1). Release = 80 + x_base × (106–131) GB, plus `layer_group` (~22 GB) and offsets.
+
+  | Build | x_base | ~Release | Pairs/s (2 threads) | r 90% | r 85% | r 80% | r 75% | r 70% |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | slim (no layer) | 0.40 | 122–132 GB | 657 k | 0.62 | 0.43 | 0.35 | 0.31 | 0.29 |
+  | slim + window 128 (`tree:0.57` composites) | 0.75 | 196–214 GB | 259 k | 0.82 | 0.67 | 0.56 | 0.48 | 0.44 |
+  | base (S3, no layer) | 1.00 | 230–255 GB | 553 k | 0.83 | 0.64 | 0.52 | 0.41 | 0.39 |
+  | **slim + window 64** | 1.11 | **234–261 GB** | 181 k | 0.87 | 0.82 | 0.71 | 0.64 | 0.58 |
+  | base + window 128 | 1.68 | 294–336 GB | 220 k | 0.96 | 0.88 | 0.79 | 0.65 | 0.57 |
+  | base + window 64, `tree:0.83` groups | 1.89 | 316–364 GB | 179 k | 0.97 | 0.91 | 0.83 | 0.73 | 0.63 |
+  | **standard** (base + window 64, `tree:0.57`) | 1.90 | **317–365 GB** | 177 k | 0.97 | 0.91 | 0.83 | 0.74 | 0.64 |
+
+  - Standard with this method matches the full scan (0.97 / 0.92 / 0.84 / 0.75 / 0.64) to a point, at 177 k against 21 k pairs/s.
+  - Slim gains nothing from alignment: its seeds alone are the same recall (its candidates are bounded by its seeds, not by chance hits). Base gains 1–2 points.
+  - A layer beats a bigger base at equal size: slim + window 64 is base's size and 18–23 points better at 85–70%, 6–12 below standard. So the middle tier is slim + window 64 (`--mode slim --layers protein:{k}:64:rare --layer-groups tree:0.57 --layer-rep composite:0.25`).
+  - Coarser groups (`tree:0.83`) do not shrink the layer (1.89× against 1.90×) and are no better.
