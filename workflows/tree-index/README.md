@@ -180,8 +180,8 @@ sample):
 | Tier | `build.py` | Recall at depth > 1 (quarter sample) | ~Release |
 | --- | --- | --- | --- |
 | `slim` | `--mode slim`: *n\_1* 1, ~2 spread minimizers, k 7 for < 16 informative 11-mers | 0.93 at 100%, 0.81 at 95%, 0.62 at 90% | 120–130 GB (75–90 GB without the neighbour rule's edges) |
-| `standard` | `--mode standard`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the rarest protein k-mer per window of 64 (`protein:{k}:64:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), then `verify.py` | 0.84 at 80%, 0.75 at 75%, 0.64 at 70% | ~280–330 GB |
-| `large` | `--mode large`: the layer at window 16 | 0.95 at 80%, 0.91 at 75%, 0.83 at 70% | ~470–560 GB |
+| `standard` | `--mode standard`: *t\_base* 0.01, ~4 spread minimizers, k 7 at window 4 for < 32, plus the rarest protein k-mer per window of 64 (`protein:{k}:64:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), then `verify.py` | 0.84 at 80%, 0.75 at 75%, 0.64 at 70% | ~305–350 GB, plus ~200 GB of group sequences for alignment if stored in the index |
+| `large` | `--mode large`: the layer at window 16 | 0.95 at 80%, 0.91 at 75%, 0.83 at 70% | ~490–585 GB, plus ~200 GB of group sequences |
 
 `{k}` in `--layers` is `build.layer_k`: ~24 chance bits on the quarter sample (k 6) plus log2 of
 the database's size over it, so k 8 on the 1-in-100 subset. `--mode standard --layers ''` is

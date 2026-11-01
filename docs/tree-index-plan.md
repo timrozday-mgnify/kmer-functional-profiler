@@ -1072,6 +1072,21 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - Standard (R64) agrees: full 0.84 / 0.75 / 0.64 at 80 / 75 / 70% at 21 k pairs/s; anchored (3-mers w4 or w8, 4-mers w4, `@group`) the same at 155–196 k; diag on all 3-mers the same at 183 k; sparse diag, order and pairs lose 10–40 points.
   - Indels: full and anchored lose ≤ 1 point (anchored 3-mers w16 or 1 in 8: ≤ 2); sparse diag loses up to 6, the binned pairs 4–5 (gap binning does not recover them).
   - murphy10 gains nothing: anchored on murphy10 4-mers matches protein 3- or 4-mers at the same sampling; diag and order on murphy10 are worse. Scanning 4 bands instead of 2 (3-mers w16) gains 1 point at half the speed.
-  - Reading: k-mer counts alone (diag, order, pairs) need every k-mer to match the alignment; a read gives ~50 residues per frame, so sampled counts fall to chance levels. The sketch only has to find the diagonal: the exact ungapped scan of one or two bands keeps the full alignment's recall with 1 seed in 5 (or 1 in 8 at −3 points at 70%), ~10× faster. Sparser seeds barely speed it up (read k-mers and the band scans dominate), and the sketch can be computed from the sequence at query time, so the stored cost is the sequence: one per layer group suffices (59 residues per leaf here, ~3 GB at release at a byte per residue, ~1.6 GB packed; ~1% of standard).
+  - Reading: k-mer counts alone (diag, order, pairs) need every k-mer to match the alignment; a read gives ~50 residues per frame, so sampled counts fall to chance levels. The sketch only has to find the diagonal: the exact ungapped scan of one or two bands keeps the full alignment's recall with 1 seed in 5 (or 1 in 8 at −3 points at 70%), ~10× faster. Sparser seeds barely speed it up (read k-mers and the band scans dominate), and the sketch can be computed from the sequence at query time, so the stored cost is the sequence: one per layer group suffices (59 residues per leaf here; see the sizes below).
   - **Proposed** (not yet changed): verify.py as anchored on protein 4-mers at minimizer window 8 against each layer group's representative's sequence (stored in the index); the full scan stays as a check. At ~120 k pairs/s per 2 threads, a sample with 100× this one's pairs (~640 M on large) takes ~1.5 h on 2 threads, ~6 min on 32.
   - **Next:** real indels (a simulator with indels, or held-out real homologues); the read's k-mers computed once per read rather than per pair (likely the next 2×).
+- **Release sizes with alignment (2026-11-01, estimate).** The release is ~21,000× the quarter sample (S3's 633 k postings × 21 k × ~9 B ≈ 120 GB, the 106–131 GB above), so ~5.5 × 10⁹ leaves and, at `tree:0.57`, ~1.8 × 10⁹ groups. The earlier ~3 GB for group sequences scaled to the 1-in-100 subset, not the release; corrected:
+  - postings + leaf tables (~35 GB) + spanning-tree edges (~45 GB): 80 + x_base × (106–131) GB;
+  - `layer_group` (4 B per leaf): ~22 GB, standard and large;
+  - sequences for alignment: one per group, ~200 GB packed at 5 bits per residue (~325 GB at a byte); per leaf, as `verify.py` aligns today, ~1.0 TB at a byte.
+
+  | Tier | x_base | Postings, tables, edges | + `layer_group` | + group sequences (5-bit) |
+  | --- | --- | --- | --- | --- |
+  | base (S3) | 1.00 | 186–211 GB | — | — |
+  | slim | — | ~120–130 GB | — | — |
+  | standard (window 64) | 1.90 | 281–329 GB | 303–351 GB | ~505–555 GB |
+  | large (window 16) | 3.67 | 469–561 GB | 491–583 GB | ~695–785 GB |
+  | old-std (window 8, every leaf) | 8.63 | 995–1,211 GB | — | (+ ~1.0 TB per-leaf sequences) |
+
+  - The group/leaf ratio (0.33) should hold at release: the sample takes whole MGnify90 clusters, and `tree:0.57` groups (85 k) are close to its units (77 k). Postings are linear upper bounds (sharing grows with scale).
+  - Not stored in the index if alignment reads representatives from the MGnify sequence store that tier 2 (DIAMOND) needs anyway: the index then keeps an offset per group (~14 GB at 8 B). Untested: coarser sequence groups (`tree:0.83`), fewer sequences at some cost to recall.
