@@ -16,6 +16,9 @@ pub enum Method {
     Pairs,
     /// [`Method::Diag`]'s `top` bands scanned exactly (ungapped, `matrix`): needs the sequence.
     Anchored,
+    /// As [`Method::Anchored`], but banded Smith-Waterman with affine gaps (open 11, extend 1)
+    /// within `gap` diagonals of each band's centre: indels.
+    Gapped,
 }
 
 /// A [`Method`] and its sketch.
@@ -34,7 +37,7 @@ pub struct Params {
     /// Diagonal band width ([`Method::Diag`], [`Method::Anchored`]).
     pub band: u32,
     /// [`Method::Pairs`]: k-mers paired up to this many positions apart, the gap stored as
-    /// gap / `gap_bin`.
+    /// gap / `gap_bin`; [`Method::Gapped`]: the band's half-width in diagonals.
     pub gap: usize,
     pub gap_bin: usize,
     /// [`Method::Anchored`]: bands scanned.
@@ -221,6 +224,62 @@ fn anchored(read: &[u8], rep: &[u8], s: &Sketch, p: &Params, matrix: &[i8]) -> i
     best
 }
 
+const GAP_OPEN: i32 = 11;
+const GAP_EXTEND: i32 = 1;
+
+/// The best band-pairs of [`bands`], most matches first.
+fn top_bands(c: &[u32], top: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..c.len().saturating_sub(1))
+        .filter(|&b| c[b] + c[b + 1] > 0)
+        .collect();
+    order.sort_unstable_by_key(|&b| std::cmp::Reverse(c[b] + c[b + 1]));
+    order.truncate(top);
+    order
+}
+
+/// Local alignment score (affine gaps) of `a` against `b` within `w` diagonals of diagonal
+/// `d0` (b's j = a's i + d0), Gotoh's recurrences on the band only.
+fn banded(a: &[u8], b: &[u8], d0: i64, w: i64, matrix: &[i8]) -> i32 {
+    let width = (2 * w + 1) as usize;
+    let neg = i32::MIN / 4;
+    // row i: column k is j = i + d0 - w + k
+    let (mut h, mut f) = (vec![0i32; width + 2], vec![neg; width + 2]);
+    let mut best = 0;
+    for (i, &x) in a.iter().enumerate() {
+        let (mut nh, mut nf) = (vec![0i32; width + 2], vec![neg; width + 2]);
+        let mut e = neg; // gap along b (left neighbour in this row)
+        for k in 0..width {
+            let j = i as i64 + d0 - w + k as i64;
+            if j < 0 || j >= b.len() as i64 {
+                e = neg;
+                continue;
+            }
+            // previous row: (i-1, j-1) is column k, (i-1, j) is column k+1
+            let diag = h[k] + i32::from(matrix[usize::from(x) << 8 | usize::from(b[j as usize])]);
+            nf[k] = (h[k + 1] - GAP_OPEN).max(f[k + 1]) - GAP_EXTEND;
+            let cell = diag.max(e).max(nf[k]).max(0);
+            nh[k] = cell;
+            best = best.max(cell);
+            e = (cell - GAP_OPEN).max(e) - GAP_EXTEND;
+        }
+        (h, f) = (nh, nf);
+    }
+    best
+}
+
+/// [`Method::Gapped`]: banded affine-gap scans around the `top` best bands' centres.
+fn gapped(read: &[u8], rep: &[u8], s: &Sketch, p: &Params, matrix: &[i8]) -> i32 {
+    let c = bands(read, rep.len(), s, p);
+    top_bands(&c, p.top)
+        .into_iter()
+        .map(|b| {
+            let centre = (b * p.band as usize + p.band as usize) as i64 - read.len() as i64;
+            banded(read, rep, centre, p.gap as i64 + p.band as i64, matrix)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Each pair's score: read `reads[pair_read[i]]` against representative `reps[pair_rep[i]]`.
 /// Pairs sorted by representative build each sketch once per run of it.
 pub fn pseudo_scores<S: AsRef<[u8]> + Sync>(
@@ -252,6 +311,7 @@ pub fn pseudo_scores<S: AsRef<[u8]> + Sync>(
                         Method::Order => chain(read, s, p) as i32,
                         Method::Pairs => shared_pairs(read, s, p) as i32,
                         Method::Anchored => anchored(read, rep, s, p, matrix),
+                        Method::Gapped => gapped(read, rep, s, p, matrix),
                     };
                 }
             });
@@ -305,8 +365,15 @@ mod tests {
         assert_eq!(score(Method::Diag, read), 6); // KVL VLA LAT ATG TGH GHE
         assert_eq!(score(Method::Order, read), 6);
         assert_eq!(score(Method::Anchored, read), 16);
+        assert_eq!(score(Method::Gapped, read), 16); // no gap needed: the ungapped score
         assert!(score(Method::Pairs, read) > score(Method::Pairs, other));
         assert_eq!(score(Method::Order, other), 1); // ATG
+        // a deletion in the read: the gapped scan bridges it (10 + 9 matches, a gap of 12)
+        let long: &[u8] = b"MKVLATWQPRGHEWRSPQDN";
+        let del: &[u8] = b"MKVLATWQPRHEWRSPQDN"; // without its G
+        let one = |method| pseudo_scores(&[del], &[long], &[0], &[0], &params(method), &m)[0];
+        assert_eq!(one(Method::Anchored), 20); // the longer side only
+        assert_eq!(one(Method::Gapped), 2 * 19 - 12);
         // a representative with no k-mer (masked, or shorter than k) scores 0
         let mut p = params(Method::Anchored);
         p.minimizer = 4;

@@ -203,11 +203,13 @@ process QUERY {
 
     script:
     def reads = "${sim}/reads_1.fq.gz ${sim}/reads_2.fq.gz"
+    // tier 2's chunks and batches from half the task's memory (verify.py's peak is tier 1's)
+    def mem = task.memory ? task.memory.toGiga().intdiv(2) : 4
     """
     ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
     ${py()} code/verify.py --index index --members members/* --reads ${reads} --query q-${tier}
     ${py()} code/tier2.py --index index --members members/* --reads ${reads} --query q-${tier} \
-        --out q-${tier}/tier2
+        --memory-gb ${mem} --out q-${tier}/tier2
     """
 }
 

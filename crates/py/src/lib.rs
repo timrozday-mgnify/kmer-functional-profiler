@@ -789,6 +789,7 @@ fn pseudo_params(
         "order" => kfp::PseudoMethod::Order,
         "pairs" => kfp::PseudoMethod::Pairs,
         "anchored" => kfp::PseudoMethod::Anchored,
+        "gapped" => kfp::PseudoMethod::Gapped,
         _ => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "method {method}"

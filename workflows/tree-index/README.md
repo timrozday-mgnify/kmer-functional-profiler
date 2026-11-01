@@ -219,8 +219,11 @@ each. Cuts fall between k-11 storage components, which few such edges cross.
 
 A per-sample database over tier 1's candidates, for presence and read classification. Tier 1
 routes each read pair to groups (its aligned pairs within `--route-below` bits of the
-read-level bar); tier 2 aligns it, with `verify.py`'s anchored masked scan, to every leaf of
-those groups, so it reaches the closest member, not only the group's composite. Candidate
+read-level bar) and their spanning-tree neighbours (`--neighbours`, 0.83); tier 2 aligns it to
+every leaf of those groups (`--method gapped`: banded affine-gap Smith-Waterman around
+`verify.py`'s anchored seeds, repeats masked; `anchored`, ungapped, ~4x faster), so it reaches
+the closest member, not only the group's composite. Each read's tied leaves are shared by EM
+(`--em-rounds`); a group with at least `--min-reads` expected reads is present. Candidate
 leaves are packed in leaf order (tier 1's tree, so relatives are adjacent and a group is one
 range) into chunks of at most `--chunk-residues`; one streaming pass writes their sequences in
 leaf order, and each chunk reads its range. Scores spill per chunk and are merged per read;
@@ -233,9 +236,13 @@ python workflows/tree-index/tier2.py --index index --members members.parquet \
     --reads r1.fq.gz r2.fq.gz --query q --out q/tier2
 ```
 
-Memory is one chunk's sequences, one batch of pairs (`--batch-pairs`) and the routed reads'
-frames, which `verify.py` saves (`frames_*.parquet`); without them tier 2 recomputes every
-read's frames, its peak (7.6 GB against 0.33 GB on the quarter sample).
+Memory is one chunk's sequences, one batch of pairs and the routed reads' frames, which
+`verify.py` saves (`frames_*.parquet`); without them tier 2 recomputes every read's frames, its
+peak (7.6 GB against 0.33 GB on the quarter sample). `--memory-gb` (build.nf: half the task's)
+sets `--chunk-residues` and `--batch-pairs` (a third of it each). `handoff/` is in
+`kfp-pileup reference`'s format (`ref.fa`, `refs.tsv`, `molecule.txt`: present leaves as
+targets, up to 5 other leaves of each group as neighbours) with the called read pairs, for
+`kfp-pileup`'s DIAMOND and `call`.
 
 ## Querying and reporting (`query.py`, `report.py`)
 

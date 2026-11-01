@@ -24,3 +24,19 @@ def test_work_list_routes_reads_to_groups_above_the_floor() -> None:
     )
     got = tier2.work_list(aligned, group, 20.0).sort("read", "g")
     assert got.rows() == [(0, 0), (1, 4)]  # read 0's pair at 12 bits and read 1's at 5 dropped
+
+
+def test_em_gives_shared_reads_to_the_supported_leaf() -> None:
+    """Reads tied between leaves 1 and 2 go to 1, which other reads support alone."""
+    calls = pl.DataFrame(
+        {"read": [0, 1, 2, 3, 3, 4, 4], "pos": [1, 1, 1, 1, 2, 1, 2], "score": [30.0] * 7}
+    )
+    w = tier2.em_weights(calls, 30)
+    assert abs(w.group_by("read").agg(pl.col("weight").sum())["weight"] - 1).max() < 1e-9
+    shared = w.filter(pl.col("read") == 3).sort("pos")["weight"].to_list()
+    assert shared[0] > 0.95 > 0.05 > shared[1]
+
+
+def test_budget_splits_memory() -> None:
+    residues, pairs = tier2.budget(3.0)
+    assert residues * tier2.RESIDUE_BYTES == pairs * tier2.PAIR_BYTES == 2**30

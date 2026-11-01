@@ -17,7 +17,8 @@ Subcommands:
 - ``reads``: precision and read classification from ``verify.py``'s output. Candidates
   (``cand_verify_<share>``, groups expanded): the share that are a source protein's leaf or
   in a source's MGnify90 unit (``cluster_rep``), and of their units, the share that are a
-  source's. Reads: each read pair's best leaves (``reads.parquet``, ties shared) at the
+  source's. Reads: each read pair's best leaves (``reads.parquet``, ties shared equally, or by
+  its ``weight`` column) at the
   read-level bar (``verify.json``'s ``read_bar_<share>``), against its strain (read names
   ``s<strain>_<n>``; others, ``spike.py``'s background, counted apart): sensitivity (called
   to the source's unit, over the strain's reads) and precision by leaf, layer group, unit
@@ -337,8 +338,12 @@ def reads(a: argparse.Namespace) -> None:
             .otherwise(pl.col("lf").list.set_intersection("sf").list.len().fill_null(0) > 0)
         )
         levels.append("pfam")
+    # ties shared equally, or by the calls' own shares (tier2.py's EM weights)
+    if "weight" not in calls.columns:
+        calls = calls.with_columns(weight=pl.lit(1.0))
+    w = pl.col("weight")
     per = calls.group_by("read", "identity_bin").agg(
-        ties=pl.len(), **{x: pl.col(x).cast(pl.Float64).mean() for x in levels}
+        ties=pl.len(), **{x: (pl.col(x).cast(pl.Float64) * w).sum() / w.sum() for x in levels}
     )
     n = strain.join(truth, on="strain").group_by("identity_bin").agg(reads=pl.len())
     table = (
