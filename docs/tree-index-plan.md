@@ -1044,3 +1044,34 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - **Then (superseded below):** `build.py --mode`'s tiers and the HPC run (`hpc/kfp-ablations/tree-index-build/run.sh`) still use the shared layers. Proposed: standard = S3 + representatives at window 64 with alignment (~280–330 GB, 0.84 at 80%), large = window 32 (~345–405 GB, 0.73 at 70%) or window 16 (~470–560 GB, 0.83 at 70%); slim unchanged. Sizes are linear upper bounds from the quarter sample.
   - **Next:** settle the tiers; alignment along seed diagonals (k-mer order sketched in the index), with its speed and index cost measured; the layer's k and group distance on the 1-in-100 subset.
 - **Tiers on representatives with alignment (2026-10-31).** `build.py --mode standard` is now the protein layer at window 64 and `--mode large` at window 16, both on `tree:0.57` composites (`composite:0.25`); slim is unchanged. `build.nf`'s QUERY runs `verify.py` after `query.py`, and its SUMMARY reports `verify_0.01_nb`. The HPC run (`hpc/kfp-ablations/tree-index-build/run.sh`) builds base, slim, standard, large and `old-std` (window 8 on every leaf) to compare. Quarter-sample estimates: standard ~280–330 GB, 0.84 / 0.75 / 0.64 at 80 / 75 / 70%; large ~470–560 GB, 0.95 / 0.91 / 0.83. The test profile passes end to end.
+- **Pseudo-alignment trial (2026-10-31 – 11-01).** `_core.pseudo_align` (`crates/core/src/pseudo.rs`) scores verify.py's (read pair, leaf) pairs from k-mer sketches of the leaf's representative (the read keeps all its k-mers); each method has its own 1% decoy bar; recall at depth > 1, neighbour rule, on the standard (R64) and large (R16) builds. The trial driver is a scratch script (`trial.py`: evidence pairs and frames cached once per build, then each method on sample and decoys). Methods:
+  - `diag`: matched read positions per diagonal band (each read position once per band, so repeats do not pile up), representative positions binned by a quantum;
+  - `order`: longest chain of matches increasing in read position and representative rank (ranks only, no positions);
+  - `pairs`: distinct shared k-mer pairs at most g apart, gap binned (no positions);
+  - `anchored`: the best one or two `diag` bands scanned exactly (ungapped BLOSUM62 bits), so the sequence is needed.
+  - Sketches: all k-mers; minimizers (window w); FracMinHash (1 in m); protein or murphy10.
+  - Conditions: `+indel` (1–3-residue indels injected into representatives, ~2.5% per position, for sample and decoys: the simulator makes substitutions only), `@group` (aligned against the layer group's representative's sequence, not the leaf's).
+
+  | Method (large, R16) | k-mers kept per leaf | Pairs/s (2 threads) | r 90% | r 80% | r 75% | r 70% |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | full ungapped (verify.py) | 181 residues | 12 k | 0.99 | 0.95 | 0.91 | 0.83 |
+  | full, one sequence per group (`@group`) | 59 residues | 12 k | 0.99 | 0.95 | 0.91 | 0.83 |
+  | anchored, 3-mers, minimizers w4, positions / 4 | 71 | 110 k | 0.99 | 0.95 | 0.91 | 0.83 |
+  | anchored, protein 4-mers, w8 | 39 | 122 k | 0.99 | 0.95 | 0.91 | 0.82 |
+  | anchored, 3-mers, 1 in 8 | 23 | 139 k | 1.00 | 0.94 | 0.89 | 0.80 |
+  | anchored, 3-mers, w16 | 20 | 88 k | 0.98 | 0.93 | 0.88 | 0.80 |
+  | anchored, 3-mers, 1 in 16 | 11 | 165 k | 0.95 | 0.88 | 0.82 | 0.75 |
+  | diag, all 3-mers | 179 | 124 k | 0.99 | 0.94 | 0.90 | 0.81 |
+  | diag, 3-mers 1 in 4 | 45 | 167 k | 0.92 | 0.79 | 0.70 | 0.59 |
+  | diag, 3-mers w4 | 71 | 153 k | 0.89 | 0.72 | 0.56 | 0.47 |
+  | order, all 3-mers | 179 | 119 k | 0.89 | 0.68 | 0.64 | 0.48 |
+  | order, 3-mers w4 | 71 | 147 k | 0.75 | 0.46 | 0.37 | 0.30 |
+  | pairs, 3-mers up to 8 apart | 1,387 | 32 k | 1.00 | 0.93 | 0.89 | 0.79 |
+  | pairs, 2-mers up to 16 apart, gap / 4 | 2,649 | 14 k | 0.89 | 0.72 | 0.67 | 0.52 |
+
+  - Standard (R64) agrees: full 0.84 / 0.75 / 0.64 at 80 / 75 / 70% at 21 k pairs/s; anchored (3-mers w4 or w8, 4-mers w4, `@group`) the same at 155–196 k; diag on all 3-mers the same at 183 k; sparse diag, order and pairs lose 10–40 points.
+  - Indels: full and anchored lose ≤ 1 point (anchored 3-mers w16 or 1 in 8: ≤ 2); sparse diag loses up to 6, the binned pairs 4–5 (gap binning does not recover them).
+  - murphy10 gains nothing: anchored on murphy10 4-mers matches protein 3- or 4-mers at the same sampling; diag and order on murphy10 are worse. Scanning 4 bands instead of 2 (3-mers w16) gains 1 point at half the speed.
+  - Reading: k-mer counts alone (diag, order, pairs) need every k-mer to match the alignment; a read gives ~50 residues per frame, so sampled counts fall to chance levels. The sketch only has to find the diagonal: the exact ungapped scan of one or two bands keeps the full alignment's recall with 1 seed in 5 (or 1 in 8 at −3 points at 70%), ~10× faster. Sparser seeds barely speed it up (read k-mers and the band scans dominate), and the sketch can be computed from the sequence at query time, so the stored cost is the sequence: one per layer group suffices (59 residues per leaf here, ~3 GB at release at a byte per residue, ~1.6 GB packed; ~1% of standard).
+  - **Proposed** (not yet changed): verify.py as anchored on protein 4-mers at minimizer window 8 against each layer group's representative's sequence (stored in the index); the full scan stays as a check. At ~120 k pairs/s per 2 threads, a sample with 100× this one's pairs (~640 M on large) takes ~1.5 h on 2 threads, ~6 min on 32.
+  - **Next:** real indels (a simulator with indels, or held-out real homologues); the read's k-mers computed once per read rather than per pair (likely the next 2×).

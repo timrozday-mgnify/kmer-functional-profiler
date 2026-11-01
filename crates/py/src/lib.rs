@@ -775,6 +775,105 @@ fn align_ungapped<'py>(
     Ok(got.into_pyarray(py))
 }
 
+fn pseudo_params(
+    method: &str,
+    k: usize,
+    classes: &[u8],
+    sketch: (usize, u32, u32),
+    band: u32,
+    gap: (usize, usize),
+    top: usize,
+) -> PyResult<kfp::PseudoParams> {
+    let method = match method {
+        "diag" => kfp::PseudoMethod::Diag,
+        "order" => kfp::PseudoMethod::Order,
+        "pairs" => kfp::PseudoMethod::Pairs,
+        "anchored" => kfp::PseudoMethod::Anchored,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "method {method}"
+            )));
+        }
+    };
+    let classes: [u8; 256] = classes
+        .try_into()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("classes: 256 bytes"))?;
+    if !(1..=12).contains(&k) || sketch.1 == 0 || sketch.2 == 0 || band == 0 || gap.1 == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "k 1-12; modulo, quantum, band, gap_bin > 0",
+        ));
+    }
+    let (minimizer, modulo, quantum) = sketch;
+    let (gap, gap_bin) = gap;
+    Ok(kfp::PseudoParams {
+        method,
+        k,
+        classes,
+        minimizer,
+        modulo,
+        quantum,
+        band,
+        gap,
+        gap_bin,
+        top,
+    })
+}
+
+/// Pseudo-alignment scores (kfp::pseudo_scores) of each pair (`reads[pair_read[i]]`,
+/// `reps[pair_rep[i]]`), pairs sorted by representative; `sketch` is (minimizer window,
+/// modulo, position quantum), `gap` (max gap, gap bin).
+#[pyfunction]
+#[pyo3(signature = (reads, reps, pair_read, pair_rep, method, k, classes, matrix, sketch=(1, 1, 1), band=1, gap=(8, 1), top=2))]
+#[allow(clippy::too_many_arguments)]
+fn pseudo_align<'py>(
+    py: Python<'py>,
+    reads: Vec<PyBackedBytes>,
+    reps: Vec<PyBackedBytes>,
+    pair_read: PyReadonlyArray1<'py, u32>,
+    pair_rep: PyReadonlyArray1<'py, u32>,
+    method: &str,
+    k: usize,
+    classes: &[u8],
+    matrix: PyReadonlyArray1<'py, i8>,
+    sketch: (usize, u32, u32),
+    band: u32,
+    gap: (usize, usize),
+    top: usize,
+) -> PyResult<Bound<'py, PyArray1<i32>>> {
+    let p = pseudo_params(method, k, classes, sketch, band, gap, top)?;
+    let (pr, pq, matrix) = (
+        pair_read.as_slice()?,
+        pair_rep.as_slice()?,
+        matrix.as_slice()?,
+    );
+    if pr.len() != pq.len()
+        || pr.iter().any(|&r| r as usize >= reads.len())
+        || pq.iter().any(|&q| q as usize >= reps.len())
+        || matrix.len() != 1 << 16
+    {
+        return Err(to_py_err(Error::LengthMismatch));
+    }
+    let got = py.detach(|| kfp::pseudo_scores(&reads, &reps, pr, pq, &p, matrix));
+    Ok(got.into_pyarray(py))
+}
+
+/// Features each representative's sketch stores (as `pseudo_align` builds it).
+#[pyfunction]
+#[pyo3(signature = (reps, method, k, classes, sketch=(1, 1, 1), gap=(8, 1)))]
+fn pseudo_sketch_sizes<'py>(
+    py: Python<'py>,
+    reps: Vec<PyBackedBytes>,
+    method: &str,
+    k: usize,
+    classes: &[u8],
+    sketch: (usize, u32, u32),
+    gap: (usize, usize),
+) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    let p = pseudo_params(method, k, classes, sketch, 1, gap, 1)?;
+    let got = py.detach(|| kfp::sketch_sizes(&reps, &p));
+    Ok(got.into_pyarray(py))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", kfp::VERSION)?;
@@ -800,6 +899,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree_schemes, m)?)?;
     m.add_function(wrap_pyfunction!(align_identity, m)?)?;
     m.add_function(wrap_pyfunction!(align_ungapped, m)?)?;
+    m.add_function(wrap_pyfunction!(pseudo_align, m)?)?;
+    m.add_function(wrap_pyfunction!(pseudo_sketch_sizes, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     m.add_class::<PyDiamondReader>()?;

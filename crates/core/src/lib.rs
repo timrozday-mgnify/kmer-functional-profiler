@@ -14,6 +14,7 @@ mod fastx;
 mod gather;
 mod kmers;
 mod packed;
+mod pseudo;
 mod route;
 mod translate;
 mod tree;
@@ -32,6 +33,7 @@ pub use kmers::{
     sequence_kmers,
 };
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};
+pub use pseudo::{Method as PseudoMethod, Params as PseudoParams, pseudo_scores, sketch_sizes};
 pub use route::{RouteHits, route_hits};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
