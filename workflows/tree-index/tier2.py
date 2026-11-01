@@ -6,12 +6,16 @@ anchored scan, tandem repeats masked); group representatives keep recall, so tie
 each read to groups; decoys (the reads reversed) set the bar; reads cannot tell near-identical
 leaves apart, so ties are shared, not broken.
 
-1. **Work list.** Tier 1's aligned (read, leaf) pairs (``verify.py``'s ``aligned.parquet``,
-   ``aligned_decoy.parquet``) within ``--route-below`` bits of the read-level bar, each leaf
-   expanded to every leaf of its layer group (``layer_group.npy``), and with ``--neighbours``
-   d, of the groups next to it on the spanning tree (an edge between them at dense-set distance
-   at most d, ``build.layer_groups``' measure): a read reaches the member closest to it, also
-   in a unit beside the one tier 1 found. The candidates are every leaf so reached.
+1. **Candidates and routing.** The candidates are every leaf of tier 1's present groups
+   (``cand_verify_<share>``) and of the groups its aligned pairs route reads to (within
+   ``--route-below`` bits of its read bar), with, at ``--neighbours`` d, the groups next to
+   them on the spanning tree (an edge at dense-set distance at most d). Tier 1 is a profile:
+   its sparse keys seed only some of a strain's reads, so ``--route dense`` (the default)
+   routes every read pair itself: all its twelve frames vote, by protein ``--route-k``-mer
+   seeds on one diagonal band (``_core.route_reads``, the candidates' k-mers held more than
+   ``--route-max-occ`` times dropped), for its ``--route-top`` leaves with at least
+   ``--route-votes``, joined with tier 1's own routed pairs; ``--route tier1`` uses tier 1's
+   pairs alone, each leaf expanded to its group.
 2. **Chunks along the tree.** Candidate leaves in leaf order (tier 1's merge-tree order, so
    relatives are adjacent and a chunk is a contiguous range) are packed into chunks of at most
    ``--chunk-residues`` residues. One streaming pass over ``--members`` writes the candidates'
@@ -21,25 +25,27 @@ leaves apart, so ties are shared, not broken.
 3. **Alignment per chunk** (``--method``: ``gapped``, the default, banded
    Smith-Waterman with affine gaps around the anchored seeds, or ``anchored``, ungapped and ~4x
    faster), in batches of at most
-   ``--batch-pairs`` pairs, each batch's scores spilled to ``--out``/spill/; then each read's
-   best leaves (ties kept) and a read-level bar at each ``--shares`` where decoy reads called
-   are at most that share of the sample's.
-4. **Ties shared by EM.** Each called read's tied leaves get weights proportional to their
-   abundance, re-estimated from the weights (``--em-rounds``): a read shared between a strain's
-   source and its near-identical siblings goes to the one the sample's other reads support.
-   Tier 2's presence: every leaf with a share in a group with at least ``--min-reads``
-   expected reads (near-identical leaves split a read evenly, which EM cannot break).
+   ``--batch-pairs`` pairs, each batch's scores spilled to ``--out``/spill/; then a read-level
+   bar at each ``--shares`` where decoy reads called are at most that share of the sample's.
+4. **Read classification, ambiguity kept.** A read pair's hits within ``--ambiguous-bits`` of
+   its best stay (an ambiguous pair keeps several), shared by EM (``--em-rounds``): weights
+   proportional to each leaf's abundance, re-estimated from the weights. Tier 2's presence:
+   every leaf with a share in a group with at least ``--min-reads`` expected reads
+   (near-identical leaves split a read evenly, which EM cannot break). Routing to an aligner
+   downstream comes after, from these calls (``handoff/``).
 
-Memory: one chunk's sequences, one batch of pairs and the routed reads' frames (~300 B per
-read pair; read from ``verify.py``'s ``frames_*.parquet``, recomputed only if absent, which
-costs every read's frames). The work list is counted before it is expanded, and expanded
-chunk by chunk. ``--memory-gb`` sets ``--chunk-residues`` and ``--batch-pairs`` from a budget
-(:func:`budget`), unless they are given.
+Memory: one chunk's sequences and seed index (~12 B per residue), one batch of reads
+(``--read-batch``; every read pair's frames are written once to ``frames_*.parquet`` and read
+back a batch at a time) and one batch of pairs. With ``--route tier1``, the routed reads'
+frames come from ``verify.py``'s ``frames_*.parquet`` (recomputed only if absent). The work
+list is expanded chunk by chunk. ``--memory-gb`` sets ``--chunk-residues`` and
+``--batch-pairs`` from a budget (:func:`budget`), unless they are given.
 
-Writes to ``--out``: ``reads.parquet`` (read, pos, score, weight: each read pair's best leaves
-and their EM shares), ``cand_verify_<share>.npy`` (tier 2's presence at each bar),
-``verify.json`` (``read_bar_<share>``, as ``verify.py`` names it, so ``recall.py reads`` scores
-tier 2 as it scores tier 1), ``tier2.json`` (work list, chunks, times, peak RSS) and, for an
+Writes to ``--out``: ``reads.parquet`` (read, pos, score, weight: each read pair's hits within
+``--ambiguous-bits`` of its best and their EM shares), ``cand_verify_<share>.npy`` (tier 2's
+presence at each bar), ``verify.json`` (``read_bar_<share>``, as ``verify.py`` names it, so
+``recall.py reads`` scores tier 2 as it scores tier 1), ``tier2.json`` (work list, chunks, times,
+peak RSS) and, for an
 aligner downstream, ``handoff/`` in ``kfp-pileup reference``'s format (:func:`handoff`: the
 present leaves as targets, their groups' other leaves as neighbours) with the read pairs
 called at the first share's bar (``reads_{1,2}.fq.gz``), for its DIAMOND and ``call``.
@@ -171,6 +177,52 @@ def routed_frames(
     return {r: frames[r] for r in routed.to_list()}
 
 
+def all_frames(reads: list[str], dst: Path, batch: int = 100_000) -> int:
+    """Every read pair's twelve frames (both mates' six), masked and joined by stops, to
+    ``dst`` (read, frames), streamed in batches; returns the read pairs."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    writer, n, rows = None, 0, []
+
+    def flush() -> None:
+        nonlocal writer
+        t = pa.table({"read": pa.array([r for r, _ in rows], pa.int64()),
+                      "frames": pa.array([f for _, f in rows], pa.binary())})  # fmt: skip
+        writer = writer or pq.ParquetWriter(dst, t.schema)
+        writer.write_table(t)
+        rows.clear()
+
+    with gzip.open(reads[0], "rb") as f, gzip.open(reads[1], "rb") as g:
+        for i, (x, y) in enumerate(zip(f, g, strict=True)):
+            if i % 4 == 1:
+                fr = _core.translate_frames(x.strip()) + _core.translate_frames(y.strip())
+                rows.append((n, verify.mask(b"*".join(fr))))
+                n += 1
+                if len(rows) >= batch:
+                    flush()
+    if rows or writer is None:
+        flush()
+    if writer:
+        writer.close()
+    return n
+
+
+def dense_pairs(
+    frames: pl.DataFrame, seqs: dict[int, bytes], a: argparse.Namespace
+) -> pl.DataFrame:
+    """(read, pos): each read's top ``--route-top`` leaves of the chunk by seed votes
+    (``_core.route_reads``: every protein ``--route-k``-mer of the leaves, ``--route-votes`` on
+    one diagonal band), the tier-1 trick of short seeds checked by an alignment after."""
+    pos = np.array(sorted(seqs), dtype=np.int64)
+    r, leaf, _ = _core.route_reads(
+        frames["frames"].to_list(), [seqs[x] for x in pos.tolist()], a.route_k,
+        verify.protein_classes(), band=8, min_votes=a.route_votes, top=a.route_top,
+        max_occ=a.route_max_occ,
+    )  # fmt: skip
+    return pl.DataFrame({"read": frames["read"].to_numpy()[r], "pos": pos[leaf]})
+
+
 def align_chunk(
     pairs: pl.DataFrame,
     frames: dict[int, bytes],
@@ -223,13 +275,14 @@ def handoff(
     present: NDArray[np.int64],
     group: NDArray[np.int64],
     reads: list[str],
-    called: list[int],
+    calls: pl.DataFrame,
 ) -> None:
     """``out``/handoff/, in ``kfp-pileup reference``'s format (``ref.fa`` with ids s0, s1, ...;
     ``refs.tsv``; ``molecule.txt``), for its DIAMOND and ``call``: the present leaves'
     proteins as targets, up to :data:`NEIGHBOURS` other leaves of each of their groups as
-    neighbours (the group as the component); and the called read pairs
-    (``reads_{1,2}.fq.gz``, in input order)."""
+    neighbours (the group as the component); the called read pairs (``reads_{1,2}.fq.gz``, in
+    input order) and their classification (``assignments.parquet``: pair, seq_id, unit, score,
+    EM weight; an ambiguous pair has several rows), so routing follows it."""
     dst = out / "handoff"
     dst.mkdir(exist_ok=True)
     seqs = pl.read_parquet(store)
@@ -254,7 +307,12 @@ def handoff(
         "unit", "cluster_rep", "protein_id", "rep", "component", "role", "seq_id", "length", "pos"
     ).write_csv(dst / "refs.tsv", separator="\t")
     (dst / "molecule.txt").write_text("protein\n")
-    want = set(called)
+    # the read classification, for routing downstream: each called pair's hits (ambiguous
+    # pairs several) on the reference, with their EM shares
+    calls.join(refs.select("pos", "seq_id", "unit"), on="pos").select(
+        pair="read", seq_id="seq_id", unit="unit", score="score", weight="weight"
+    ).sort("pair", "seq_id").write_parquet(dst / "assignments.parquet")
+    want = set(calls["read"].to_list())
     for m, path in enumerate(reads, start=1):
         with gzip.open(path, "rt") as f, gzip.open(dst / f"reads_{m}.fq.gz", "wt", 1) as g:
             for i, rec in enumerate(zip(f, f, f, f, strict=False)):
@@ -274,6 +332,15 @@ def main() -> None:
     p.add_argument("--neighbours", type=float, default=0.83,
                    help="also route to spanning-tree neighbour groups this close")  # fmt: skip
     p.add_argument("--method", choices=["anchored", "gapped"], default="gapped")
+    p.add_argument("--route", choices=["dense", "tier1"], default="dense",
+                   help="dense: every read by seed votes; tier1: its pairs")  # fmt: skip
+    p.add_argument("--route-k", type=int, default=5)
+    p.add_argument("--route-votes", type=int, default=4)
+    p.add_argument("--route-top", type=int, default=16)
+    p.add_argument("--route-max-occ", type=int, default=2000)
+    p.add_argument("--read-batch", type=int, default=200_000)
+    p.add_argument("--ambiguous-bits", type=float, default=3.0,
+                   help="a read keeps every hit within this many bits of its best")  # fmt: skip
     p.add_argument("--memory-gb", type=float, default=4.0)
     p.add_argument("--chunk-residues", type=int, help="default: from --memory-gb")
     p.add_argument("--batch-pairs", type=int, help="default: from --memory-gb")
@@ -298,14 +365,20 @@ def main() -> None:
         name: work_list(pl.read_parquet(qdir / f), group, floor, nb)
         for name, f in (("sample", "aligned.parquet"), ("decoy", "aligned_decoy.parquet"))
     }
-    # the candidates: every leaf of a group some read is routed to
-    routed_g = pl.concat([w["g"] for w in wls.values()]).unique().to_numpy()
+    # the candidates: tier 1's present groups and the groups its pairs route reads to, with
+    # their spanning-tree neighbours
+    cand = np.load(qdir / f"cand_verify_{a.share}.npy").astype(np.int64)
+    cand_g = pl.DataFrame({"g": np.unique(group[cand])})
+    if nb is not None:
+        cand_g = cand_g.join(nb, on="g").select(g="nb")
+    routed_g = pl.concat([cand_g["g"], *(w["g"] for w in wls.values())]).unique().to_numpy()
     leaves = np.flatnonzero(np.isin(group, routed_g))
     length = np.load(index / "pos_len.npy").astype(np.int64)
     chunk_of = chunks(leaves, length, chunk_residues)
     leaf_chunk = pl.DataFrame({"pos": leaves, "g": group[leaves], "chunk": chunk_of})
     info: dict[str, float | int | str] = {
         "method": a.method,
+        "route": a.route,
         "neighbours": a.neighbours,
         "candidate_leaves": len(leaves),
         "chunks": int(chunk_of.max()) + 1 if len(leaves) else 0,
@@ -319,25 +392,49 @@ def main() -> None:
     info["store_s"] = time.perf_counter() - t0
     # chunks holding each group (one, or two where a chunk boundary cuts it)
     g_chunk = leaf_chunk.select("g", "chunk").unique()
-    saved = (qdir / "frames_decoy.parquet").exists()  # else the decoy reads to recompute from
+    dense = a.route == "dense"
+    saved = (qdir / "frames_decoy.parquet").exists() and not dense
     reads = {"sample": a.reads, "decoy": [] if saved else query.reversed_reads(a.reads, out)}
     for name, wl in wls.items():
-        # counted before expanding: (read, group) x the group's candidate leaves
-        size = wl.join(leaf_chunk.group_by("g").agg(n=pl.len()), on="g")["n"].sum()
-        info |= {f"{name}_reads_routed": wl["read"].n_unique(), f"{name}_pairs": int(size)}
         t1 = time.perf_counter()
-        frames = routed_frames(tier1, qdir / f"frames_{name}.parquet", reads[name], wl)
+        if dense:  # every read pair's frames, once, read back a batch at a time
+            fpath = out / f"frames_{name}.parquet"
+            info[f"{name}_read_pairs"] = all_frames(reads[name], fpath)
+        else:
+            frames = routed_frames(tier1, qdir / f"frames_{name}.parquet", reads[name], wl)
         info[f"{name}_frames_s"] = time.perf_counter() - t1
-        t1 = time.perf_counter()
+        t1, n_pairs, route_s = time.perf_counter(), 0, 0.0
         parts = wl.join(g_chunk, on="g").partition_by("chunk", as_dict=True)
-        for (c,), part in parts.items():
+        for c in range(info["chunks"]):  # type: ignore[arg-type]
             mine = leaf_chunk.filter(pl.col("chunk") == c)
-            pairs = part.join(mine.select("g", "pos"), on="g").select("read", "pos")
             seqs = chunk_seqs(store, int(mine["pos"].min()), int(mine["pos"].max()))
-            got = align_chunk(pairs, frames, seqs, matrix, batch_pairs, a.method)
-            got.write_parquet(spill / f"{name}.{c:05d}.parquet")
-        info[f"{name}_align_s"] = time.perf_counter() - t1
-        del frames
+            part = parts.get((c,), pl.DataFrame(schema={"read": pl.Int64, "g": pl.Int64}))
+            t1_pairs = part.join(mine.select("g", "pos"), on="g").select("read", "pos")
+            if not dense:
+                if t1_pairs.height:
+                    got = align_chunk(t1_pairs, frames, seqs, matrix, batch_pairs, a.method)
+                    got.write_parquet(spill / f"{name}.{c:05d}.parquet")
+                    n_pairs += t1_pairs.height
+                continue
+            for b, batch in enumerate(pl.read_parquet(fpath).iter_slices(a.read_batch)):
+                t2 = time.perf_counter()
+                pairs = dense_pairs(batch, seqs, a)
+                route_s += time.perf_counter() - t2
+                lo, hi = int(batch["read"][0]), int(batch["read"][-1])
+                mine_t1 = t1_pairs.filter(pl.col("read").is_between(lo, hi))
+                pairs = pl.concat([pairs, mine_t1.cast(pairs.schema)]).unique()
+                if not pairs.height:
+                    continue
+                fr = dict(zip(batch["read"].to_list(), batch["frames"].to_list(), strict=True))
+                got = align_chunk(pairs, fr, seqs, matrix, batch_pairs, a.method)
+                got.write_parquet(spill / f"{name}.{c:05d}.{b:05d}.parquet")
+                n_pairs += pairs.height
+        info |= {f"{name}_pairs": n_pairs, f"{name}_route_s": route_s,
+                 f"{name}_align_s": time.perf_counter() - t1 - route_s}  # fmt: skip
+        if dense:
+            fpath.unlink()
+        else:
+            del frames
     # each read's best leaves, merged across chunks lazily
     best = {}
     schema = {"read": pl.Int64, "pos": pl.Int64, "score": pl.Float64}
@@ -347,28 +444,32 @@ def main() -> None:
             best[name] = pl.DataFrame(schema=schema)
             continue
         lf = pl.scan_parquet(parts).cast(schema)  # type: ignore[arg-type]
-        best[name] = lf.filter(pl.col("score") == pl.col("score").max().over("read")).collect()
-    per_read = {n: b.group_by("read").agg(pl.col("score").first()) for n, b in best.items()}
+        # a read's hits within --ambiguous-bits of its best: ambiguous reads keep several
+        best[name] = lf.filter(
+            pl.col("score") >= pl.col("score").max().over("read") - a.ambiguous_bits
+        ).collect()
+    per_read = {n: b.group_by("read").agg(pl.col("score").max()) for n, b in best.items()}
     bars: dict[str, float] = {}
     for s in a.shares.split(","):
         bars[f"read_bar_{float(s)}"] = query.decoy_bar(per_read["sample"], per_read["decoy"],
                                                        float(s))[0]  # fmt: skip
     # EM over the reads called at the loosest bar; presence per bar from the shares
     loosest = min(bars.values())
-    calls = em_weights(best["sample"].filter(pl.col("score") >= loosest), a.em_rounds)
+    top = pl.col("score").max().over("read")
+    calls = em_weights(best["sample"].filter(top >= loosest), a.em_rounds)
     calls.sort("read", "pos").write_parquet(out / "reads.parquet")
     first = None
     for s in a.shares.split(","):
         # a group is present with at least min_reads expected reads (near-identical leaves split
         # a read's weight evenly, which EM cannot break), and so is each of its leaves with any
-        at = calls.filter(pl.col("score") >= bars[f"read_bar_{float(s)}"])
+        at = calls.filter(pl.col("score").max().over("read") >= bars[f"read_bar_{float(s)}"])
         expected = at.group_by("pos").agg(pl.col("weight").sum())
         expected = expected.with_columns(g=pl.Series(group[expected["pos"].to_numpy()]))
         ok = expected.group_by("g").agg(n=pl.col("weight").sum()).filter(pl.col("n") >= a.min_reads)
         present = np.sort(expected.filter(pl.col("g").is_in(ok["g"].implode()))["pos"].to_numpy())
         np.save(out / f"cand_verify_{float(s)}.npy", present)
         if first is None:
-            first = (present, at["read"].unique().to_list())
+            first = (present, at)
     (out / "verify.json").write_text(json.dumps(bars, indent=1) + "\n")
     if not a.no_handoff and first is not None:
         t1 = time.perf_counter()

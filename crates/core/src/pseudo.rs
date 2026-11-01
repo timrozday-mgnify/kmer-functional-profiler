@@ -320,6 +320,96 @@ pub fn pseudo_scores<S: AsRef<[u8]> + Sync>(
     out
 }
 
+/// Dense routing for tier 2 (Progress log: tier 2, dense routing): every read's candidate
+/// leaves by seed votes. `leaves`' k-mers (all of them, `p`'s k and classes) are indexed,
+/// those held more than `max_occ` times dropped; each read votes, each of its positions once
+/// per (leaf, diagonal band of width `p.band`), and a leaf's votes are its best two adjacent
+/// bands'. Returns (read, leaf, votes) for each read's `top` leaves with at least `min_votes`
+/// (ties at the cut kept), reads in order.
+pub fn route_votes<S: AsRef<[u8]> + Sync>(
+    reads: &[S],
+    leaves: &[S],
+    p: &Params,
+    min_votes: u32,
+    top: usize,
+    max_occ: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut index: Vec<(u32, u32, u32)> = Vec::new(); // (hash, leaf, position)
+    for (l, seq) in leaves.iter().enumerate() {
+        index.extend(
+            kmers(seq.as_ref(), p)
+                .into_iter()
+                .map(|(h, i)| (h, l as u32, i)),
+        );
+    }
+    index.sort_unstable();
+    // drop k-mers held more than max_occ times (repeats, low complexity left after masking)
+    let mut kept = Vec::with_capacity(index.len());
+    let mut i = 0;
+    while i < index.len() {
+        let j = i + index[i..].partition_point(|x| x.0 == index[i].0);
+        if j - i <= max_occ {
+            kept.extend_from_slice(&index[i..j]);
+        }
+        i = j;
+    }
+    let index = kept;
+    let band = i64::from(p.band.max(1));
+    let n = reads.len();
+    let per_thread = n.div_ceil(threads()).max(1);
+    let mut out: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); n.div_ceil(per_thread).max(1)];
+    std::thread::scope(|scope| {
+        for (t, slot) in out.iter_mut().enumerate() {
+            let index = &index;
+            scope.spawn(move || {
+                let mut votes: std::collections::HashMap<(u32, i64), (u32, u32)> =
+                    std::collections::HashMap::new();
+                let first = t * per_thread;
+                let mine = &reads[first..((t + 1) * per_thread).min(n)];
+                for (r, read) in mine
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (first + i, x.as_ref()))
+                {
+                    votes.clear();
+                    for (h, i) in kmers(read, p) {
+                        let lo = index.partition_point(|x| x.0 < h);
+                        for &(_, l, j) in index[lo..].iter().take_while(|x| x.0 == h) {
+                            let b = (i64::from(j) - i64::from(i)).div_euclid(band);
+                            let e = votes.entry((l, b)).or_insert((0, u32::MAX));
+                            if e.1 != i {
+                                *e = (e.0 + 1, i); // a read position once per band
+                            }
+                        }
+                    }
+                    let mut best: std::collections::HashMap<u32, u32> =
+                        std::collections::HashMap::new();
+                    for (&(l, b), &(c, _)) in &votes {
+                        let next = votes.get(&(l, b + 1)).map_or(0, |x| x.0);
+                        let v = best.entry(l).or_insert(0);
+                        *v = (*v).max(c + next);
+                    }
+                    let mut got: Vec<(u32, u32)> =
+                        best.into_iter().filter(|&(_, v)| v >= min_votes).collect();
+                    got.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    if got.len() > top {
+                        let cut = got[top - 1].1;
+                        got.retain(|x| x.1 >= cut);
+                    }
+                    slot.extend(got.into_iter().map(|(l, v)| (r as u32, l, v)));
+                }
+            });
+        }
+    });
+    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+    for (r, l, v) in out.into_iter().flatten() {
+        a.push(r);
+        b.push(l);
+        c.push(v);
+    }
+    (a, b, c)
+}
+
 /// Features each representative's sketch stores.
 pub fn sketch_sizes<S: AsRef<[u8]> + Sync>(reps: &[S], p: &Params) -> Vec<u32> {
     reps.iter()
@@ -374,6 +464,9 @@ mod tests {
         let one = |method| pseudo_scores(&[del], &[long], &[0], &[0], &params(method), &m)[0];
         assert_eq!(one(Method::Anchored), 20); // the longer side only
         assert_eq!(one(Method::Gapped), 2 * 19 - 12);
+        // dense routing: the read votes for the leaf sharing its diagonal, not the other
+        let (r, l, v) = route_votes(&[read], &[other, rep], &params(Method::Diag), 2, 4, 100);
+        assert_eq!((r, l, v), (vec![0], vec![1], vec![6]));
         // a representative with no k-mer (masked, or shorter than k) scores 0
         let mut p = params(Method::Anchored);
         p.minimizer = 4;

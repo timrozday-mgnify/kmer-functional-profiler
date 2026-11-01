@@ -858,6 +858,34 @@ fn pseudo_align<'py>(
     Ok(got.into_pyarray(py))
 }
 
+/// Dense routing (kfp::route_votes): each read's top leaves by seed votes on a diagonal band;
+/// returns (read, leaf, votes), reads in order.
+#[pyfunction]
+#[pyo3(signature = (reads, leaves, k, classes, band=8, min_votes=2, top=32, max_occ=2000))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn route_reads<'py>(
+    py: Python<'py>,
+    reads: Vec<PyBackedBytes>,
+    leaves: Vec<PyBackedBytes>,
+    k: usize,
+    classes: &[u8],
+    band: u32,
+    min_votes: u32,
+    top: usize,
+    max_occ: usize,
+) -> PyResult<(
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+)> {
+    if top == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("top > 0"));
+    }
+    let p = pseudo_params("diag", k, classes, (1, 1, 1), band, (8, 1), 1)?;
+    let (r, l, v) = py.detach(|| kfp::route_votes(&reads, &leaves, &p, min_votes, top, max_occ));
+    Ok((r.into_pyarray(py), l.into_pyarray(py), v.into_pyarray(py)))
+}
+
 /// Features each representative's sketch stores (as `pseudo_align` builds it).
 #[pyfunction]
 #[pyo3(signature = (reps, method, k, classes, sketch=(1, 1, 1), gap=(8, 1)))]
@@ -902,6 +930,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(align_ungapped, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_align, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_sketch_sizes, m)?)?;
+    m.add_function(wrap_pyfunction!(route_reads, m)?)?;
     m.add_class::<PyDistinct>()?;
     m.add_class::<PyFastxHits>()?;
     m.add_class::<PyDiamondReader>()?;

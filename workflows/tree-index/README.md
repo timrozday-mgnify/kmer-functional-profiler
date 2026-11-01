@@ -219,13 +219,17 @@ each. Cuts fall between k-11 storage components, which few such edges cross.
 
 ## Tier 2 (`tier2.py`)
 
-A per-sample database over tier 1's candidates, for presence and read classification. Tier 1
-routes each read pair to groups (its aligned pairs within `--route-below` bits of the
-read-level bar) and their spanning-tree neighbours (`--neighbours`, 0.83); tier 2 aligns it to
-every leaf of those groups (`--method gapped`: banded affine-gap Smith-Waterman around
-`verify.py`'s anchored seeds, repeats masked; `anchored`, ungapped, ~4x faster), so it reaches
-the closest member, not only the group's composite. Each read's tied leaves are shared by EM
-(`--em-rounds`); a group with at least `--min-reads` expected reads is present. Candidate
+A per-sample database over tier 1's candidates, for read classification. Tier 1 is a profile:
+it says which groups are present, with high recall from a small index, but its sparse keys
+seed only some of each strain's reads. Tier 2's candidates are tier 1's present groups, the
+groups its pairs route reads to, and their spanning-tree neighbours (`--neighbours`, 0.83).
+Every read pair is then classified by tier 2 itself (`--route dense`): all twelve frames vote
+by protein 5-mer seeds on a diagonal band against every candidate leaf (`_core.route_reads`,
+the top `--route-top` 16 leaves with at least `--route-votes` 4), and the gapped alignment
+(`--method gapped`: banded affine-gap Smith-Waterman around `verify.py`'s anchored seeds,
+repeats masked) makes the call. A read keeps every hit within `--ambiguous-bits` (3) of its
+best, shared by EM (`--em-rounds`); a group with at least `--min-reads` expected reads is
+present. Routing to an aligner comes after, from these calls (`handoff/assignments.parquet`). Candidate
 leaves are packed in leaf order (tier 1's tree, so relatives are adjacent and a group is one
 range) into chunks of at most `--chunk-residues`; one streaming pass writes their sequences in
 leaf order, and each chunk reads its range. Scores spill per chunk and are merged per read;

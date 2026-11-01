@@ -24,8 +24,10 @@ Subcommands:
   to the source's unit, over the strain's reads) and precision by leaf, layer group, unit
   and, with ``--pfam``, Pfam family (the called leaf's and the source's accessions overlap).
   Writes ``reads.tsv`` (per identity bin) and ``reads.json``.
-- ``summary``: one row per build (postings, decoy bar, recall by identity; with ``reads``'s
-  output, candidate unit precision and read sensitivity and precision), across builds.
+- ``summary``: one row per build: postings, decoy bar and candidate recall by identity; tier 1
+  as a profile (its candidate units' precision and recall, strains detected at depth >= 1)
+  and, from ``tier2/``, tier 2 as a read classifier (read recall and precision, leaf, top-leaf
+  and Pfam precision, median hits, its units' precision and recall), across builds.
 
 Strategies, each from the leaves with ``min_hits`` hit k-mers (seeds):
 
@@ -245,12 +247,18 @@ def summary(a: argparse.Namespace) -> None:
             "query_s": round(q["total_s"]),
             "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
         }
-        for pre, f in (("", sdir / "reads.json"), ("t2_", sdir / "tier2" / "reads.json")):
-            if f.exists():  # recall.py reads, on tier 1's calls and tier 2's
-                r = json.loads(f.read_text())
-                keys = ("cand_unit_precision", "unit_recall", "read_recall", "read_precision",
-                        "leaf_precision", "pfam_precision", "detected_depth1")  # fmt: skip
-                row |= {pre + k: r.get(k) for k in keys}
+        # tier 1 is a profile: its candidates' units and strain detection; tier 2 classifies
+        # reads (tier 1's read numbers stay in its reads.json, a diagnostic)
+        if (sdir / "reads.json").exists():
+            r = json.loads((sdir / "reads.json").read_text())
+            row |= {k: r.get(k) for k in ("cand_unit_precision", "unit_recall", "detected_depth1")}
+        if (sdir / "tier2" / "reads.json").exists():
+            r = json.loads((sdir / "tier2" / "reads.json").read_text())
+            keys = (
+                "read_recall", "read_precision", "leaf_precision", "leaf_precision_top",
+                "pfam_precision", "hits_median", "cand_unit_precision", "unit_recall",
+            )  # fmt: skip
+            row |= {f"t2_{k}": r.get(k) for k in keys}
         for ident, got in per.group_by("identity_bin").agg(pl.col(a.strategy).mean()).iter_rows():
             row[f"r{ident}"] = got
         rows.append(row)
