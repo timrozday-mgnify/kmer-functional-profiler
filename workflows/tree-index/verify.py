@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import query
+import store as leaf_store
 from numpy.typing import NDArray
 
 from kmer_functional_profiler import _core
@@ -101,22 +102,35 @@ def read_frames(index: query.Index, r1: str, r2: str) -> list[bytes]:
     return out
 
 
-def rep_seqs(index: Path, members: str) -> dict[int, bytes]:
-    """Each position's representative, masked: the longest protein (ties: the first) of its
-    layer group's representative position if the index has groups, else of its own."""
-    prot = pl.read_parquet(index / "proteins.parquet").filter(pl.col("pos") >= 0)
-    seqs = pl.read_parquet(members, columns=["protein_id", "sequence"])
-    got = (
-        prot.join(seqs, on="protein_id")
-        .with_columns(n=pl.col("sequence").str.len_bytes())
-        .sort("pos", "n", descending=[False, True])
-        .unique("pos", keep="first")
-    )
+def rep_seqs(
+    index: Path,
+    positions: NDArray[np.int64],
+    members: str | None = None,
+    store: str | None = None,
+) -> dict[int, bytes]:
+    """Each of ``positions``' representative, masked: the longest protein (ties: the first) of
+    its layer group's representative position if the index has groups, else of its own; read
+    from the leaf-ordered ``store`` (store.py) for just those positions, else from ``members``."""
+    positions = np.unique(np.asarray(positions, dtype=np.int64))
+    gfile = index / "layer_group.npy"
+    group = np.load(gfile).astype(np.int64) if gfile.exists() else None
+    need = np.unique(np.r_[positions, group[positions]]) if group is not None else positions
+    if store:
+        got = leaf_store.LeafStore(store).get(need)
+    else:
+        prot = pl.read_parquet(index / "proteins.parquet").filter(
+            pl.col("pos").is_in(pl.Series(need).implode())
+        )
+        got = (
+            prot.join(pl.read_parquet(members, columns=["protein_id", "sequence"]), on="protein_id")
+            .with_columns(n=pl.col("sequence").str.len_bytes())
+            .sort("pos", "n", "protein_id", descending=[False, True, False])
+            .unique("pos", keep="first")
+        )
     own = dict(zip(got["pos"].to_list(), (mask(s.encode()) for s in got["sequence"]), strict=True))
-    if not (index / "layer_group.npy").exists():
-        return own
-    group = np.load(index / "layer_group.npy")
-    return {p: own.get(int(group[p]), s) for p, s in own.items()}
+    if group is None:
+        return {p: own[p] for p in positions.tolist() if p in own}
+    return {p: own.get(int(group[p]), own[p]) for p in positions.tolist() if p in own}
 
 
 def scored(
@@ -149,7 +163,8 @@ def scored(
 def main() -> None:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     p.add_argument("--index", required=True)
-    p.add_argument("--members", required=True, help="the index's members (sequences)")
+    p.add_argument("--members", help="the index's members (sequences), without --store")
+    p.add_argument("--store", help="the index's leaf-ordered store (store.py)")
     p.add_argument("--reads", nargs=2, required=True)
     p.add_argument("--query", required=True, help="query.py --out: candidates are added here")
     p.add_argument("--floor", type=float, default=8.0, help="read-pair evidence to align")
@@ -157,16 +172,23 @@ def main() -> None:
     p.add_argument("--method", choices=["anchored", "full"], default="anchored")
     a = p.parse_args()
     index, qdir = query.Index(a.index), Path(a.query)
-    matrix, reps = blosum62(), rep_seqs(Path(a.index), a.members)
+    matrix = blosum62()
     info: dict[str, float | int] = {}
-    got = {}
+    got, evs, all_frames, t_ev = {}, {}, {}, {}
     for name, reads in (("sample", a.reads), ("decoy", query.reversed_reads(a.reads, qdir))):
         t0 = time.perf_counter()
         pairs, windows, n_reads = query.read_pairs(index, *reads, "all")
         log2_w = float(np.log2(max(windows.get(index.k, 1) / max(n_reads, 1), 2)))
-        ev = query.evidence_chunked(index, pairs, log2_w, True, per_read=True, floor=a.floor)
-        ev = ev.filter(pl.col("pos").is_in(list(reps)))  # leafless positions: none here
-        frames = read_frames(index, *reads)
+        evs[name] = query.evidence_chunked(index, pairs, log2_w, True, per_read=True, floor=a.floor)
+        all_frames[name] = read_frames(index, *reads)
+        t_ev[name] = time.perf_counter() - t0
+    # the representatives of the leaves the pairs touch, and only those
+    touched = np.unique(np.concatenate([e["pos"].to_numpy() for e in evs.values()]))
+    reps = rep_seqs(Path(a.index), touched, a.members, a.store)
+    for name in ("sample", "decoy"):
+        t0 = time.perf_counter() - t_ev[name]
+        ev = evs[name].filter(pl.col("pos").is_in(list(reps)))  # leafless positions: none here
+        frames = all_frames[name]
         got[name], took = scored(ev, frames, reps, matrix, a.method)
         # the aligned reads' frames, for tier2.py (recomputing them is its largest cost)
         r = np.unique(ev["read"].to_numpy())

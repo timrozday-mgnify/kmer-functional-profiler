@@ -18,10 +18,11 @@ leaves apart, so ties are shared, not broken.
    pairs alone, each leaf expanded to its group.
 2. **Chunks along the tree.** Candidate leaves in leaf order (tier 1's merge-tree order, so
    relatives are adjacent and a chunk is a contiguous range) are packed into chunks of at most
-   ``--chunk-residues`` residues. One streaming pass over ``--members`` writes the candidates'
-   sequences (each leaf's longest protein) in leaf order (``seqs.parquet``), so a chunk reads
-   one range of it. A layer group is a single-linkage cluster of the tree, so one contiguous
-   range: the work list splits by chunk once, each group in one chunk or two.
+   ``--chunk-residues`` residues. Their sequences (each leaf's longest protein) come from the
+   index's leaf-ordered store (``--store``, ``store.py``: only the row groups holding them), or
+   without one from one streaming pass over ``--members`` that writes them in leaf order. A
+   layer group is a single-linkage cluster of the tree, so one contiguous range: the work list
+   splits by chunk once, each group in one chunk or two.
 3. **Alignment per chunk** (``--method``: ``gapped``, the default, banded
    Smith-Waterman with affine gaps around the anchored seeds, or ``anchored``, ungapped and ~4x
    faster), in batches of at most
@@ -64,6 +65,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import query
+import store as leaf_store_mod
 import verify
 from numpy.typing import NDArray
 
@@ -142,6 +144,10 @@ def leaf_store(index: Path, members: str, leaves: NDArray[np.int64], dst: Path) 
         .select("pos", "protein_id", "cluster_rep", "sequence")
         .sink_parquet(dst, row_group_size=20_000)
     )
+
+
+def _masked(s: str) -> bytes:
+    return verify.mask(s.encode())
 
 
 def chunk_seqs(store: Path, lo: int, hi: int) -> dict[int, bytes]:
@@ -271,7 +277,7 @@ NEIGHBOURS = 5  # per group: the reference's neighbours, as kfp-pileup's REFEREN
 
 def handoff(
     out: Path,
-    store: Path,
+    seqs: pl.DataFrame,
     present: NDArray[np.int64],
     group: NDArray[np.int64],
     reads: list[str],
@@ -285,7 +291,6 @@ def handoff(
     EM weight; an ambiguous pair has several rows), so routing follows it."""
     dst = out / "handoff"
     dst.mkdir(exist_ok=True)
-    seqs = pl.read_parquet(store)
     seqs = seqs.with_columns(component=pl.Series(group[seqs["pos"].to_numpy()]))
     targets = seqs.filter(pl.col("pos").is_in(pl.Series(present).implode()))
     others = seqs.filter(
@@ -323,7 +328,8 @@ def handoff(
 def main() -> None:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     p.add_argument("--index", required=True)
-    p.add_argument("--members", required=True, help="the index's members (sequences)")
+    p.add_argument("--members", help="the index's members (sequences), without --store")
+    p.add_argument("--store", help="the index's leaf-ordered store (store.py)")
     p.add_argument("--reads", nargs=2, required=True)
     p.add_argument("--query", required=True, help="query.py and verify.py's --out")
     p.add_argument("--share", default="0.01", help="tier 1's read bar share")
@@ -387,8 +393,27 @@ def main() -> None:
         "residues": int(length[leaves].sum()),
         "route_floor": floor,
     }
-    store = out / "seqs.parquet"
-    leaf_store(index, a.members, leaves, store)
+    # sequences: the index's leaf-ordered store (store.py) read by position, else one streaming
+    # pass over the members writing the candidates' in leaf order
+    if a.store:
+        ls = leaf_store_mod.LeafStore(a.store)
+
+        def get(pos: NDArray[np.int64]) -> dict[int, bytes]:
+            got = ls.get(pos)
+            return dict(zip(got["pos"].to_list(), map(_masked, got["sequence"]), strict=True))
+
+        def ids(pos: NDArray[np.int64]) -> pl.DataFrame:
+            return ls.get(pos, ids=True)
+    else:
+        store = out / "seqs.parquet"
+        leaf_store(index, a.members, leaves, store)
+
+        def get(pos: NDArray[np.int64]) -> dict[int, bytes]:
+            return chunk_seqs(store, int(pos.min()), int(pos.max()))
+
+        def ids(pos: NDArray[np.int64]) -> pl.DataFrame:
+            return pl.read_parquet(store).filter(pl.col("pos").is_in(pl.Series(pos).implode()))
+
     info["store_s"] = time.perf_counter() - t0
     # chunks holding each group (one, or two where a chunk boundary cuts it)
     g_chunk = leaf_chunk.select("g", "chunk").unique()
@@ -407,7 +432,7 @@ def main() -> None:
         parts = wl.join(g_chunk, on="g").partition_by("chunk", as_dict=True)
         for c in range(info["chunks"]):  # type: ignore[arg-type]
             mine = leaf_chunk.filter(pl.col("chunk") == c)
-            seqs = chunk_seqs(store, int(mine["pos"].min()), int(mine["pos"].max()))
+            seqs = get(mine["pos"].to_numpy())
             part = parts.get((c,), pl.DataFrame(schema={"read": pl.Int64, "g": pl.Int64}))
             t1_pairs = part.join(mine.select("g", "pos"), on="g").select("read", "pos")
             if not dense:
@@ -473,10 +498,11 @@ def main() -> None:
     (out / "verify.json").write_text(json.dumps(bars, indent=1) + "\n")
     if not a.no_handoff and first is not None:
         t1 = time.perf_counter()
-        handoff(out, store, first[0], group, a.reads, first[1])
+        handoff(out, ids(leaves), first[0], group, a.reads, first[1])
         info["handoff_s"] = time.perf_counter() - t1
     shutil.rmtree(spill)
-    store.unlink()
+    if not a.store:
+        store.unlink()
     for f in out.glob("decoy_*.fq.gz"):
         f.unlink()
     info |= bars | {"total_s": time.perf_counter() - t0, "peak_rss_gb": peak_rss_gb()}

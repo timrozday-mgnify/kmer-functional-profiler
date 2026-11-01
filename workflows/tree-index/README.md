@@ -156,6 +156,8 @@ BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the 
            per spanning-tree group, its k from the whole database's size (partition.json's
            proteins)
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
+STORE      store.py per part and tier: each leaf's longest protein in leaf order (row =
+           position) -> store-<tier>/, which verify.py and tier2.py read by position
 TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
 SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM62
            substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
@@ -249,6 +251,29 @@ sets `--chunk-residues` and `--batch-pairs` (a third of it each). `handoff/` is 
 `kfp-pileup reference`'s format (`ref.fa`, `refs.tsv`, `molecule.txt`: present leaves as
 targets, up to 5 other leaves of each group as neighbours) with the called read pairs, for
 `kfp-pileup`'s DIAMOND and `call`.
+
+## The leaf-ordered store (`store.py`)
+
+One row per leaf position (row = position): the leaf's longest protein, its `protein_id` and
+`cluster_rep`, built per partition part (a part's positions are one range of the merged
+index, `merge.py`'s `parts.json`). `verify.py` and `tier2.py` read only the candidates' rows
+(`--store`) instead of scanning the members. It is a reordered copy of the MGnify protein
+store, beside the index, not in it. Formats (`build.nf --store_format`):
+
+| Format | Files | A read costs | Size |
+| --- | --- | --- | --- |
+| `flat` (default) | `.bin` (sequences concatenated), `.offsets.npy`, `.ids.npy`, memory-mapped | the candidates' own bytes, wherever they fall | ~1× the residues (~1.6 TB at release, estimate) |
+| `parquet` | `.parquet`, zstd, 1,024-row groups | every row group holding a candidate | ~0.55× |
+
+Measured on a 3 M-leaf synthetic store, 2,000 candidates: in 100 runs of 20, flat 0.007 s,
+parquet 0.039 s; scattered, flat 0.004 s, parquet 0.32 s (half the row groups), a full members
+scan 0.33 s either way. At release (2 M candidates in ~5.5 × 10⁹ leaves, a ~1.3 TB members
+store) the scan is ~20–40 min per sample; flat reads ≤ ~8 GB of pages (estimate).
+
+```bash
+python workflows/tree-index/store.py build --proteins index/proteins.parquet \
+    --members members.parquet --format flat --out store
+```
 
 ## Querying and reporting (`query.py`, `report.py`)
 

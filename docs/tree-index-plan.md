@@ -1216,3 +1216,16 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     By identity (fresh, dense, votes 4): read recall 0.97 / 0.97 / 0.94 / 0.91 / 0.84 / 0.76 / 0.66 / 0.63 at 100–70% (tier 1: 0.88 … 0.25), precision 0.98–1.00; by coding share < 25 / 25–50 / 50–75 / ≥ 75%: 0.18 / 0.74 / 0.83 / 0.90. Median hits per called read 12 (3-bit ambiguity; top leaf alone right 42%).
   - Votes 4 / top 16 is the default: the same strain-read scores with background at a third of the pairs. It calls more background reads (6,978 against 4,608): fewer decoy pairs lower the decoy bar; the bar still holds decoys to 1% of the calls, so the extra calls are not chance, but the background's truth is unknown (`read_precision_bg_lower` 0.71 against 0.79).
   - **Next:** the alignment is ~90% of tier 2's time (gapped, ~22 k pairs/s on 2 threads with background): anchored first and gapped only near the bar; the slice on HPC for unit precision with near units present.
+- **A leaf-ordered sequence store (2026-11-01, the user's request: faster extraction than scanning the members parquet).** Tier 2 and `verify.py` read every candidate's sequence by joining against a full scan of the members store: at release ~1.3 TB per sample for ~600 MB of sequences (2 M candidates; ~20–40 min, estimate). Row-group statistics cannot prune it: the buckets are sorted by `cluster_rep`, and at 2 M candidates nearly every ~100 k-row group holds one. `verify.py`'s `rep_seqs` also loaded every leaf's sequence into memory.
+  - `store.py`: one row per leaf position (row = position), the leaf's longest protein (ties: the least `protein_id`), with its `protein_id` and `cluster_rep`; built per partition part from the part's own `proteins.parquet` and `merge.py`'s new `parts.json` (each part's first position), so no step holds the release; `LeafStore` reads any number of parts by position. `build.nf`: STORE per part and tier, STORE_DIR → `store-<tier>/`; QUERY passes `--store` to `verify.py` and `tier2.py` (both keep `--members` without one). `verify.py` now computes both sides' evidence first and reads only the representatives the pairs touch.
+  - Formats, measured on a synthetic 3 M-leaf store (2 threads; the members file in the page cache, which favours the scan):
+
+    | Candidates | Members scan | Parquet (1,024-row groups) | Flat (mmap) |
+    | --- | --- | --- | --- |
+    | 200 k, in runs of 20 | 0.37 s | 0.68 s | 0.78 s |
+    | 200 k, scattered | 0.36 s | 0.90 s | 0.86 s |
+    | 2,000, in 100 runs of 20 | 0.33 s | 0.039 s (99 of 2,930 groups) | 0.007 s |
+    | 2,000, scattered | 0.33 s | 0.32 s (1,483 of 2,930 groups) | 0.004 s |
+
+    At 6.7% of the store the scan is fastest (the per-row decode, ~3–4 µs, dominates the stores); at release candidates are ~0.04% of the leaves, where a scan reads everything, parquet every row group a candidate falls in (cheap only when candidates cluster) and flat only the candidates' own pages. Flat is the default (~1× the residues on disk, ~1.6 TB at release; parquet ~0.55×).
+  - Checked: on the quarter sample `verify.rep_seqs` returns the same 20,000 representatives from a flat store as from the members; the test profile's `bench.tsv` is unchanged through the store (both formats).

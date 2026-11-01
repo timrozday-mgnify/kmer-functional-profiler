@@ -3,7 +3,7 @@
 Parts are taken in name order. Positions, node ranges, spanning-tree edges, pieces and protein
 positions are offset by the positions before each part; internal nodes are numbered part by part;
 postings are re-sorted by (hash, lo). The result has ``build.py``'s format, so ``query.py`` reads
-it as is.
+it as is; ``parts.json`` gives each part's first position (``store.py`` builds per part).
 """
 
 import argparse
@@ -36,6 +36,7 @@ def main() -> None:
     }
     pieces, proteins, bits = [], [], []
     off = 0
+    offsets = []  # each part's first merged position (store.py builds per part from them)
     for p, m in zip(parts, metas, strict=True):
         load = lambda name: np.load(p / f"{name}.npy")  # noqa: B023, E731
         for x in ("hash", "sign", "kind", *TABLES):
@@ -52,6 +53,7 @@ def main() -> None:
                 pos=pl.when(pl.col("pos") >= 0).then(pl.col("pos") + off).otherwise(-1)
             )
         )
+        offsets.append({"name": p.name, "offset": off, "positions": m["stats"]["positions"]})
         off += m["stats"]["positions"]
     if off >= 2**32:
         raise ValueError(f"{off} positions do not fit the format's u32 ranges")
@@ -99,6 +101,7 @@ def main() -> None:
     }
     meta = {"format": metas[0]["format"], "params": params, "stats": stats, "files": files}
     (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    (out / "parts.json").write_text(json.dumps(offsets, indent=1) + "\n")
     print(json.dumps(stats))
 
 

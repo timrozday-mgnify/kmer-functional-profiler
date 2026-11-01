@@ -38,6 +38,8 @@
 #                                    rule; strategies.tsv also has ev_ and fam_ seeds alone)
 #   results/runs/q-<tier>/verify.json  pairs aligned, seconds, pairs per second
 #   results/index-<tier>/meta.json   postings by kind, bytes, positions, parts, build time
+#   results/store-<tier>/            the leaf-ordered store (store.py, flat), read by verify.py
+#                                    and tier2.py; ~1x the index's residues on disk
 #   results/runs/s-<tier>/           recall.tsv (identity x depth), strategies.tsv
 #   results/trace.tsv                time and peak RSS per task
 # Re-submitting resumes: PARTITION is reused; BUILD and MERGE rerun when build.py changes.
