@@ -292,9 +292,10 @@ def test_rare_windows_break_ties_by_hash() -> None:
 
 
 def test_default_modes_query_soundly(tmp_path: Path) -> None:
-    """The tiers (slim: one posting per leaf where possible; standard and large: a protein
-    layer on spanning-tree groups' composites, k from the database's size): covers sum to 0 or
-    1, and the query and report checks hold against brute force, the layer's k-mers included."""
+    """The tiers (slim: one posting per leaf where possible; standard: that plus a protein
+    layer on spanning-tree groups' composites; large: the n_1 2 base and a denser layer; k from
+    the database's size): covers sum to 0 or 1, and the query and report checks hold against
+    brute force, the layer's k-mers included."""
     assert [build.layer_k(n) for n in (320, 262_391, 53_000_000)] == [5, 6, 8]
     members = fixture(tmp_path)
     layers = {"slim": "", "standard": "protein:5:64:rare", "large": "protein:5:16:rare"}
@@ -305,7 +306,7 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         )
         meta = json.loads((idx / "meta.json").read_text())
         assert meta["params"]["layers"] == want
-        assert meta["params"]["n_1"] == (1 if mode == "slim" else 2)
+        assert meta["params"]["n_1"] == (2 if mode == "large" else 1)
         assert (idx / "layer_group.npy").exists() == bool(want)
         codes = set(np.load(idx / "key_k.npy").tolist())
         assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k

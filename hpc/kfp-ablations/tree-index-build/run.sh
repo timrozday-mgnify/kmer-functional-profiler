@@ -9,16 +9,18 @@
 # Tree index on the 1-in-100 subset (docs/tree-index-plan.md, Progress log: per-layer bars,
 # gather, layer representatives and rough alignment), with workflows/tree-index/build.nf, then
 # each tier benchmarked on BLOSUM62 strains.
-#   base      S3, no layer (--mode standard --layers ''): t_base 0.01, ~4 spread 11-mer
+#   base      S3, no layer (--mode large --layers ''): t_base 0.01, ~4 spread 11-mer
 #             minimizers, k 7 ladder (window 4) for leaves with < 32 informative 11-mers
 #   slim      --mode slim: as base with n_1 1, ~2 minimizers (--window-min 1) and the ladder
 #             for < 16; ~100-130 GB at release (estimate)
-#   standard  --mode standard: base plus the rarest protein k-mer per window of 64 on one
-#             composite per spanning-tree group (tree:0.57, k-mers of >= 25% of its members),
-#             k from the database's size (build.layer_k: k 8 here); a representative's seed
-#             stands for its group; ~280-330 GB at release; ~0.84 recall at 80% aligned
-#   large     --mode large: the layer at window 16; ~470-560 GB; ~0.83 at 70% aligned
-#   old-std   the old standard: the layer at window 8 on every leaf (~1.0-1.2 TB), to compare
+#   standard  --mode standard: slim's base plus the rarest protein k-mer per window of 64 on
+#             one composite per spanning-tree group (tree:0.57, k-mers of >= 25% of its
+#             members), k from the database's size (build.layer_k: k 8 here); a
+#             representative's seed stands for its group; ~235-260 GB at release; ~0.71
+#             recall at 80% aligned
+#   base-w64  base plus that layer (the previous standard; ~315-365 GB, ~0.83 at 80%)
+#   large     --mode large: base plus the layer at window 16; ~505-600 GB; ~0.82 at 70%
+#   old-std   the first standard: the layer at window 8 on every leaf (~1.0-1.2 TB)
 # a leaf per distinct dense 8-mer set, the dense 8-mer topology, Fitch diffs on the spanning
 # tree itself. PARTITION (~130 GB, one job) splits ~53 M proteins into parts of 2 M; BUILD runs
 # per part and tier (~60 GB with a layer: 7.6-8.0 GB per 262 k proteins locally); MERGE writes
@@ -39,11 +41,12 @@
 source ../common.sh
 [[ -f $SUBSET/members.parquet ]] || { echo "no $SUBSET/members.parquet" >&2; exit 1; }
 tiers=(
-    "base:--mode standard --layers ''"
+    "base:--mode large --layers ''"
     "slim:--mode slim"
     "standard:--mode standard"
+    "base-w64:--mode large --layers protein:{k}:64:rare"
     "large:--mode large"
-    "old-std:--mode standard --layers protein:{k}:8:rare --layer-groups ''"
+    "old-std:--mode large --layers protein:{k}:8:rare --layer-groups ''"
 )
 TIERS=$(IFS=';'; echo "${tiers[*]}")
 nextflow run "$WF/tree-index/build.nf" -c ../site.config -resume --outdir results \

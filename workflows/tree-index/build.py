@@ -441,9 +441,12 @@ def holdings(index: Path) -> pl.DataFrame:
 # standard and large add one layer of the rarest protein k-mer per window on every leaf.
 MODES: Final[dict[str, dict[str, Any]]] = {
     "slim": {"n_1": 1, "window_min": 1, "min_kmers": 16, "layers": ""},
-    # layers on spanning-tree groups' composites (Progress log: layer representatives), for
-    # query.py then verify.py (rough alignment)
+    # layers on spanning-tree groups' composites (Progress log: layer representatives, a
+    # middle tier), for query.py then verify.py (rough alignment); standard on slim's base
     "standard": {
+        "n_1": 1,
+        "window_min": 1,
+        "min_kmers": 16,
         "layers": "protein:{k}:64:rare",
         "layer_groups": "tree:0.57",
         "layer_rep": "composite:0.25",
@@ -500,9 +503,10 @@ def main() -> None:
     parser.add_argument(
         "--mode", choices=list(MODES), default="standard",
         help="slim: one posting per leaf where possible, no layer (~100-130 GB at release); "
-        "standard: a protein layer at window 64 on group composites (tree:0.57, composite:0.25), "
-        "with verify.py ~0.84 recall at 80%% identity (~280-330 GB); large: at window 16 (~0.83 "
-        "at 70%%, ~470-560 GB). Options given explicitly win",
+        "standard: slim's base plus a protein layer at window 64 on group composites (tree:0.57, "
+        "composite:0.25), with verify.py ~0.71 recall at 80%% identity (~235-260 GB); large: "
+        "the n_1 2 base plus the layer at window 16 (~0.83 at 70%%, ~505-600 GB). Options given "
+        "explicitly win",
     )  # fmt: skip
     parser.add_argument(
         "--window-min", type=int, default=2,
