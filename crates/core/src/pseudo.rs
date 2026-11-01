@@ -70,7 +70,7 @@ fn kmers(seq: &[u8], p: &Params) -> Vec<(u32, u32)> {
 fn sampled(seq: &[u8], p: &Params) -> Vec<(u32, u32)> {
     let all = kmers(seq, p);
     let mut out: Vec<(u32, u32)> = Vec::new();
-    if p.minimizer <= 1 {
+    if p.minimizer <= 1 || all.is_empty() {
         out = all;
     } else {
         for w in all.windows(p.minimizer.min(all.len())) {
@@ -307,5 +307,12 @@ mod tests {
         assert_eq!(score(Method::Anchored, read), 16);
         assert!(score(Method::Pairs, read) > score(Method::Pairs, other));
         assert_eq!(score(Method::Order, other), 1); // ATG
+        // a representative with no k-mer (masked, or shorter than k) scores 0
+        let mut p = params(Method::Anchored);
+        p.minimizer = 4;
+        assert_eq!(
+            pseudo_scores(&[read], &[b"xxxxMK" as &[u8]], &[0], &[0], &p, &m)[0],
+            0
+        );
     }
 }
