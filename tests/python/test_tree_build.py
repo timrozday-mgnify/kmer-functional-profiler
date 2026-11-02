@@ -234,12 +234,17 @@ def test_build_matches_brute_force_and_survey(tmp_path: Path) -> None:
 
 def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     members = fixture(tmp_path)
-    run("--members", str(members), "--out", "parts", "--part-proteins", "30",
+    # parts of 10 cut the fixture's larger components (up to 13 proteins) between atoms
+    run("--members", str(members), "--out", "parts", "--part-proteins", "10",
         cwd=tmp_path, script=PARTITION)  # fmt: skip
     info = json.loads((tmp_path / "parts" / "partition.json").read_text())
     parts = sorted((tmp_path / "parts").glob("part*.parquet"))
     assert info["parts"] == len(parts) >= 3
+    assert info["split_components"] > 0
     assert sum(info["part_proteins"]) == pl.read_parquet(members).height
+    # equal sequences share a leaf, so a part (a cluster can span components, as before)
+    where = pl.concat(pl.read_parquet(p).with_columns(part=pl.lit(i)) for i, p in enumerate(parts))
+    assert where.group_by("sequence").agg(pl.col("part").n_unique())["part"].max() == 1
     built = []
     for p in parts:
         out = tmp_path / f"b-{p.stem}"

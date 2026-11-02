@@ -55,8 +55,9 @@ tiers=(
 )
 TIERS=$(IFS=';'; echo "${tiers[*]}")
 # BUILD's memory grows with a part's proteins (~60 GB per 2 M with a layer, at the default
-# 64 GB): parts of 1 M (~30 GB), 96 GB up front, +96 GB per retry for a part that is one larger
-# component (partition.json: largest_component)
+# 64 GB): parts of 1 M (~30 GB), 96 GB up front, +96 GB per retry. A component larger than a part
+# (single linkage chains families: the largest outgrew 288 GB) is cut between MGnify90 clusters
+# (partition.json: largest_component, split_components)
 cat > build.config <<'CFG'
 process {
     withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
