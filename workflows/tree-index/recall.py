@@ -53,6 +53,7 @@ import polars as pl
 import query
 import report
 from numpy.typing import NDArray
+from polars.testing import assert_frame_equal
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components
 
@@ -493,11 +494,34 @@ def reads(a: argparse.Namespace) -> None:
     print(json.dumps(info, default=float))
 
 
+def chunks(a: argparse.Namespace) -> None:
+    """Whether tier 2's runs at several memory budgets (``tier2.py --memory-gb``) made the same
+    calls and hand-off assignments: exactly, and to float rounding (EM weights)."""
+    runs = sorted(Path(r) for r in a.runs)
+    files = ("reads.parquet", "handoff/assignments.parquet")
+    read = lambda run, f: (lambda d: d.sort(d.columns))(pl.read_parquet(run / f))  # noqa: E731
+    same: dict[str, dict[str, bool]] = {}
+    for f in files:
+        first = read(runs[0], f)
+        exact, close = True, True
+        for run in runs[1:]:
+            other = read(run, f)
+            exact &= other.equals(first)
+            try:
+                assert_frame_equal(other, first, check_exact=False, rtol=1e-5)
+            except AssertionError:
+                close = False
+        same[f] = {"exact": exact, "close": close}
+    info = {r.name: json.loads((r / "tier2.json").read_text()) for r in runs}
+    Path(a.out).write_text(json.dumps({"identical": same, "runs": info}, indent=1) + "\n")
+    print(json.dumps(same))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("targets")
-    p.add_argument("--members", required=True)
+    p.add_argument("--members", nargs="+", required=True)
     p.add_argument("--index", required=True)
     p.add_argument("--n", type=int, default=2000)
     p.add_argument("--seed", type=int, default=1)
@@ -527,8 +551,13 @@ def main() -> None:
     p.add_argument("--depth", type=float, default=1.0)
     p.add_argument("--base", default="S3", help="postings are also given over this build's")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("chunks")
+    p.add_argument("--runs", nargs="+", required=True, help="tier2.py --out directories")
+    p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"targets": targets, "score": score, "reads": reads, "summary": summary}[a.command](a)
+    {"targets": targets, "score": score, "reads": reads, "summary": summary, "chunks": chunks}[
+        a.command
+    ](a)
 
 
 if __name__ == "__main__":

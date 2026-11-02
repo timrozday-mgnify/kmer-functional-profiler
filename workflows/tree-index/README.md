@@ -149,13 +149,18 @@ identity) from one members table, in parts:
 FIXTURE    synthetic members when --members is '' (the test profile)
 PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-find during
            the pair join, _core.overlap_components) or an equal sequence; components packed
-           into parts of ~--part_proteins (2 M) -> partition.json
+           into parts of ~--part_proteins (2 M) -> partition.json. With --partition_per_file,
+           once per members file (the release's buckets, each of whole MGnify90 clusters):
+           edges between clusters in different buckets are lost, so their k-mers are posted
+           once per bucket
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
            topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
            tree, per-leaf top-ups; standard and large also a protein layer on one composite
            per spanning-tree group, its k from the whole database's size (partition.json's
            proteins)
-MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
+MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/; out of
+           core (tables part by part into memory-mapped files, postings and keys one hash
+           range of --ranges 256 at a time), so the release merges in bounded memory
 STORE      store.py per part and tier: each leaf's longest protein in leaf order (row =
            position) -> store-<tier>/, which verify.py and tier2.py read by position
 TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
@@ -180,9 +185,17 @@ of `--slice_families` random Pfam families (`--slice_min_proteins`–`--slice_ma
 proteins each), so near units are present and read precision by unit means something (a
 cluster sample almost never holds a protein's neighbouring units).
 
+With `--reads R1,R2` and `--built <a build run's outdir>`, a real sample goes through the built
+tiers instead (no build, no truth): TIER1 (`query.py --decoy`, `verify.py`) -> `q-<tier>/`,
+TIER2 (`tier2.py`) once per `--tier2_memory` budget (GB, default `16,4`) -> `t2-<tier>-<gb>gb/`
+with the hand-off, and CHUNKS (`recall.py chunks`) -> `chunks-<tier>.json`: whether the
+budgets' calls and assignments are identical, which they must be.
+
 ```bash
 nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
+nextflow run workflows/tree-index/build.nf -profile slurm --members '/path/members.bucket*.parquet' --partition_per_file true --bench false
+nextflow run workflows/tree-index/build.nf -profile slurm --reads r1.fq.gz,r2.fq.gz --built results --tiers 'standard:;large:'
 ```
 
 `--tiers` holds `name:build.py options` pairs, `;`-separated (split at each tier's first `:`,

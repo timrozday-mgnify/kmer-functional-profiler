@@ -249,6 +249,11 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     idx = tmp_path / "merged"
     stats = json.loads((idx / "meta.json").read_text())["stats"]
     assert stats["parts"] == len(parts)
+    # merged by hash range out of core: the result does not depend on the ranges
+    run("--parts", *built, "--out", "ranged", "--ranges", "5", cwd=tmp_path, script=MERGE)
+    for f in sorted(idx.glob("*.npy")):
+        a, b = np.load(f), np.load(tmp_path / "ranged" / f.name)
+        assert a.dtype == b.dtype and np.array_equal(a, b), f.name
     check_index(idx, members)
     check_query(tmp_path, idx, members)
 
