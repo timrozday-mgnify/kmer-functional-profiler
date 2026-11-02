@@ -191,6 +191,12 @@ TIER2 (`tier2.py`) once per `--tier2_memory` budget (GB, default `16,4`) -> `t2-
 with the hand-off, and CHUNKS (`recall.py chunks`) -> `chunks-<tier>.json`: whether the
 budgets' calls and assignments are identical, which they must be.
 
+For laptop benchmarks with realistic neighbourhoods, `slice.py mini` cuts a built slice down to
+~300 k proteins: whole clumps of its spanning tree (each protein's layer group and the groups
+next to it), taken systematically in size order, so the neighbourhood a random protein sits in
+matches the slice's up to its 90th percentile. Build it at the target database's layer k
+(`build.py --database-proteins`). Chance seeds and bars still need the HPC runs.
+
 ```bash
 nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet

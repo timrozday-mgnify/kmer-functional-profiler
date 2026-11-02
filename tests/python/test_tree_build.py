@@ -16,6 +16,7 @@ QUERY = SCRIPT.with_name("query.py")
 REPORT = SCRIPT.with_name("report.py")
 PARTITION = SCRIPT.with_name("partition.py")
 MERGE = SCRIPT.with_name("merge.py")
+SLICE = SCRIPT.with_name("slice.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import build  # noqa: E402
 import phase0 as p0  # noqa: E402
@@ -403,3 +404,19 @@ def test_allocate_layer_keys() -> None:
         assert set(got_h[got_pos == r]) == set(mine[: k[[0, 4, 5].index(r)]])
     k = np.bincount(build.allocate(group, pos, h, "fixed:4")[0], minlength=6)[[0, 4, 5]]
     assert k.tolist() == [5, 2, 5]  # rep 4 holds 2: its spare split between the others
+
+
+def test_mini_slice_keeps_clumps_whole(tmp_path: Path) -> None:
+    """slice.py mini: whole spanning-tree clumps, about the requested share of proteins."""
+    members = fixture(tmp_path)
+    idx = tmp_path / "idx"
+    run("--members", str(members), "--out", str(idx), *MEDIUM, cwd=tmp_path, script=BUILD)
+    run("mini", "--index", str(idx), "--members", str(members), "--proteins", "80",
+        "--out", "mini.parquet", cwd=tmp_path, script=SLICE)  # fmt: skip
+    got = set(pl.read_parquet(tmp_path / "mini.parquet")["protein_id"].to_list())
+    prot = pl.read_parquet(idx / "proteins.parquet").filter(pl.col("pos") >= 0)
+    held = np.zeros(int(prot["pos"].max()) + 1, dtype=bool)
+    held[prot.filter(pl.col("protein_id").is_in(list(got)))["pos"].to_numpy()] = True
+    a, b = np.load(idx / "edge_a.npy"), np.load(idx / "edge_b.npy")
+    assert (held[a] == held[b]).all()  # no edge cut
+    assert 40 <= len(got) <= 120, len(got)

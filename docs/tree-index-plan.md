@@ -1316,3 +1316,37 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 
     A threshold alone trades recall for precision steeply at this depth (lognormal μ 0.3, σ 0.6: a few read pairs per strain). Units need their own presence model: EM with units dropped when their weight is explained by a neighbour (the pileup's posterior presence), or a unit-level decoy bar. That is the next tier-2 step. The read-level calls are usable as they are.
   - **Cost:** QUERY ≤ 17 GB and 3 min (tier 2: 100 s, 11 GB, 1.5 M candidate leaves, 15.8 M pairs aligned); FAMILIES 90 GB (the release's Pfam table).
+- **Local against HPC: where recall goes (2026-11-02, the user's question: bias, a redesign of local benchmarks, or smaller than it looks?).** Standard tier, recall at depth > 1 (`verify_0.01_nb`), same simulation settings throughout. "Fresh" is `sim5`: 2,000 strains, no background, as `build.nf` simulates. "Pooled" is sim1 + sim4 with 251 k real background reads, which the local headline numbers came from. Quarter-sample builds are `SQ-R16-2.63`'s settings with only the layer k changed.
+
+  | Identity | pooled, local k 6 | fresh, local k 6 | fresh, local k 7 | fresh, local k 8 | fresh, local k 8, HPC verify bar | subset (HPC) k 8 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 0.90 | 0.91 | 0.87 | 0.85 | 0.81 | 0.81 | 0.84 |
+  | 0.85 | 0.82 | 0.78 | 0.73 | 0.68 | 0.67 | 0.66 |
+  | 0.80 | 0.73 | 0.70 | 0.64 | 0.62 | 0.61 | 0.46 |
+  | 0.75 | 0.62 | 0.53 | 0.50 | 0.45 | 0.44 | 0.34 |
+  | 0.70 | 0.58 | 0.50 | 0.46 | 0.41 | 0.41 | 0.23 |
+
+  Bins hold ~180–220 strains at depth > 1, so a bin's 95% interval is about ±0.06.
+  - **Sample design (−0.03 to −0.08 below 90%).** The pooled sample's strains are deeper: mean depth 3.8–4.4 in its 100–90% bins and 2.3–2.9 below, against 2.2–2.5 in the fresh sample. "Depth > 1" averages over whatever depth mix a bin has. The local headline numbers were optimistic for this reason alone; it is not a scale effect.
+  - **Layer k (−0.08 to −0.09 at 80–70%).** The same quarter index at k 8 instead of 6, as the log-size rule picks at 53 M proteins. This is the seed-survival cost the detection model predicts.
+  - **Scale (−0.16 at 80%, −0.18 at 70%), the largest step.** Not the alignment bar: applying the subset's verify bar (24.5 bits) to the local k 8 run removes only 164 of 36,594 candidate leaves. The loss is at the seed stage (subset evidence-only 0.31 at 80%, against 0.62 locally at k 8). It is not a smaller key budget either: the layer adds ~0.81 postings per protein on the subset and ~0.86 on the quarter.
+    - Candidate causes, not yet measured: per-key bits at 200× the proteins (chance holders); group representatives farther from a strain's source in larger groups (verify aligns against the representative); and seeds won by near units that are not the source's group.
+    - Measuring them needs the subset's per-read files: `q-standard/{seeds,evidence,aligned,hits}.parquet`, `s-standard/strains.parquet` and `index-standard/{layer_group,key_k,key_bits,keys}.npy` with `proteins.parquet`.
+  - **Group dilution where the database is dense.** The group a random protein sits in has 118 members on the quarter sample and 592 on the slice. Layer keys grow with the square root of group size (`sqrt:2.63`), so keys per member fall from 0.86 to 0.41. That does not explain the subset (similar budget), but the release is far denser than the subset, so it will bite there.
+  - **Bars depend on the sample, not only the database.** The verify and evidence bars hold decoy seeds to 1% of the sample's own seeds, so a seed-rich sample lowers them. The slice (16× the quarter) has the quarter's evidence bar (27.75 bits) because its strains' relatives give 38 seeds per pair, against 4.
+  - **For local benchmarks:** (1) always the fresh design (as `build.nf`), reported with intervals; (2) the layer k the target database will use (k 9 at release), not the local size's; (3) a family-complete mini-slice (a few families, ~300 k proteins) instead of a cluster sample, so group sizes and near units are realistic on the laptop. Bars and chance seeds at 200× the proteins cannot be emulated locally; the HPC subset stays the calibration.
+- **A family-complete mini-slice for local benchmarks (2026-11-02, the user's request).** `slice.py mini` cuts a built slice down to laptop size: whole clumps of its spanning tree (every edge kept, so each protein's layer group and its neighbouring groups come whole), taken systematically in size order. It works from the slice's index alone; no Pfam table needed.
+  - **From `tree-index-slice`** (`data/mini-slice/members.parquet`, git-ignored): 294,644 proteins, 54,983 units, 41,009 clumps. The clump a random protein sits in matches the slice at the 10th–90th percentiles (2 / 9 / 58 / 326 / 1,049 proteins, against 2 / 9 / 62 / 359 / 1,309). The top 1% is thinner: the largest clump is 4.3 k proteins, against 10–23 k. `test_mini_slice_keeps_clumps_whole` checks that no spanning-tree edge is cut.
+  - **Standard at the slice's layer k (7, `--database-proteins 4230133`), 2,000 fresh strains, on the laptop.** BUILD peaked at 10.3 GB (5.2 GB at 100 k proteins), everything else ≤ 1.6 GB.
+
+    | Measure | HPC slice (4.2 M) | Mini-slice (295 k) |
+    | --- | --- | --- |
+    | recall at depth > 1, 90 / 85 / 80 / 75 / 70% | 0.91 / 0.82 / 0.71 / 0.55 / 0.52 | 0.93 / 0.87 / 0.75 / 0.67 / 0.61 |
+    | tier 1: candidate units (true share) | 80,314 (0.02) | 8,410 (0.14) |
+    | tier 1: read recall / precision | 0.41 / 0.61 | 0.44 / 0.81 |
+    | tier 2: read recall / precision | 0.81 / 0.90 | 0.83 / 0.95 |
+    | tier 2: leaf precision, median hits | 0.81, 27 | 0.87, 20 |
+    | tier 2: units called (true share), unit recall | 20,552 (0.07), 0.76 | 5,466 (0.22), 0.78 |
+    | evidence / verify bar, seeds per pair | 27.75 / 18.25, 38.4 | 0 / 0, 6.7 |
+
+  - **Reading.** The mini-slice reproduces tier 2's read recall, the recall curve down to ~80%, and tier 2's over-calling of units. It is optimistic at 75–70% (+0.12 / +0.09) and on precision: there are 4–10× fewer false units, and no decoy seed scores at all, so the bars are 0. Those follow the database's size, since chance hits grow with the proteins, so 14× fewer proteins gives fewer and weaker chance seeds. Use the mini-slice for development (tier 2, unit presence, near-unit confusion, recall). Take absolute precision, bars and low-identity recall from the HPC slice and subset.
