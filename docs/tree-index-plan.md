@@ -1400,3 +1400,20 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     | large k 7 | 477–702 GB | 204–299 GB | 0.68–1.00 TB | 0.99 | 0.94 | 0.89 | 0.79 | 0.62 | 0.89 | ~5.8 h |
 
     Tier 2 needs, once for all tiers, the full store (~1.16 TB) and the spanning-tree edges (~59 GB). The release goes in two shards of ≤ 4.29 × 10⁹ positions (u32 positions).
+- **Layer-only tiers, wide clusters for key budgets, and chance at release scale (2026-11-02, the user's direction: tier 1 as fewer representatives sensitive to wider AAI).**
+  - **Layer-only builds** need no new code: `--t-base 0 --window 0 --ladder= --n-1 0` leaves only the layer's keys on group representatives (98% of postings on one representative position in the fixture). Scoring expands a representative's hit to its group.
+  - **Coarser tree cuts do not make wider groups:** on the mini-slice, 46,090 groups at 0.57 (~90%), 40,913 at 0.83 (~80%) and 40,557 with no cut. The dense 8-mer tree has almost no edges below ~90%.
+  - **`--layer-units kmer:<k>:<share>[:<t>]`** (`build.wide_clusters`, `layer_units`): the group representatives are clustered by shared protein k-mers (a FracMinHash sample at rate `t`, 0.2 by default; k-mers held by more than 64 representatives skipped), with greedy centroids taken longest first, so clusters do not chain. `allocate` then spends each budget per cluster, on the least hashes across its groups' keys, and keys stay on their own groups' representatives (so verify aligns against a close one). The default is byte-identical to before. On the mini-slice it takes 4 s and 2 GB. 5-mers shared ≥ 30% (~79% pairwise): 36,554 clusters (0.79 of groups); ≥ 20%: 31,430; ≥ 10%: 20,586. **The user chose 30%.**
+  - **Size at release, layer-only with positions per group** (a format change), alignment data apart (slice → subset rates; groups 0.156–0.313 per protein, layer postings 0.404–0.814 per protein at today's budget):
+
+    | Keys (vs today's layer) | Postings | Per-group tables | Lookup | Alignment data |
+    | --- | --- | --- | --- | --- |
+    | same (`sqrt:3.28` per wide cluster) | 44–89 GB | 23–41 GB | 67–130 GB | 182–276 GB |
+    | half (`sqrt:1.64`) | 22–44 GB | 23–41 GB | 45–85 GB | 182–276 GB |
+    | quarter (`sqrt:0.82`) | 11–22 GB | 23–41 GB | 34–63 GB | 182–276 GB |
+
+    Standard today: 288–319 GB lookup and 204–299 GB alignment data. A leaf → group map (~23 GB) goes with tier 2.
+  - **Chance at release scale, emulated (`--chance-scale F`** on `query.py`, `verify.py`, `tier2.py`; `query.decoy_bar`). Decoy counts are multiplied by F before the bar is chosen, and past the observed decoys the tail is extended from the 10th highest, halving per bit. Validated on the mini-slice's standard (layer k 7) at F = 14.36 (the slice's size): evidence and verify bars 30.0 and 21.75, against the HPC slice's 27.75 and 18.25. Recall barely moves with the bar (0.61 → 0.60 at 70%), because true alignments clear it.
+    - The mini-slice still reads high at ≤ 75% against the slice: 0.67 / 0.60 against 0.55 / 0.52 at 75 / 70% (~2 SE). By the source group's size, the two agree except for groups of 11–1,000 members at ≤ 75% (0.54 against 0.44; 0.91 against 0.76). It is not budget normalisation (c 1.53 against 1.54). Treat it as the mini-slice's known optimism at low identity.
+    - For release, F = 5.74 × 10⁹ / 294,644 ≈ 19,480; every grid index is rescored at that scale (`grid-release`).
+  - Tests: `test_decoy_bar_chance_scale` and `test_wide_clusters_link_relatives_only` (siblings ~90% apart cluster at 30%; at ~72% they do not, which is what 30% means).

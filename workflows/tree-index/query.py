@@ -208,7 +208,12 @@ def gather(ev: pl.DataFrame, floor: float) -> pl.DataFrame:
 
 
 def candidates(
-    index: Index, pairs: pl.DataFrame, d_pairs: pl.DataFrame, log2_w: float, shares: list[float]
+    index: Index,
+    pairs: pl.DataFrame,
+    d_pairs: pl.DataFrame,
+    log2_w: float,
+    shares: list[float],
+    scale: float = 1.0,
 ) -> tuple[dict[str, NDArray[np.int64]], dict[str, Any]]:
     """``fam_<share>``: seeds by one read pair's evidence at each decoy share, a bar per key
     family (:func:`families`) from that family's hits alone, so a layer's chance seeds do not
@@ -229,7 +234,7 @@ def candidates(
     for s in shares:
         got, bars = [], []
         for sd, dd in per:
-            bar, _ = decoy_bar(sd, dd, s)
+            bar, _ = decoy_bar(sd, dd, s, scale=scale)
             bars.append(bar)
             got.append(sd.filter(pl.col("score") >= bar)["pos"].to_numpy())
         out[f"fam_{s}"] = np.unique(np.concatenate(got)).astype(np.int64)
@@ -290,16 +295,33 @@ def reversed_reads(paths: list[str], out: Path) -> list[str]:
     return made
 
 
+TAIL_DECOYS: Final = 10  # decoys above which the scaled tail is extrapolated
+
+
 def decoy_bar(
-    seeds: pl.DataFrame, decoys: pl.DataFrame, share: float, hi: float = 160.0
+    seeds: pl.DataFrame,
+    decoys: pl.DataFrame,
+    share: float,
+    hi: float = 160.0,
+    scale: float = 1.0,
 ) -> tuple[float, list[tuple[float, float, int]]]:
     """The least score below ``hi`` at which leaves seeded by decoy reads are at most
     ``share`` of the leaves seeded by the sample (target-decoy); and the curve (score, decoy
-    seeds, seeds)."""
+    seeds, seeds).
+
+    ``scale`` emulates a database ``scale`` times larger (``--chance-scale``): chance hits
+    grow with its keys, so decoy counts are multiplied by it. Past the decoys observed, the
+    count is extended from the :data:`TAIL_DECOYS`-th highest decoy score, halving per bit
+    (scores are log-odds in bits). ponytail: assumes chance grows linearly in proteins and the
+    sample's true seeds do not; validated against the HPC slice (Progress log)."""
     sc, dc = np.sort(seeds["score"].to_numpy()), np.sort(decoys["score"].to_numpy())
+    ref = dc[-min(TAIL_DECOYS, len(dc))] if len(dc) else 0.0
+    n_ref = len(dc) - np.searchsorted(dc, ref)
     curve = []
     for bar in np.arange(0.0, hi, 0.25):
         n, d = len(sc) - np.searchsorted(sc, bar), len(dc) - np.searchsorted(dc, bar)
+        if scale != 1.0:
+            d = scale * max(d, n_ref * 2.0 ** -(bar - ref) if bar > ref else d)
         curve.append((float(bar), float(d), int(n)))
     ok = [c for c in curve if c[1] <= share * max(c[2], 1)]
     return (ok[0][0] if ok else curve[-1][0]), curve
@@ -477,6 +499,10 @@ def main() -> None:
     src.add_argument("--proteins", help="protein FASTA")
     parser.add_argument("--frames", default="all")
     parser.add_argument(
+        "--chance-scale", type=float, default=1.0,
+        help="decoy counts x this: bars as for a database this many times larger (decoy_bar)",
+    )  # fmt: skip
+    parser.add_argument(
         "--chance-share", type=float, default=0.01,
         help="reads: seeds by evidence, at the least bits whose expected chance seeds are at "
         "most this share of the seeds (seeds.parquet)",
@@ -525,10 +551,10 @@ def main() -> None:
             d_pairs, _, _ = read_pairs(index, *dr, a.frames, a.ladder_frames, a.mode)
             decoys = evidence_chunked(index, d_pairs, log2_w, clamp=True)
             decoys.write_parquet(out / "decoy_seeds.parquet")
-            bar, curve = decoy_bar(seeds, decoys, a.chance_share)
+            bar, curve = decoy_bar(seeds, decoys, a.chance_share, scale=a.chance_scale)
             stats["decoy_seeds"] = int((decoys["score"] >= bar).sum())
             shares = [float(x) for x in a.shares.split(",")]
-            cand, info = candidates(index, pairs, d_pairs, log2_w, shares)
+            cand, info = candidates(index, pairs, d_pairs, log2_w, shares, a.chance_scale)
             for name, got in cand.items():
                 np.save(out / f"cand_{name}.npy", got)
             stats |= info | {f"{name}_n": len(got) for name, got in cand.items()}

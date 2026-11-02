@@ -427,3 +427,37 @@ def test_mini_slice_keeps_clumps_whole(tmp_path: Path) -> None:
     a, b = np.load(idx / "edge_a.npy"), np.load(idx / "edge_b.npy")
     assert (held[a] == held[b]).all()  # no edge cut
     assert 40 <= len(got) <= 120, len(got)
+
+
+def test_decoy_bar_chance_scale() -> None:
+    """query.decoy_bar: scale 1 is the plain target-decoy bar; a larger database (more chance
+    hits) raises it, past the decoys observed by the halving-per-bit tail."""
+    rng = np.random.default_rng(0)
+    seeds = pl.DataFrame({"score": rng.uniform(20, 60, 2000)})
+    decoys = pl.DataFrame({"score": 10 + rng.exponential(1 / np.log(2), 500)})  # halves per bit
+    bar1, curve = query.decoy_bar(seeds, decoys, 0.01)
+    n, d = len(seeds), (decoys["score"] >= bar1).sum()
+    assert d <= 0.01 * (seeds["score"] >= bar1).sum() and bar1 <= n
+    bars = [query.decoy_bar(seeds, decoys, 0.01, scale=f)[0] for f in (1, 100, 10_000)]
+    assert bars[0] == bar1 and bars[0] < bars[1] < bars[2]
+    # ~log2(100) bits per 100-fold, within the quarter-bit grid and the sample's own counts
+    assert abs((bars[2] - bars[1]) - np.log2(100)) < 1.5
+
+
+def test_wide_clusters_link_relatives_only() -> None:
+    """build.wide_clusters: siblings ~90% identical to each other (5% from a root each) share
+    ~0.9^5 = 59% of their 5-mers, above 30%, and cluster; unrelated ones stay apart."""
+    rng = np.random.default_rng(4)
+    aa = np.frombuffer(b"ACDEFGHIKLMNPQRSTVWY", dtype=np.uint8)
+    roots = [rng.choice(aa, 300) for _ in range(3)]
+    seqs = []
+    for r in roots:
+        for _ in range(4):
+            s = r.copy()
+            hit = rng.random(len(s)) < 0.05
+            s[hit] = rng.choice(aa, int(hit.sum()))
+            seqs.append(s.tobytes())
+    centre = build.wide_clusters(seqs, 5, 0.3, t=1.0)
+    family = np.repeat(np.arange(3), 4)
+    assert len(np.unique(centre)) == 3
+    assert all(len(np.unique(centre[family == f])) == 1 for f in range(3))

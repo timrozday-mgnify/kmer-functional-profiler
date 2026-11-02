@@ -170,6 +170,7 @@ def main() -> None:
     p.add_argument("--query", required=True, help="query.py --out: candidates are added here")
     p.add_argument("--floor", type=float, default=8.0, help="read-pair evidence to align")
     p.add_argument("--shares", default="0.01,0.05,0.1")
+    p.add_argument("--chance-scale", type=float, default=1.0, help="query.decoy_bar's scale")
     p.add_argument("--method", choices=["anchored", "full"], default="anchored")
     a = p.parse_args()
     index, qdir = query.Index(a.index), Path(a.query)
@@ -211,7 +212,7 @@ def main() -> None:
     per_read = {n: t.group_by("read").agg(pl.col("score").first()) for n, t in top.items()}
     best = {n: g.group_by("pos").agg(pl.col("score").max()) for n, g in got.items()}
     for s in map(float, a.shares.split(",")):
-        bar, _ = query.decoy_bar(best["sample"], best["decoy"], s)
+        bar, _ = query.decoy_bar(best["sample"], best["decoy"], s, scale=a.chance_scale)
         np.save(
             qdir / f"cand_verify_{s}.npy",
             np.sort(best["sample"].filter(pl.col("score") >= bar)["pos"].to_numpy()),
@@ -220,7 +221,11 @@ def main() -> None:
         g = query.gather(got["sample"].filter(pl.col("score") >= bar), 0.0)
         np.save(qdir / f"cand_vgather_{s}.npy", np.sort(g["pos"].to_numpy()))
         info |= {f"verify_{s}_bar": bar}
-        info |= {f"read_bar_{s}": query.decoy_bar(per_read["sample"], per_read["decoy"], s)[0]}
+        info |= {
+            f"read_bar_{s}": query.decoy_bar(
+                per_read["sample"], per_read["decoy"], s, scale=a.chance_scale
+            )[0]
+        }
     for f in qdir.glob("decoy_*.fq.gz"):
         f.unlink()
     (qdir / "verify.json").write_text(json.dumps(info, indent=1) + "\n")

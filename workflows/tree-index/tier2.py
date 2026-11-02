@@ -402,6 +402,7 @@ def main() -> None:
     p.add_argument("--em-rounds", type=int, default=20)
     p.add_argument("--min-reads", type=float, default=0.5, help="expected reads for presence")
     p.add_argument("--shares", default="0.01,0.05,0.1")
+    p.add_argument("--chance-scale", type=float, default=1.0, help="query.decoy_bar's scale")
     p.add_argument("--no-handoff", action="store_true")
     p.add_argument("--out", required=True)
     a = p.parse_args()
@@ -541,8 +542,8 @@ def main() -> None:
     per_read = {n: b.group_by("read").agg(pl.col("score").max()) for n, b in best.items()}
     bars: dict[str, float] = {}
     for s in a.shares.split(","):
-        bars[f"read_bar_{float(s)}"] = query.decoy_bar(per_read["sample"], per_read["decoy"],
-                                                       float(s))[0]  # fmt: skip
+        got = query.decoy_bar(per_read["sample"], per_read["decoy"], float(s), scale=a.chance_scale)
+        bars[f"read_bar_{float(s)}"] = got[0]
     # EM over the reads called at the loosest bar; presence per bar from the shares
     loosest = min(bars.values())
     top = pl.col("score").max().over("read")
