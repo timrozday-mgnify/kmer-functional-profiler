@@ -19,16 +19,17 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
   with no k-mer up to t\\_cap get a position of their own after the tree's, holding their n\\_1
   lowest hashes.
 
-Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8) and
-``kind.npy`` (u8), sorted by (hash, lo); ``node_lo.npy``, ``node_hi.npy``, ``node_level.npy``
-(internal node i of the merge tree, by positions); ``pos_size.npy`` and ``node_size.npy``
+Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8),
+``bits.npy`` (u8: the key's evidence per hit in quarter-bits, -log2 q0 - log2 g,
+``query.encode_bits``), ``kcode.npy`` (u8 or u16: the key's k code) and ``kind.npy`` (u8, the
+build's: merge counts it, the merged index leaves it out), sorted by (hash, lo);
+``node_lo.npy``, ``node_hi.npy``, ``node_level.npy`` (internal node i of the merge tree, by
+positions); ``pos_size.npy`` and ``node_size.npy``
 (|S\\_v|: k-mers held at each position and each internal node); ``pos_len.npy`` (each
 position's representative's length); ``edge_a.npy``, ``edge_b.npy``, ``edge_w.npy`` (the spanning
 tree's edges between positions, weighed in topology units, for the neighbour rule);
-``keys.npy``, ``key_bits.npy`` and ``key_k.npy`` (each key's evidence per hit in bits,
--log2 q0 - log2 g, and its k); ``pieces.parquet`` (lo, hi, floor,
-coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and
-``meta.json``.
+``pieces.parquet`` (lo, hi, floor, coherence; the build's, as ``kind``); ``proteins.parquet``
+(protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and ``meta.json``.
 """
 
 import argparse
@@ -600,6 +601,11 @@ def main() -> None:
     for col, dtype in (("hash", U64), ("lo", np.uint32), ("hi", np.uint32), ("sign", np.int8),
                        ("kind", np.uint8)):  # fmt: skip
         np.save(out / f"{col}.npy", table[col].to_numpy().astype(dtype))
+    # each posting carries its key's evidence and k code (no separate key table)
+    keyed = table.select("hash").join(bits, on="hash", how="left", maintain_order="left")
+    np.save(out / "bits.npy", query.encode_bits(keyed["bits"].fill_null(0.0).to_numpy()))
+    code = keyed["k"].fill_null(0).to_numpy()
+    np.save(out / "kcode.npy", code.astype(query.code_dtype(code)))
     lay, n = tree.lay, tree.forest.n
     np.save(out / "node_lo.npy", lay["lo"][n:])
     np.save(out / "node_hi.npy", lay["hi"][n:])
@@ -612,9 +618,6 @@ def main() -> None:
     np.save(out / "edge_w.npy", f.mst_w.astype(np.uint32))
     lengths = np.array([len(s) for s in tree.seqs], dtype=np.uint32)
     leafless = np.flatnonzero((tree.leaf_of < 0) & (tree.n_valid > 0)) if a.n_1 else []
-    np.save(out / "keys.npy", bits["hash"].to_numpy())
-    np.save(out / "key_bits.npy", bits["bits"].to_numpy().astype(np.float32))
-    np.save(out / "key_k.npy", bits["k"].to_numpy().astype(np.uint16))
     np.save(out / "pos_len.npy", np.concatenate([lengths[tree.rep_by_pos], lengths[leafless]]))
     # |S_v|: k-mers held at each position and each internal node (Fitch's states)
     rng = (

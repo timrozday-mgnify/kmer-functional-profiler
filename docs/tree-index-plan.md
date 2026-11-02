@@ -1381,3 +1381,22 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - **The price is alignment.** At k 6, 89% of the pairs `verify.py` aligns are chance. Chance pairs scale with the database's keys: projected to the release, that is ~42 k pairs per read, ~330 thread-hours (~10 h on 32 cores) for 10 M read pairs at ~350 k pairs/s/thread. k 7 needs ~36 thread-hours (~1.1 h on 32 cores), k 8 ~8 (~15 min). Query memory: 11.5 GB at k 6, 8.4 GB at k 8 (subset). BUILD is unchanged (~90 GB peak).
   - **Next lever:** cut chance pairs before alignment (a higher per-pair evidence floor in `verify.py`, or two seeds per pair). The decoy reads measure that on the laptop, since chance pairs per read scale with proteins. Tune it on the mini-slice at k 6 and 7, then confirm on the subset.
   - `bench.tsv` now also carries `pairs_per_read`, `chance_share` and `release_pairs_per_read`.
+- **Bits on the postings; build-only files dropped (2026-11-02, the user's request; the easy wins).**
+  - `keys.npy` was exactly the set of distinct posting hashes (slice: 3,088,418 keys for 5,574,200 postings; 77% of hashes have one posting, 13% two, 11% more, up to 2,362). It was there only to hold each key's bits (f32) and k (u16), at 14 B per key, and `query.py` loaded it whole into RAM (59–116 GB at release).
+  - Each posting now carries them: `bits.npy` (u8, quarter-bits, clipped to 0–63.75; measured 16.5–59.75) and `kcode.npy` (u8, or u16 when reduced-alphabet codes exceed 255). `query.evidence` reads bits from the posting rows it already finds. `families` maps k codes to layers. `choose_bits` (the model bar, not the decoy one) derives the key table from the postings when needed. Negative bits (common k-mers) count as 0, as the decoy path's clamp already did.
+  - `merge.py` combines each key's bits across parts (gains add, as before) and writes the result onto every posting of the key. The merged index leaves out the build's `kind.npy` and `pieces.parquet`; the parts keep them.
+  - Tests: the evidence brute force holds with the encoded bits; the partitioned build checks one bits value per key and no build files in the merged index; the test profile passes end to end. 20 passed.
+  - **Sizes now split** (`recall.release_gb`, `bench.tsv`): `release_lookup_gb` covers postings at 19–20 B (hash, lo, hi, sign, bits, k), `pos_size`, the node tables and the protein map. `release_align_gb` covers `layer_group` and the representatives' sequences, to be reconsidered once the rest of the index is settled. `release_tier1_gb` is their sum.
+  - **Release projection** (lookup + alignment, slice → subset rates), recall at depth > 1 on the subset (`tree-index-build`, `tree-index-layer-k`), alignment time for 10 M read pairs on 32 cores:
+
+    | Option | Lookup | Alignment data | Tier 1 | 90% | 85% | 80% | 75% | 70% | Detected | Alignment |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | slim | 230–244 GB | 1,115 GB (every leaf) | 1.35–1.36 TB | 0.50 | 0.31 | 0.18 | 0.10 | 0.04 | 0.45 | ~0.2 h |
+    | standard k 8 | 288–319 GB | 204–299 GB | 492–618 GB | 0.84 | 0.66 | 0.47 | 0.34 | 0.23 | 0.66 | ~0.2 h |
+    | std k 7 | 286–317 GB | 204–299 GB | 490–616 GB | 0.86 | 0.73 | 0.50 | 0.45 | 0.31 | 0.70 | ~1.1 h |
+    | std k 6 | 288–319 GB | 204–299 GB | 492–618 GB | 0.84 | 0.75 | 0.60 | 0.56 | 0.39 | 0.75 | ~10 h |
+    | std, 2× keys, k 8 | 368–408 GB | 204–299 GB | 572–707 GB | 0.91 | 0.77 | 0.61 | 0.45 | 0.28 | 0.73 | ~0.3 h |
+    | large k 8 | 481–708 GB | 204–299 GB | 0.69–1.01 TB | 0.98 | 0.94 | 0.84 | 0.72 | 0.53 | 0.86 | ~0.6 h |
+    | large k 7 | 477–702 GB | 204–299 GB | 0.68–1.00 TB | 0.99 | 0.94 | 0.89 | 0.79 | 0.62 | 0.89 | ~5.8 h |
+
+    Tier 2 needs, once for all tiers, the full store (~1.16 TB) and the spanning-tree edges (~59 GB). The release goes in two shards of ≤ 4.29 × 10⁹ positions (u32 positions).

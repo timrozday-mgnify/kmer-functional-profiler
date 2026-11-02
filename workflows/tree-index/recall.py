@@ -229,30 +229,38 @@ MGNIFY_MEAN_LENGTH = 1.07e12 / MGNIFY_PROTEINS  # residues per protein, ~186
 
 def release_gb(idx: Path, meta: dict, n_release: int = MGNIFY_PROTEINS) -> dict[str, float]:
     """Tier 1's footprint scaled to ``n_release`` proteins by this index's per-protein rates
-    (docs/tree-index-plan.md, Progress log: size estimates revisited): postings (hash 8 B, lo
-    and hi 4 B each, sign 1 B; ``kind`` is the build's), keys (hash 8, bits 4, k 2),
-    per-position and per-node tables (pos_size, layer_group, a unit id; node lo, hi, level,
-    size) and the sequences ``verify.py`` aligns against: each layer group's representative,
-    or every leaf without groups (residues 1 B, offsets 8 B). Positions stay u32 with the
-    release in two shards. Rates follow density: a slice's (complete neighbourhoods) is the
-    release's best guess, a cluster sample's an upper bound; tier 2's full store is apart.
-    Sequences are rescaled to the release's mean length (a slice's proteins are ~40% longer).
-    ponytail: postings are not rescaled; the layer's keys grow with length, so a long-protein
-    sample overstates them somewhat."""
-    s = meta["stats"]
+    (docs/tree-index-plan.md, Progress log: size estimates revisited), in two parts:
+
+    - *lookup*: postings (hash 8 B, lo and hi 4 B each, sign 1 B, bits 1 B, k code 1-2 B),
+      ``pos_size`` and the node tables (lo, hi, level, size), and the protein -> leaf -> unit
+      map (``proteins.parquet`` as written);
+    - *align*: what ``verify.py`` aligns against, to be reconsidered with the rest of the
+      index: ``layer_group`` and each group's representative (or every leaf without groups;
+      residues 1 B at the release's mean length, offsets 8 B).
+
+    Positions stay u32 with the release in two shards. Rates follow density: a slice's
+    (complete neighbourhoods) is the release's best guess, a cluster sample's an upper bound.
+    Tier 2's full store and the spanning-tree edges are apart. ponytail: postings are not
+    rescaled to the release's mean length; a long-protein sample overstates the layer's."""
+    s, f = meta["stats"], meta["files"]
     n = s["proteins"]
     lengths = np.load(idx / "pos_len.npy").astype(np.int64)
     groups = idx / "layer_group.npy"
     reps = np.unique(np.load(groups)) if groups.exists() else np.arange(len(lengths))
-    nodes = (meta["files"]["node_lo.npy"] - 128) // 4  # u32 after the .npy header
+    nodes = (f["node_lo.npy"] - 128) // 4  # u32 after the .npy header
+    code = (f["kcode.npy"] - 128) / max(s["postings"], 1) if "kcode.npy" in f else 1
+    residues = lengths[reps].sum() * MGNIFY_MEAN_LENGTH / lengths.mean()
     per = {
-        "postings": 17 * s["postings"] / n,
-        "keys": 14 * s["keys"] / n,
-        "tables": (8 + 4 * groups.exists()) * s["positions"] / n + 16 * nodes / n,
-        "reps": (lengths[reps].sum() * MGNIFY_MEAN_LENGTH / lengths.mean() + 8 * len(reps)) / n,
+        "postings": (18 + code) * s["postings"] / n,
+        "tables": (4 * s["positions"] + 16 * nodes + f["proteins.parquet"]) / n,
+        "align": (4 * groups.exists() * s["positions"] + residues + 8 * len(reps)) / n,
     }
     got = {f"release_{k}_gb": round(v * n_release / 1e9) for k, v in per.items()}
-    return got | {"release_tier1_gb": sum(got.values())}
+    lookup = got["release_postings_gb"] + got["release_tables_gb"]
+    return got | {
+        "release_lookup_gb": lookup,
+        "release_tier1_gb": lookup + got["release_align_gb"],
+    }
 
 
 def release_pairs(q: dict, verify: dict, n: int, n_release: int = MGNIFY_PROTEINS) -> dict:

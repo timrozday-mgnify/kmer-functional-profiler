@@ -68,12 +68,13 @@ def check_index(idx: Path, members_path: Path, n_1: int = 2) -> None:
     want = pl.DataFrame({"hash": h, "pos": rep["pos"].to_numpy()[seq]}).sort("pos", "hash")
     got = held.filter(pl.col("hash") <= base)
     assert got.equals(want.with_columns(pl.col("pos").cast(got["pos"].dtype)))
-    # every floored piece's floor is held across it
-    t = pl.DataFrame({x: np.load(idx / f"{x}.npy") for x in ("hash", "lo", "hi", "kind")})
-    floors = t.filter(pl.col("kind") == build.FLOOR)
-    assert floors.height > 0
-    spread = floors.select("hash", pos=pl.int_ranges("lo", "hi")).explode("pos")
-    assert spread.join(held, on=["hash", "pos"], how="anti").height == 0
+    # every floored piece's floor is held across it (a build's: a merged index has no kind)
+    if (idx / "kind.npy").exists():
+        t = pl.DataFrame({x: np.load(idx / f"{x}.npy") for x in ("hash", "lo", "hi", "kind")})
+        floors = t.filter(pl.col("kind") == build.FLOOR)
+        assert floors.height > 0
+        spread = floors.select("hash", pos=pl.int_ranges("lo", "hi")).explode("pos")
+        assert spread.join(held, on=["hash", "pos"], how="anti").height == 0
     # every protein with a valid k-mer is covered by at least min(n_1, its k-mers)
     covered = dict(held.group_by("pos").len().rows())
     n_valid = _core.distinct_kmers(seqs, np.arange(len(seqs), dtype=np.uint32), 11)
@@ -255,6 +256,12 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     idx = tmp_path / "merged"
     stats = json.loads((idx / "meta.json").read_text())["stats"]
     assert stats["parts"] == len(parts)
+    # bits on the postings: one value per key across its postings (combined over parts); the
+    # build's files stay with the parts
+    h, b = np.load(idx / "hash.npy"), np.load(idx / "bits.npy")
+    run_start = np.r_[True, h[1:] != h[:-1]]
+    assert (b == np.repeat(b[run_start], np.diff(np.r_[np.flatnonzero(run_start), len(h)]))).all()
+    assert not (idx / "kind.npy").exists() and not (idx / "pieces.parquet").exists()
     # merged by hash range out of core: the result does not depend on the ranges
     run("--parts", *built, "--out", "ranged", "--ranges", "5", cwd=tmp_path, script=MERGE)
     for f in sorted(idx.glob("*.npy")):
@@ -319,7 +326,7 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         assert meta["params"]["layers"] == want
         assert meta["params"]["n_1"] == 1
         assert (idx / "layer_group.npy").exists() == bool(want)
-        codes = set(np.load(idx / "key_k.npy").tolist())
+        codes = set(np.load(idx / "kcode.npy").tolist())
         assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
         check_query(tmp_path, idx, members)
 
