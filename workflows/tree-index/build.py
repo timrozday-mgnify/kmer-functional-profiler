@@ -104,6 +104,12 @@ def postings(
                 )
     pos = np.concatenate([tree.pos[keep], *extra["pos"]])
     h = np.concatenate([tree.h[keep], *extra["h"]])
+    # a k-mer two steps add alike is held once (the ladder's k 7 and a layer whose k from the
+    # database's size is 7: a repeated holder breaks tree_schemes)
+    o = np.lexsort((h, pos))
+    pos, h = pos[o], h[o]
+    once = np.r_[True, (pos[1:] != pos[:-1]) | (h[1:] != h[:-1])]
+    pos, h = pos[once], h[once]
     leaf = lay["order"][pos]
     o = np.lexsort((h, leaf))
     # every hash a leaf does not hold is known absent (no missing data above t_base)
