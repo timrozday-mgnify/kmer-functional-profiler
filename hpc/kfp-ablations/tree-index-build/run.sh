@@ -25,8 +25,8 @@
 #   prev-std  the previous standard (window 64, no thinning; ~235-260 GB, ~0.71 at 80%)
 #   prev-large the previous large (base plus window 16; ~505-600 GB, ~0.82 at 70%)
 # a leaf per distinct dense 8-mer set, the dense 8-mer topology, Fitch diffs on the spanning
-# tree itself. PARTITION (~130 GB, one job) splits ~53 M proteins into parts of 2 M; BUILD runs
-# per part and tier (~60 GB with a layer: 7.6-8.0 GB per 262 k proteins locally); MERGE writes
+# tree itself. PARTITION (~130 GB, one job) splits ~53 M proteins into parts of 1 M; BUILD runs
+# per part and tier (~30 GB with a layer: 7.6-8.0 GB per 262 k proteins locally; 96 GB given); MERGE writes
 # one index per tier. TARGETS/SIMULATE: 2,000 proteins, one strain each at 100-70% identity
 # (BLOSUM62, depth lognormal mu 0.3 sigma 0.6); QUERY per tier with decoys (reads reversed)
 # setting a 1% chance-share bar, then verify.py: each (read pair, leaf) with evidence aligned
@@ -42,7 +42,7 @@
 #                                    and tier2.py; ~1x the index's residues on disk
 #   results/runs/s-<tier>/           recall.tsv (identity x depth), strategies.tsv
 #   results/trace.tsv                time and peak RSS per task
-# Re-submitting resumes: PARTITION is reused; BUILD and MERGE rerun when build.py changes.
+# Re-submitting resumes; any change to the workflow's scripts or --part_proteins reruns from PARTITION.
 source ../common.sh
 [[ -f $SUBSET/members.parquet ]] || { echo "no $SUBSET/members.parquet" >&2; exit 1; }
 tiers=(
@@ -54,6 +54,14 @@ tiers=(
     "prev-large:--mode standard --n-1 2 --window-min 2 --min-kmers 32 --layers protein:{k}:16:rare --layer-keys ''"
 )
 TIERS=$(IFS=';'; echo "${tiers[*]}")
-nextflow run "$WF/tree-index/build.nf" -c ../site.config -resume --outdir results \
+# BUILD's memory grows with a part's proteins (~60 GB per 2 M with a layer, at the default
+# 64 GB): parts of 1 M (~30 GB), 96 GB up front, +96 GB per retry for a part that is one larger
+# component (partition.json: largest_component)
+cat > build.config <<'CFG'
+process {
+    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+}
+CFG
+nextflow run "$WF/tree-index/build.nf" -c ../site.config -c build.config -resume --outdir results \
     --members "$(realpath "$SUBSET/members.parquet")" --pfam "$(realpath "$SUBSET/pfam.parquet")" \
-    --tiers "$TIERS"
+    --tiers "$TIERS" --part_proteins 1000000
