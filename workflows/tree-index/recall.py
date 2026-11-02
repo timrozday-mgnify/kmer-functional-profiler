@@ -388,6 +388,9 @@ def reads(a: argparse.Namespace) -> None:
             .otherwise(pl.col("lf").list.set_intersection("sf").list.len().fill_null(0) > 0)
         )
         levels.append("pfam_ok")
+        # a source without a Pfam hit has no family to agree with: its reads are left out of
+        # Pfam precision (before, its null turned into a wrong call)
+        annotated = src_fam["member"].implode()
     per = (
         calls.sort("weight", descending=True)
         .group_by("read")
@@ -405,6 +408,8 @@ def reads(a: argparse.Namespace) -> None:
         .with_columns(called=pl.col("hits").is_not_null(), **{x: pl.col(x).fill_null(False)
                                                               for x in (*levels, "leaf_top")})
     )  # fmt: skip
+    if a.pfam:
+        allr = allr.with_columns(pfam_known=pl.col("member").is_in(annotated))
     called = allr.filter(pl.col("called"))
     # every strain, a strain with no read pair undetected (its recall has no reads: null)
     strains = (
@@ -434,7 +439,9 @@ def reads(a: argparse.Namespace) -> None:
             "units_median": c["hit_units"].median(),
         }
         if "pfam_ok" in levels:
-            got["pfam_precision"] = c["pfam_ok"].mean()
+            known = c.filter(pl.col("pfam_known"))
+            got["pfam_precision"] = known["pfam_ok"].mean()
+            got["pfam_known_share"] = known.height / c.height if c.height else None
         return got
 
     rows = []
