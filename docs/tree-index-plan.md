@@ -1292,3 +1292,27 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 - **Pfam precision fixed; layer k run set up (2026-11-02, the user's request).**
   - **Pfam precision** (`recall.py reads`) counted every read whose source protein has no Pfam hit as a wrong call: its `pfam_ok` was null, and the per-read `any()` turned an all-null group into False. About half of MGnify proteins have no Pfam hit, hence ~0.6 at every identity. It is now taken over called reads whose source has a Pfam hit, and `pfam_known_share` gives their share of the calls. Checked on the test profile with half the clusters annotated (one family per cluster, so Pfam precision should equal unit precision): tier 1 old 0.38, fixed 0.84 (unit 0.84); tier 2 old 0.49, fixed 0.96 (unit 0.98). The `tree-index-build` numbers above are the old measure.
   - **`hpc/kfp-ablations/tree-index-layer-k`:** standard at layer k 8 (control), 7 and 6, and k 8 with twice the keys (`sqrt:5.2`); large at k 8 and 7; the same subset and benchmark as `tree-index-build`. It asks whether k 7 or 6 recovers the quarter's recall below 85%, at what cost in decoy bar, aligned pairs and QUERY memory, and whether more keys at k 8 does as well at fewer chance seeds. A tier whose QUERY fails twice is skipped. Passes the test profile.
+- **`tree-index-slice` results (2026-11-02, the user's HPC run; `results-hpc/tree-index-slice/`).** 40 Pfam families taken with their whole clusters: 4.23 M proteins (2.66 M with one of the families' Pfam hits). The largest component holds 3.2 M proteins, cut into 5 parts. BUILD peaked at 94.5 GB against its 96 GB, so every run now gives BUILD 128 GB, +128 GB per retry. At 4.2 M proteins the layer's k is 7. Pfam precision here is still the old measure (fixed after this run).
+  - **Recall at depth > 1** (90 / 85 / 80 / 75 / 70%): standard 0.91 / 0.83 / 0.71 / 0.55 / 0.52, large 0.99 / 0.94 / 0.94 / 0.88 / 0.80. That is above the subset's (k 8: 0.84 / 0.66 / 0.47 / 0.34 / 0.23 for standard), but the database size, family density and k all differ; `tree-index-layer-k` separates k.
+  - **Read classification with near units present** (the reason for the slice):
+
+    | Tier | Calls | Read recall | Read precision (unit) | Leaf precision | Median hits | Units called | True | Unit recall |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | standard | tier 1 | 0.414 | 0.612 | 0.28 | 1 | 80,314 | 0.019 | 0.79 |
+    | standard | tier 2 | 0.809 | 0.899 | 0.81 | 27 | 20,552 | 0.071 | 0.76 |
+    | large | tier 1 | 0.595 | 0.673 | 0.25 | 1 | 150,532 | 0.012 | 0.93 |
+    | large | tier 2 | 0.913 | 0.949 | 0.86 | 28 | 21,138 | 0.081 | 0.89 |
+
+    By identity (standard tier 2), read precision is 0.99 at 100–98%, 0.94 at 90%, 0.83 at 80% and 0.66 at 70%. Most reads are still placed in the right unit. Tier 1's single best hit is right for only 61–67% of reads, against ~95% on the subset: near units compete.
+  - **The unit-level profile over-calls.** Tier 2 calls a group present at ≥ 0.5 expected reads and then calls all of its leaves that hold a share. With near units present, that puts ~20 k units on 1,917 true ones (7% true). EM gives a read's own unit 74% of its weight (standard; large 78%), and the rest spreads over its near units. A per-unit threshold on expected reads (the sum of EM weights from the hand-off's `assignments.parquet`):
+
+    | Expected reads per unit | standard: called / true share / unit recall | large |
+    | --- | --- | --- |
+    | > 0 | 15,798 / 0.09 / 0.76 | 16,417 / 0.10 / 0.89 |
+    | ≥ 0.5 | 2,299 / 0.57 / 0.68 | 2,429 / 0.63 / 0.80 |
+    | ≥ 1 | 1,928 / 0.64 / 0.64 | 2,012 / 0.72 / 0.75 |
+    | ≥ 2 | 1,378 / 0.78 / 0.56 | 1,474 / 0.83 / 0.64 |
+    | ≥ 5 | 631 / 0.90 / 0.30 | 666 / 0.91 / 0.32 |
+
+    A threshold alone trades recall for precision steeply at this depth (lognormal μ 0.3, σ 0.6: a few read pairs per strain). Units need their own presence model: EM with units dropped when their weight is explained by a neighbour (the pileup's posterior presence), or a unit-level decoy bar. That is the next tier-2 step. The read-level calls are usable as they are.
+  - **Cost:** QUERY ≤ 17 GB and 3 min (tier 2: 100 s, 11 GB, 1.5 M candidate leaves, 15.8 M pairs aligned); FAMILIES 90 GB (the release's Pfam table).
