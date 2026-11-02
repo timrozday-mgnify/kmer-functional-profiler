@@ -244,7 +244,7 @@ def release_gb(idx: Path, meta: dict, n_release: int = MGNIFY_PROTEINS) -> dict[
     lengths = np.load(idx / "pos_len.npy").astype(np.int64)
     groups = idx / "layer_group.npy"
     reps = np.unique(np.load(groups)) if groups.exists() else np.arange(len(lengths))
-    nodes = len(np.load(idx / "node_lo.npy", mmap_mode="r"))
+    nodes = (meta["files"]["node_lo.npy"] - 128) // 4  # u32 after the .npy header
     per = {
         "postings": 17 * s["postings"] / n,
         "keys": 14 * s["keys"] / n,
@@ -253,6 +253,20 @@ def release_gb(idx: Path, meta: dict, n_release: int = MGNIFY_PROTEINS) -> dict[
     }
     got = {f"release_{k}_gb": round(v * n_release / 1e9) for k, v in per.items()}
     return got | {"release_tier1_gb": sum(got.values())}
+
+
+def release_pairs(q: dict, verify: dict, n: int, n_release: int = MGNIFY_PROTEINS) -> dict:
+    """``verify.py``'s alignment work per read pair, now and scaled to ``n_release`` proteins:
+    chance pairs (the decoy reads') grow with the database's keys, so with its proteins; true
+    pairs do not. ponytail: linear in proteins, as chance seeds are; a denser release shares
+    more keys, so this is an upper bound."""
+    reads = max(q["read_pairs"], 1)
+    sample, decoy = verify["sample_pairs"] / reads, verify["decoy_pairs"] / reads
+    return {
+        "pairs_per_read": round(sample),
+        "chance_share": round(decoy / max(sample, 1e-9), 2),
+        "release_pairs_per_read": round(max(sample - decoy, 0) + decoy * n_release / n),
+    }
 
 
 def summary(a: argparse.Namespace) -> None:
@@ -280,6 +294,9 @@ def summary(a: argparse.Namespace) -> None:
             "query_s": round(q["total_s"]),
             "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
         } | release_gb(idx, meta)
+        vfile = root / f"q-{name}" / "verify.json"
+        if vfile.exists():
+            row |= release_pairs(q, json.loads(vfile.read_text()), meta["stats"]["proteins"])
         # tier 1 is a profile: its candidates' units and strain detection; tier 2 classifies
         # reads (tier 1's read numbers stay in its reads.json, a diagnostic)
         if (sdir / "reads.json").exists():

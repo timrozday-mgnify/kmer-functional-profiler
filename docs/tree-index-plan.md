@@ -1366,3 +1366,18 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
   - **Format limit.** Positions are u32 (`merge.py` refuses ≥ 2³²), and the release has ~5.73 × 10⁹. Either the release goes in two shards of ≤ 4.29 × 10⁹ positions, each a whole index queried in turn, or positions become u64 (+8 B per posting, +8 per node and edge). Sharding needs no format change and fits the per-bucket build (128 buckets per shard). That is assumed above.
   - **Where to save:** keys duplicate the posting hashes (8 of their 14 B); folding bits and k into the postings saves ~30–60 GB on standard. Packing representatives at 5 bits per residue saves ~40%. Narrower node tables help too. None is done.
   - **In the benchmarks:** `recall.py summary` now writes `release_postings_gb`, `release_keys_gb`, `release_tables_gb`, `release_reps_gb` and `release_tier1_gb` per tier into `bench.tsv` (`recall.release_gb`). The mini-slice's standard projects 544 GB against the HPC slice's 517 GB, so a local mini-slice benchmark gives release size within ~5% at slice density.
+- **`tree-index-layer-k` results (2026-11-02, the user's HPC run; `results-hpc/tree-index-layer-k/`).** The 1-in-100 subset, six tiers differing in the layer only; the control (`standard`, k 8) reproduces `tree-index-build` exactly. Recall at depth > 1 (`verify_0.01_nb`) with 95% bootstrap intervals (±0.05–0.07 per bin). Sizes are projected tier-1 footprints at release at the subset's rates (an upper bound; the slice's rates give ~15% less). Alignment work is `verify.py`'s pairs per read now, and projected to release with chance pairs scaled by proteins (`recall.release_pairs`).
+
+  | Tier | Size | 90% | 85% | 80% | 75% | 70% | Detected (depth ≥ 1) | Pairs per read: now (chance share) → release |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | standard (k 8) | 696 GB | 0.84 | 0.66 | 0.46 | 0.34 | 0.23 | 0.66 | 48 (0.18) → ~1,000 |
+  | std-k7 | 680 GB | 0.86 | 0.73 | 0.50 | 0.45 | 0.31 | 0.70 | 81 (0.51) → ~4,500 |
+  | std-k6 | 664 GB | 0.84 | 0.75 | 0.60 | 0.56 | 0.39 | 0.75 | 432 (0.89) → ~42,000 |
+  | std-keys2x (k 8) | 835 GB | 0.91 | 0.77 | 0.61 | 0.45 | 0.28 | 0.73 | 52 (0.22) → ~1,300 |
+  | large (k 8) | 1,293 GB | 0.98 | 0.94 | 0.84 | 0.72 | 0.53 | 0.86 | 67 (0.32) → ~2,400 |
+  | large-k7 | 1,194 GB | 0.99 | 0.94 | 0.89 | 0.79 | 0.62 | 0.89 | 263 (0.83) → ~23,600 |
+
+  - **Shorter layer k wins on recall and size.** k 6 against k 8: +0.14 / +0.22 / +0.16 at 80 / 75 / 70%, and 30 GB smaller (shorter k-mers are shared more, so there are fewer distinct keys). Its decoy bar is higher (50 against 34 bits), but survival outweighs it. Doubling the keys at k 8 matches k 6 at 85–80% and loses at 75–70%, for +140 GB. `build.layer_k`'s log-size rule (k 9 at release) goes the wrong way for recall.
+  - **The price is alignment.** At k 6, 89% of the pairs `verify.py` aligns are chance. Chance pairs scale with the database's keys: projected to the release, that is ~42 k pairs per read, ~330 thread-hours (~10 h on 32 cores) for 10 M read pairs at ~350 k pairs/s/thread. k 7 needs ~36 thread-hours (~1.1 h on 32 cores), k 8 ~8 (~15 min). Query memory: 11.5 GB at k 6, 8.4 GB at k 8 (subset). BUILD is unchanged (~90 GB peak).
+  - **Next lever:** cut chance pairs before alignment (a higher per-pair evidence floor in `verify.py`, or two seeds per pair). The decoy reads measure that on the laptop, since chance pairs per read scale with proteins. Tune it on the mini-slice at k 6 and 7, then confirm on the subset.
+  - `bench.tsv` now also carries `pairs_per_read`, `chance_share` and `release_pairs_per_read`.
