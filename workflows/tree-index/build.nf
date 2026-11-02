@@ -8,7 +8,9 @@
 // TAKE       per members bucket: every member of each cluster holding one of their proteins
 // SLICE      the buckets' takes -> members.parquet: every unit of the families, whole
 // PARTITION  proteins -> parts of ~--part_proteins (k 11 storage components and equal
-//            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py)
+//            sequences kept whole) -> parts/part*.parquet, partition.json (partition.py); with
+//            --partition_per_file, once per members file (release buckets, each of whole
+//            MGnify90 clusters) -> b000-part*.parquet, b000-partition.json, ...
 // BUILD      per part and tier: build.py (a leaf per dense 8-mer set, dense 8-mer topology,
 //            spread minimizers and the k 7 ladder diffed on the spanning tree; standard and
 //            large add a protein layer on spanning-tree groups' composites, its k from the whole
@@ -25,6 +27,14 @@
 //            read classification (recall.py reads; by Pfam with --pfam or the slice's families)
 // SUMMARY    -> bench.tsv: per tier, postings, decoy bar and recall by identity (recall.py summary,
 //            verify_0.01_nb: aligned at a 1% decoy bar, neighbour rule)
+//
+// With --reads R1,R2 and --built <dir> (a build run's outdir: index-<tier>/, store-<tier>/), a
+// real sample through the built tiers instead (no build, no truth); on HPC,
+// hpc/kfp-ablations/tree-index-reads/run.sh:
+// TIER1      per tier: query.py --decoy, verify.py -> q-<tier>/
+// TIER2      per tier and --tier2_memory budget (GB): tier2.py -> t2-<tier>-<gb>gb/ (handoff/ in
+//            kfp-pileup reference's format)
+// CHUNKS     per tier: are the budgets' calls and assignments identical -> chunks-<tier>.json
 
 nextflow.enable.dsl = 2
 
@@ -38,6 +48,11 @@ params.slice_families     = 40
 params.slice_min_proteins = 20000
 params.slice_max_proteins = 150000
 params.part_proteins = 2000000    // proteins per part
+params.partition_per_file = false // one PARTITION per members file (the release's buckets)
+// a real sample through built tiers, instead of building
+params.reads         = ''         // R1,R2
+params.built         = ''         // a build run's outdir (index-<tier>/, store-<tier>/)
+params.tier2_memory  = '16,4'     // tier2.py --memory-gb budgets; outputs must not depend on them
 params.store_format  = 'flat'     // the leaf-ordered store (store.py): flat (mmap) or parquet
 // name:build.py options, ';'-separated (split at each tier's first ':')
 params.tiers         = 'slim:--mode slim;standard:--mode standard;large:--mode large'
@@ -112,20 +127,21 @@ process SLICE {
 }
 
 process PARTITION {
+    tag "${prefix}"
     label 'process_high_memory'
-    publishDir params.outdir, mode: 'copy', pattern: 'partition.json'
+    publishDir params.outdir, mode: 'copy', pattern: '*partition.json'
 
     input:
-    path members, stageAs: 'members/*'
+    tuple val(prefix), path(members, stageAs: 'members/*')
     path code, stageAs: 'code/*'
     val part_proteins  // an input, so -resume reruns when it changes
 
     output:
-    path 'part*.parquet', emit: parts
-    path 'partition.json'
+    path '*part[0-9]*.parquet', emit: parts
+    path '*partition.json', emit: json
 
     script:
-    "${py()} code/partition.py --members members/* --out . --part-proteins ${part_proteins}"
+    "${py()} code/partition.py --members members/* --out . --part-proteins ${part_proteins} --prefix '${prefix}'"
 }
 
 process BUILD {
@@ -134,7 +150,7 @@ process BUILD {
 
     input:
     tuple val(tier), val(args), path(part)
-    path partition
+    val proteins  // the whole database's, for the layer's k
     path code, stageAs: 'code/*'
 
     output:
@@ -142,10 +158,7 @@ process BUILD {
     tuple val(tier), path("${tier}-${part.baseName}"), path(part, includeInputs: true), emit: with_part
 
     script:
-    """
-    n=\$(${py()} -c "import json; print(json.load(open('${partition}'))['proteins'])")
-    ${py()} code/build.py --members ${part} --out ${tier}-${part.baseName} --database-proteins \$n ${args}
-    """
+    "${py()} code/build.py --members ${part} --out ${tier}-${part.baseName} --database-proteins ${proteins} ${args}"
 }
 
 process MERGE {
@@ -273,6 +286,63 @@ process SCORE {
     """
 }
 
+process TIER1 {
+    tag "${tier}"
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy', pattern: 'q-*'
+
+    input:
+    tuple val(tier), path(index, stageAs: 'index'), path(store, stageAs: 'store')
+    path reads, stageAs: 'reads/*'
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(tier), path(index), path(store), path("q-${tier}")
+
+    script:
+    """
+    ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
+    ${py()} code/verify.py --index index --store store --reads ${reads} --query q-${tier}
+    """
+}
+
+process TIER2 {
+    tag "${tier} ${gb} GB"
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    tuple val(tier), path(index, stageAs: 'index'), path(store, stageAs: 'store'), path(q), val(gb)
+    path reads, stageAs: 'reads/*'
+    path code, stageAs: 'code/*'
+
+    output:
+    tuple val(tier), path("t2-${tier}-${gb}gb")
+
+    script:
+    """
+    ${py()} code/tier2.py --index index --store store --reads ${reads} --query ${q} \
+        --memory-gb ${gb} --out t2-${tier}-${gb}gb
+    rm -rf t2-${tier}-${gb}gb/spill
+    """
+}
+
+process CHUNKS {
+    tag "${tier}"
+    label 'process_medium'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    tuple val(tier), path(runs, stageAs: 'runs/*')
+    path code, stageAs: 'code/*'
+
+    output:
+    path "chunks-${tier}.json"
+
+    script:
+    "${py()} code/recall.py chunks --runs runs/* --out chunks-${tier}.json"
+}
+
 process SUMMARY {
     label 'process_low'
     publishDir params.outdir, mode: 'copy'
@@ -296,6 +366,27 @@ workflow {
         .collect { file("${projectDir}/${it}") }
     pfam = params.pfam ? Channel.fromPath(params.pfam, checkIfExists: true).collect()
                        : Channel.value([])
+    tiers = Channel.fromList(params.tiers.tokenize(';')*.trim().collect { it.split(':', 2) as List })
+    if (params.reads) {  // a real sample through built tiers
+        reads = params.reads.tokenize(',').collect { file(it, checkIfExists: true) }
+        built = tiers.map { tier, args ->
+            [tier, file("${params.built}/index-${tier}", checkIfExists: true),
+             file("${params.built}/store-${tier}", checkIfExists: true)] }
+        TIER1(built, reads, code)
+        TIER2(TIER1.out.combine(Channel.fromList(params.tier2_memory.toString().tokenize(','))), reads, code)
+        CHUNKS(TIER2.out.groupTuple(), code)
+    } else {
+        build(code, pfam, tiers)
+    }
+}
+
+workflow build {
+    take:
+    code
+    pfam
+    tiers
+
+    main:
     if (params.slice_store) {
         FAMILIES(Channel.fromPath(params.slice_pfam, checkIfExists: true).first(), code)
         TAKE(Channel.fromPath(params.slice_store, checkIfExists: true).combine(FAMILIES.out.chosen), code)
@@ -305,9 +396,16 @@ workflow {
         members = params.members ? Channel.fromPath(params.members, checkIfExists: true).collect()
                                  : FIXTURE()
     }
-    PARTITION(members, code, params.part_proteins)
-    tiers = Channel.fromList(params.tiers.tokenize(';')*.trim().collect { it.split(':', 2) as List })
-    BUILD(tiers.combine(PARTITION.out.parts.flatten()), PARTITION.out[1].first(), code)
+    // one partition, or one per members file (release buckets: b000-, b001-, ...)
+    by_file = members.flatMap { fs ->
+        fs = fs instanceof List ? fs : [fs]
+        params.partition_per_file
+            ? fs.sort { it.name }.withIndex().collect { f, i -> [String.format('b%03d-', i), [f]] }
+            : [['', fs]]
+    }
+    PARTITION(by_file, code, params.part_proteins)
+    proteins = PARTITION.out.json.map { new groovy.json.JsonSlurper().parse(it).proteins as long }.sum()
+    BUILD(tiers.combine(PARTITION.out.parts.flatten()), proteins, code)
     MERGE(BUILD.out.dir.groupTuple(), code)
     index = MERGE.out.map { [it.name - 'index-', it] }
     // the leaf-ordered store, per part (its positions one range of the merged index)

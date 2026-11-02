@@ -98,6 +98,13 @@ cd kfp-ablations/tree-index-build && sbatch run.sh
 # the tiers on a family-complete slice (every unit of 40 Pfam families; needs release-tiers'
 # buckets and pfam.parquet): read precision by unit where near units are present:
 cd kfp-ablations/tree-index-slice && sbatch run.sh
+# tier 1 and tier 2 on a real sample (hadza10M) through tiers already built (BUILT=, default
+# tree-index-build's results), tier 2 at two memory budgets that must agree; when
+# tree-index-build has finished:
+cd kfp-ablations/tree-index-reads && sbatch run.sh
+# the whole release (release-tiers' 256 buckets), partitioned per bucket, merged out of core;
+# standard by default (TIERS=): then tree-index-reads again with BUILT=../tree-index-release/results
+cd kfp-ablations/tree-index-release && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs

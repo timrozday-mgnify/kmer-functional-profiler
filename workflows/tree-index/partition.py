@@ -8,7 +8,10 @@ about ``--part-proteins`` proteins; a component larger than that is a part of it
 is built alone (``build.py``) and the parts are merged (``merge.py``). Edges the dense topology
 would find between components are lost, so a k-mer shared across parts is posted in each.
 
-Writes ``part0000.parquet``... (the members table, per part) and ``partition.json``.
+Writes ``part0000.parquet``... (the members table, per part) and ``partition.json``, each name
+after ``--prefix``. At release, one call per members bucket (``build.nf --partition_per_file``):
+buckets hold whole MGnify90 clusters, so only edges between clusters in different buckets are
+lost, and their k-mers are posted once per bucket.
 """
 
 import argparse
@@ -69,6 +72,7 @@ def main() -> None:
     parser.add_argument("--members", nargs="+", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--part-proteins", type=int, default=2_000_000)
+    parser.add_argument("--prefix", default="", help="before each output's name (a bucket's)")
     parser.add_argument("--k", type=int, default=11)
     parser.add_argument("--t-cap", type=float, default=0.2)
     parser.add_argument("--levels", type=int, default=8)
@@ -86,10 +90,10 @@ def main() -> None:
     raw = raw.sort("cluster_rep", "protein_id").with_columns(part=part)
     sizes = []
     for (p,), rows in raw.partition_by("part", as_dict=True, maintain_order=True).items():
-        rows.drop("part").write_parquet(out / f"part{p:04d}.parquet")
+        rows.drop("part").write_parquet(out / f"{args.prefix}part{p:04d}.parquet")
         sizes.append(rows.height)
     stats |= {"parts": len(sizes), "part_proteins": sorted(sizes, reverse=True)}
-    (out / "partition.json").write_text(json.dumps(stats, indent=1) + "\n")
+    (out / f"{args.prefix}partition.json").write_text(json.dumps(stats, indent=1) + "\n")
     print(json.dumps(stats | {"part_proteins": sizes[:5]}))
 
 
