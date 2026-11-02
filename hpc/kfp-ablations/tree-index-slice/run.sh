@@ -30,7 +30,14 @@ source ../common.sh
 STD=../release-tiers/results-standard
 compgen -G "$STD/members.bucket*.parquet" >/dev/null || { echo "no $STD/members.bucket*.parquet: run release-tiers first" >&2; exit 1; }
 [[ -f $STD/pfam.parquet ]] || { echo "no $STD/pfam.parquet (release-tiers with --pfam)" >&2; exit 1; }
-nextflow run "$WF/tree-index/build.nf" -c ../site.config -resume --outdir results \
+# BUILD as tree-index-build's: parts of 1 M proteins (~30 GB; components larger than a part,
+# common in a family-complete slice, cut between clusters), 96 GB up front, +96 GB per retry
+cat > build.config <<'CFG'
+process {
+    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+}
+CFG
+nextflow run "$WF/tree-index/build.nf" -c ../site.config -c build.config -resume --outdir results \
     --slice_store "$(realpath "$STD")/members.bucket*.parquet" \
-    --slice_pfam "$(realpath "$STD/pfam.parquet")" \
+    --slice_pfam "$(realpath "$STD/pfam.parquet")" --part_proteins 1000000 \
     --tiers 'slim:--mode slim;standard:--mode standard;large:--mode large'
