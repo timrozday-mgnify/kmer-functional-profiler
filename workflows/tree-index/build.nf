@@ -53,6 +53,8 @@ params.partition_per_file = false // one PARTITION per members file (the release
 params.reads         = ''         // R1,R2
 params.built         = ''         // a build run's outdir (index-<tier>/, store-<tier>/)
 params.tier2_memory  = '16,4'     // tier2.py --memory-gb budgets; outputs must not depend on them
+// decoy counts x this: bars as for a database this many times larger (query.decoy_bar)
+params.chance_scale  = 1
 params.store_format  = 'flat'     // the leaf-ordered store (store.py): flat (mmap) or parquet
 // name:build.py options, ';'-separated (split at each tier's first ':')
 params.tiers         = 'slim:--mode slim;standard:--mode standard;large:--mode large'
@@ -255,9 +257,9 @@ process QUERY {
     // tier 2's chunks and batches from half the task's memory (verify.py's peak is tier 1's)
     def mem = task.memory ? task.memory.toGiga().intdiv(2) : 4
     """
-    ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
-    ${py()} code/verify.py --index index --store store --reads ${reads} --query q-${tier}
-    ${py()} code/tier2.py --index index --store store --reads ${reads} --query q-${tier} \
+    ${py()} code/query.py --index index --reads ${reads} --decoy --chance-scale ${params.chance_scale} --out q-${tier}
+    ${py()} code/verify.py --index index --store store --reads ${reads} --query q-${tier} --chance-scale ${params.chance_scale}
+    ${py()} code/tier2.py --index index --store store --reads ${reads} --query q-${tier} --chance-scale ${params.chance_scale} \
         --memory-gb ${mem} --out q-${tier}/tier2
     """
 }
@@ -301,8 +303,8 @@ process TIER1 {
 
     script:
     """
-    ${py()} code/query.py --index index --reads ${reads} --decoy --out q-${tier}
-    ${py()} code/verify.py --index index --store store --reads ${reads} --query q-${tier}
+    ${py()} code/query.py --index index --reads ${reads} --decoy --chance-scale ${params.chance_scale} --out q-${tier}
+    ${py()} code/verify.py --index index --store store --reads ${reads} --query q-${tier} --chance-scale ${params.chance_scale}
     """
 }
 
@@ -321,7 +323,7 @@ process TIER2 {
 
     script:
     """
-    ${py()} code/tier2.py --index index --store store --reads ${reads} --query ${q} \
+    ${py()} code/tier2.py --index index --store store --reads ${reads} --query ${q} --chance-scale ${params.chance_scale} \
         --memory-gb ${gb} --out t2-${tier}-${gb}gb
     rm -rf t2-${tier}-${gb}gb/spill
     """

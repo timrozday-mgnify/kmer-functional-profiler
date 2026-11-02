@@ -1417,3 +1417,29 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
     - The mini-slice still reads high at ≤ 75% against the slice: 0.67 / 0.60 against 0.55 / 0.52 at 75 / 70% (~2 SE). By the source group's size, the two agree except for groups of 11–1,000 members at ≤ 75% (0.54 against 0.44; 0.91 against 0.76). It is not budget normalisation (c 1.53 against 1.54). Treat it as the mini-slice's known optimism at low identity.
     - For release, F = 5.74 × 10⁹ / 294,644 ≈ 19,480; every grid index is rescored at that scale (`grid-release`).
   - Tests: `test_decoy_bar_chance_scale` and `test_wide_clusters_link_relatives_only` (siblings ~90% apart cluster at 30%; at ~72% they do not, which is what 30% means).
+- **High recall at 70–75% with wide-cluster budgets (2026-11-02, the user's targets: 0.95 at 80% identity, high at 75–70%, smaller than the full-leaf tiers; alignment cost set aside).** Mini-slice, 2,000 fresh strains, scored at release chance scale (`--chance-scale` 19,480). Layer only (`--t-base 0 --window 0 --ladder= --n-1 0`), wide clusters at 30% shared 5-mers. Lookup sizes at release assume one position per group (19 B per posting, ~26 B per group); full-leaf tiers are per leaf, as built. Recall at depth > 1 (`verify_0.01_nb`), 90 / 85 / 80 / 75 / 70%:
+
+  | Config | Lookup | 90% | 85% | 80% | 75% | 70% | Pairs per read (mini) |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | standard k 8 (full leaf) | 289 GB | 0.90 | 0.82 | 0.73 | 0.61 | 0.57 | 37 |
+  | standard k 6 (full leaf) | 289 GB | 0.93 | 0.87 | 0.80 | 0.73 | 0.66 | 38 |
+  | large k 8 (full leaf) | 482 GB | 0.99 | 0.96 | 0.93 | 0.85 | 0.78 | 39 |
+  | large k 7 (full leaf) | 482 GB | 0.99 | 0.99 | 0.98 | 0.87 | 0.82 | 40 |
+  | layer only, per group, k 7 | ~68 GB | 0.82 | 0.79 | 0.70 | 0.61 | 0.56 | — |
+  | wide k 7, same keys | ~68 GB | 0.78 | 0.75 | 0.69 | 0.57 | 0.54 | — |
+  | wide k 6, 2× | ~112 GB | 0.92 | 0.89 | 0.84 | 0.79 | 0.73 | — |
+  | wide k 6, 2×, union composites | ~112 GB | 0.84 | 0.85 | 0.74 | 0.69 | 0.63 | — |
+  | wide k 5, 2× | ~112 GB | 0.93 | 0.94 | 0.90 | 0.83 | 0.77 | — |
+  | wide k 4, 2× | ~112 GB | 0.99 | 0.95 | 0.93 | 0.92 | 0.89 | 634 |
+  | wide k 6, 4×, window 8 | ~198 GB | 0.98 | 0.96 | 0.95 | 0.89 | 0.83 | — |
+  | wide k 5, 4×, window 8 | ~198 GB | 0.98 | 0.98 | 0.95 | 0.92 | 0.87 | — |
+  | wide k 4, 3×, window 8 | ~155 GB | 1.00 | 0.97 | 0.96 | 0.93 | 0.95 | 1,186 |
+  | wide k 4, 4×, window 8 | ~198 GB | 1.00 | 0.99 | 0.96 | 0.96 | 0.97 | 1,559 |
+  | wide k 5, 6×, window 8 | ~286 GB | 0.99 | 1.00 | 0.96 | 0.94 | 0.94 | 145 |
+  | wide k 5, 8×, window 8 | ~373 GB | 0.99 | 1.00 | 0.99 | 0.95 | 0.97 | — |
+
+  - **Shorter layer k is the strongest lever** (survival 0.7^k at 70%), then keys. Window 8 adds ~0.01–0.02 at no size cost. Union composites (`composite:0`) lose 0.1, so drop them. Wide clusters at equal keys match per-group budgets.
+  - **The wide design beats full-leaf large at a fraction of the size:** k 4 with 3× keys reaches 0.93 / 0.95 at 75 / 70% against 0.87 / 0.82, with ~a third of the lookup data. At 80% the k 4 variants plateau at ~0.96 whatever the keys (residual misses not from seeds; ~2 SE from 0.99).
+  - **Against 0.95 at 80% at full scale** (the mini-slice reads ~0.04 high at 80% against the HPC slice): only k 5 with 8× (0.99 here, ~373 GB) is expected to clear it; k 4 with 3–4× is expected at ~0.92.
+  - **Cost:** short k aligns far more chance pairs (k 4: 1,200–1,600 per read on the mini-slice, ×19,480 at release in chance pairs), for a pseudo-alignment step later.
+  - **HPC confirmation:** `hpc/kfp-ablations/tree-index-wide` (subset; wide k 4 at 3× and 4×, k 5 at 6× and 8×; full-leaf large k 7 as the control; `build.nf --chance_scale 108` for release bars). The test profile passes with these tiers.

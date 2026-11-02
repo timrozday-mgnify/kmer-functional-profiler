@@ -105,6 +105,9 @@ cd kfp-ablations/tree-index-reads && sbatch run.sh
 # the protein layer's k at the subset's size (k 8, 7, 6 and k 8 with twice the keys; large at
 # k 8 and 7): tree-index-build lost recall below ~85% at k 8:
 cd kfp-ablations/tree-index-layer-k && sbatch run.sh
+# tier 1 as fewer representatives sensitive to wider AAI: layer-only, key budgets per wide
+# cluster (30% shared 5-mers), layer k 4-5, at release chance scale, against full-leaf large:
+cd kfp-ablations/tree-index-wide && sbatch run.sh
 # the whole release (release-tiers' 256 buckets), partitioned per bucket, merged out of core;
 # standard by default (TIERS=): then tree-index-reads again with BUILT=../tree-index-release/results
 cd kfp-ablations/tree-index-release && sbatch run.sh
