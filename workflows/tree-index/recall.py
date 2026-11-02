@@ -223,6 +223,38 @@ def score(a: argparse.Namespace) -> None:
         print(table)
 
 
+MGNIFY_PROTEINS = 5_739_566_171  # MGnify Proteins 2026_07 (docs/mgnify-2026_07.md)
+MGNIFY_MEAN_LENGTH = 1.07e12 / MGNIFY_PROTEINS  # residues per protein, ~186
+
+
+def release_gb(idx: Path, meta: dict, n_release: int = MGNIFY_PROTEINS) -> dict[str, float]:
+    """Tier 1's footprint scaled to ``n_release`` proteins by this index's per-protein rates
+    (docs/tree-index-plan.md, Progress log: size estimates revisited): postings (hash 8 B, lo
+    and hi 4 B each, sign 1 B; ``kind`` is the build's), keys (hash 8, bits 4, k 2),
+    per-position and per-node tables (pos_size, layer_group, a unit id; node lo, hi, level,
+    size) and the sequences ``verify.py`` aligns against: each layer group's representative,
+    or every leaf without groups (residues 1 B, offsets 8 B). Positions stay u32 with the
+    release in two shards. Rates follow density: a slice's (complete neighbourhoods) is the
+    release's best guess, a cluster sample's an upper bound; tier 2's full store is apart.
+    Sequences are rescaled to the release's mean length (a slice's proteins are ~40% longer).
+    ponytail: postings are not rescaled; the layer's keys grow with length, so a long-protein
+    sample overstates them somewhat."""
+    s = meta["stats"]
+    n = s["proteins"]
+    lengths = np.load(idx / "pos_len.npy").astype(np.int64)
+    groups = idx / "layer_group.npy"
+    reps = np.unique(np.load(groups)) if groups.exists() else np.arange(len(lengths))
+    nodes = len(np.load(idx / "node_lo.npy", mmap_mode="r"))
+    per = {
+        "postings": 17 * s["postings"] / n,
+        "keys": 14 * s["keys"] / n,
+        "tables": (8 + 4 * groups.exists()) * s["positions"] / n + 16 * nodes / n,
+        "reps": (lengths[reps].sum() * MGNIFY_MEAN_LENGTH / lengths.mean() + 8 * len(reps)) / n,
+    }
+    got = {f"release_{k}_gb": round(v * n_release / 1e9) for k, v in per.items()}
+    return got | {"release_tier1_gb": sum(got.values())}
+
+
 def summary(a: argparse.Namespace) -> None:
     """One row per build under ``--root`` (``idx-<name>`` or ``index-<name>``, ``q-<name>``,
     ``s-<name>``): its
@@ -247,7 +279,7 @@ def summary(a: argparse.Namespace) -> None:
             "decoy_seeds": q.get("decoy_seeds"),
             "query_s": round(q["total_s"]),
             "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
-        }
+        } | release_gb(idx, meta)
         # tier 1 is a profile: its candidates' units and strain detection; tier 2 classifies
         # reads (tier 1's read numbers stay in its reads.json, a diagnostic)
         if (sdir / "reads.json").exists():
