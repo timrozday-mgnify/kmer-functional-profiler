@@ -91,8 +91,13 @@ cd kfp-ablations/presence-calibration && sbatch run.sh
 # tree index, phase 0 (docs/tree-index-plan.md): trees on a 1-in-5,000 cluster sample,
 # whole-release streaming counts, and the gate against today's standard tier:
 cd kfp-ablations/tree-index-phase0 && sbatch run.sh
-# tree index, the three tiers (quick, medium, large) on the 1-in-100 subset, built in parts:
+# tree index on the 1-in-100 subset, built in parts: the slim, standard and large tiers (plus
+# base, no layer, and the previous standard and large), each benchmarked on BLOSUM62 strains
+# at 100-70% identity, aligned (results/bench.tsv; Pfam precision from the subset's table):
 cd kfp-ablations/tree-index-build && sbatch run.sh
+# the tiers on a family-complete slice (every unit of 40 Pfam families; needs release-tiers'
+# buckets and pfam.parquet): read precision by unit where near units are present:
+cd kfp-ablations/tree-index-slice && sbatch run.sh
 ```
 
 `../reads/` (beside `kfp-ablations/`'s runs, i.e. `kfp-ablations/reads/`) holds ENA runs

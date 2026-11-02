@@ -21,7 +21,9 @@ Subcommands (run by ``main.nf``; each prints what it wrote):
   back-translated with random codons; every strain sits between random flanks. Paired
   reads (``--read-len``, fragments ``--fragment`` +- 10%, either strand) get ``--error``
   substitutions; reads are named ``s<strain>_<n>``, background pairs (``--background``,
-  appended) ``bg<n>``. Writes ``reads_1.fq.gz``, ``reads_2.fq.gz`` and ``truth.tsv``.
+  appended) ``bg<n>``. Writes ``reads_1.fq.gz``, ``reads_2.fq.gz``, ``truth.tsv`` and
+  ``reads.parquet`` (per read pair in file order: strain, -1 for background, and its coding
+  bases over both mates).
 - ``translate``: a nucleotide targets FASTA translated (code 11, internal stops as X), for the
   amino-acid arm on the same targets (phase 14, step 5).
 - ``score``: one sample's arms against its truth -> ``scores.tsv`` (one row per arm) and
@@ -249,6 +251,7 @@ def simulate(args: argparse.Namespace) -> None:
 
     qual = chr(33 + round(-10 * math.log10(max(args.error, 1e-4))))
     rows = []
+    pairs: list[tuple[int, int]] = []  # each strain read pair's (strain, coding bases), in order
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with (
@@ -276,8 +279,11 @@ def simulate(args: argparse.Namespace) -> None:
                 frag = max(args.read_len, round(rng.gauss(args.fragment, args.fragment / 10)))
                 frag = min(frag, len(dna))
                 s = rng.randrange(len(dna) - frag + 1)
+                pair = 0
                 for a in (s, s + frag - args.read_len):
-                    cds_bases += max(0, min(a + args.read_len, FLANK + len(cds)) - max(a, FLANK))
+                    pair += max(0, min(a + args.read_len, FLANK + len(cds)) - max(a, FLANK))
+                cds_bases += pair
+                pairs.append((k, pair))
                 fwd = dna[s : s + frag]
                 if rng.random() < 0.5:
                     fwd = reverse_complement(fwd.encode()).decode()
@@ -317,6 +323,15 @@ def simulate(args: argparse.Namespace) -> None:
         orient="row",
     ).with_columns(depth=pl.col("cds_bases") / pl.col("cds_len"))
     truth.write_csv(out / "truth.tsv", separator="\t")
+    # per read pair, in file order (background after the strains: strain -1, coding null)
+    pl.DataFrame(
+        {
+            "read": np.arange(len(pairs) + n_bg),
+            "strain": [k for k, _ in pairs] + [-1] * n_bg,
+            "coding": pl.Series([c for _, c in pairs] + [None] * n_bg, dtype=pl.Int32),
+            "pair_bases": 2 * args.read_len,
+        }
+    ).write_parquet(out / "reads.parquet")
     print(f"{len(strains)} strains, {truth['pairs'].sum()} pairs, {n_bg} background -> {out}")
 
 

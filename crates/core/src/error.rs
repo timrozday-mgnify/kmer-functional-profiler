@@ -4,7 +4,9 @@
 pub enum Error {
     #[error("k = {k} is outside 1..={max} for this alphabet")]
     InvalidK { k: usize, max: usize },
-    #[error("unknown alphabet {0:?} (expected protein, murphy10 or dayhoff)")]
+    #[error(
+        "unknown alphabet {0:?} (expected protein, murphy10, dayhoff or one of alphabet::REDUCED)"
+    )]
     UnknownAlphabet(String),
     #[error("unsupported genetic code {0} (expected 11 or 4)")]
     UnknownGeneticCode(u8),

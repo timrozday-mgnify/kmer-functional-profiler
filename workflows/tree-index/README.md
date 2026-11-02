@@ -142,8 +142,8 @@ Not covered here:
 
 ## Building the tiers (`build.nf`)
 
-`build.nf` builds the standard tier and the high-recall one (the plan's Progress log: the
-standard index restored) from one members table, in parts:
+`build.nf` builds the slim, standard and large tiers (the plan's Progress log: tiers by
+identity) from one members table, in parts:
 
 ```
 FIXTURE    synthetic members when --members is '' (the test profile)
@@ -152,29 +152,128 @@ PARTITION  partition.py: proteins linked by a possible k-11 storage edge (union-
            into parts of ~--part_proteins (2 M) -> partition.json
 BUILD      build.py per part and tier: a leaf per distinct dense 8-mer set, the dense 8-mer
            topology, spread 11-mer minimizers and the k 7 ladder by Fitch on the spanning
-           tree, per-leaf top-ups; recall also a Dayhoff 7-mer layer on every leaf
+           tree, per-leaf top-ups; standard and large also a protein layer on one composite
+           per spanning-tree group, its k from the whole database's size (partition.json's
+           proteins)
 MERGE      merge.py per tier: parts concatenated, positions offset -> index-<tier>/
+STORE      store.py per part and tier: each leaf's longest protein in leaf order (row =
+           position) -> store-<tier>/, which verify.py and tier2.py read by position
+TARGETS    recall.py targets: --bench_targets (2,000) proteins with an index position
+SIMULATE   spike.py simulate: one strain per target at 100-70% identity, BLOSUM62
+           substitutions, depth lognormal (mu 0.3, sigma 0.6): the plan's sim4
+QUERY      query.py --decoy per tier: chance seeds counted on the reads reversed; then
+           verify.py: candidates aligned (anchored ungapped scans, tandem repeats masked)
+           against each group's representative, their own decoy bar; each read pair's best
+           leaves and a read-level bar; then tier2.py: each routed read aligned to every
+           leaf of its groups, chunk by chunk along the tree (tier 2)
+SCORE      recall.py score per tier; recall.py reads on tier 1's and tier 2's calls: read
+           recall and precision (a read right when any tied best hit is the source's: unit,
+           group, leaf, Pfam with --pfam), per-strain means with 95% intervals, strain
+           detection by depth x identity, and the same by each pair's coding share
+SUMMARY    recall.py summary -> bench.tsv: per tier, postings, decoy bar, recall by identity
+           (verify_0.01_nb)
 ```
+
+With `--slice_store` (members buckets) and `--slice_pfam` (the release's Pfam table), FAMILIES,
+TAKE and SLICE (`slice.py`) build the members first: every MGnify90 cluster holding a protein
+of `--slice_families` random Pfam families (`--slice_min_proteins`–`--slice_max_proteins`
+proteins each), so near units are present and read precision by unit means something (a
+cluster sample almost never holds a protein's neighbouring units).
 
 ```bash
 nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts
 nextflow run workflows/tree-index/build.nf -profile slurm --members /path/members.parquet
 ```
 
-`--tiers` holds `name:build.py options` pairs, `;`-separated (options without `:`). The
-defaults are `standard` (`build.py --mode standard`, the defaults: *t\_base* 0.01, no floors,
-~4 spread minimizers per protein, k 7 at window 4 for leaves with < 32 informative 11-mers;
-~140–165 GB at release, estimated) and `recall` (`--mode recall`: also the rarest Dayhoff 7-mer
-per window of 8 on every leaf, for high recall at 70–85% identity; several times the standard
-size, and not yet tested for precision or F1). Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
+`--tiers` holds `name:build.py options` pairs, `;`-separated (split at each tier's first `:`,
+so options may name layers such as `--layers seb8:8:8:rare`). `--bench false` skips the
+benchmark. The
+defaults are `build.py`'s three modes (sizes at release are estimates, scaled from the quarter
+sample; with layers, `layer_group` and an offset per group's sequence in the MGnify protein
+store, which alignment reads):
+
+| Tier | `build.py` | Recall at depth > 1 (quarter sample) | ~Release |
+| --- | --- | --- | --- |
+| `slim` | `--mode slim`: *n\_1* 1, ~2 spread minimizers, k 7 for < 16 informative 11-mers | 0.93 at 100%, 0.81 at 95%, 0.62 at 90% | 120–130 GB (75–90 GB without the neighbour rule's edges) |
+| `standard` | `--mode standard`: slim's base plus the rarest protein k-mer per window of 16 (`protein:{k}:16:rare`) on one composite per spanning-tree group (`--layer-groups tree:0.57 --layer-rep composite:0.25`), thinned to ~2.6 keys per group in proportion to the square root of its members (`--layer-keys sqrt:2.6`), then `verify.py` | 0.91 at 90%, 0.73 at 80%, 0.58 at 70% | ~195–215 GB |
+| `large` | `--mode large`: the layer at window 8, ~14 keys per group (`sqrt:14`) | 1.00 at 90%, 0.94 at 80%, 0.86 at 70% | ~360–415 GB |
+
+`{k}` in `--layers` is `build.layer_k`: ~24 chance bits on the quarter sample (k 6) plus log2 of
+the database's size over it, so k 8 on the 1-in-100 subset. `--mode standard --layers '' --n-1 2 --window-min 2 --min-kmers 32`
+is the old standard tier without a layer (S3, ~185–210 GB). `query.py --mode precision` skips
+layers, which are not yet tested for precision or F1. Each `index-<tier>/` is in `build.py`'s format (`tree-v0`), which `query.py` reads.
 Its `meta.json` has postings by kind, bytes, positions, parts and the parts' build time and peak
 RSS.
+
+Layers on representatives (docs/tree-index-plan.md, Progress log: per-layer bars, gather,
+layer representatives and rough alignment): `layer_group.npy` maps each position to its
+group's representative, and `recall.py` expands a representative's seed to its group.
+`query.py --decoy` also writes `cand_fam_<share>.npy`, seeds at a decoy bar per key family
+(base, each layer). `verify.py` aligns each (read pair, leaf) with evidence ungapped (BLOSUM62)
+against the leaf's longest protein, decoy-calibrated (`cand_verify_<share>.npy`). The old
+standard (window 8 on every leaf, ~1.0–1.2 TB) is `--layers protein:{k}:8:rare --layer-groups ''`.
 
 Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITION 37 s and
 2.6 GB (~2.4 KB per protein); BUILD 68 s and 3.4 GB per 262 k proteins (the medium tier).
 
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
+
+## Tier 2 (`tier2.py`)
+
+A per-sample database over tier 1's candidates, for read classification. Tier 1 is a profile:
+it says which groups are present, with high recall from a small index, but its sparse keys
+seed only some of each strain's reads. Tier 2's candidates are tier 1's present groups, the
+groups its pairs route reads to, and their spanning-tree neighbours (`--neighbours`, 0.83).
+Every read pair is then classified by tier 2 itself (`--route dense`): all twelve frames vote
+by protein 5-mer seeds on a diagonal band against every candidate leaf (`_core.route_reads`,
+the top `--route-top` 16 leaves with at least `--route-votes` 4), and the gapped alignment
+(`--method gapped`: banded affine-gap Smith-Waterman around `verify.py`'s anchored seeds,
+repeats masked) makes the call. A read keeps every hit within `--ambiguous-bits` (3) of its
+best, shared by EM (`--em-rounds`); a group with at least `--min-reads` expected reads is
+present. Routing to an aligner comes after, from these calls (`handoff/assignments.parquet`). Candidate
+leaves are packed in leaf order (tier 1's tree, so relatives are adjacent and a group is one
+range) into chunks of at most `--chunk-residues`; one streaming pass writes their sequences in
+leaf order, and each chunk reads its range. Scores spill per chunk and are merged per read;
+decoys set the read bar. Outputs match `verify.py`'s names (`reads.parquet`, `verify.json`,
+`cand_verify_<share>.npy`), so `recall.py reads` scores them. Chunking changes memory, not
+results (checked: identical calls at 11 chunks and at one).
+
+```bash
+python workflows/tree-index/tier2.py --index index --members members.parquet \
+    --reads r1.fq.gz r2.fq.gz --query q --out q/tier2
+```
+
+Memory is one chunk's sequences, one batch of pairs and the routed reads' frames, which
+`verify.py` saves (`frames_*.parquet`); without them tier 2 recomputes every read's frames, its
+peak (7.6 GB against 0.33 GB on the quarter sample). `--memory-gb` (build.nf: half the task's)
+sets `--chunk-residues` and `--batch-pairs` (a third of it each). `handoff/` is in
+`kfp-pileup reference`'s format (`ref.fa`, `refs.tsv`, `molecule.txt`: present leaves as
+targets, up to 5 other leaves of each group as neighbours) with the called read pairs, for
+`kfp-pileup`'s DIAMOND and `call`.
+
+## The leaf-ordered store (`store.py`)
+
+One row per leaf position (row = position): the leaf's longest protein, its `protein_id` and
+`cluster_rep`, built per partition part (a part's positions are one range of the merged
+index, `merge.py`'s `parts.json`). `verify.py` and `tier2.py` read only the candidates' rows
+(`--store`) instead of scanning the members. It is a reordered copy of the MGnify protein
+store, beside the index, not in it. Formats (`build.nf --store_format`):
+
+| Format | Files | A read costs | Size |
+| --- | --- | --- | --- |
+| `flat` (default) | `.bin` (sequences concatenated), `.offsets.npy`, `.ids.npy`, memory-mapped | the candidates' own bytes, wherever they fall | ~1× the residues (~1.6 TB at release, estimate) |
+| `parquet` | `.parquet`, zstd, 1,024-row groups | every row group holding a candidate | ~0.55× |
+
+Measured on a 3 M-leaf synthetic store, 2,000 candidates: in 100 runs of 20, flat 0.007 s,
+parquet 0.039 s; scattered, flat 0.004 s, parquet 0.32 s (half the row groups), a full members
+scan 0.33 s either way. At release (2 M candidates in ~5.5 × 10⁹ leaves, a ~1.3 TB members
+store) the scan is ~20–40 min per sample; flat reads ≤ ~8 GB of pages (estimate).
+
+```bash
+python workflows/tree-index/store.py build --proteins index/proteins.parquet \
+    --members members.parquet --format flat --out store
+```
 
 ## Querying and reporting (`query.py`, `report.py`)
 
@@ -216,4 +315,15 @@ chance probability from residue composition, less log₂ of its gains on the tre
 informative k-mers. With reads, `query.py` scores each leaf by its best read pair's hits
 (`seeds.parquet`) and picks the bar at which expected chance seeds are `--chance-share` (1%) of
 the seeds (`evidence.parquet`, `evidence_bits` in `query.json`). `recall.py score` reports these
-as `ev_<share>` strategies.
+as `ev_<share>` strategies, and `recall.py summary --root DIR` tabulates builds side by side
+(`idx-<name>` or `index-<name>`, `q-<name>`, `s-<name>` under DIR).
+
+### Reduced alphabets (`alphabets.py`)
+
+Layer and ladder steps take an alphabet (`<alphabet>:k:w[:rare]`): `protein`, `murphy10`,
+`dayhoff`, or one of `alphabets.py`'s `REDUCED` (Murphy 8/12/15, DIAMOND's 11, Edgar's SE-B
+6/8/10/14, SE-V 10, Li-A/B 10, and `opt4`–`opt14`), which `crates/core/src/alphabet.rs`
+mirrors. `alphabets.py --members m.parquet` reports, before any build, each alphabet's share of
+BLOSUM62 substitutions kept within a class, its chance-match bits per residue
+(−log₂ Σ Q\_c²), the k that meets each bit budget, and the predicted miss rate at 70–85%
+identity. `opt<n>` alphabets maximise survival at 70% identity per chance bit.

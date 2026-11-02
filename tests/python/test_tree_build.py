@@ -26,7 +26,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 # phase 1's medium tier: base band, floors and top-ups only, which check_index checks in full
 MEDIUM = ["--t-base", "0.02", "--n-min", "16", "--tau", "0.3", "--n-1", "2", "--window", "0",
-          "--ladder", ""]  # fmt: skip
+          "--ladder", "", "--layers", ""]  # fmt: skip
 
 
 def fixture(tmp_path: Path) -> Path:
@@ -256,7 +256,10 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
 def test_window_kmers_match_brute_force() -> None:
     """build.window_kmers: each sequence's least hash per window (shrunk by min_count)."""
     rng = np.random.default_rng(2)
-    seqs = [bytes(rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n)) for n in (5, 15, 22, 40, 120, 61)]
+    seqs = [
+        rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n).astype(np.uint8).tobytes()
+        for n in (5, 15, 22, 40, 120, 61)
+    ]
     seqs[4] = seqs[4][:50] + b"X" + seqs[4][51:]  # k-mers over X have no hash
     for w, min_count in ((4, 0), (20, 0), (20, 4), (10, 8)):
         seq, h = build.window_kmers(seqs, 11, w, min_count)
@@ -269,18 +272,102 @@ def test_window_kmers_match_brute_force() -> None:
             assert {int(x) for x in h[seq == j]} == want, (w, min_count, j)
 
 
+def test_rare_windows_break_ties_by_hash() -> None:
+    """Rarest per window: with equal counts it is plain winnowing (not near-dense, as ties by
+    position were); a rarer k-mer wins its windows."""
+    rng = np.random.default_rng(3)
+    seqs = [
+        rng.choice(list(b"ACDEFGHIKLMNPQRSTVWY"), n).astype(np.uint8).tobytes()
+        for n in (30, 120, 200)
+    ]
+    ks = [s[i : i + 6] for s in seqs for i in range(len(s) - 5)]
+    hs = np.unique(_core.hash_proteins(ks, 6)["hash"])
+    plain = build.window_kmers(seqs, 6, 16)
+    tied = build.window_kmers(seqs, 6, 16, rank=(hs, np.ones(len(hs), np.uint64)))
+    assert sorted(zip(*map(list, plain), strict=True)) == sorted(zip(*map(list, tied), strict=True))
+    rare = _core.hash_proteins([seqs[2][100:106]], 6)["hash"][0]
+    counts = np.where(hs == rare, 1, 2).astype(np.uint64)
+    seq, h = build.window_kmers(seqs, 6, 16, rank=(hs, counts))
+    assert rare in h[seq == 2]
+
+
 def test_default_modes_query_soundly(tmp_path: Path) -> None:
-    """The default build (standard: spread minimizers, k 7 ladder) and ``--mode recall`` (a
-    Dayhoff layer on every leaf): covers sum to 0 or 1, and the query and report checks hold
-    against brute force, the Dayhoff layer's k-mers included."""
+    """The tiers (slim: one posting per leaf where possible; standard and large: that plus a
+    protein layer on spanning-tree groups' composites, thinned by group size; k from the
+    database's size): covers sum to 0 or 1, and the query and report checks hold against
+    brute force, the layer's k-mers included."""
+    assert [build.layer_k(n) for n in (320, 262_391, 53_000_000)] == [5, 6, 8]
     members = fixture(tmp_path)
-    for mode in ("standard", "recall"):
+    layers = {"slim": "", "standard": "protein:5:16:rare", "large": "protein:5:8:rare"}
+    for mode, want in layers.items():
         idx = tmp_path / f"idx-{mode}"
         run(
             "--members", str(members), "--out", str(idx), "--mode", mode, cwd=tmp_path, script=BUILD
         )
         meta = json.loads((idx / "meta.json").read_text())
-        assert meta["params"]["layers"] == ("dayhoff:7:8:rare" if mode == "recall" else "")
+        assert meta["params"]["layers"] == want
+        assert meta["params"]["n_1"] == 1
+        assert (idx / "layer_group.npy").exists() == bool(want)
         codes = set(np.load(idx / "key_k.npy").tolist())
-        assert (71 in codes) == (mode == "recall")  # Dayhoff 7: 7 + 32 x 2
+        assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
         check_query(tmp_path, idx, members)
+
+
+def test_reduced_alphabets_match_rust() -> None:
+    """alphabets.py's classes are the Rust kernel's: residues of a class hash alike, classes
+    apart, for every alphabet a layer can name."""
+    import alphabets
+
+    for name, spec in (alphabets.BUILTIN | alphabets.REDUCED).items():
+        groups = spec.split()
+        first = [(g[0] * 3).encode() for g in groups]
+        last = [(g[-1] * 3).encode() for g in groups]
+        got = _core.hash_proteins(first + last, 3, alphabet=name)
+        h = dict(zip(got["seq"].tolist(), got["hash"].tolist(), strict=True))
+        m = len(groups)
+        assert [h[i] for i in range(m)] == [h[i + m] for i in range(m)], name
+        assert len({h[i] for i in range(m)}) == m, name
+
+
+def test_gather_takes_reads_greedily() -> None:
+    # leaf 0: reads 1-3; leaf 1 shares reads 1-2 with it, plus read 5; leaf 2: read 4 alone
+    ev = pl.DataFrame(
+        {"pos": [0, 0, 0, 1, 1, 1, 2], "read": [1, 2, 3, 1, 2, 5, 4],
+         "score": [10.0, 10, 10, 12, 12, 3, 5]}
+    )  # fmt: skip
+    got = query.gather(ev, floor=1.0)
+    assert got.rows() == [(0, 30.0), (2, 5.0), (1, 3.0)]  # leaf 1's gain falls from 27 to 3
+    assert query.gather(ev, floor=4.0)["pos"].to_list() == [0, 2]
+
+
+def test_layer_on_reps() -> None:
+    pos = np.array([0, 0, 1, 1, 1, 2, 3])
+    h = np.array([1, 2, 1, 2, 3, 2, 9], dtype=np.uint64)
+    for rule, want, rep in (
+        ("medoid", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),  # leaf 1 shares the most in group 0
+        ("longest", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),
+        ("central", {(2, 2), (3, 9)}, 2),  # leaf 2's one k-mer is held by all three
+        ("composite:0.5", {(1, 1), (1, 2), (3, 9)}, 1),  # k-mers on at least 2 of the 3
+        ("composite:0", {(1, 1), (1, 2), (1, 3), (3, 9)}, 1),
+        ("composite:0.5:central", {(2, 1), (2, 2), (3, 9)}, 2),
+    ):
+        group = np.array([0, 0, 0, 3])
+        p, hh = build.on_reps(group, pos, h, rule)
+        assert set(zip(p.tolist(), hh.tolist(), strict=True)) == want, rule
+        assert group.tolist() == [rep, rep, rep, 3]
+
+
+def test_allocate_layer_keys() -> None:
+    """Each representative keeps its least hashes; the K_g average the mean, follow the rule
+    (sqrt: more to bigger groups) and never exceed a representative's keys (the spare moves)."""
+    group = np.array([0, 0, 0, 0, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5])  # reps 0 (m 4), 4 (1), 5 (9)
+    pos = np.repeat([0, 4, 5], [10, 2, 10])
+    h = np.arange(22, dtype=np.uint64)[::-1].copy()
+    got_pos, got_h = build.allocate(group, pos, h, "sqrt:4")
+    k = np.bincount(got_pos, minlength=6)[[0, 4, 5]]
+    assert k.sum() == 12 and k[1] <= 2 and k[2] > k[0] > k[1]
+    for r in (0, 4, 5):  # the least hashes of each
+        mine = np.sort(h[pos == r])
+        assert set(got_h[got_pos == r]) == set(mine[: k[[0, 4, 5].index(r)]])
+    k = np.bincount(build.allocate(group, pos, h, "fixed:4")[0], minlength=6)[[0, 4, 5]]
+    assert k.tolist() == [5, 2, 5]  # rep 4 holds 2: its spare split between the others
