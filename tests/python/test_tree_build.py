@@ -318,6 +318,28 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         check_query(tmp_path, idx, members)
 
 
+def test_layer_at_the_ladders_k(tmp_path: Path) -> None:
+    """A database of ~4 M proteins gives the layer k 7, the ladder's: short proteins get the
+    same 7-mers from both, held once (a repeated holder panicked tree_schemes)."""
+    assert build.layer_k(4_230_133) == 7
+    m = pl.read_parquet(fixture(tmp_path))
+    rng = np.random.default_rng(0)
+    short = [
+        "".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), int(n))) for n in rng.integers(18, 30, 40)
+    ]
+    ids = np.arange(10**9, 10**9 + 40)
+    extra = pl.DataFrame(
+        {"protein_id": ids, "cluster_rep": ids, "full_length": True, "sequence": short}
+    ).cast(m.schema)
+    members = tmp_path / "short.parquet"
+    pl.concat([m, extra]).write_parquet(members)
+    idx = tmp_path / "idx"
+    run("--members", str(members), "--out", str(idx), "--mode", "standard",
+        "--database-proteins", "4230133", cwd=tmp_path, script=BUILD)  # fmt: skip
+    assert json.loads((idx / "meta.json").read_text())["params"]["layers"] == "protein:7:16:rare"
+    check_query(tmp_path, idx, members)
+
+
 def test_reduced_alphabets_match_rust() -> None:
     """alphabets.py's classes are the Rust kernel's: residues of a class hash alike, classes
     apart, for every alphabet a layer can name."""
