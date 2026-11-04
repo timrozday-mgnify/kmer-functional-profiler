@@ -39,3 +39,22 @@ def test_emd() -> None:
         np.array([0, 0, 1]), np.array([0, 1, 0]), np.array([0.9, 0.8, 0.8]),
     )  # fmt: skip
     assert got == pytest.approx(0.2)
+
+
+def test_uses_sweep_and_restricted_forest() -> None:
+    import uses
+
+    # nodes over positions 0-7: (0,2), (2,4), (0,4), (4,8); only 1, 2, 3, 6 are kept
+    left, right, tops, ranges = uses.restricted_forest(
+        np.array([1, 2, 3, 6]), np.array([0, 2, 0, 4]), np.array([2, 4, 4, 8])
+    )
+    assert ranges[4:].tolist() == [[1, 3], [0, 3]]  # (0,2) and (4,8) hold one leaf each
+    assert left.tolist() == [1, 0]
+    assert right.tolist() == [2, 4]
+    assert tops.tolist() == [5, 3]
+    # k-mer 7: gained on leaves 0-3, lost on 1-2; k-mer 9: leaf 2
+    h, leaf = uses.sweep(
+        np.array([7, 7, 9], np.uint64), np.array([0, 1, 2]), np.array([4, 3, 3]),
+        np.array([1, -1, 1], np.int8),
+    )  # fmt: skip
+    assert sorted(zip(h.tolist(), leaf.tolist(), strict=True)) == [(7, 0), (7, 3), (9, 2)]

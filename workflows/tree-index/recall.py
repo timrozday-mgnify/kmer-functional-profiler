@@ -558,9 +558,23 @@ def reads(a: argparse.Namespace) -> None:
     print(json.dumps(info, default=float))
 
 
+MAX_CHUNK_DIFF = 0.01  # the user's decision, 2026-11-04: 0.27% measured on the mini-slice
+
+
+def reads_differing(a: pl.DataFrame, b: pl.DataFrame) -> float:
+    """The share of reads called in ``a`` or ``b`` whose (read, pos) calls are not the same."""
+    a, b = a.select("read", "pos").unique(), b.select("read", "pos").unique()
+    changed = pl.concat(
+        [a.join(b, on=["read", "pos"], how="anti"), b.join(a, on=["read", "pos"], how="anti")]
+    )["read"]
+    return changed.n_unique() / max(pl.concat([a["read"], b["read"]]).n_unique(), 1)
+
+
 def chunks(a: argparse.Namespace) -> None:
     """Whether tier 2's runs at several memory budgets (``tier2.py --memory-gb``) made the same
-    calls and hand-off assignments: exactly, and to float rounding (EM weights)."""
+    calls and hand-off assignments: exactly, and to float rounding (EM weights); and the share
+    of called reads whose (read, leaf) calls differ, which must be at most
+    :data:`MAX_CHUNK_DIFF` (routing's caps apply per chunk, so exact is not required)."""
     runs = sorted(Path(r) for r in a.runs)
     files = ("reads.parquet", "handoff/assignments.parquet")
     read = lambda run, f: (lambda d: d.sort(d.columns))(pl.read_parquet(run / f))  # noqa: E731
@@ -576,9 +590,14 @@ def chunks(a: argparse.Namespace) -> None:
             except AssertionError:
                 close = False
         same[f] = {"exact": exact, "close": close}
+    calls = [pl.read_parquet(r / "reads.parquet", columns=["read", "pos"]) for r in runs]
+    differ = max((reads_differing(calls[0], c) for c in calls[1:]), default=0.0)
+    verdict = {"share": differ, "passes": differ <= MAX_CHUNK_DIFF}
     info = {r.name: json.loads((r / "tier2.json").read_text()) for r in runs}
-    Path(a.out).write_text(json.dumps({"identical": same, "runs": info}, indent=1) + "\n")
-    print(json.dumps(same))
+    Path(a.out).write_text(
+        json.dumps({"identical": same, "reads_differing": verdict, "runs": info}, indent=1) + "\n"
+    )
+    print(json.dumps(same | {"reads_differing": verdict}))
 
 
 def main() -> None:

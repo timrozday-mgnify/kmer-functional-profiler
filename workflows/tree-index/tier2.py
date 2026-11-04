@@ -344,7 +344,7 @@ def handoff(
     refs = pl.concat(
         [targets.with_columns(role=pl.lit("target")), others.with_columns(role=pl.lit("neighbour"))]
     ).with_columns(
-        unit=pl.col("cluster_rep"),
+        unit=pl.col("cluster_rep").rank("dense").cast(pl.Int64) - 1,  # call's are u32
         rep=pl.col("protein_id") == pl.col("cluster_rep"),
         seq_id=pl.format("s{}", pl.int_range(pl.len())),
         length=pl.col("sequence").str.len_bytes(),

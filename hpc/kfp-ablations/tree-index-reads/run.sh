@@ -12,7 +12,7 @@
 #   TIER1   per tier: query.py --decoy (reads reversed for the 1% chance-share bar), verify.py
 #   TIER2   per tier and memory budget (16 and 4 GB): tier2.py (dense routing, two-stage
 #           alignment, EM over ties, the hand-off in kfp-pileup reference's format)
-#   CHUNKS  per tier: the two budgets' calls and assignments must be identical
+#   CHUNKS  per tier: the two budgets' calls compared; at most 1% of called reads may differ
 # BUILT=<a build run's results> (default: tree-index-build's, the 1-in-100 subset; later
 # tree-index-release's) and TIERS='standard:;large:' pick the index. Compare against the flat
 # table on the same reads: ../pileup-fdr/results/hadza10M/ and its trace.tsv.
@@ -22,7 +22,7 @@
 #                                              seconds per step; reads.parquet (calls);
 #                                              handoff/ (ref.fa, refs.tsv, assignments.parquet,
 #                                              reads_{1,2}.fq.gz) for kfp-pileup's DIAMOND
-#   results/chunks-<tier>.json                 identical across budgets (exact, and to rounding)
+#   results/chunks-<tier>.json                 identical across budgets (exact, to rounding), share of reads differing
 #   results/trace.tsv                          time and peak RSS per task
 # Re-submitting resumes.
 source ../common.sh

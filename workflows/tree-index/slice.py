@@ -18,6 +18,9 @@ Subcommands:
   systematically in size order, so the clump a random protein sits in is distributed as in the
   slice. Proteins with no
   index position (no k-mer) are dropped. Writes ``--out`` (members) and ``mini.json``.
+- ``generic``: a set with no published clustering (phase 6), from ``--fasta`` or a members table
+  with its clusters dropped (``--members``), as a members table where each protein is its own
+  cluster. Writes ``--out`` and, from a FASTA, ``<out>.names.tsv`` (protein_id, name).
 """
 
 import argparse
@@ -29,6 +32,8 @@ import numpy as np
 import polars as pl
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import connected_components
+
+from kmer_functional_profiler.index import read_fasta
 
 
 def families(a: argparse.Namespace) -> None:
@@ -115,6 +120,22 @@ def mini(a: argparse.Namespace) -> None:
     print(json.dumps(info))
 
 
+def generic(a: argparse.Namespace) -> None:
+    if a.fasta:
+        names, seqs = zip(*read_fasta(a.fasta), strict=True)
+        got = pl.DataFrame({"protein_id": np.arange(len(names)), "sequence": seqs})
+        got = got.with_columns(pl.col("sequence").str.strip_chars_end("*"))
+        pl.DataFrame({"protein_id": np.arange(len(names)), "name": names}).write_csv(
+            f"{a.out}.names.tsv", separator="\t"
+        )
+    else:
+        got = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    got.select(
+        "protein_id", cluster_rep="protein_id", full_length=pl.lit(True), sequence="sequence"
+    ).write_parquet(a.out)
+    print(f"{got.height} proteins -> {a.out}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -140,8 +161,15 @@ def main() -> None:
     p.add_argument("--proteins", type=int, default=300_000)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("generic")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--fasta", help="a protein FASTA")
+    g.add_argument("--members", help="a members table, its clusters dropped")
+    p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"families": families, "take": take, "concat": concat, "mini": mini}[a.command](a)
+    {"families": families, "take": take, "concat": concat, "mini": mini, "generic": generic}[
+        a.command
+    ](a)
 
 
 if __name__ == "__main__":

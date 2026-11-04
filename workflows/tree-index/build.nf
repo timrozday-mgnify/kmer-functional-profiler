@@ -34,7 +34,7 @@
 // TIER1      per tier: query.py --decoy, verify.py -> q-<tier>/
 // TIER2      per tier and --tier2_memory budget (GB): tier2.py -> t2-<tier>-<gb>gb/ (handoff/ in
 //            kfp-pileup reference's format)
-// CHUNKS     per tier: are the budgets' calls and assignments identical -> chunks-<tier>.json
+// CHUNKS     per tier: the budgets' calls and assignments compared; at most 1% of reads may differ -> chunks-<tier>.json
 //
 // With --built <dir> alone, or --phase4 after a build, TARGETS to SCORE on built tiers and phase 4
 // (docs/tree-index-plan.md, Benchmark scoring without fixed units; needs --members; on HPC,
