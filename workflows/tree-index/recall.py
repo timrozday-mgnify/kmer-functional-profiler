@@ -72,6 +72,106 @@ def targets(a: argparse.Namespace) -> None:
     print(f"{len(rows)} targets -> {a.out}")
 
 
+HOLDOUT_BINS = (1.0, 0.98, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.6)  # nearest relative's identity
+AMINO = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def nearest_relatives(
+    members: pl.DataFrame, pool: pl.DataFrame, k: int = 5, sample: int = 4, top: int = 10
+) -> pl.DataFrame:
+    """(protein_id, relative, identity, cover): each ``pool`` protein's nearest other member
+    by local alignment (BLOSUM62, gaps 11/1; identity over aligned columns, cover over the
+    pool protein), aligned against its ``top`` members by shared k-mers (codes divisible by
+    ``sample``, those held by more than 500 members dropped). ponytail: Biopython, ~1 ms an
+    alignment; fine for ~10^5."""
+    from Bio.Align import PairwiseAligner, substitution_matrices
+
+    code = {c: i for i, c in enumerate(AMINO)}
+
+    def kmers(df: pl.DataFrame) -> pl.DataFrame:
+        ids, codes = [], []
+        for pid, seq in df.select("protein_id", "sequence").iter_rows():
+            x = np.array([code.get(c, -1) for c in seq], dtype=np.int64)
+            if len(x) < k:
+                continue
+            w = np.lib.stride_tricks.sliding_window_view(x, k)
+            c = (w * 20 ** np.arange(k)).sum(1)[(w >= 0).all(1)]
+            c = np.unique(c[c % sample == 0])
+            ids.append(np.full(len(c), pid))
+            codes.append(c)
+        return pl.DataFrame({"protein_id": np.concatenate(ids), "c": np.concatenate(codes)})
+
+    held = kmers(members)
+    common = held.group_by("c").len().filter(pl.col("len") > 500).select("c")
+    held = held.join(common, on="c", how="anti")
+    hits = (
+        kmers(pool).join(held.rename({"protein_id": "relative"}), on="c")
+        .filter(pl.col("protein_id") != pl.col("relative"))
+        .group_by("protein_id", "relative").len()
+        .sort("len", descending=True).group_by("protein_id").head(top)
+    )  # fmt: skip
+    seq = dict(members.select("protein_id", "sequence").iter_rows())
+    al = PairwiseAligner(mode="local", open_gap_score=-11, extend_gap_score=-1)
+    al.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    rows = []
+    for q, t in hits.select("protein_id", "relative").iter_rows():
+        a, b = seq[q].replace("*", ""), seq[t].replace("*", "")
+        n = al.align(a, b)[0].counts()
+        cols = n.identities + n.mismatches + n.gaps
+        rows.append((q, t, n.identities / max(cols, 1), (n.identities + n.mismatches) / len(a)))
+    sch = {"protein_id": pl.Int64, "relative": pl.Int64, "identity": pl.Float64,
+           "cover": pl.Float64}  # fmt: skip
+    return (
+        pl.DataFrame(rows, schema=sch, orient="row")
+        .filter(pl.col("cover") >= 0.8)
+        .sort("identity", descending=True).group_by("protein_id").head(1)
+    )  # fmt: skip
+
+
+def holdout(a: argparse.Namespace) -> None:
+    """Held-out proteins for recall on real relatives: ``--per-bin`` proteins per bin of their
+    nearest other member's identity (:data:`HOLDOUT_BINS`, a bin from its value up), none of
+    them another's nearest relative, nor its nearest held out. Writes ``members.parquet``
+    (the rest, to build the index from), ``targets.fa`` (the held-out, to simulate reads from)
+    and ``relatives.tsv`` (protein_id, relative, identity, identity_bin; for ``score
+    --relatives``)."""
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    pool = members.filter(pl.col("sequence").str.len_chars() >= a.min_length).sample(
+        a.pool, seed=a.seed
+    )
+    near = nearest_relatives(members, pool)
+    bins = np.array(HOLDOUT_BINS)
+    near = (
+        near.with_columns(
+            identity_bin=pl.col("identity").map_elements(
+                lambda x: float(bins[bins <= x + 0.005][0]) if x + 0.005 >= bins[-1] else None,
+                return_dtype=pl.Float64,
+            )
+        )
+        .drop_nulls("identity_bin")
+        .sample(fraction=1.0, shuffle=True, seed=a.seed)
+    )
+    held, blocked, rows = set(), set(), []
+    count = dict.fromkeys(HOLDOUT_BINS, 0)
+    for q, t, ident, _, b in near.iter_rows():
+        if count[b] >= a.per_bin or q in blocked or t in held:
+            continue
+        held.add(q)
+        blocked.add(t)
+        count[b] += 1
+        rows.append((q, t, ident, b))
+    pl.DataFrame(
+        rows, schema=["protein_id", "relative", "identity", "identity_bin"], orient="row"
+    ).write_csv(out / "relatives.tsv", separator="\t")
+    members_all = pl.read_parquet(a.members)
+    members_all.filter(~pl.col("protein_id").is_in(held)).write_parquet(out / "members.parquet")
+    sel = members.filter(pl.col("protein_id").is_in(held)).sort("protein_id")
+    (out / "targets.fa").write_text("".join(f">{i}\n{s}\n" for i, s in sel.rows()))
+    print(json.dumps({"held": len(held), "per_bin": {str(k): v for k, v in count.items()}}))
+
+
 def observable(
     truth: pl.DataFrame, sources: dict[str, str], r1: str, r2: str, k: int
 ) -> pl.DataFrame:
@@ -176,6 +276,14 @@ def score(a: argparse.Namespace) -> None:
         .join(prot.rename({"protein_id": "member"}), on="member", how="left")
         .with_columns(depth_bin=pl.col("depth").cut(DEPTH_BINS, left_closed=True))
     )
+    if a.relatives:  # held out: recall is the nearest relative left in the index
+        rel = pl.read_csv(a.relatives, separator="\t").rename({"protein_id": "member"})
+        truth = (
+            truth.select("strain", "member", "depth", "depth_bin")
+            .join(rel.select("member", "relative", "identity_bin"), on="member")
+            .with_columns(member=pl.col("relative")).drop("relative")
+            .join(prot.rename({"protein_id": "member"}), on="member", how="left")
+        )  # fmt: skip
     if a.reads:
         sources = dict(read_fasta(a.targets))
         k = int(json.loads((path / "meta.json").read_text())["params"]["k"])
@@ -223,6 +331,60 @@ def score(a: argparse.Namespace) -> None:
         print(table)
 
 
+MGNIFY_PROTEINS = 5_739_566_171  # MGnify Proteins 2026_07 (docs/mgnify-2026_07.md)
+MGNIFY_MEAN_LENGTH = 1.07e12 / MGNIFY_PROTEINS  # residues per protein, ~186
+
+
+def release_gb(idx: Path, meta: dict, n_release: int = MGNIFY_PROTEINS) -> dict[str, float]:
+    """Tier 1's footprint scaled to ``n_release`` proteins by this index's per-protein rates
+    (docs/tree-index-plan.md, Progress log: size estimates revisited), in two parts:
+
+    - *lookup*: postings (hash 8 B, lo and hi 4 B each, sign 1 B, bits 1 B, k code 1-2 B),
+      ``pos_size`` and the node tables (lo, hi, level, size), and the protein -> leaf -> unit
+      map (``proteins.parquet`` as written);
+    - *align*: what ``verify.py`` aligns against, to be reconsidered with the rest of the
+      index: ``layer_group`` and each group's representative (or every leaf without groups;
+      residues 1 B at the release's mean length, offsets 8 B).
+
+    Positions stay u32 with the release in two shards. Rates follow density: a slice's
+    (complete neighbourhoods) is the release's best guess, a cluster sample's an upper bound.
+    Tier 2's full store and the spanning-tree edges are apart. ponytail: postings are not
+    rescaled to the release's mean length; a long-protein sample overstates the layer's."""
+    s, f = meta["stats"], meta["files"]
+    n = s["proteins"]
+    lengths = np.load(idx / "pos_len.npy").astype(np.int64)
+    groups = idx / "layer_group.npy"
+    reps = np.unique(np.load(groups)) if groups.exists() else np.arange(len(lengths))
+    nodes = (f["node_lo.npy"] - 128) // 4  # u32 after the .npy header
+    code = (f["kcode.npy"] - 128) / max(s["postings"], 1) if "kcode.npy" in f else 1
+    residues = lengths[reps].sum() * MGNIFY_MEAN_LENGTH / lengths.mean()
+    per = {
+        "postings": (18 + code) * s["postings"] / n,
+        "tables": (4 * s["positions"] + 16 * nodes + f["proteins.parquet"]) / n,
+        "align": (4 * groups.exists() * s["positions"] + residues + 8 * len(reps)) / n,
+    }
+    got = {f"release_{k}_gb": round(v * n_release / 1e9) for k, v in per.items()}
+    lookup = got["release_postings_gb"] + got["release_tables_gb"]
+    return got | {
+        "release_lookup_gb": lookup,
+        "release_tier1_gb": lookup + got["release_align_gb"],
+    }
+
+
+def release_pairs(q: dict, verify: dict, n: int, n_release: int = MGNIFY_PROTEINS) -> dict:
+    """``verify.py``'s alignment work per read pair, now and scaled to ``n_release`` proteins:
+    chance pairs (the decoy reads') grow with the database's keys, so with its proteins; true
+    pairs do not. ponytail: linear in proteins, as chance seeds are; a denser release shares
+    more keys, so this is an upper bound."""
+    reads = max(q["read_pairs"], 1)
+    sample, decoy = verify["sample_pairs"] / reads, verify["decoy_pairs"] / reads
+    return {
+        "pairs_per_read": round(sample),
+        "chance_share": round(decoy / max(sample, 1e-9), 2),
+        "release_pairs_per_read": round(max(sample - decoy, 0) + decoy * n_release / n),
+    }
+
+
 def summary(a: argparse.Namespace) -> None:
     """One row per build under ``--root`` (``idx-<name>`` or ``index-<name>``, ``q-<name>``,
     ``s-<name>``): its
@@ -247,7 +409,10 @@ def summary(a: argparse.Namespace) -> None:
             "decoy_seeds": q.get("decoy_seeds"),
             "query_s": round(q["total_s"]),
             "candidates": cand.filter(pl.col("strategy") == a.strategy)["positions"].item(),
-        }
+        } | release_gb(idx, meta)
+        vfile = root / f"q-{name}" / "verify.json"
+        if vfile.exists():
+            row |= release_pairs(q, json.loads(vfile.read_text()), meta["stats"]["proteins"])
         # tier 1 is a profile: its candidates' units and strain detection; tier 2 classifies
         # reads (tier 1's read numbers stay in its reads.json, a diagnostic)
         if (sdir / "reads.json").exists():
@@ -501,9 +666,23 @@ def reads(a: argparse.Namespace) -> None:
     print(json.dumps(info, default=float))
 
 
+MAX_CHUNK_DIFF = 0.01  # the user's decision, 2026-11-04: 0.27% measured on the mini-slice
+
+
+def reads_differing(a: pl.DataFrame, b: pl.DataFrame) -> float:
+    """The share of reads called in ``a`` or ``b`` whose (read, pos) calls are not the same."""
+    a, b = a.select("read", "pos").unique(), b.select("read", "pos").unique()
+    changed = pl.concat(
+        [a.join(b, on=["read", "pos"], how="anti"), b.join(a, on=["read", "pos"], how="anti")]
+    )["read"]
+    return changed.n_unique() / max(pl.concat([a["read"], b["read"]]).n_unique(), 1)
+
+
 def chunks(a: argparse.Namespace) -> None:
     """Whether tier 2's runs at several memory budgets (``tier2.py --memory-gb``) made the same
-    calls and hand-off assignments: exactly, and to float rounding (EM weights)."""
+    calls and hand-off assignments: exactly, and to float rounding (EM weights); and the share
+    of called reads whose (read, leaf) calls differ, which must be at most
+    :data:`MAX_CHUNK_DIFF` (routing's caps apply per chunk, so exact is not required)."""
     runs = sorted(Path(r) for r in a.runs)
     files = ("reads.parquet", "handoff/assignments.parquet")
     read = lambda run, f: (lambda d: d.sort(d.columns))(pl.read_parquet(run / f))  # noqa: E731
@@ -519,9 +698,14 @@ def chunks(a: argparse.Namespace) -> None:
             except AssertionError:
                 close = False
         same[f] = {"exact": exact, "close": close}
+    calls = [pl.read_parquet(r / "reads.parquet", columns=["read", "pos"]) for r in runs]
+    differ = max((reads_differing(calls[0], c) for c in calls[1:]), default=0.0)
+    verdict = {"share": differ, "passes": differ <= MAX_CHUNK_DIFF}
     info = {r.name: json.loads((r / "tier2.json").read_text()) for r in runs}
-    Path(a.out).write_text(json.dumps({"identical": same, "runs": info}, indent=1) + "\n")
-    print(json.dumps(same))
+    Path(a.out).write_text(
+        json.dumps({"identical": same, "reads_differing": verdict, "runs": info}, indent=1) + "\n"
+    )
+    print(json.dumps(same | {"reads_differing": verdict}))
 
 
 def main() -> None:
@@ -533,6 +717,13 @@ def main() -> None:
     p.add_argument("--n", type=int, default=2000)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("holdout")
+    p.add_argument("--members", required=True)
+    p.add_argument("--per-bin", type=int, default=250)
+    p.add_argument("--pool", type=int, default=15000, help="proteins searched for relatives")
+    p.add_argument("--min-length", type=int, default=100)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("score")
     p.add_argument("--index", required=True)
     p.add_argument("--query", required=True)
@@ -540,6 +731,7 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--reads", nargs=2, help="the sample's R1 R2, for observable k-mers")
     p.add_argument("--targets", help="targets' FASTA (with --reads)")
+    p.add_argument("--relatives", help="holdout's relatives.tsv: score on the nearest relative")
     p.add_argument("--min-hits", type=int, default=1)
     p.add_argument("--deltas", type=float, nargs="+", default=[0.0, 0.05, 0.1, 0.15, 0.3])
     p.add_argument("--caps", type=int, nargs="+", default=[16, 256])
@@ -562,9 +754,14 @@ def main() -> None:
     p.add_argument("--runs", nargs="+", required=True, help="tier2.py --out directories")
     p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"targets": targets, "score": score, "reads": reads, "summary": summary, "chunks": chunks}[
-        a.command
-    ](a)
+    {
+        "targets": targets,
+        "holdout": holdout,
+        "score": score,
+        "reads": reads,
+        "summary": summary,
+        "chunks": chunks,
+    }[a.command](a)
 
 
 if __name__ == "__main__":

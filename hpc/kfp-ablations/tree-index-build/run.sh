@@ -26,7 +26,7 @@
 #   prev-large the previous large (base plus window 16; ~505-600 GB, ~0.82 at 70%)
 # a leaf per distinct dense 8-mer set, the dense 8-mer topology, Fitch diffs on the spanning
 # tree itself. PARTITION (~130 GB, one job) splits ~53 M proteins into parts of 1 M; BUILD runs
-# per part and tier (~30 GB with a layer: 7.6-8.0 GB per 262 k proteins locally; 96 GB given); MERGE writes
+# per part and tier (~30 GB, ~90 GB on the giant component's parts; 128 GB given); MERGE writes
 # one index per tier. TARGETS/SIMULATE: 2,000 proteins, one strain each at 100-70% identity
 # (BLOSUM62, depth lognormal mu 0.3 sigma 0.6); QUERY per tier with decoys (reads reversed)
 # setting a 1% chance-share bar, then verify.py: each (read pair, leaf) with evidence aligned
@@ -55,12 +55,12 @@ tiers=(
 )
 TIERS=$(IFS=';'; echo "${tiers[*]}")
 # BUILD's memory grows with a part's proteins (~60 GB per 2 M with a layer, at the default
-# 64 GB): parts of 1 M (~30 GB), 96 GB up front, +96 GB per retry. A component larger than a part
+# 64 GB): parts of 1 M (~30 GB), 128 GB up front, +128 GB per retry (peaks of 91 GB on the subset, 94.5 GB on the slice). A component larger than a part
 # (single linkage chains families: the largest outgrew 288 GB) is cut between MGnify90 clusters
 # (partition.json: largest_component, split_components)
 cat > build.config <<'CFG'
 process {
-    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+    withName: '.*BUILD' { memory = { 128.GB * task.attempt } }
 }
 CFG
 nextflow run "$WF/tree-index/build.nf" -c ../site.config -c build.config -resume --outdir results \

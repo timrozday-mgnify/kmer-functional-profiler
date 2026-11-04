@@ -12,7 +12,7 @@
 #              k 11 storage components packed into parts of 1 M proteins (~22 M proteins and
 #              ~55 GB per bucket, from the 1-in-100 subset's ~130 GB for 53 M). Edges between
 #              clusters in different buckets are lost: their k-mers are posted once per bucket.
-#   BUILD      per part and tier (~5,700 parts per tier, ~30 GB each; 96 GB given)
+#   BUILD      per part and tier (~5,700 parts per tier, ~30 GB each, ~90 GB on a giant component's; 128 GB given)
 #   MERGE      per tier, out of core by hash range (merge.py): -> results/index-<tier>/
 #              (standard ~195-215 GB, large ~360-415 GB, slim ~100-130 GB; estimates)
 #   STORE      per part, -> results/store-<tier>/ (flat, ~1x the residues: ~1.6 TB per tier)
@@ -30,8 +30,8 @@ STD=../release-tiers/results-standard
 compgen -G "$STD/members.bucket*.parquet" >/dev/null || { echo "no $STD/members.bucket*.parquet: run release-tiers first" >&2; exit 1; }
 cat > release.config <<'CFG'
 process {
-    withName: '.*PARTITION' { memory = { 96.GB * task.attempt }; time = { 24.h * task.attempt } }
-    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+    withName: '.*PARTITION' { memory = { 128.GB * task.attempt }; time = { 24.h * task.attempt } }
+    withName: '.*BUILD' { memory = { 128.GB * task.attempt } }
     withName: '.*MERGE' { cpus = 4; memory = { 128.GB * task.attempt }; time = { 72.h * task.attempt } }
     withName: '.*STORE_DIR' { publishDir = [path: 'results', mode: 'move'] }
 }

@@ -816,6 +816,8 @@ fn pseudo_params(
         band,
         gap,
         gap_bin,
+        min_gap: 1,
+        combo: 2,
         top,
     })
 }
@@ -859,9 +861,10 @@ fn pseudo_align<'py>(
 }
 
 /// Dense routing (kfp::route_votes): each read's top leaves by seed votes on a diagonal band;
-/// returns (read, leaf, votes), reads in order.
+/// returns (read, leaf, votes), reads in order. `modulo` > 1 indexes only hashes divisible by
+/// it (a sparse index: the pair filter after tier 1).
 #[pyfunction]
-#[pyo3(signature = (reads, leaves, k, classes, band=8, min_votes=2, top=32, max_occ=2000))]
+#[pyo3(signature = (reads, leaves, k, classes, band=8, min_votes=2, top=32, max_occ=2000, modulo=1))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn route_reads<'py>(
     py: Python<'py>,
@@ -873,6 +876,7 @@ fn route_reads<'py>(
     min_votes: u32,
     top: usize,
     max_occ: usize,
+    modulo: u32,
 ) -> PyResult<(
     Bound<'py, PyArray1<u32>>,
     Bound<'py, PyArray1<u32>>,
@@ -881,13 +885,187 @@ fn route_reads<'py>(
     if top == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err("top > 0"));
     }
-    let p = pseudo_params("diag", k, classes, (1, 1, 1), band, (8, 1), 1)?;
+    let p = pseudo_params("diag", k, classes, (1, modulo.max(1), 1), band, (8, 1), 1)?;
     let (r, l, v) = py.detach(|| kfp::route_votes(&reads, &leaves, &p, min_votes, top, max_occ));
     Ok((r.into_pyarray(py), l.into_pyarray(py), v.into_pyarray(py)))
 }
 
 /// Each read pair's twelve frames (both mates' six), tandem repeats masked, joined by stops
 /// (kfp::pair_frames), in parallel.
+/// The pair filter after tier 1 (kfp::pair_route): each read's candidate representatives by
+/// shared pair features (k-mer pairs `min_gap` to `gap` apart in order, the gap not hashed; the
+/// representatives' sampled by window minimizers `minimizer` and/or `modulo`); returns (read,
+/// rep, shared features; with `min_bits`, their information in quarter-bits, features below
+/// `min_bits` dropped), reads in order.
+#[pyfunction]
+#[pyo3(signature = (reads, reps, k, classes, gap=12, min_gap=4, combo=2, minimizer=1, modulo=1, min_hits=1, top=64, max_occ=2000, min_bits=None))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn pair_route<'py>(
+    py: Python<'py>,
+    reads: Vec<PyBackedBytes>,
+    reps: Vec<PyBackedBytes>,
+    k: usize,
+    classes: &[u8],
+    gap: usize,
+    min_gap: usize,
+    combo: usize,
+    minimizer: usize,
+    modulo: u32,
+    min_hits: u32,
+    top: usize,
+    max_occ: usize,
+    min_bits: Option<f32>,
+) -> PyResult<(
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+)> {
+    if top == 0 || gap == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("top, gap > 0"));
+    }
+    let mut p = pseudo_params(
+        "pairs",
+        k,
+        classes,
+        (minimizer.max(1), modulo.max(1), 1),
+        1,
+        (gap, 1),
+        1,
+    )?;
+    p.min_gap = min_gap;
+    p.combo = combo;
+    let (r, q, h) =
+        py.detach(|| kfp::pair_route(&reads, &reps, &p, min_hits, top, max_occ, min_bits));
+    Ok((r.into_pyarray(py), q.into_pyarray(py), h.into_pyarray(py)))
+}
+
+/// Sampled pair features of each sequence (kfp::pair_features_many): (sequence, feature).
+#[pyfunction]
+#[pyo3(signature = (seqs, k, classes, gap=12, min_gap=4, combo=2, minimizer=1, modulo=1))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn pair_features<'py>(
+    py: Python<'py>,
+    seqs: Vec<PyBackedBytes>,
+    k: usize,
+    classes: &[u8],
+    gap: usize,
+    min_gap: usize,
+    combo: usize,
+    minimizer: usize,
+    modulo: u32,
+) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
+    let mut p = pseudo_params(
+        "pairs",
+        k,
+        classes,
+        (minimizer.max(1), modulo.max(1), 1),
+        1,
+        (gap, 1),
+        1,
+    )?;
+    p.min_gap = min_gap;
+    p.combo = combo;
+    let (a, b) = py.detach(|| kfp::pair_features_many(&seqs, &p));
+    Ok((a.into_pyarray(py), b.into_pyarray(py)))
+}
+
+/// Pair features from the k-mers starting where each sequence's mask byte is non-zero
+/// (kfp::pair_features_masked_many), unsampled: (sequence, feature).
+#[pyfunction]
+#[pyo3(signature = (seqs, masks, k, classes, gap=12, min_gap=4, combo=2))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn pair_features_masked<'py>(
+    py: Python<'py>,
+    seqs: Vec<PyBackedBytes>,
+    masks: Vec<PyBackedBytes>,
+    k: usize,
+    classes: &[u8],
+    gap: usize,
+    min_gap: usize,
+    combo: usize,
+) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
+    if seqs.len() != masks.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "seqs, masks: same length",
+        ));
+    }
+    let mut p = pseudo_params("pairs", k, classes, (1, 1, 1), 1, (gap, 1), 1)?;
+    p.min_gap = min_gap;
+    p.combo = combo;
+    let (a, b) = py.detach(|| kfp::pair_features_masked_many(&seqs, &masks, &p));
+    Ok((a.into_pyarray(py), b.into_pyarray(py)))
+}
+
+/// kfp::pair_route_index: reads against a given (feature, rep) index (a soft intersection
+/// of each group's leaves); `modulo` must be the one the features were sampled at.
+#[pyfunction]
+#[pyo3(signature = (reads, feature, rep, k, classes, gap=12, min_gap=4, combo=2, modulo=1, min_hits=1, top=64, max_occ=2000, min_bits=None))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn pair_route_index<'py>(
+    py: Python<'py>,
+    reads: Vec<PyBackedBytes>,
+    feature: PyReadonlyArray1<'py, u32>,
+    rep: PyReadonlyArray1<'py, u32>,
+    k: usize,
+    classes: &[u8],
+    gap: usize,
+    min_gap: usize,
+    combo: usize,
+    modulo: u32,
+    min_hits: u32,
+    top: usize,
+    max_occ: usize,
+    min_bits: Option<f32>,
+) -> PyResult<(
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+)> {
+    let (f, r) = (feature.as_slice()?, rep.as_slice()?);
+    if f.len() != r.len() || top == 0 || gap == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "feature, rep: same length; top, gap > 0",
+        ));
+    }
+    let index: Vec<(u32, u32)> = f.iter().copied().zip(r.iter().copied()).collect();
+    let mut p = pseudo_params("pairs", k, classes, (1, modulo.max(1), 1), 1, (gap, 1), 1)?;
+    p.min_gap = min_gap;
+    p.combo = combo;
+    let (a, b, c) =
+        py.detach(|| kfp::pair_route_index(&reads, index, &p, min_hits, top, max_occ, min_bits));
+    Ok((a.into_pyarray(py), b.into_pyarray(py), c.into_pyarray(py)))
+}
+
+/// Each representative's sampled pair features (kfp::pair_feature_counts), for sizing.
+#[pyfunction]
+#[pyo3(signature = (reps, k, classes, gap=12, min_gap=4, combo=2, minimizer=1, modulo=1))]
+#[allow(clippy::too_many_arguments)]
+fn pair_feature_counts<'py>(
+    py: Python<'py>,
+    reps: Vec<PyBackedBytes>,
+    k: usize,
+    classes: &[u8],
+    gap: usize,
+    min_gap: usize,
+    combo: usize,
+    minimizer: usize,
+    modulo: u32,
+) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    let mut p = pseudo_params(
+        "pairs",
+        k,
+        classes,
+        (minimizer.max(1), modulo.max(1), 1),
+        1,
+        (gap, 1),
+        1,
+    )?;
+    p.min_gap = min_gap;
+    p.combo = combo;
+    let got = py.detach(|| kfp::pair_feature_counts(&reps, &p));
+    Ok(got.into_pyarray(py))
+}
+
 #[pyfunction]
 #[pyo3(signature = (r1, r2, genetic_code = 11))]
 fn pair_frames<'py>(
@@ -955,6 +1133,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pseudo_align, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_sketch_sizes, m)?)?;
     m.add_function(wrap_pyfunction!(route_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_route, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_route_index, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_features_masked, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_features, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_feature_counts, m)?)?;
     m.add_function(wrap_pyfunction!(pair_frames, m)?)?;
     m.add_function(wrap_pyfunction!(mask_repeats, m)?)?;
     m.add_class::<PyDistinct>()?;

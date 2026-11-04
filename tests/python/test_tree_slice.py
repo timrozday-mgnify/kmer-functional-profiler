@@ -47,3 +47,17 @@ def test_mask_hides_tandem_repeats_only() -> None:
     assert verify.mask(b"MKVAAAAGCVCVCVCVQ") == b"MKVxxxxGxxxxxxxxQ"
     assert verify.mask(b"GCVCVCVCQ") == b"GCVCVCVCQ"  # three copies stay
     assert verify.mask(b"MKVLATGHEW") == b"MKVLATGHEW"
+
+
+def test_generic_set_is_singleton_clusters(tmp_path: Path) -> None:
+    fasta = tmp_path / "set.fa"
+    fasta.write_text(">aph(3) x\nMKLV*\n>tet\nACDE\n")
+    out = tmp_path / "members.parquet"
+    run("generic", "--fasta", str(fasta), "--out", str(out), cwd=tmp_path, script=SLICE)
+    got = pl.read_parquet(out)
+    assert got["sequence"].to_list() == ["MKLV", "ACDE"]
+    assert got["cluster_rep"].to_list() == got["protein_id"].to_list() == [0, 1]
+    assert pl.read_csv(f"{out}.names.tsv", separator="\t")["name"].to_list() == ["aph(3)", "tet"]
+    again = tmp_path / "again.parquet"
+    run("generic", "--members", str(out), "--out", str(again), cwd=tmp_path, script=SLICE)
+    assert pl.read_parquet(again).equals(got)

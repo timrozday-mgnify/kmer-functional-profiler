@@ -11,7 +11,7 @@
 Writes to ``--out``: ``leaves.parquet`` (pos, size, hit\\_kmers, hits, containment) and
 ``nodes.parquet`` (node, lo, hi, level, size, hit\\_kmers, hits, containment), rows with a hit
 k-mer only; ``hits.parquet`` (hash, n: the sample's k-mers that are keys, for ``report.py``); and
-``query.json`` (counts and timings). With reads and an index with key bits:
+``query.json`` (counts and timings). With reads and an index with bits on its postings:
 ``seeds.parquet`` (pos, score: the best evidence any one read pair gives each leaf, in bits;
 :func:`evidence`), ``evidence.parquet`` (the curve :func:`choose_bits` reads) and the chosen
 ``evidence_bits`` in ``query.json``.
@@ -33,9 +33,23 @@ from numpy.typing import NDArray
 
 from kmer_functional_profiler import _core
 
+BITS_STEP: Final = 0.25  # bits.npy: a key's evidence per hit in steps of 1/4 bit, as u8
+
+
+def encode_bits(bits: NDArray[np.float64]) -> NDArray[np.uint8]:
+    """A key's bits as u8 quarter-bits, clipped to 0-63.75. ponytail: bits measured at 16-60
+    (slice, subset); negative (common k-mers) count as 0, as ``evidence``'s clamp does."""
+    return np.clip(np.round(np.asarray(bits) / BITS_STEP), 0, 255).astype(np.uint8)
+
+
+def code_dtype(codes: NDArray[np.integer]) -> type:
+    """k codes as u8 where they fit (protein k), else u16 (reduced alphabets: k + 32 x i)."""
+    return np.uint8 if len(codes) == 0 or int(np.max(codes)) < 256 else np.uint16
+
 
 class Index:
-    """A ``tree-v0`` index, memory-mapped."""
+    """A ``tree-v0`` index, memory-mapped. Each posting carries its key's evidence bits
+    (``bits.npy``, :data:`BITS_STEP`) and k code (``kcode.npy``)."""
 
     def __init__(self, path: str | Path) -> None:
         path = Path(path)
@@ -50,10 +64,37 @@ class Index:
         self.sketch_max = _core.max_hash(float(self.meta["params"]["t_cap"]))
         tail = np.asarray(self.hash[np.searchsorted(self.hash, self.sketch_max, "right") :])
         self.beyond = np.unique(tail)
-        if (path / "keys.npy").exists():
-            self.keys, self.key_bits, self.key_k = (
-                np.load(path / f"{x}.npy") for x in ("keys", "key_bits", "key_k")
-            )
+        self.has_bits = (path / "bits.npy").exists()
+        if self.has_bits:
+            self.bits, self.kcode = load("bits"), load("kcode")
+        self._keys: tuple[NDArray[Any], ...] | None = None
+
+    def _key_table(self) -> tuple[NDArray[Any], ...]:
+        """(hash, bits, k code) per distinct key: each hash's first posting. A pass over every
+        posting; only the chance model (``choose_bits``) and tests need it."""
+        if self._keys is None:
+            h = np.asarray(self.hash)
+            first = np.flatnonzero(np.r_[True, h[1:] != h[:-1]]) if len(h) else np.zeros(0, int)
+            bits = np.asarray(self.bits[first]).astype(np.float32) * BITS_STEP
+            self._keys = (h[first], bits, np.asarray(self.kcode[first]))
+        return self._keys
+
+    @property
+    def keys(self) -> NDArray[np.uint64]:
+        return self._key_table()[0]
+
+    @property
+    def key_bits(self) -> NDArray[np.float32]:
+        return self._key_table()[1]
+
+    @property
+    def key_k(self) -> NDArray[np.integer]:
+        return self._key_table()[2]
+
+    def code_of(self, h: NDArray[np.uint64]) -> NDArray[np.int64]:
+        """Each hash's k code (the hashes are keys)."""
+        at = np.minimum(np.searchsorted(self.hash, h), max(len(self.hash) - 1, 0))
+        return np.asarray(self.kcode[at]).astype(np.int64)
 
     @property
     def k(self) -> int:
@@ -127,11 +168,24 @@ def evidence_chunked(
     return pl.concat(parts).group_by("pos").agg(pl.col("score").max()).sort("pos")
 
 
+def trim(index: Index, pairs: pl.DataFrame, min_bits: float) -> pl.DataFrame:
+    """``pairs`` less its hits on keys below ``min_bits`` (promiscuous keys: each hit after a
+    read pair's first is charged log2(windows) bits, so a key carrying fewer costs a seed more
+    than it adds)."""
+    if min_bits <= 0 or not len(index.hash):
+        return pairs
+    h = pairs["hash"].to_numpy()
+    at = np.minimum(np.searchsorted(index.hash, h), len(index.hash) - 1)
+    bits = np.asarray(index.bits[at]).astype(np.float64) * BITS_STEP
+    return pairs.filter(pl.Series((index.hash[at] != h) | (bits >= min_bits)))
+
+
 def families(index: Index) -> NDArray[np.int64]:
-    """Per key, its family for per-layer bars: 0 the base and ladder, i the i-th layer."""
-    fam = np.zeros(len(index.keys), dtype=np.int64)
-    for i, (*_, code) in enumerate(ladder(index.meta["params"].get("layers", "") or ""), 1):
-        fam[index.key_k == code] = i
+    """Per k code, its family for per-layer bars: 0 the base and ladder, i the i-th layer."""
+    layers = ladder(index.meta["params"].get("layers", "") or "")
+    fam = np.zeros(max([code for *_, code in layers], default=0) + 1, dtype=np.int64)
+    for i, (*_, code) in enumerate(layers, 1):
+        fam[code] = i
     return fam
 
 
@@ -166,7 +220,12 @@ def gather(ev: pl.DataFrame, floor: float) -> pl.DataFrame:
 
 
 def candidates(
-    index: Index, pairs: pl.DataFrame, d_pairs: pl.DataFrame, log2_w: float, shares: list[float]
+    index: Index,
+    pairs: pl.DataFrame,
+    d_pairs: pl.DataFrame,
+    log2_w: float,
+    shares: list[float],
+    scale: float = 1.0,
 ) -> tuple[dict[str, NDArray[np.int64]], dict[str, Any]]:
     """``fam_<share>``: seeds by one read pair's evidence at each decoy share, a bar per key
     family (:func:`families`) from that family's hits alone, so a layer's chance seeds do not
@@ -174,7 +233,7 @@ def candidates(
     key is hit by chance many times per sample, so summed evidence is mostly chance; see
     verify.py for gather over aligned read pairs.)"""
     fam = families(index)
-    of = lambda p: fam[np.searchsorted(index.keys, p["hash"].to_numpy())]  # noqa: E731
+    of = lambda p: fam[np.minimum(index.code_of(p["hash"].to_numpy()), len(fam) - 1)]  # noqa: E731
     f, df = of(pairs), of(d_pairs)
     per = [
         (
@@ -187,7 +246,7 @@ def candidates(
     for s in shares:
         got, bars = [], []
         for sd, dd in per:
-            bar, _ = decoy_bar(sd, dd, s)
+            bar, _ = decoy_bar(sd, dd, s, scale=scale)
             bars.append(bar)
             got.append(sd.filter(pl.col("score") >= bar)["pos"].to_numpy())
         out[f"fam_{s}"] = np.unique(np.concatenate(got)).astype(np.int64)
@@ -209,15 +268,13 @@ def evidence(
     ``clamp``: a hit's bits are at least 0 (common k-mers add nothing rather than subtract).
     ``per_read``: (pos, score, read) for every read pair, not each leaf's best."""
     h = pairs["hash"].to_numpy()
-    bits = index.key_bits[np.searchsorted(index.keys, h)].astype(np.float64)
-    if clamp:
-        bits = np.maximum(bits, 0.0)
     first = np.searchsorted(index.hash, h, "left")
     per = np.searchsorted(index.hash, h, "right") - first
     rows = np.repeat(first - np.cumsum(per) + per, per) + np.arange(per.sum())
     read = np.repeat(pairs["read"].to_numpy(), per)
     sign = np.asarray(index.sign[rows], dtype=np.float64)
-    b = np.repeat(bits, per) * sign
+    # each posting carries its key's bits (>= 0: ``clamp`` holds by the encoding)
+    b = np.asarray(index.bits[rows]).astype(np.float64) * BITS_STEP * sign
     x = np.concatenate([np.asarray(index.lo[rows]), np.asarray(index.hi[rows])]).astype(np.int64)
     r = np.concatenate([read, read])
     o = np.lexsort((x, r))
@@ -250,16 +307,33 @@ def reversed_reads(paths: list[str], out: Path) -> list[str]:
     return made
 
 
+TAIL_DECOYS: Final = 10  # decoys above which the scaled tail is extrapolated
+
+
 def decoy_bar(
-    seeds: pl.DataFrame, decoys: pl.DataFrame, share: float, hi: float = 160.0
+    seeds: pl.DataFrame,
+    decoys: pl.DataFrame,
+    share: float,
+    hi: float = 160.0,
+    scale: float = 1.0,
 ) -> tuple[float, list[tuple[float, float, int]]]:
     """The least score below ``hi`` at which leaves seeded by decoy reads are at most
     ``share`` of the leaves seeded by the sample (target-decoy); and the curve (score, decoy
-    seeds, seeds)."""
+    seeds, seeds).
+
+    ``scale`` emulates a database ``scale`` times larger (``--chance-scale``): chance hits
+    grow with its keys, so decoy counts are multiplied by it. Past the decoys observed, the
+    count is extended from the :data:`TAIL_DECOYS`-th highest decoy score, halving per bit
+    (scores are log-odds in bits). ponytail: assumes chance grows linearly in proteins and the
+    sample's true seeds do not; validated against the HPC slice (Progress log)."""
     sc, dc = np.sort(seeds["score"].to_numpy()), np.sort(decoys["score"].to_numpy())
+    ref = dc[-min(TAIL_DECOYS, len(dc))] if len(dc) else 0.0
+    n_ref = len(dc) - np.searchsorted(dc, ref)
     curve = []
     for bar in np.arange(0.0, hi, 0.25):
         n, d = len(sc) - np.searchsorted(sc, bar), len(dc) - np.searchsorted(dc, bar)
+        if scale != 1.0:
+            d = scale * max(d, n_ref * 2.0 ** -(bar - ref) if bar > ref else d)
         curve.append((float(bar), float(d), int(n)))
     ok = [c for c in curve if c[1] <= share * max(c[2], 1)]
     return (ok[0][0] if ok else curve[-1][0]), curve
@@ -437,9 +511,17 @@ def main() -> None:
     src.add_argument("--proteins", help="protein FASTA")
     parser.add_argument("--frames", default="all")
     parser.add_argument(
+        "--chance-scale", type=float, default=1.0,
+        help="decoy counts x this: bars as for a database this many times larger (decoy_bar)",
+    )  # fmt: skip
+    parser.add_argument(
         "--chance-share", type=float, default=0.01,
         help="reads: seeds by evidence, at the least bits whose expected chance seeds are at "
         "most this share of the seeds (seeds.parquet)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--min-key-bits", default="0",
+        help="drop read hits on keys below this many bits (trim); 'auto': the per-hit charge",
     )  # fmt: skip
     parser.add_argument("--ladder-frames", help="frames for ladder k-mers (default: --frames)")
     parser.add_argument(
@@ -473,22 +555,27 @@ def main() -> None:
     at = np.minimum(np.searchsorted(index.hash, h), max(len(index.hash) - 1, 0))
     keyed = index.hash[at] == h if len(index.hash) else np.zeros(len(h), dtype=bool)
     sample.filter(pl.Series(keyed)).write_parquet(out / "hits.parquet")
-    if a.reads and hasattr(index, "keys"):
+    if a.reads and index.has_bits:
         t1 = time.perf_counter()
         pairs, windows, n_reads = read_pairs(
             index, a.reads[0], (a.reads[1:] or [None])[0], a.frames, a.ladder_frames, a.mode
         )
         log2_w = float(np.log2(max(windows.get(index.k, 1) / max(n_reads, 1), 2)))
+        min_bits = log2_w if a.min_key_bits == "auto" else float(a.min_key_bits)
+        n_hits = pairs.height
+        pairs = trim(index, pairs, min_bits)
+        stats |= {"min_key_bits": min_bits, "trimmed_hits": n_hits - pairs.height}
         seeds = evidence_chunked(index, pairs, log2_w, clamp=a.decoy)
         if a.decoy:  # the bar from reversed reads: chance seeds counted, not modelled
             dr = reversed_reads(a.reads, out)
             d_pairs, _, _ = read_pairs(index, *dr, a.frames, a.ladder_frames, a.mode)
+            d_pairs = trim(index, d_pairs, min_bits)
             decoys = evidence_chunked(index, d_pairs, log2_w, clamp=True)
             decoys.write_parquet(out / "decoy_seeds.parquet")
-            bar, curve = decoy_bar(seeds, decoys, a.chance_share)
+            bar, curve = decoy_bar(seeds, decoys, a.chance_share, scale=a.chance_scale)
             stats["decoy_seeds"] = int((decoys["score"] >= bar).sum())
             shares = [float(x) for x in a.shares.split(",")]
-            cand, info = candidates(index, pairs, d_pairs, log2_w, shares)
+            cand, info = candidates(index, pairs, d_pairs, log2_w, shares, a.chance_scale)
             for name, got in cand.items():
                 np.save(out / f"cand_{name}.npy", got)
             stats |= info | {f"{name}_n": len(got) for name, got in cand.items()}

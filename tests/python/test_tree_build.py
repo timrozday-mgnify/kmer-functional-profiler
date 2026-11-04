@@ -16,6 +16,7 @@ QUERY = SCRIPT.with_name("query.py")
 REPORT = SCRIPT.with_name("report.py")
 PARTITION = SCRIPT.with_name("partition.py")
 MERGE = SCRIPT.with_name("merge.py")
+SLICE = SCRIPT.with_name("slice.py")
 sys.path.insert(0, str(SCRIPT.parent))
 import build  # noqa: E402
 import phase0 as p0  # noqa: E402
@@ -67,12 +68,13 @@ def check_index(idx: Path, members_path: Path, n_1: int = 2) -> None:
     want = pl.DataFrame({"hash": h, "pos": rep["pos"].to_numpy()[seq]}).sort("pos", "hash")
     got = held.filter(pl.col("hash") <= base)
     assert got.equals(want.with_columns(pl.col("pos").cast(got["pos"].dtype)))
-    # every floored piece's floor is held across it
-    t = pl.DataFrame({x: np.load(idx / f"{x}.npy") for x in ("hash", "lo", "hi", "kind")})
-    floors = t.filter(pl.col("kind") == build.FLOOR)
-    assert floors.height > 0
-    spread = floors.select("hash", pos=pl.int_ranges("lo", "hi")).explode("pos")
-    assert spread.join(held, on=["hash", "pos"], how="anti").height == 0
+    # every floored piece's floor is held across it (a build's: a merged index has no kind)
+    if (idx / "kind.npy").exists():
+        t = pl.DataFrame({x: np.load(idx / f"{x}.npy") for x in ("hash", "lo", "hi", "kind")})
+        floors = t.filter(pl.col("kind") == build.FLOOR)
+        assert floors.height > 0
+        spread = floors.select("hash", pos=pl.int_ranges("lo", "hi")).explode("pos")
+        assert spread.join(held, on=["hash", "pos"], how="anti").height == 0
     # every protein with a valid k-mer is covered by at least min(n_1, its k-mers)
     covered = dict(held.group_by("pos").len().rows())
     n_valid = _core.distinct_kmers(seqs, np.arange(len(seqs), dtype=np.uint32), 11)
@@ -254,6 +256,12 @@ def test_partitioned_build_is_sound(tmp_path: Path) -> None:
     idx = tmp_path / "merged"
     stats = json.loads((idx / "meta.json").read_text())["stats"]
     assert stats["parts"] == len(parts)
+    # bits on the postings: one value per key across its postings (combined over parts); the
+    # build's files stay with the parts
+    h, b = np.load(idx / "hash.npy"), np.load(idx / "bits.npy")
+    run_start = np.r_[True, h[1:] != h[:-1]]
+    assert (b == np.repeat(b[run_start], np.diff(np.r_[np.flatnonzero(run_start), len(h)]))).all()
+    assert not (idx / "kind.npy").exists() and not (idx / "pieces.parquet").exists()
     # merged by hash range out of core: the result does not depend on the ranges
     run("--parts", *built, "--out", "ranged", "--ranges", "5", cwd=tmp_path, script=MERGE)
     for f in sorted(idx.glob("*.npy")):
@@ -318,7 +326,7 @@ def test_default_modes_query_soundly(tmp_path: Path) -> None:
         assert meta["params"]["layers"] == want
         assert meta["params"]["n_1"] == 1
         assert (idx / "layer_group.npy").exists() == bool(want)
-        codes = set(np.load(idx / "key_k.npy").tolist())
+        codes = set(np.load(idx / "kcode.npy").tolist())
         assert (5 in codes) == bool(want)  # the protein 5-mer layer's code is its k
         check_query(tmp_path, idx, members)
 
@@ -403,3 +411,53 @@ def test_allocate_layer_keys() -> None:
         assert set(got_h[got_pos == r]) == set(mine[: k[[0, 4, 5].index(r)]])
     k = np.bincount(build.allocate(group, pos, h, "fixed:4")[0], minlength=6)[[0, 4, 5]]
     assert k.tolist() == [5, 2, 5]  # rep 4 holds 2: its spare split between the others
+
+
+def test_mini_slice_keeps_clumps_whole(tmp_path: Path) -> None:
+    """slice.py mini: whole spanning-tree clumps, about the requested share of proteins."""
+    members = fixture(tmp_path)
+    idx = tmp_path / "idx"
+    run("--members", str(members), "--out", str(idx), *MEDIUM, cwd=tmp_path, script=BUILD)
+    run("mini", "--index", str(idx), "--members", str(members), "--proteins", "80",
+        "--out", "mini.parquet", cwd=tmp_path, script=SLICE)  # fmt: skip
+    got = set(pl.read_parquet(tmp_path / "mini.parquet")["protein_id"].to_list())
+    prot = pl.read_parquet(idx / "proteins.parquet").filter(pl.col("pos") >= 0)
+    held = np.zeros(int(prot["pos"].max()) + 1, dtype=bool)
+    held[prot.filter(pl.col("protein_id").is_in(list(got)))["pos"].to_numpy()] = True
+    a, b = np.load(idx / "edge_a.npy"), np.load(idx / "edge_b.npy")
+    assert (held[a] == held[b]).all()  # no edge cut
+    assert 40 <= len(got) <= 120, len(got)
+
+
+def test_decoy_bar_chance_scale() -> None:
+    """query.decoy_bar: scale 1 is the plain target-decoy bar; a larger database (more chance
+    hits) raises it, past the decoys observed by the halving-per-bit tail."""
+    rng = np.random.default_rng(0)
+    seeds = pl.DataFrame({"score": rng.uniform(20, 60, 2000)})
+    decoys = pl.DataFrame({"score": 10 + rng.exponential(1 / np.log(2), 500)})  # halves per bit
+    bar1, curve = query.decoy_bar(seeds, decoys, 0.01)
+    n, d = len(seeds), (decoys["score"] >= bar1).sum()
+    assert d <= 0.01 * (seeds["score"] >= bar1).sum() and bar1 <= n
+    bars = [query.decoy_bar(seeds, decoys, 0.01, scale=f)[0] for f in (1, 100, 10_000)]
+    assert bars[0] == bar1 and bars[0] < bars[1] < bars[2]
+    # ~log2(100) bits per 100-fold, within the quarter-bit grid and the sample's own counts
+    assert abs((bars[2] - bars[1]) - np.log2(100)) < 1.5
+
+
+def test_wide_clusters_link_relatives_only() -> None:
+    """build.wide_clusters: siblings ~90% identical to each other (5% from a root each) share
+    ~0.9^5 = 59% of their 5-mers, above 30%, and cluster; unrelated ones stay apart."""
+    rng = np.random.default_rng(4)
+    aa = np.frombuffer(b"ACDEFGHIKLMNPQRSTVWY", dtype=np.uint8)
+    roots = [rng.choice(aa, 300) for _ in range(3)]
+    seqs = []
+    for r in roots:
+        for _ in range(4):
+            s = r.copy()
+            hit = rng.random(len(s)) < 0.05
+            s[hit] = rng.choice(aa, int(hit.sum()))
+            seqs.append(s.tobytes())
+    centre = build.wide_clusters(seqs, 5, 0.3, t=1.0)
+    family = np.repeat(np.arange(3), 4)
+    assert len(np.unique(centre)) == 3
+    assert all(len(np.unique(centre[family == f])) == 1 for f in range(3))

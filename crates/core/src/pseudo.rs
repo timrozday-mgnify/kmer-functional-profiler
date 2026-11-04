@@ -40,6 +40,11 @@ pub struct Params {
     /// gap / `gap_bin`; [`Method::Gapped`]: the band's half-width in diagonals.
     pub gap: usize,
     pub gap_bin: usize,
+    /// The pair filter (`pair_route`): k-mer pairs at least this many positions apart.
+    pub min_gap: usize,
+    /// The pair filter: k-mers per feature, 2 (pairs) or 3 (triples; consecutive ones
+    /// `min_gap` or more apart, the first to the last at most `gap`).
+    pub combo: usize,
     /// [`Method::Anchored`]: bands scanned.
     pub top: usize,
 }
@@ -386,8 +391,9 @@ pub fn pair_frames<S: AsRef<[u8]> + Sync>(
 }
 
 /// Dense routing for tier 2 (Progress log: tier 2, dense routing): every read's candidate
-/// leaves by seed votes. `leaves`' k-mers (all of them, `p`'s k and classes) are indexed,
-/// those held more than `max_occ` times dropped; each read votes, each of its positions once
+/// leaves by seed votes. `leaves`' k-mers (`p`'s k and classes; those whose hash is
+/// divisible by `p.modulo`, all at 1: a sparse index for the pair filter after tier 1) are
+/// indexed, those held more than `max_occ` times dropped; each read votes, each of its positions once
 /// per (leaf, diagonal band of width `p.band`), and a leaf's votes are its best two adjacent
 /// bands'. Returns (read, leaf, votes) for each read's `top` leaves with at least `min_votes`
 /// (ties at the cut kept), reads in order.
@@ -401,9 +407,11 @@ pub fn route_votes<S: AsRef<[u8]> + Sync>(
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut index: Vec<(u32, u32, u32)> = Vec::new(); // (hash, leaf, position)
     for (l, seq) in leaves.iter().enumerate() {
+        let modulo = p.modulo.max(1);
         index.extend(
             kmers(seq.as_ref(), p)
                 .into_iter()
+                .filter(|&(h, _)| h % modulo == 0)
                 .map(|(h, i)| (h, l as u32, i)),
         );
     }
@@ -475,6 +483,199 @@ pub fn route_votes<S: AsRef<[u8]> + Sync>(
     (a, b, c)
 }
 
+/// Pair features of `seq` (k-mer pairs `p.min_gap` to `p.gap` positions apart, in order, the
+/// gap not hashed: an indel between them keeps the pair; with `p.combo` 3, triples; with
+/// `keep`, only k-mers starting where it is non-zero), in position order; with `sample`, window minimizers over them
+/// (`p.minimizer` > 1) and then those divisible by `p.modulo`. Distinct, sorted.
+fn pair_features(seq: &[u8], p: &Params, sample: bool, keep: Option<&[u8]>) -> Vec<u32> {
+    let all: Vec<(u32, u32)> = kmers(seq, p)
+        .into_iter()
+        .filter(|x| keep.is_none_or(|m| m.get(x.1 as usize).is_some_and(|&b| b != 0)))
+        .collect();
+    let mut feats = Vec::new();
+    for (i, &(a, pa)) in all.iter().enumerate() {
+        for &(b, pb) in all[i + 1..]
+            .iter()
+            .take_while(|x| (x.1 - pa) as usize <= p.gap)
+            .filter(|x| (x.1 - pa) as usize >= p.min_gap)
+        {
+            if p.combo < 3 {
+                feats.push(pair_hash(a, b, 0));
+                continue;
+            }
+            let ab = pair_hash(a, b, 0);
+            for &(c, _) in all[i + 1..]
+                .iter()
+                .take_while(|x| (x.1 - pa) as usize <= p.gap)
+                .filter(|x| x.1 >= pb && (x.1 - pb) as usize >= p.min_gap)
+            {
+                feats.push(pair_hash(ab, c, 1));
+            }
+        }
+    }
+    if sample && p.minimizer > 1 && !feats.is_empty() {
+        let mut mins = Vec::new();
+        for w in feats.windows(p.minimizer.min(feats.len())) {
+            let m = *w.iter().min().unwrap();
+            if mins.last() != Some(&m) {
+                mins.push(m);
+            }
+        }
+        feats = mins;
+    }
+    let modulo = p.modulo.max(1);
+    feats.retain(|h| h % modulo == 0);
+    feats.sort_unstable();
+    feats.dedup();
+    feats
+}
+
+/// The pair filter after tier 1: every read's candidate representatives by shared pair
+/// features (two k-mers in order within a window, hashed as one, so one shared feature is
+/// already two seeds close together). The representatives' features are sampled
+/// (`pair_features`: minimizers and/or modulo, a sparse index) and indexed, those held more
+/// than `max_occ` times dropped; a read's features are all looked up (those divisible by
+/// `p.modulo`, which any indexed one is). Returns (read, rep, score) for each read's `top`
+/// representatives scoring at least `min_hits` (ties at the cut kept). The score is the
+/// distinct shared features, or with `min_bits` each feature's information in quarter-bits,
+/// log2(representatives / representatives holding it) (promiscuous features carry little),
+/// features below `min_bits` dropped.
+pub fn pair_route<S: AsRef<[u8]> + Sync>(
+    reads: &[S],
+    reps: &[S],
+    p: &Params,
+    min_hits: u32,
+    top: usize,
+    max_occ: usize,
+    min_bits: Option<f32>,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (feature, rep)
+    for (r, seq) in reps.iter().enumerate() {
+        index.extend(
+            pair_features(seq.as_ref(), p, true, None)
+                .into_iter()
+                .map(|h| (h, r as u32)),
+        );
+    }
+    pair_route_index(reads, index, p, min_hits, top, max_occ, min_bits)
+}
+
+/// Each sequence's sampled pair features, flattened: (sequence, feature).
+pub fn pair_features_many<S: AsRef<[u8]> + Sync>(seqs: &[S], p: &Params) -> (Vec<u32>, Vec<u32>) {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (i, s) in seqs.iter().enumerate() {
+        for h in pair_features(s.as_ref(), p, true, None) {
+            a.push(i as u32);
+            b.push(h);
+        }
+    }
+    (a, b)
+}
+
+/// Each sequence's pair features from the k-mers starting where its mask is non-zero only
+/// (e.g. the 3-mers inside a group's stored keys), unsampled: (sequence, feature).
+pub fn pair_features_masked_many<S: AsRef<[u8]> + Sync, M: AsRef<[u8]> + Sync>(
+    seqs: &[S],
+    masks: &[M],
+    p: &Params,
+) -> (Vec<u32>, Vec<u32>) {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (i, (s, m)) in seqs.iter().zip(masks).enumerate() {
+        for h in pair_features(s.as_ref(), p, false, Some(m.as_ref())) {
+            a.push(i as u32);
+            b.push(h);
+        }
+    }
+    (a, b)
+}
+
+/// [`pair_route`] against a given index of (feature, rep) entries (e.g. a group's features
+/// held by a share of its leaves, a soft intersection built by the caller).
+pub fn pair_route_index<S: AsRef<[u8]> + Sync>(
+    reads: &[S],
+    mut index: Vec<(u32, u32)>,
+    p: &Params,
+    min_hits: u32,
+    top: usize,
+    max_occ: usize,
+    min_bits: Option<f32>,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    index.sort_unstable();
+    index.dedup();
+    let mut reps: Vec<u32> = index.iter().map(|x| x.1).collect();
+    reps.sort_unstable();
+    reps.dedup();
+    let n_reps = reps.len().max(1) as f32;
+    let mut kept: Vec<(u32, u32, u32)> = Vec::with_capacity(index.len()); // (feature, rep, weight)
+    let mut i = 0;
+    while i < index.len() {
+        let j = i + index[i..].partition_point(|x| x.0 == index[i].0);
+        let w = match min_bits {
+            None => Some(1),
+            Some(b) => {
+                let bits = (n_reps / (j - i) as f32).log2();
+                (bits >= b).then(|| ((bits * 4.0).round() as u32).max(1))
+            }
+        };
+        if let (true, Some(w)) = (j - i <= max_occ, w) {
+            kept.extend(index[i..j].iter().map(|&(h, q)| (h, q, w)));
+        }
+        i = j;
+    }
+    let index = kept;
+    let n = reads.len();
+    let per_thread = n.div_ceil(threads()).max(1);
+    let mut out: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); n.div_ceil(per_thread).max(1)];
+    std::thread::scope(|scope| {
+        for (t, slot) in out.iter_mut().enumerate() {
+            let index = &index;
+            scope.spawn(move || {
+                let mut hits: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                let first = t * per_thread;
+                for (r, read) in reads[first..((t + 1) * per_thread).min(n)]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (first + i, x.as_ref()))
+                {
+                    hits.clear();
+                    for h in pair_features(read, p, false, None) {
+                        let lo = index.partition_point(|x| x.0 < h);
+                        for &(_, q, w) in index[lo..].iter().take_while(|x| x.0 == h) {
+                            *hits.entry(q).or_insert(0) += w;
+                        }
+                    }
+                    let mut got: Vec<(u32, u32)> = hits
+                        .iter()
+                        .filter(|x| *x.1 >= min_hits)
+                        .map(|(&q, &c)| (q, c))
+                        .collect();
+                    got.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    if got.len() > top {
+                        let cut = got[top - 1].1;
+                        got.retain(|x| x.1 >= cut);
+                    }
+                    slot.extend(got.into_iter().map(|(q, c)| (r as u32, q, c)));
+                }
+            });
+        }
+    });
+    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+    for (r, q, h) in out.into_iter().flatten() {
+        a.push(r);
+        b.push(q);
+        c.push(h);
+    }
+    (a, b, c)
+}
+
+/// Each representative's sampled pair features (`pair_route`'s index entries).
+pub fn pair_feature_counts<S: AsRef<[u8]> + Sync>(reps: &[S], p: &Params) -> Vec<u32> {
+    reps.iter()
+        .map(|s| pair_features(s.as_ref(), p, true, None).len() as u32)
+        .collect()
+}
+
 /// Features each representative's sketch stores.
 pub fn sketch_sizes<S: AsRef<[u8]> + Sync>(reps: &[S], p: &Params) -> Vec<u32> {
     reps.iter()
@@ -501,6 +702,8 @@ mod tests {
             band: 1,
             gap: 4,
             gap_bin: 1,
+            min_gap: 1,
+            combo: 2,
             top: 1,
         }
     }

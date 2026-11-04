@@ -293,6 +293,27 @@ Without MGnify90 units, "the right unit" is no longer defined, so accuracy is sc
 - **Today's tier 1 scored the same way.** Each reported MGnify90 unit is expanded to its member sequences and scored by the same curves, a like-for-like comparison. The existing roll-ups (MGnify90 via membership, Pfam, KOfam) are kept for continuity with past results.
 - **Pitfall:** in dense families a reported sequence can be near the truth by chance, so precision inflates at loose levels (90%). The whole curve, not only the 90% read-out, is reported.
 
+## Options after tier 1: conserved k-mer combinations (to try)
+
+These ideas wait for the pair-filter results (tier 1 → k-mer pairs, pair-hash sampling, soft intersection over a group's leaves). The data decides which to build.
+
+- **Conserved ordered combinations.** Start from a group's conserved hashes (its soft intersection over leaves). Form ordered combinations of those hashes that occur within a short window, then soft-intersect the combinations across the group's leaves, keeping the conserved ones. A short window supports a range of read lengths.
+- **In the index, not built per run.** Store these combinations in the index alongside the single k-mer hashes, rather than generating them after tier 1.
+- **Several orders per group.** Each group holds hashes of 1, 2, … n k-mers.
+- **Parameters per group.** Find which parameters work for which target groups:
+  - which parameters: n, window, soft-intersection share and sampling;
+  - which groups: by sequence length, group size and uniqueness in the database.
+
+  Then set them per group from a continuous criterion, such as an information metric, rather than from fixed classes. That widens where the method works and spends index space where it buys recall or precision.
+- **One feature generator for singles, pairs and n-k-mer combinations (2026-11-03).** Generate all feature kinds in one pass:
+  - not pairs built from the sampled singles;
+  - any n k-mers within a window safe for short reads, hashed as one feature (n = 1, 2, … at once);
+  - soft-intersect every hash, of every kind, over the group's leaves (kept if held by at least a share of them), before any sparsifying;
+  - then sparsify across the conserved hashes together.
+
+  Each hash's information bits (its rarity across groups, as in `pairs.py --min-bits`) decide how it is used: which to keep, and how much it adds to a read's score.
+- **Test design (2026-11-03):** recall is measured on held-out proteins (`recall.py holdout`, `score --relatives`). Proteins are removed before the build, and reads are simulated from them. A read counts as recalled when the nearest relative left in the index (by local alignment) is a candidate. The earlier spiked strains were mutated copies of proteins still in the index.
+
 ## Risks
 
 - **Postings above budget.** If MGnify's members are less redundant than assumed (members at 90–94% to their nearest neighbour post more than a fresh set), the tree degenerates into today's per-unit storage plus a node table. Phase 0 decides.
@@ -327,7 +348,7 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - *Updates:* a held-out batch (e.g. 10% of phase 0's sample) added through the delta index. Query counts must be identical to a rebuild containing the batch, and identical again after compaction. The batched Kruskal update's total weight must equal a from-scratch tree's, under equal candidate edges. Report the drift (weight) of leaf-only insertion without the batched update.
 2. **Query: counting.** Lookup as today (sketch, merge-join), interval sweep per band, node counts and |S\_v|. Checked against brute-force per-sequence containment on fixtures. *Done 2026-10-30 (`workflows/tree-index/query.py`); see Progress log.*
 3. **Reporting, recall first.** Candidate subtrees above background, members as leaf ranges into the main plan's round-2 dense stage and the pileup's `REFERENCE`. Then greedy gather with LCA ties, and per-node containment AAI. *Done 2026-10-30 (`workflows/tree-index/report.py`), checked locally; see Progress log. Calibration and the δ sweep are phase 4's.*
-4. **Benchmark against tier 1**, at matched index size and *t*:
+4. **Benchmark against tier 1**, at matched index size and *t*: *Scoring written and checked on the fixture 2026-11-04 (`workflows/tree-index/nearest.py`, `build.nf --built`, `hpc/kfp-ablations/tree-index-benchmark`); the run is the user's, results pending; see Progress log.*
    - `fmh-benchmark` and `presence-calibration` (spiked truth), scored as in Benchmark scoring without fixed units:
      - nearest-match identity curves for recall and precision, with read-outs at 99, 95, 90 and 80%;
      - earth mover's distance for abundance, with alignment identities (DIAMOND) as ground distances;
@@ -337,16 +358,16 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
    - *neighbour rule* (Recall-first candidates and neighbours): δ at 0.05, 0.1 and 0.15. Report the share of spiked units with no own hit that reach the candidate set, by depth and identity; the candidate count against "every hit node"; and how often the true divergence exceeds *d̂⁺*. Against the main plan's index-level neighbour graph (recall-first pileup, next step 0), by that step's rule: worth it if it reaches a substantial share of unhit spikes for < ~2× the candidates;
    - cost: index size, build CPU-h, query wall and peak RSS per stage;
    - **gate (proposed):** recall at matched precision ≥ tier 1's at every read-out level (99–80%) and every roll-up level, for ≤ 1.2× query cost and ≤ 1.5× index size. Below that, the tree stays a round-2 candidate generator only.
-4b. **Tier 2, routing and reclassification** (Uses beyond tier 1): on `spike-benchmark` locally, then `pileup-fdr`'s `hadza10M` candidate set on HPC. Each use is built from the candidate subtrees along tier 1's topology, per sample and node-major precomputed, and compared with the flat table it replaces:
+4b. **Tier 2, routing and reclassification** (Uses beyond tier 1): on `spike-benchmark` locally, then `pileup-fdr`'s `hadza10M` candidate set on HPC. *Local part measured 2026-11-04 (`workflows/tree-index/uses.py`, on the mini-slice rather than `spike-benchmark`): routing and tier 2 keep their flat tables; `sibling_caught_em` and the `hadza10M` run are still to do; see Progress log.* Each use is built from the candidate subtrees along tier 1's topology, per sample and node-major precomputed, and compared with the flat table it replaces:
    - build time and peak RSS;
    - use time (dense pass, routing pass, per-read candidates);
    - table size;
    - and the same truth metrics: recall and precision for tier 2; for routing, `route.json`'s routed and dropped pairs and the spike benchmark's `read_precision_em` and `sibling_caught_em`.
-   - *chunked:* each use run chunk by chunk (Chunks by similarity) at two budgets *B*. Outputs must be identical to the unchunked run; report peak RSS and wall against *B*;
+   - *chunked:* each use run chunk by chunk (Chunks by similarity) at two budgets *B*. At most 1% of called reads may differ from the unchunked run (routing's caps apply per chunk; the user's decision, 2026-11-04); report peak RSS and wall against *B*;
    - **Gate per use:** build and use each ≤ 1.2× today's at equal truth metrics; a use that fails keeps its flat table.
 5. **Full scale** (HPC, the user's run): the staged build and Fitch pass on all of MGnify (MGnify90 membership only as a check), then the phase-4 benchmark at full size.
-6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering.
-6b. **Reduced amino-acid alphabets for the high-recall layer** (the user's request, 2026-10-30). *Status: measured locally (Progress log, 2026-10-31); at matched bits the full alphabet wins. The layer is now protein, in `build.py --mode standard` and `--mode large` (Progress log: tiers by identity, which also corrects 6b's window labels and S3 baseline). Per-layer bars and ungapped verification are still to do.* The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
+6. **Generic sets:** a set with no published clustering (e.g. CARD resistance proteins, or viral proteins) built and queried with the same defaults, to show nothing in it depends on MGnify's clustering. *Done 2026-11-04: the mini-slice with its clusters removed gives identical search results (`slice.py generic`), and CARD builds, queries and scores on the default settings; see Progress log.*
+6b. **Reduced amino-acid alphabets for the high-recall layer** (the user's request, 2026-10-30). *Status: measured locally (Progress log, 2026-10-31); at matched bits the full alphabet wins. The layer is now protein, in `build.py --mode standard` and `--mode large` (Progress log: tiers by identity, which also corrects 6b's window labels and S3 baseline). Per-layer bars and ungapped verification were done 2026-10-31 (Progress log); spaced seeds were tested 2026-11-04 and give no gain. Closed.* The layer so far used Dayhoff (6 classes) and Murphy-10, both fixed, small and not chosen for this use. Try a range of reduced alphabets instead:
    - Murphy et al.'s 8, 12 and 15-letter alphabets; the alphabets DIAMOND (11 letters) and MMseqs2 (13) seed with; SE-B(14); and compressed alphabets optimised for alignment sensitivity (Edgar 2004), chosen from BLOSUM62 so classes absorb the most likely substitutions.
    - *Compare at matched bits per k-mer, not matched k.* At equal bits, a shorter full-alphabet k-mer has so far survived as well as Murphy-10 or Dayhoff. A reduced alphabet only helps if its within-class share of BLOSUM62 substitutions is high for its size. Report that share, p\_eff at 70–85% identity, and the predicted miss rate at 1× (as in the feasibility table above) before any build.
    - *Then on the benchmark:* `spike.py simulate --substitution blosum62` strains at 70–85% identity, recall at depth > 1, decoy-controlled background seeds, and postings, against L3 and the Dayhoff layer.
@@ -1292,3 +1313,558 @@ Laptop work runs one job at a time with capped threads; full-scale runs go to HP
 - **Pfam precision fixed; layer k run set up (2026-11-02, the user's request).**
   - **Pfam precision** (`recall.py reads`) counted every read whose source protein has no Pfam hit as a wrong call: its `pfam_ok` was null, and the per-read `any()` turned an all-null group into False. About half of MGnify proteins have no Pfam hit, hence ~0.6 at every identity. It is now taken over called reads whose source has a Pfam hit, and `pfam_known_share` gives their share of the calls. Checked on the test profile with half the clusters annotated (one family per cluster, so Pfam precision should equal unit precision): tier 1 old 0.38, fixed 0.84 (unit 0.84); tier 2 old 0.49, fixed 0.96 (unit 0.98). The `tree-index-build` numbers above are the old measure.
   - **`hpc/kfp-ablations/tree-index-layer-k`:** standard at layer k 8 (control), 7 and 6, and k 8 with twice the keys (`sqrt:5.2`); large at k 8 and 7; the same subset and benchmark as `tree-index-build`. It asks whether k 7 or 6 recovers the quarter's recall below 85%, at what cost in decoy bar, aligned pairs and QUERY memory, and whether more keys at k 8 does as well at fewer chance seeds. A tier whose QUERY fails twice is skipped. Passes the test profile.
+- **`tree-index-slice` results (2026-11-02, the user's HPC run; `results-hpc/tree-index-slice/`).** 40 Pfam families taken with their whole clusters: 4.23 M proteins (2.66 M with one of the families' Pfam hits). The largest component holds 3.2 M proteins, cut into 5 parts. BUILD peaked at 94.5 GB against its 96 GB, so every run now gives BUILD 128 GB, +128 GB per retry. At 4.2 M proteins the layer's k is 7. Pfam precision here is still the old measure (fixed after this run).
+  - **Recall at depth > 1** (90 / 85 / 80 / 75 / 70%): standard 0.91 / 0.83 / 0.71 / 0.55 / 0.52, large 0.99 / 0.94 / 0.94 / 0.88 / 0.80. That is above the subset's (k 8: 0.84 / 0.66 / 0.47 / 0.34 / 0.23 for standard), but the database size, family density and k all differ; `tree-index-layer-k` separates k.
+  - **Read classification with near units present** (the reason for the slice):
+
+    | Tier | Calls | Read recall | Read precision (unit) | Leaf precision | Median hits | Units called | True | Unit recall |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | standard | tier 1 | 0.414 | 0.612 | 0.28 | 1 | 80,314 | 0.019 | 0.79 |
+    | standard | tier 2 | 0.809 | 0.899 | 0.81 | 27 | 20,552 | 0.071 | 0.76 |
+    | large | tier 1 | 0.595 | 0.673 | 0.25 | 1 | 150,532 | 0.012 | 0.93 |
+    | large | tier 2 | 0.913 | 0.949 | 0.86 | 28 | 21,138 | 0.081 | 0.89 |
+
+    By identity (standard tier 2), read precision is 0.99 at 100–98%, 0.94 at 90%, 0.83 at 80% and 0.66 at 70%. Most reads are still placed in the right unit. Tier 1's single best hit is right for only 61–67% of reads, against ~95% on the subset: near units compete.
+  - **The unit-level profile over-calls.** Tier 2 calls a group present at ≥ 0.5 expected reads and then calls all of its leaves that hold a share. With near units present, that puts ~20 k units on 1,917 true ones (7% true). EM gives a read's own unit 74% of its weight (standard; large 78%), and the rest spreads over its near units. A per-unit threshold on expected reads (the sum of EM weights from the hand-off's `assignments.parquet`):
+
+    | Expected reads per unit | standard: called / true share / unit recall | large |
+    | --- | --- | --- |
+    | > 0 | 15,798 / 0.09 / 0.76 | 16,417 / 0.10 / 0.89 |
+    | ≥ 0.5 | 2,299 / 0.57 / 0.68 | 2,429 / 0.63 / 0.80 |
+    | ≥ 1 | 1,928 / 0.64 / 0.64 | 2,012 / 0.72 / 0.75 |
+    | ≥ 2 | 1,378 / 0.78 / 0.56 | 1,474 / 0.83 / 0.64 |
+    | ≥ 5 | 631 / 0.90 / 0.30 | 666 / 0.91 / 0.32 |
+
+    A threshold alone trades recall for precision steeply at this depth (lognormal μ 0.3, σ 0.6: a few read pairs per strain). Units need their own presence model: EM with units dropped when their weight is explained by a neighbour (the pileup's posterior presence), or a unit-level decoy bar. That is the next tier-2 step. The read-level calls are usable as they are.
+  - **Cost:** QUERY ≤ 17 GB and 3 min (tier 2: 100 s, 11 GB, 1.5 M candidate leaves, 15.8 M pairs aligned); FAMILIES 90 GB (the release's Pfam table).
+- **Local against HPC: where recall goes (2026-11-02, the user's question: bias, a redesign of local benchmarks, or smaller than it looks?).** Standard tier, recall at depth > 1 (`verify_0.01_nb`), same simulation settings throughout. "Fresh" is `sim5`: 2,000 strains, no background, as `build.nf` simulates. "Pooled" is sim1 + sim4 with 251 k real background reads, which the local headline numbers came from. Quarter-sample builds are `SQ-R16-2.63`'s settings with only the layer k changed.
+
+  | Identity | pooled, local k 6 | fresh, local k 6 | fresh, local k 7 | fresh, local k 8 | fresh, local k 8, HPC verify bar | subset (HPC) k 8 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 0.90 | 0.91 | 0.87 | 0.85 | 0.81 | 0.81 | 0.84 |
+  | 0.85 | 0.82 | 0.78 | 0.73 | 0.68 | 0.67 | 0.66 |
+  | 0.80 | 0.73 | 0.70 | 0.64 | 0.62 | 0.61 | 0.46 |
+  | 0.75 | 0.62 | 0.53 | 0.50 | 0.45 | 0.44 | 0.34 |
+  | 0.70 | 0.58 | 0.50 | 0.46 | 0.41 | 0.41 | 0.23 |
+
+  Bins hold ~180–220 strains at depth > 1, so a bin's 95% interval is about ±0.06.
+  - **Sample design (−0.03 to −0.08 below 90%).** The pooled sample's strains are deeper: mean depth 3.8–4.4 in its 100–90% bins and 2.3–2.9 below, against 2.2–2.5 in the fresh sample. "Depth > 1" averages over whatever depth mix a bin has. The local headline numbers were optimistic for this reason alone; it is not a scale effect.
+  - **Layer k (−0.08 to −0.09 at 80–70%).** The same quarter index at k 8 instead of 6, as the log-size rule picks at 53 M proteins. This is the seed-survival cost the detection model predicts.
+  - **Scale (−0.16 at 80%, −0.18 at 70%), the largest step.** Not the alignment bar: applying the subset's verify bar (24.5 bits) to the local k 8 run removes only 164 of 36,594 candidate leaves. The loss is at the seed stage (subset evidence-only 0.31 at 80%, against 0.62 locally at k 8). It is not a smaller key budget either: the layer adds ~0.81 postings per protein on the subset and ~0.86 on the quarter.
+    - Candidate causes, not yet measured: per-key bits at 200× the proteins (chance holders); group representatives farther from a strain's source in larger groups (verify aligns against the representative); and seeds won by near units that are not the source's group.
+    - Measuring them needs the subset's per-read files: `q-standard/{seeds,evidence,aligned,hits}.parquet`, `s-standard/strains.parquet` and `index-standard/{layer_group,key_k,key_bits,keys}.npy` with `proteins.parquet`.
+  - **Group dilution where the database is dense.** The group a random protein sits in has 118 members on the quarter sample and 592 on the slice. Layer keys grow with the square root of group size (`sqrt:2.63`), so keys per member fall from 0.86 to 0.41. That does not explain the subset (similar budget), but the release is far denser than the subset, so it will bite there.
+  - **Bars depend on the sample, not only the database.** The verify and evidence bars hold decoy seeds to 1% of the sample's own seeds, so a seed-rich sample lowers them. The slice (16× the quarter) has the quarter's evidence bar (27.75 bits) because its strains' relatives give 38 seeds per pair, against 4.
+  - **For local benchmarks:** (1) always the fresh design (as `build.nf`), reported with intervals; (2) the layer k the target database will use (k 9 at release), not the local size's; (3) a family-complete mini-slice (a few families, ~300 k proteins) instead of a cluster sample, so group sizes and near units are realistic on the laptop. Bars and chance seeds at 200× the proteins cannot be emulated locally; the HPC subset stays the calibration.
+- **A family-complete mini-slice for local benchmarks (2026-11-02, the user's request).** `slice.py mini` cuts a built slice down to laptop size: whole clumps of its spanning tree (every edge kept, so each protein's layer group and its neighbouring groups come whole), taken systematically in size order. It works from the slice's index alone; no Pfam table needed.
+  - **From `tree-index-slice`** (`data/mini-slice/members.parquet`, git-ignored): 294,644 proteins, 54,983 units, 41,009 clumps. The clump a random protein sits in matches the slice at the 10th–90th percentiles (2 / 9 / 58 / 326 / 1,049 proteins, against 2 / 9 / 62 / 359 / 1,309). The top 1% is thinner: the largest clump is 4.3 k proteins, against 10–23 k. `test_mini_slice_keeps_clumps_whole` checks that no spanning-tree edge is cut.
+  - **Standard at the slice's layer k (7, `--database-proteins 4230133`), 2,000 fresh strains, on the laptop.** BUILD peaked at 10.3 GB (5.2 GB at 100 k proteins), everything else ≤ 1.6 GB.
+
+    | Measure | HPC slice (4.2 M) | Mini-slice (295 k) |
+    | --- | --- | --- |
+    | recall at depth > 1, 90 / 85 / 80 / 75 / 70% | 0.91 / 0.82 / 0.71 / 0.55 / 0.52 | 0.93 / 0.87 / 0.75 / 0.67 / 0.61 |
+    | tier 1: candidate units (true share) | 80,314 (0.02) | 8,410 (0.14) |
+    | tier 1: read recall / precision | 0.41 / 0.61 | 0.44 / 0.81 |
+    | tier 2: read recall / precision | 0.81 / 0.90 | 0.83 / 0.95 |
+    | tier 2: leaf precision, median hits | 0.81, 27 | 0.87, 20 |
+    | tier 2: units called (true share), unit recall | 20,552 (0.07), 0.76 | 5,466 (0.22), 0.78 |
+    | evidence / verify bar, seeds per pair | 27.75 / 18.25, 38.4 | 0 / 0, 6.7 |
+
+  - **Reading.** The mini-slice reproduces tier 2's read recall, the recall curve down to ~80%, and tier 2's over-calling of units. It is optimistic at 75–70% (+0.12 / +0.09) and on precision: there are 4–10× fewer false units, and no decoy seed scores at all, so the bars are 0. Those follow the database's size, since chance hits grow with the proteins, so 14× fewer proteins gives fewer and weaker chance seeds. Use the mini-slice for development (tier 2, unit presence, near-unit confusion, recall). Take absolute precision, bars and low-identity recall from the HPC slice and subset.
+- **Size estimates revisited (2026-11-02, the user's request: estimates that scale, to choose index parameters by score and size on disk).**
+  - **Why the earlier estimates were low (2.5–3×).** They counted postings at ~9 B and assumed partial sequences collapse into ~2 × 10⁹ leaves. In fact every protein is a leaf (0.998 positions per protein at every scale), and two costs were left out. Per-protein tables (per-position, per-node, a unit id) come to ~25 B per protein whatever the tier, ~130–150 GB at release. The sequences `verify.py` aligns against (each layer group's representative) come to ~32–45 residues per protein, ~180–300 GB.
+  - **What tier 1 reads** (`query.py`, `verify.py`): postings (hash, lo, hi, sign), keys (hash, bits, k), `pos_size`, the node tables, `layer_group` and the representatives' sequences, plus a leaf → unit map to report units. Not `kind`, `pos_len`, `pieces`, the spanning-tree edges or the full store: those are the build's and tier 2's. Positions, edges and the store are identical across tiers (same partition and topology), so tier 2's full store (~1.17 TB) and edges (~60 GB) exist once for all tiers.
+  - **Rates by density.** The mini-slice and the slice agree: 1.31 against 1.32 postings per protein, 0.156 groups per protein each, 0.86 internal nodes per protein each. The cluster-sample subset runs higher, 1.75 for standard, because a protein's neighbours are missing and fewer k-mers are shared. The release has every protein's neighbours, so the slice's rates are the best guess and the subset's an upper bound.
+  - **Projected tier-1 footprint at release** (5.74 × 10⁹ proteins; sequences rescaled to the release's mean length of ~186; slice → subset rates):
+
+    | Tier | Postings | Keys | Tables | Representatives | Tier 1 | Earlier estimate |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | slim | 89–92 GB | 32–56 GB | 125–110 GB | 1,115 GB (every leaf) | 1.36–1.37 TB | 100–130 GB |
+    | standard | 129–171 GB | 59–116 GB | 148–133 GB | 181–190 GB | 517–610 GB | 195–215 GB |
+    | large | 301–519 GB | 154–364 GB | 148–133 GB | 182–190 GB | 0.79–1.21 TB | 360–415 GB |
+
+    Slim is the largest because without groups `verify.py` aligns against every leaf: slim needs layer groups for its alignment (or no alignment) to be small.
+  - **Format limit.** Positions are u32 (`merge.py` refuses ≥ 2³²), and the release has ~5.73 × 10⁹. Either the release goes in two shards of ≤ 4.29 × 10⁹ positions, each a whole index queried in turn, or positions become u64 (+8 B per posting, +8 per node and edge). Sharding needs no format change and fits the per-bucket build (128 buckets per shard). That is assumed above.
+  - **Where to save:** keys duplicate the posting hashes (8 of their 14 B); folding bits and k into the postings saves ~30–60 GB on standard. Packing representatives at 5 bits per residue saves ~40%. Narrower node tables help too. None is done.
+  - **In the benchmarks:** `recall.py summary` now writes `release_postings_gb`, `release_keys_gb`, `release_tables_gb`, `release_reps_gb` and `release_tier1_gb` per tier into `bench.tsv` (`recall.release_gb`). The mini-slice's standard projects 544 GB against the HPC slice's 517 GB, so a local mini-slice benchmark gives release size within ~5% at slice density.
+- **`tree-index-layer-k` results (2026-11-02, the user's HPC run; `results-hpc/tree-index-layer-k/`).** The 1-in-100 subset, six tiers differing in the layer only; the control (`standard`, k 8) reproduces `tree-index-build` exactly. Recall at depth > 1 (`verify_0.01_nb`) with 95% bootstrap intervals (±0.05–0.07 per bin). Sizes are projected tier-1 footprints at release at the subset's rates (an upper bound; the slice's rates give ~15% less). Alignment work is `verify.py`'s pairs per read now, and projected to release with chance pairs scaled by proteins (`recall.release_pairs`).
+
+  | Tier | Size | 90% | 85% | 80% | 75% | 70% | Detected (depth ≥ 1) | Pairs per read: now (chance share) → release |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | standard (k 8) | 696 GB | 0.84 | 0.66 | 0.46 | 0.34 | 0.23 | 0.66 | 48 (0.18) → ~1,000 |
+  | std-k7 | 680 GB | 0.86 | 0.73 | 0.50 | 0.45 | 0.31 | 0.70 | 81 (0.51) → ~4,500 |
+  | std-k6 | 664 GB | 0.84 | 0.75 | 0.60 | 0.56 | 0.39 | 0.75 | 432 (0.89) → ~42,000 |
+  | std-keys2x (k 8) | 835 GB | 0.91 | 0.77 | 0.61 | 0.45 | 0.28 | 0.73 | 52 (0.22) → ~1,300 |
+  | large (k 8) | 1,293 GB | 0.98 | 0.94 | 0.84 | 0.72 | 0.53 | 0.86 | 67 (0.32) → ~2,400 |
+  | large-k7 | 1,194 GB | 0.99 | 0.94 | 0.89 | 0.79 | 0.62 | 0.89 | 263 (0.83) → ~23,600 |
+
+  - **Shorter layer k wins on recall and size.** k 6 against k 8: +0.14 / +0.22 / +0.16 at 80 / 75 / 70%, and 30 GB smaller (shorter k-mers are shared more, so there are fewer distinct keys). Its decoy bar is higher (50 against 34 bits), but survival outweighs it. Doubling the keys at k 8 matches k 6 at 85–80% and loses at 75–70%, for +140 GB. `build.layer_k`'s log-size rule (k 9 at release) goes the wrong way for recall.
+  - **The price is alignment.** At k 6, 89% of the pairs `verify.py` aligns are chance. Chance pairs scale with the database's keys: projected to the release, that is ~42 k pairs per read, ~330 thread-hours (~10 h on 32 cores) for 10 M read pairs at ~350 k pairs/s/thread. k 7 needs ~36 thread-hours (~1.1 h on 32 cores), k 8 ~8 (~15 min). Query memory: 11.5 GB at k 6, 8.4 GB at k 8 (subset). BUILD is unchanged (~90 GB peak).
+  - **Next lever:** cut chance pairs before alignment (a higher per-pair evidence floor in `verify.py`, or two seeds per pair). The decoy reads measure that on the laptop, since chance pairs per read scale with proteins. Tune it on the mini-slice at k 6 and 7, then confirm on the subset.
+  - `bench.tsv` now also carries `pairs_per_read`, `chance_share` and `release_pairs_per_read`.
+- **Bits on the postings; build-only files dropped (2026-11-02, the user's request; the easy wins).**
+  - `keys.npy` was exactly the set of distinct posting hashes (slice: 3,088,418 keys for 5,574,200 postings; 77% of hashes have one posting, 13% two, 11% more, up to 2,362). It was there only to hold each key's bits (f32) and k (u16), at 14 B per key, and `query.py` loaded it whole into RAM (59–116 GB at release).
+  - Each posting now carries them: `bits.npy` (u8, quarter-bits, clipped to 0–63.75; measured 16.5–59.75) and `kcode.npy` (u8, or u16 when reduced-alphabet codes exceed 255). `query.evidence` reads bits from the posting rows it already finds. `families` maps k codes to layers. `choose_bits` (the model bar, not the decoy one) derives the key table from the postings when needed. Negative bits (common k-mers) count as 0, as the decoy path's clamp already did.
+  - `merge.py` combines each key's bits across parts (gains add, as before) and writes the result onto every posting of the key. The merged index leaves out the build's `kind.npy` and `pieces.parquet`; the parts keep them.
+  - Tests: the evidence brute force holds with the encoded bits; the partitioned build checks one bits value per key and no build files in the merged index; the test profile passes end to end. 20 passed.
+  - **Sizes now split** (`recall.release_gb`, `bench.tsv`): `release_lookup_gb` covers postings at 19–20 B (hash, lo, hi, sign, bits, k), `pos_size`, the node tables and the protein map. `release_align_gb` covers `layer_group` and the representatives' sequences, to be reconsidered once the rest of the index is settled. `release_tier1_gb` is their sum.
+  - **Release projection** (lookup + alignment, slice → subset rates), recall at depth > 1 on the subset (`tree-index-build`, `tree-index-layer-k`), alignment time for 10 M read pairs on 32 cores:
+
+    | Option | Lookup | Alignment data | Tier 1 | 90% | 85% | 80% | 75% | 70% | Detected | Alignment |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | slim | 230–244 GB | 1,115 GB (every leaf) | 1.35–1.36 TB | 0.50 | 0.31 | 0.18 | 0.10 | 0.04 | 0.45 | ~0.2 h |
+    | standard k 8 | 288–319 GB | 204–299 GB | 492–618 GB | 0.84 | 0.66 | 0.47 | 0.34 | 0.23 | 0.66 | ~0.2 h |
+    | std k 7 | 286–317 GB | 204–299 GB | 490–616 GB | 0.86 | 0.73 | 0.50 | 0.45 | 0.31 | 0.70 | ~1.1 h |
+    | std k 6 | 288–319 GB | 204–299 GB | 492–618 GB | 0.84 | 0.75 | 0.60 | 0.56 | 0.39 | 0.75 | ~10 h |
+    | std, 2× keys, k 8 | 368–408 GB | 204–299 GB | 572–707 GB | 0.91 | 0.77 | 0.61 | 0.45 | 0.28 | 0.73 | ~0.3 h |
+    | large k 8 | 481–708 GB | 204–299 GB | 0.69–1.01 TB | 0.98 | 0.94 | 0.84 | 0.72 | 0.53 | 0.86 | ~0.6 h |
+    | large k 7 | 477–702 GB | 204–299 GB | 0.68–1.00 TB | 0.99 | 0.94 | 0.89 | 0.79 | 0.62 | 0.89 | ~5.8 h |
+
+    Tier 2 needs, once for all tiers, the full store (~1.16 TB) and the spanning-tree edges (~59 GB). The release goes in two shards of ≤ 4.29 × 10⁹ positions (u32 positions).
+- **Layer-only tiers, wide clusters for key budgets, and chance at release scale (2026-11-02, the user's direction: tier 1 as fewer representatives sensitive to wider AAI).**
+  - **Layer-only builds** need no new code: `--t-base 0 --window 0 --ladder= --n-1 0` leaves only the layer's keys on group representatives (98% of postings on one representative position in the fixture). Scoring expands a representative's hit to its group.
+  - **Coarser tree cuts do not make wider groups:** on the mini-slice, 46,090 groups at 0.57 (~90%), 40,913 at 0.83 (~80%) and 40,557 with no cut. The dense 8-mer tree has almost no edges below ~90%.
+  - **`--layer-units kmer:<k>:<share>[:<t>]`** (`build.wide_clusters`, `layer_units`): the group representatives are clustered by shared protein k-mers (a FracMinHash sample at rate `t`, 0.2 by default; k-mers held by more than 64 representatives skipped), with greedy centroids taken longest first, so clusters do not chain. `allocate` then spends each budget per cluster, on the least hashes across its groups' keys, and keys stay on their own groups' representatives (so verify aligns against a close one). The default is byte-identical to before. On the mini-slice it takes 4 s and 2 GB. 5-mers shared ≥ 30% (~79% pairwise): 36,554 clusters (0.79 of groups); ≥ 20%: 31,430; ≥ 10%: 20,586. **The user chose 30%.**
+  - **Size at release, layer-only with positions per group** (a format change), alignment data apart (slice → subset rates; groups 0.156–0.313 per protein, layer postings 0.404–0.814 per protein at today's budget):
+
+    | Keys (vs today's layer) | Postings | Per-group tables | Lookup | Alignment data |
+    | --- | --- | --- | --- | --- |
+    | same (`sqrt:3.28` per wide cluster) | 44–89 GB | 23–41 GB | 67–130 GB | 182–276 GB |
+    | half (`sqrt:1.64`) | 22–44 GB | 23–41 GB | 45–85 GB | 182–276 GB |
+    | quarter (`sqrt:0.82`) | 11–22 GB | 23–41 GB | 34–63 GB | 182–276 GB |
+
+    Standard today: 288–319 GB lookup and 204–299 GB alignment data. A leaf → group map (~23 GB) goes with tier 2.
+  - **Chance at release scale, emulated (`--chance-scale F`** on `query.py`, `verify.py`, `tier2.py`; `query.decoy_bar`). Decoy counts are multiplied by F before the bar is chosen, and past the observed decoys the tail is extended from the 10th highest, halving per bit. Validated on the mini-slice's standard (layer k 7) at F = 14.36 (the slice's size): evidence and verify bars 30.0 and 21.75, against the HPC slice's 27.75 and 18.25. Recall barely moves with the bar (0.61 → 0.60 at 70%), because true alignments clear it.
+    - The mini-slice still reads high at ≤ 75% against the slice: 0.67 / 0.60 against 0.55 / 0.52 at 75 / 70% (~2 SE). By the source group's size, the two agree except for groups of 11–1,000 members at ≤ 75% (0.54 against 0.44; 0.91 against 0.76). It is not budget normalisation (c 1.53 against 1.54). Treat it as the mini-slice's known optimism at low identity.
+    - For release, F = 5.74 × 10⁹ / 294,644 ≈ 19,480; every grid index is rescored at that scale (`grid-release`).
+  - Tests: `test_decoy_bar_chance_scale` and `test_wide_clusters_link_relatives_only` (siblings ~90% apart cluster at 30%; at ~72% they do not, which is what 30% means).
+- **High recall at 70–75% with wide-cluster budgets (2026-11-02, the user's targets: 0.95 at 80% identity, high at 75–70%, smaller than the full-leaf tiers; alignment cost set aside).** Mini-slice, 2,000 fresh strains, scored at release chance scale (`--chance-scale` 19,480). Layer only (`--t-base 0 --window 0 --ladder= --n-1 0`), wide clusters at 30% shared 5-mers. Lookup sizes at release assume one position per group (19 B per posting, ~26 B per group); full-leaf tiers are per leaf, as built. Recall at depth > 1 (`verify_0.01_nb`), 90 / 85 / 80 / 75 / 70%:
+
+  | Config | Lookup | 90% | 85% | 80% | 75% | 70% | Pairs per read (mini) |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | standard k 8 (full leaf) | 289 GB | 0.90 | 0.82 | 0.73 | 0.61 | 0.57 | 37 |
+  | standard k 6 (full leaf) | 289 GB | 0.93 | 0.87 | 0.80 | 0.73 | 0.66 | 38 |
+  | large k 8 (full leaf) | 482 GB | 0.99 | 0.96 | 0.93 | 0.85 | 0.78 | 39 |
+  | large k 7 (full leaf) | 482 GB | 0.99 | 0.99 | 0.98 | 0.87 | 0.82 | 40 |
+  | layer only, per group, k 7 | ~68 GB | 0.82 | 0.79 | 0.70 | 0.61 | 0.56 | — |
+  | wide k 7, same keys | ~68 GB | 0.78 | 0.75 | 0.69 | 0.57 | 0.54 | — |
+  | wide k 6, 2× | ~112 GB | 0.92 | 0.89 | 0.84 | 0.79 | 0.73 | — |
+  | wide k 6, 2×, union composites | ~112 GB | 0.84 | 0.85 | 0.74 | 0.69 | 0.63 | — |
+  | wide k 5, 2× | ~112 GB | 0.93 | 0.94 | 0.90 | 0.83 | 0.77 | — |
+  | wide k 4, 2× | ~112 GB | 0.99 | 0.95 | 0.93 | 0.92 | 0.89 | 634 |
+  | wide k 6, 4×, window 8 | ~198 GB | 0.98 | 0.96 | 0.95 | 0.89 | 0.83 | — |
+  | wide k 5, 4×, window 8 | ~198 GB | 0.98 | 0.98 | 0.95 | 0.92 | 0.87 | — |
+  | wide k 4, 3×, window 8 | ~155 GB | 1.00 | 0.97 | 0.96 | 0.93 | 0.95 | 1,186 |
+  | wide k 4, 4×, window 8 | ~198 GB | 1.00 | 0.99 | 0.96 | 0.96 | 0.97 | 1,559 |
+  | wide k 5, 6×, window 8 | ~286 GB | 0.99 | 1.00 | 0.96 | 0.94 | 0.94 | 145 |
+  | wide k 5, 8×, window 8 | ~373 GB | 0.99 | 1.00 | 0.99 | 0.95 | 0.97 | — |
+
+  - **Shorter layer k is the strongest lever** (survival 0.7^k at 70%), then keys. Window 8 adds ~0.01–0.02 at no size cost. Union composites (`composite:0`) lose 0.1, so drop them. Wide clusters at equal keys match per-group budgets.
+  - **The wide design beats full-leaf large at a fraction of the size:** k 4 with 3× keys reaches 0.93 / 0.95 at 75 / 70% against 0.87 / 0.82, with ~a third of the lookup data. At 80% the k 4 variants plateau at ~0.96 whatever the keys (residual misses not from seeds; ~2 SE from 0.99).
+  - **Against 0.95 at 80% at full scale** (the mini-slice reads ~0.04 high at 80% against the HPC slice): only k 5 with 8× (0.99 here, ~373 GB) is expected to clear it; k 4 with 3–4× is expected at ~0.92.
+  - **Cost:** short k aligns far more chance pairs (k 4: 1,200–1,600 per read on the mini-slice, ×19,480 at release in chance pairs), for a pseudo-alignment step later.
+  - **HPC confirmation:** `hpc/kfp-ablations/tree-index-wide` (subset; wide k 4 at 3× and 4×, k 5 at 6× and 8×; full-leaf large k 7 as the control; `build.nf --chance_scale 108` for release bars). The test profile passes with these tiers.
+
+- **2026-11-03 — k-mer pair filter after tier 1, on strains plus real background** (mini-slice; 9,191 strain read pairs and 251,268 real background read pairs; chance scale 19,480; share 0.01; `pairs.py`):
+  - **Tier 1 itself is the bottleneck in this test.** With the background added, its decoy bar rose from 70.5 to 84.5 bits (wide k 4, 3×) and from 64.5 to 81 bits (wide k 5, 8×). Recall at 80% fell from 0.96 to 0.29 and from 0.99 to 0.65. The bar is target-decoy: decoys grow with every read, but background reads find few true seeds on a 294 k-protein slice (their relatives are absent). The local test therefore over-penalises: at full scale the background's own relatives raise the sample's seed count too. A bar on expected chance seeds per read at release scale would not depend on the sample's make-up.
+  - **The pair filter keeps tier 1's recall but removes little.** After tier 1's strict bar, the candidates left are mostly true or close homologs.
+
+    | Variant (k 4 pairs, gap ≤ 8) | k 4 index groups (203 in) | Recall at 80% | k 5 index groups (953 in) | Recall at 80% | Peak memory |
+    | --- | --- | --- | --- | --- | --- |
+    | Tier 1 alone | 203 | 0.29 | 953 | 0.65 | — |
+    | K-mer sampled 1 in 1 / 4 / 16 | 172 / 140 / 14 | 0.26 / 0.24 / 0.05 | 941 / 529 / 35 | 0.64 / 0.34 / 0.06 | 0.6 GB |
+    | Pair hash, modulo 1 / 4 / 16 | 197 / 202 / 171 | 0.28 / 0.29 / 0.27 | 951 / 944 / 846 | 0.65 / 0.64 / 0.55 | 0.6–1.2 GB |
+    | Pair hash, minimizers w 4 / 16 | 203 / 186 | 0.29 / 0.28 | 937 / 934 | 0.64 / 0.64 | 0.7–0.9 GB |
+    | Soft intersection 25%, modulo 1 / 4 / 16 | 203 / 203 / 180 | 0.29 / 0.29 / 0.27 | 923 / 949 / 855 | 0.64 / 0.65 / 0.56 | 1.5–7.4 GB |
+
+  - **Pair hashing beats k-mer sampling at equal sparsity, as expected** (1/m against 1/m²): at 1 in 4 on the k 5 index, 0.64 against 0.34 at 80%. Minimizers and modulo are close. Soft intersection over all leaves gains nothing over the representative here and costs 3–7 GB (137–233 M leaf features before sampling).
+  - **Each pair run takes 5–55 s for 520 k read pairs** (sample plus decoys), reading the FASTQ again with no files written.
+  - **Today's alignment (`verify.py`) is not gated by tier 1** and recovers 0.92–0.94 at 80%. But it keeps 9.7–11.3 k groups (~65% of the slice's positions) and aligned ~1,000 representative pairs per read (268 M in 40 min on 2 threads), so it neither filters nor scales.
+  - **Next, before more pair options:** a tier 1 bar that holds at full scale, then the pair filter tested where it has false candidates to remove (tier 1 at a loose bar, the pair filter setting the cut).
+- **2026-11-03 — pair filter after a loose tier 1** (same sample; tier 1 re-cut at 30, 40 and 50 bits from its saved seeds; the pair filter's decoy bar at chance scale 19,480 sets the cut). Wide k 5, 8× index, groups kept and recall at 90 / 80 / 70%:
+
+  | Step | Groups | Recall at 90 / 80 / 70% |
+  | --- | --- | --- |
+  | Tier 1 at 30 bits | 24,452 | 0.98 / 0.95 / 0.91 |
+  | Tier 1 at 40 bits | 3,615 | 0.93 / 0.85 / 0.66 |
+  | Tier 1 at 50 bits | 1,711 | 0.89 / 0.79 / 0.55 |
+  | Tier 1 at 81 bits (decoy share, today) | 953 | 0.78 / 0.65 / 0.46 |
+  | 30 bits, then k 4 pairs, 1 in 1 | 2,032 | 0.88 / 0.64 / 0.42 |
+  | 30 bits, then k 5 pairs, 1 in 1 | 2,334 | 0.91 / 0.68 / 0.42 |
+  | 30 bits, then k 5 pairs, minimizers w 4 | 3,497 | 0.95 / 0.81 / 0.55 |
+  | 40 bits, then k 5 pairs, minimizers w 4 | 1,848 | 0.91 / 0.75 / 0.48 |
+  | 50 bits, then k 4 pairs, minimizers w 4 | 1,514 | 0.89 / 0.76 / 0.54 |
+
+  - **No pair variant beats a tighter tier 1 bar.** At equal groups kept, a tier 1 bar alone gives the same or better recall at 80% (3,615 groups: 0.85 against 0.81 for the best pairs). The wide k 4, 3× index shows the same.
+  - **k 5 pairs beat k 4 pairs when tier 1 is loose** (0.81 against 0.66 at 80%, minimizers), so chance at release scale does limit k 4 pairs. But the larger limit is survival: a pair needs both k-mers and their exact gap kept. At 80% identity that is ~0.8⁹ ≈ 0.13 for k 4 pairs, against ~0.4 for a single 4-mer, so distant reads share too few pairs with the representative to clear a release-scale chance bar.
+  - **Sampling:** minimizers (w 4) hold recall better than modulo 4. Dynamic sparsity chose 1 in 1 at the 4 GB budget each time (≤ 55 M entries). The pair filter's decoy bars vary widely between sampling modes (17–142 shared features), so the tail extrapolation is not stable for these counts.
+  - **Implication for the conserved-combination options:** exact multi-k-mer features are more specific but survive divergence worse. They would help where groups are tight (≥ 90%), not at 70–80%.
+- **2026-11-03 — promiscuity trim by information** (same sample and loose tier 1 cuts). Each pair feature's information is log2(R / df): R candidate groups, df those holding it. A read's score for a group is the sum over shared features (`pairs.py --min-bits`), and features below the floor are dropped. Tier 1 gets `query.py --min-key-bits` (drops hits on keys below the per-hit charge). Wide k 5, 8× index, minimizers w 4:
+
+  | Step | Groups | Recall at 90 / 80 / 70% |
+  | --- | --- | --- |
+  | Tier 1 at 30 bits | 24,452 | 0.98 / 0.95 / 0.90 |
+  | Tier 1 at 40 bits | 3,615 | 0.93 / 0.85 / 0.68 |
+  | Tier 1 at 50 bits | 1,711 | 0.89 / 0.79 / 0.55 |
+  | 30 bits, then k 5 pairs, counted | 3,497 | 0.95 / 0.81 / 0.53 |
+  | 30 bits, then k 5 pairs, information (floor 0, 3 or 6) | 4,449 | 0.97 / 0.88 / 0.72 |
+  | 30 bits, then k 4 pairs, counted | 957 | 0.64 / 0.36 / 0.29 |
+  | 30 bits, then k 4 pairs, information | 2,849 | 0.96 / 0.84 / 0.53–0.61 |
+  | 40 bits, then k 5 pairs, information | 2,178 | 0.93 / 0.82 / 0.61–0.64 |
+
+  - **Scoring by information fixes counting,** most for k 4 pairs (0.36 to 0.84 at 80%). The filter now sits on or slightly above the frontier of a tier 1 bar alone (4,449 groups at 0.88, against 3,615 at 0.85 and 24,452 at 0.95). It is not a step change.
+  - **Floors of 3 and 6 bits trim nothing:** among candidates, almost no pair feature is held by more than 1/64 of groups. Pairs are not promiscuous; their limit is survival at 70–80%.
+  - **Tier 1's keys are not promiscuous on the mini-slice either.** Every key carries ≥ 12 composition bits, and none covers more than ~200 of 294 k positions (≥ 15 bits by coverage), so `--min-key-bits` trims nothing here. At release, coverage of chance holders grows ~19,480× (−14 bits). Whether real keys turn promiscuous there needs the HPC slice index.
+  - **The wide k 4, 3× index shows no gain:** its tier 1 caps recall at 0.69 at 80% even at 30 bits.
+- **2026-11-03 — k-mer combination modes on four families** (exploratory). Mini-slice families of 63–217 full-length members, plus domain-sharing neighbours. The query protein is held out, and reads are its 50-aa fragments. The query's group is its nearest relative's 70% cluster, kept at features held by ≥ 25% of members. Chance is measured against 5,000 background proteins and scaled to release. Pairs and triples lie within 16 aa, with an exact gap. Figures: `results-local/kmer-modes-families.png`, `results-local/kmer-modes-sparse.png`.
+
+  | Mode (index per group) | Features | Reads ≥ 2 shared, 60–70% / 50–60% | Chance groups per read (≥ 2) |
+  | --- | --- | --- | --- |
+  | single 5-mers | 436 | 0.92 / 0.70 | 1.6 × 10⁷ |
+  | single 6-mers | 437 | 0.82 / 0.58 | 9.9 × 10⁶ |
+  | single 7-mers | 438 | 0.69 / 0.44 | 7.2 × 10⁶ |
+  | single 8-mers | 439 | 0.55 / 0.39 | 5.5 × 10⁶ |
+  | 3-mer pairs, conserved singles then paired | 4,893 | 0.97 / 0.82 | 2.0 × 10⁷ |
+  | … modulo-sampled 1 in 12 | 429 | 0.72 / 0.47 | 7.2 × 10⁶ |
+  | 4-mer pairs, conserved singles then paired | 3,922 | 0.82 / 0.61 | 8.9 × 10⁶ |
+  | … 1 in 9 | 426 | 0.47 / 0.27 | 4.3 × 10⁶ |
+  | 3-mer triples, conserved | 15,578 | 0.85 / 0.57 | 9.9 × 10⁶ |
+  | … 1 in 36 | 438 | 0.41 / 0.16 | 3.7 × 10⁶ |
+
+  - **Unsampled, combinations beat a single k-mer of the same span slightly** (spaced-seed effect), at 10× (pairs) to 40× (triples) the features.
+  - **Sampled to the singles' size, they are no better than longer singles.** 3-mer pairs at 1 in 12 match 7-mers (0.72 against 0.69 at equal chance); 4-mer pairs and triples fall below 8-mers. Sampling removes the extra shared features the combinations had.
+  - **Conserved singles, then paired, equals pairs then conserved** at the same size, and is cheaper to build.
+  - **Chance is ~10⁷ groups per read in every mode:** homology in the background, not random matches.
+  - **Hit breadth separates where k-mer modes cannot.** The query's hits cover 0.9–1.0 of a true relative's tenths at ≥ 80% identity and 0.7–0.8 at 70–80%. They cover 0.4 for domain-sharing neighbours and 0.2–0.5 for background. Decision (2026-11-03): breadth is left to a downstream step (EM or greedy gather), not a filter at this stage.
+  - Window minimizers were sized wrongly (one feature per 2m − 1 positions, ~10× too sparse), so not compared.
+- **2026-11-03 — group sizes in the favoured index** (wide k 5, 8×, window 8; mini-slice, 294 k proteins; `results-local/group-sizes-mini.png`):
+
+  | Members | Layer groups (tree:0.57) | Their proteins | Wide clusters (30% shared 5-mers) | Their proteins |
+  | --- | --- | --- | --- | --- |
+  | 1 | 26,500 (57%) | 9% | 18,237 (50%) | 6% |
+  | 2–3 | 9,971 (22%) | 8% | 8,824 (24%) | 7% |
+  | 4–7 | 4,775 (10%) | 8% | 4,616 (13%) | 8% |
+  | 8–31 | 3,596 (8%) | 17% | 3,615 (10%) | 18% |
+  | 32+ | 1,248 (3%) | 58% | 1,287 (4%) | 61% |
+
+  - **A 25% soft intersection only means something at ≥ 8 members:** below that, one holder already passes. That is 4,844 of 46,090 layer groups (10.5%), which hold 75% of the proteins. The other 89% of groups keep the union of their members' k-mers, and most of those are singletons.
+  - Sizes on the mini-slice reflect its clump sampling; release groups will be larger (more redundancy per family).
+- **2026-11-03 — held-out test** (`recall.py holdout`). 1,800 mini-slice proteins were held out before the build, 200 per bin of identity to their nearest remaining relative (local alignment). Reads were simulated from them unmutated (lognormal depth), plus 251 k real background read pairs, at chance scale 19,480. A read counts as recalled when the nearest relative's position is a candidate (`score --relatives`). Recall by identity bin:
+
+  | Wide k 5, 8× index | Positions | 1.0 | 0.95 | 0.9 | 0.85 | 0.8 | 0.75 | 0.7 | 0.6 |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | tier 1, decoy bar (78.5 bits) | 105,634 | 0.93 | 0.76 | 0.59 | 0.45 | 0.35 | 0.17 | 0.15 | 0.09 |
+  | tier 1 at 30 bits | 258,569 | 0.99 | 0.98 | 0.96 | 0.93 | 0.93 | 0.77 | 0.78 | 0.71 |
+  | tier 1 at 40 bits | 163,757 | 0.98 | 0.95 | 0.91 | 0.77 | 0.69 | 0.49 | 0.41 | 0.31 |
+  | 30 bits, then k 5 pairs (information) | 159,001 | 0.99 | 0.98 | 0.96 | 0.92 | 0.93 | 0.76 | 0.75 | 0.57 |
+  | 30 bits, then k 4 pairs (information) | 141,136 | 0.99 | 0.98 | 0.96 | 0.92 | 0.92 | 0.74 | 0.68 | 0.45 |
+
+  - **Real relatives are harder than mutated copies.** At today's decoy bar, recall at 80% is 0.35, against 0.65 for spiked strains in the same sample.
+  - **A loose tier 1 (30 bits) reaches 0.93 at 80%, but keeps 88% of the slice's positions.** k 5 pair filtering then keeps 8,144 of 25,587 groups (62% of positions) at about the same recall down to 70%.
+  - **The wide k 4, 3× index fails here:** 0.81 even at identity 1.0 and 0.26 at 80% at 30 bits. A single 4-mer key carries ~16 bits against a ~9-bit charge per further hit, so reads need several hits.
+- **2026-11-03 — pair windows for a follow-up after single k-mers** (exploratory; the four families). Tier 1 is conserved single 5-mers sampled 1 in 8. The follow-up is pairs of a group's conserved k-mers: a before b, any gap in the window (the gap is not hashed), dense. Reads are 50 aa; chance means passing both stages on the same background protein, at release scale. Queries are mostly ≥ 80% identity (87), with only 7–11 per bin below, so the low-identity figures are rough.
+
+  | Window (k, gaps) | Pairs per group | Reads ≥ 2 pairs, 50–60 / 60–70 / 70–80 / ≥ 80% | Chance groups per read (≥ 2) |
+  | --- | --- | --- | --- |
+  | tier 1 alone | — | 0.54 at 60–70% (≥ 1 single) | 1.2 × 10⁷ |
+  | k 4, 4–8 | 2,194 | 0.18 / 0.51 / 0.81 / 0.96 | 3.4 × 10⁶ |
+  | k 4, 4–12 | 3,930 | 0.24 / 0.51 / 0.82 / 0.96 | 3.6 × 10⁶ |
+  | k 4, 4–16 | 5,638 | 0.24 / 0.52 / 0.82 / 0.96 | 3.7 × 10⁶ |
+  | k 4, 4–32 | 12,348 | 0.24 / 0.53 / 0.82 / 0.97 | 4.0 × 10⁶ |
+  | k 4, 1–16 (overlapping) | 6,950 | 0.25 / 0.54 / 0.82 / 0.97 | 5.2 × 10⁶ |
+  | k 4, 8–16 | 3,884 | 0.18 / 0.50 / 0.81 / 0.96 | 3.5 × 10⁶ |
+  | k 4, 12–32 | 8,857 | 0.19 / 0.50 / 0.81 / 0.96 | 3.5 × 10⁶ |
+  | k 4, 4–16, read window +2 | 5,638 | 0.24 / 0.52 / 0.82 / 0.96 | 3.7 × 10⁶ |
+  | k 3, 3–16 | 6,432 | 0.25 / 0.54 / 0.82 / 0.97 | 5.4 × 10⁶ |
+
+  - **The follow-up keeps nearly every read tier 1 passes** and cuts chance about 3× (1.2 × 10⁷ to ~3.5 × 10⁶). The rest of the chance is homology that pairs share too.
+  - **The window barely matters for sensitivity.** 4–12 matches 4–32 with a third of the pairs and slightly less chance; 4–8 loses only at 50–60% identity.
+  - **Lower bounds:** overlapping pairs (from gap 1) add chance for nothing (a 4-mer pair at gap 1 is a 5-mer, which tier 1 already matched). Lower bounds of 8–12 lose a little at 50–60%. The lower bound should be k (non-overlapping).
+  - **A wider read window (+1, +2) changes nothing measurable** here: no cliff edge with window-gapped pairs on these relatives.
+  - **k 3 pairs add chance (5.4 × 10⁶) with no gain** over k 4.
+  - **Tier 1 is the sensitivity limit:** at 1 in 8 sampling, only 0.54 of reads at 60–70% pass it.
+- **2026-11-03 — combination modes again, window-gapped** (gap not hashed; pairs at gaps k to 12, triples of 3-mers non-overlapping within 12). Same four families; 135 queries, of which 16 / 31 / 34 / 54 are at 50–60 / 60–70 / 70–80 / ≥ 80% identity; 2,500 background proteins. The index is ~290 features per group (the conserved 5-mers' size):
+  - singles: conserved single k-mers;
+  - singles first: conserved singles in the index, then all of the group's conserved combinations, dense, in the follow-up (a read needs ≥ 1 single and ≥ s combinations; chance means both on the same background protein);
+  - sparse: conserved combinations only, hash-sampled 1 in m.
+
+  | Mode | Index features | ≥ 1 shared at 50 / 60 / 70% | ≥ 2 shared at 50 / 60 / 70% | Chance ≥ 1 | Chance ≥ 2 |
+  | --- | --- | --- | --- | --- | --- |
+  | single 5-mers | 293 | 0.76 / 0.97 / 0.98 | 0.65 / 0.92 / 0.97 | 6.1 × 10⁷ | 1.2 × 10⁷ |
+  | single 6-mers | 292 | 0.63 / 0.89 / 0.95 | 0.53 / 0.82 / 0.93 | 1.2 × 10⁷ | 6.4 × 10⁶ |
+  | single 7-mers | 292 | 0.50 / 0.80 / 0.91 | 0.36 / 0.66 / 0.83 | 6.3 × 10⁶ | 4.4 × 10⁶ |
+  | single 8-mers | 292 | 0.36 / 0.64 / 0.80 | 0.31 / 0.51 / 0.75 | 4.4 × 10⁶ | 3.1 × 10⁶ |
+  | 5-mers, then 3-mer pairs | 293 | 0.72 / 0.96 / 0.97 | 0.69 / 0.95 / 0.97 | 2.0 × 10⁷ | 1.3 × 10⁷ |
+  | 5-mers, then 4-mer pairs | 293 | 0.61 / 0.83 / 0.94 | 0.57 / 0.79 / 0.93 | 6.6 × 10⁶ | 5.7 × 10⁶ |
+  | 5-mers, then 3-mer triples | 293 | 0.55 / 0.86 / 0.94 | 0.51 / 0.84 / 0.94 | 6.8 × 10⁶ | 5.9 × 10⁶ |
+  | 6-mers, then 4-mer pairs | 292 | 0.56 / 0.79 / 0.93 | 0.53 / 0.76 / 0.92 | 5.8 × 10⁶ | 5.1 × 10⁶ |
+  | 6-mers, then 3-mer triples | 292 | 0.52 / 0.83 / 0.94 | 0.48 / 0.82 / 0.93 | 6.3 × 10⁶ | 5.5 × 10⁶ |
+  | 3-mer pairs, sampled 1 in 10 | 284 | 0.66 / 0.87 / 0.95 | 0.45 / 0.72 / 0.90 | 3.4 × 10⁷ | 5.4 × 10⁶ |
+  | 4-mer pairs, sampled 1 in 9 | 319 | 0.34 / 0.63 / 0.85 | 0.24 / 0.46 / 0.73 | 3.7 × 10⁶ | 2.2 × 10⁶ |
+  | 3-mer triples, sampled 1 in 27 | 287 | 0.30 / 0.53 / 0.78 | 0.17 / 0.39 / 0.67 | 3.1 × 10⁶ | 1.9 × 10⁶ |
+  | 4-mer pairs, dense (reference) | 2,596 | 0.61 / 0.83 / 0.94 | 0.57 / 0.79 / 0.93 | 7.8 × 10⁶ | 5.8 × 10⁶ |
+  | 3-mer triples, dense (reference) | 7,999 | 0.60 / 0.87 / 0.94 | 0.54 / 0.85 / 0.94 | 8.2 × 10⁶ | 6.6 × 10⁶ |
+
+  - **Singles first, then dense combinations in the follow-up, is the better use of the index.** At ~6 × 10⁶ chance (≥ 1), 5-mers then triples keep 0.86 at 60–70% and 5-mers then 4-mer pairs keep 0.83, against 0.80 for single 7-mers at the same chance and index size. That is a modest gain (+0.03 to +0.06), which costs no index space because the combinations are generated in the follow-up.
+  - **Sampled combinations in the index lose to longer singles** at equal chance: 4-mer pairs at 1 in 9 give 0.63 at 60–70% against 0.64 for 8-mers at a similar chance; triples at 1 in 27 give 0.53. Same as with exact gaps.
+  - **The follow-up adds nothing at 3-mer pairs** (5-mers then 3-mer pairs ≈ 5-mers alone at ≥ 2). 3-mer pairs are too common to filter.
+  - **The chance floor is ~5 × 10⁶ groups per read in every mode** (homology in the background), so a read-level k-mer test alone cannot reach a release-scale bar; that is for gather or EM downstream.
+- **2026-11-03 — held-out test and full-scale translation** (`recall.py holdout`: 200 proteins per bin of identity to their nearest remaining relative, 1.0 to 0.6, removed before the build; reads from them plus 251 k real background read pairs; recall = the nearest relative's leaf is a candidate).
+  - **On this measure, k-mer pairs after a loose tier 1 beat a tighter tier 1** (k 5, 8× index; recall at 85 / 80 / 75 / 70%): tier 1 at 30 bits, then k 4 pairs, keeps 5,679 groups at 0.92 / 0.92 / 0.74 / 0.68. Tier 1 at 40 bits keeps 5,082 at 0.77 / 0.69 / 0.49 / 0.41.
+  - **The k 4, 3× index's tier 1 loses reads:** at 30 bits, 0.81 at identity 1.0 and 0.26 at 80%. A 4-mer hit carries ~16 bits against a ~9-bit charge per further hit, so its floor has to be ~20 bits (queued).
+  - **Full scale: chance candidates per 10 M read pairs at release** (decoy leaves at each floor × 19,480 × 38; past the decoys seen, halving per bit):
+
+    | k 5, 8× tier 1 floor | Recall at 90 / 80 / 70% | Chance leaves per sample at release | Share of release |
+    | --- | --- | --- | --- |
+    | 30 bits | 0.96 / 0.93 / 0.78 | ~1.7 × 10¹⁰ | all |
+    | 40 bits | 0.91 / 0.69 / 0.41 | 1.4 × 10⁹ | 25% |
+    | 50 bits | 0.81 / 0.52 / 0.28 | 1.4 × 10⁸ | 2.5% |
+    | 60 bits | 0.72 / 0.45 / 0.22 | 1.1 × 10⁷ | 0.2% |
+    | 65 bits | 0.67 / 0.42 / 0.20 | 1.6 × 10⁶ | < 0.1% |
+
+  - **An on-the-fly follow-up does not scale after a low floor.** At ~850 sampled pair features per candidate (~7 KB), 10⁷ candidate leaves need ~70 GB, and below ~55 bits the candidates approach the whole release. A floor the follow-up can take (60–65 bits) keeps 0.42–0.45 at 80%. Either tier 1 must be far more specific per read at release scale, or the follow-up must be a stored index looked up directly by reads (no candidate set).
+  - **Release lookup sizes** (`recall.release_gb`, held-out builds): k 4, 3×: 277 GB; k 5, 8×: 494 GB; alignment data 214 GB each.
+- **2026-11-03 — the same modes with singleton groups** (each query's index is its nearest relative alone, every k-mer kept; same queries, reads and background; `results-local/kmer-modes-window-singleton.png`). Reads sharing ≥ 1, grouped / singleton:
+
+  | Mode | Features | 50–60% | 60–70% | 70–80% | ≥ 80% |
+  | --- | --- | --- | --- | --- | --- |
+  | single 5-mers | 293 / 210 | 0.76 / 0.73 | 0.97 / 0.93 | 0.98 / 0.95 | 1.00 / 0.97 |
+  | single 6-mers | 292 / 209 | 0.63 / 0.60 | 0.89 / 0.84 | 0.95 / 0.93 | 0.99 / 0.97 |
+  | single 7-mers | 292 / 208 | 0.50 / 0.50 | 0.80 / 0.73 | 0.91 / 0.89 | 0.99 / 0.97 |
+  | 5-mers, then 4-mer pairs | 293 / 210 | 0.61 / 0.54 | 0.83 / 0.80 | 0.94 / 0.91 | 0.99 / 0.97 |
+  | 5-mers, then 3-mer triples | 293 / 210 | 0.55 / 0.55 | 0.86 / 0.82 | 0.94 / 0.92 | 0.99 / 0.97 |
+  | 4-mer pairs, sampled | 319 / 197 | 0.34 / 0.34 | 0.63 / 0.60 | 0.85 / 0.80 | 0.98 / 0.97 |
+  | 3-mer triples, sampled | 287 / 211 | 0.30 / 0.25 | 0.53 / 0.53 | 0.78 / 0.73 | 0.97 / 0.96 |
+
+  - **The method does not rely heavily on groups:** singletons lose 0.00–0.07 in every mode, and the ranking of modes is unchanged (singles first then a dense follow-up ≳ longer singles > sampled combinations). Chance is the same (it depends on the reads and background only).
+  - **The grouped case here is mostly a union, not a soft intersection:** median group size 4 (mean 9.5, at most 30), and below 8 members one holder passes 25%. Grouped indexes have ~40% more features than singletons, which may account for much of the gain. A test of intersection itself needs larger groups at a matched feature budget.
+- **2026-11-03 — what sets the elbow in sensitivity against chance** (same queries, reads and 2,500 background proteins as the window-gapped modes; chance re-measured against residue-shuffled background, and real background hits split by whether the background protein aligns to the query, local BLOSUM62 11/1, E < 1e-3; `results-local/kmer-elbow.png`). Chance per read at release, ≥ 1 shared unless noted:
+
+  | Mode | Real | Shuffled | Homologous hits | Non-homologous hits |
+  | --- | --- | --- | --- | --- |
+  | single 5-mers | 6.1e7 | 4.4e7 | 1.4e7 | 4.7e7 |
+  | single 6-mers | 1.2e7 | 2.6e6 | 8.8e6 | 3.0e6 |
+  | single 7-mers | 6.3e6 | 1.0e5 | 6.1e6 | 2.0e5 |
+  | single 8-mers | 4.4e6 | 2.4e3 | 4.4e6 | 9.4e3 |
+  | 5-mers, then 4-mer pairs | 6.6e6 | 1.2e5 | 6.4e6 | 1.3e5 |
+  | 5-mers, then 3-mer triples | 6.8e6 | 6.2e4 | 6.7e6 | 4.7e4 |
+  | 4-mer pairs ≥ 2 | 5.8e6 | 5.6e4 | 5.8e6 | 4.6e4 |
+
+  - **The elbow is the background's homologs, not chance:** at and past the elbow (3–8e6), 93–100% of "chance" hits are background proteins that align to the query. True chance (shuffled, or non-homologous hits) keeps falling ~20× per k; the homologous part falls only ~1.4× per k. Every mode converges on the same homologs, hence one shared elbow.
+  - **Those homologs are distant and partial:** 349 of 2,500 background proteins (14%) align to some query; median identity 0.30 (90th percentile 0.54), median query cover 0.45 (shared domains); 0.6% are closer than the query's own nearest relative. These four families were chosen for distant relatives, so they sit in large superfamilies; the floor differs by family (≈ 3e6 for three, 2.7e7 for family 3).
+  - **Not grouping:** chance is computed against whole background proteins and is identical with singleton groups.
+  - **Consequence:** the vertical arm of the elbow cannot be pushed with more specific k-mer features without losing sensitivity at the same rate (a 50–70% target and a 30–50% homolog share the same conserved motifs). With homologs removed the curves are nearly flat to 1e3–1e5. This floor is real similarity for downstream (EM / greedy gather, alignment) to resolve, and should be reported as homologous hits rather than chance. Reversed-read decoys measure the true-chance part only.
+- **2026-11-03 — tier 1 noise floor: rarefaction and per-leaf chance** (exploratory; held-out sample, wide k 5, 8× index; per-read seeds at ≥ 25 bits for the 261,591 read pairs and their reversed decoys; scripts in the session scratchpad, `rarefy.py`, `sticky.py`).
+  - **(read pair, leaf) chance seeds grow linearly with reads, but distinct chance leaves do not.** Decoys, 1/64 → all reads (×64): leaves at 30 bits 3,371 → 23,364 (×6.9), at 40 bits 119 → 1,947 (×16), at 50 bits 8 → 192 (×24). Local exponent ~0.5 at 30 bits and ~0.7 at 40–50 bits. The real background reads give the same curves as the decoys up to 40 bits, so on the slice the background is chance.
+  - **The saturation is on the leaf side: some leaves are "sticky".** At 30 bits one leaf takes 3,680 decoy seeds, and the top 1% of decoy-seeded leaves take 25–35% of the seeds. Stickiness persists between independent halves of the decoys (70–91% of half B's leaves are also in half A). So the linear ×38 in reads in the full-scale table overstates distinct chance leaves (~×13 at 0.7, ~1.5 bits). The ×19,480 in proteins is unaffected.
+  - **Rules at matched chance** (chance = decoy half B's leaves; recall at 90 / 80 / 70%, with group expansion):
+
+    | Rule | Candidates (reps) | Chance leaves | Recall 90 / 80 / 70% |
+    | --- | --- | --- | --- |
+    | one read pair ≥ 40 bits | 5,082 | 2,438 | 0.91 / 0.69 / 0.41 |
+    | one read pair ≥ 45 | 3,577 | 1,046 | 0.86 / 0.59 / 0.34 |
+    | one read pair ≥ 50 | 2,577 | 186 | 0.81 / 0.52 / 0.28 |
+    | per-leaf penalty, ≥ 35 | 7,286 | 4,414 | 0.93 / 0.74 / 0.47 |
+    | per-leaf penalty, ≥ 40 | 4,000 | 880 | 0.90 / 0.66 / 0.38 |
+    | per-leaf penalty, ≥ 50 | 2,314 | 44 | 0.79 / 0.51 / 0.26 |
+    | ≥ 2 read pairs ≥ 35 | 10,343 | 5,476 (×4) | 0.87 / 0.68 / 0.43 |
+    | ≥ 2 read pairs ≥ 40 | 4,214 | 1,157 (×4) | 0.83 / 0.58 / 0.32 |
+
+    The per-leaf penalty is score − log2(1 + the leaf's decoy read pairs at ≥ 25 bits), learned on half A. At matched chance it gains ~+0.07 at 80%, i.e. 3–4× fewer chance leaves (~2 bits). Requiring two read pairs is worse than a single-read bar: sticky leaves get many chance reads, and true proteins at low depth have only one.
+  - **Not measured:** read-side redundancy at depth. 261 k read pairs is shallow, and 1-in-64-sampled protein 5-mers saturate the k-mer space, so that curve says nothing. It needs a real 10 M read-pair sample (HPC).
+- **2026-11-03 — what makes tier 1 leaves sticky** (same held-out run; `why_sticky.py`, `fix_sticky.py`, `codon_decoy.py`, `pen_transfer.py` in the session scratchpad).
+  - **Mostly the leaf's target size.** The 3,695 representatives with ≥ 20 decoy seeds at 30 bits (16% of decoy-seeded leaves, 72% of seeds) hold a median of 47 keys, against 15 for the rest. They are longer (275 aa against 187 aa) and not low complexity (3% of residues in low-entropy windows, the same as the rest). Keys held is the best predictor of decoy seeds (Spearman 0.53). The evidence score charges log2(windows) per extra hit, but nothing for the number of keys the leaf offers. At 40–50 bits, these leaves are 62–72% of decoy leaves. The decoy leaves have a median of 40–51 keys, against 30–32 for the sample's leaves.
+  - **Partly hot keys.** Composition bits predict decoy hits per key within ~2× by bit bin (observed/expected 0.57–2.0). But the top 1% of keys take 19% of hits. Homopolymers and repeats run 50–1,000× over their estimate (GGGGG, PPPPP, PPGPP, RGGGG). Keys with ≤ 2 distinct residues are 1,117 keys and 2% of hits.
+  - **The decoy construction does not matter for the floor.** 15.6% of reversed-read decoy hits fall on keys that real reads rarely hit (> 10× the sample's, e.g. EARVL 5,985 against 19). Reversing codon order instead keeps codon usage and lowers that share to 10.6%. But the decoy leaves at every bar from 30 to 60 bits are the same within noise (40 bits: 1,947 against 1,999; 50: 192 against 190).
+  - **Fixes at matched chance** (decoy leaves, the reversed-read decoys; recall at 90 / 80 / 70%):
+
+    | Variant | Chance 2,000 | Chance 500 | Chance 200 | Chance 50 |
+    | --- | --- | --- | --- | --- |
+    | today | 0.91 / 0.69 / 0.41 | 0.82 / 0.56 / 0.32 | 0.81 / 0.52 / 0.28 | 0.78 / 0.47 / 0.25 |
+    | mask keys with ≤ 2 distinct residues | 0.90 / 0.69 / 0.41 | 0.82 / 0.56 / 0.32 | 0.81 / 0.53 / 0.28 | 0.78 / 0.48 / 0.25 |
+    | key bits recalibrated on background reads | 0.90 / 0.69 / 0.41 | 0.83 / 0.57 / 0.30 | 0.81 / 0.54 / 0.29 | 0.77 / 0.50 / 0.26 |
+    | leaf size charge, 2 · log2(keys / median) | 0.90 / 0.69 / 0.41 | 0.85 / 0.58 / 0.33 | 0.81 / 0.53 / 0.28 | 0.77 / 0.49 / 0.24 |
+    | per-leaf offset, 2 · log2(1 + decoy read pairs ≥ 25 bits), learned on codon-reversed decoys | 0.92 / 0.70 / 0.42 | 0.88 / 0.67 / 0.35 | 0.85 / 0.60 / 0.32 | 0.81 / 0.52 / 0.28 |
+
+  - **Only the measured per-leaf offset helps:** +0.11 at 80% at 500 chance leaves, +0.08 at 200 and +0.05 at 50. That is today's 2,000-chance recall at a quarter of the chance. It was learned on one decoy set and tested on another (codon-reversed against base-reversed), but both come from the same sample's reads. The analytic proxies (key count, hot keys) move the floor ≤ 0.03, within noise (~200 proteins per bin). True relatives are large leaves too, and only a minority of decoy hits are hot.
+  - **At release**, a per-leaf offset would be a build-time pass: tier 1 over a standard decoy read set (reversed reads of a few real metagenomes), stored as one byte per leaf. Its rate per leaf does not depend on database size, so a few million decoy read pairs should identify sticky leaves at any scale. Not yet shown: transfer across samples, which needs decoys from a different metagenome than the sample (HPC).
+- **2026-11-03 — 6-mer and 5-mer tier 1 at 30 bits, then dense 3-mer triples** (held-out sample; triples of 3-mers, consecutive ≥ 3 apart, span ≤ 12, gaps not hashed, no sampling, no conservation, from the representatives; `pairs.py --combo 3`). Recall at identity 1.0 / 0.95 / 0.9 / 0.85 / 0.8 / 0.75 / 0.7 / 0.6:
+
+  | Tier 1 | Groups at 30 bits | Recall, tier 1 | Groups after triples | Recall after triples |
+  | --- | --- | --- | --- | --- |
+  | k 6, 4× | 4,657 | 0.95 / 0.92 / 0.85 / 0.74 / 0.59 / 0.38 / 0.33 / 0.21 | 3,664 | same (0.20 at 0.6) |
+  | k 5, 8× | 25,587 | 1.00 / 0.98 / 0.96 / 0.93 / 0.93 / 0.77 / 0.78 / 0.71 | 9,465 | 1.00 / 0.98 / 0.96 / 0.92 / 0.93 / 0.77 / 0.77 / 0.60 |
+
+  - **Triples cut chance, not homologs.** The triple bar (release chance scale) lets no decoy group through, so groups kept are homologous matches: to held-out proteins' relatives or to the background reads' own families. The k 5 index reaches 2.6× more of them, and its recall at 80% is 0.92 against 0.59.
+  - **Chance per read at release (30 bits):** k 6: 112 groups; k 5: 1,740. Seeds land on group representatives, so these are groups, not leaves.
+  - **Full-scale estimates per 10 M read pairs** (chance linear in proteins; homolog groups ×10 for release density and ×38 for reads as upper bounds; evidence cost ~50 ns per posting event, release posting lists from local postings × 19,480 over the possible k-mers; an anchored triple check ~50 µs per (read, group)):
+
+    | | k 6, 4× | k 5, 8× |
+    | --- | --- | --- |
+    | Release index (lookup + alignment data) | 320 + 214 GB | 494 + 214 GB |
+    | Tier 1 chance checks | ~1.1 × 10⁹ | ~1.7 × 10¹⁰ |
+    | Tier 1 evidence | ~10 CPU-h | ~450 CPU-h |
+    | Triple checks | ~17 CPU-h | ~240 CPU-h |
+    | Groups after triples (homologous) | ≤ ~1.4 M | ≤ ~3.6 M |
+    | Recall at 80% / 75% (local less the slice's offset, 0.04 / 0.1) | ~0.55 / ~0.28 | ~0.88 / ~0.67 |
+
+  - **Measured times:** dense triples unanchored, all 12 frames: ~1 ms (k 6) to ~1.9 ms (k 5) per read pair; triple index 38 M (k 6) and 196 M (k 5) entries for 4.7 k and 25.6 k candidates; peak 2.1 and 6.6 GB.
+- **2026-11-03 — per-group offsets and a policy for low-information keys** (same run; `kmer_policy.py`, session scratchpad). Every seeded position in this index is a layer representative (100% of decoy-seeded positions), so the per-leaf offset above is already per representative (45,502 of 292,634 positions here, ~16%). Stickiness follows group size by construction: `--layer-keys sqrt` gives a group keys in proportion to √members. Sticky reps have a median group of 9 members and 43 keys, against 1 member and 15 keys for the rest (Spearman: seeds against group size 0.42, keys against group size 0.73).
+  - **Key information is measured, not modelled:** −log2(hits per window in a training set) − log2 g. The training set is the codon-reversed decoys or the real background reads forward. Measured information starts at ~15 bits (0.1% quantile 15.3, 1% 17.1, 10% 19.3), so on this index every key's hit is worth more than the 8.9-bit per-hit charge, and a threshold at the charge drops nothing.
+  - **Recall at 80% at matched chance** (chance = base-reversed decoy leaves 2,000 / 500 / 200 / 50; postings dropped):
+
+    | Policy | Dropped | 2,000 | 500 | 200 | 50 |
+    | --- | --- | --- | --- | --- | --- |
+    | today | 0 | 0.69 | 0.55 | 0.52 | 0.47 |
+    | group offset, log2(members) | 0 | 0.68 | 0.58 | 0.54 | 0.48 |
+    | per-rep offset (decoy-measured) | 0 | 0.69 | 0.66 | 0.60 | 0.52 |
+    | drop measured < 16 / 17 / 18 / 19 bits (background) | 1.3 / 3.0 / 6.5 / 12% | 0.68 / 0.67 / 0.66 / 0.66 | 0.55 / 0.55 / 0.55 / 0.52 | 0.51 / 0.50 / 0.49 / 0.47 | 0.47 / 0.49 / 0.47 / 0.46 |
+    | drop hot keys, > 4× / > 2× composition's rate (background) | 3.7 / 9.0% | 0.69 / 0.68 | 0.57 / 0.56 | 0.52 / 0.52 | 0.50 / 0.49 |
+    | recalibrate, bits = min(composition, measured) (background) | 0 | 0.69 | 0.57 | 0.54 | 0.50 |
+    | recalibrate + per-rep offset | 0 | 0.69 | 0.66 | 0.61 | 0.53 |
+    | drop hot > 4× + per-rep offset | 3.7% | 0.69 | 0.67 | 0.60 | 0.51 |
+
+    Codon-decoy training gives the same within 0.02 (dropping by information loses a little more at 18–19 bits).
+  - **Dropping keys never lowers the floor;** beyond ~4% of postings it costs recall. Promiscuous keys are not what limits tier 1 on this index: they are few, and the bits already discount them. Recalibration and the analytic group offset are within noise (+0.02–0.03). The decoy-measured per-rep offset is the only real gain, and adding the key policies on top changes nothing.
+  - **Policy:** (1) recalibrate key bits to min(composition, measured on real background reads). It is free and never adds bits. (2) For index size only, drop keys measured > 4× hotter than composition (3.7% of postings, no loss). (3) Drop keys whose measured bits at release g fall below the per-hit charge (`--min-key-bits auto`). They cost more than they add. Untested here: at release, g of common k-mers grows with the database, so many more keys may fall below the charge.
+  - **Parked (2026-11-03, the user's decision): incremental gains (~2 bits, a 4× cut in chance candidates), not pursued now.** If taken up: a build-time per-rep offset from a standard decoy read set (one byte per representative, applied in `query.evidence`), key bits recalibrated to min(composition, measured), and an HPC test of transfer across metagenomes.
+- **2026-11-03 — what database scale offers tier 1** (the user's question: use the advantages of scale so tier 1 stops degrading with n leaves; exploratory; held-out run, wide k 5, 8×; scripts `prior.py`, `rarefy_nn.py`, `soft.py`, `close_miss.py` in the session scratchpad).
+  - **The cost of scale, in score units:** at release, chance candidates fall ~10× per 10 bits of bar (40 → 50 bits) and ~7× per 5 bits (60 → 65), so each doubling of the database costs ~2–3 bits of bar at matched chance. Nothing tried so far changes that slope; levers so far shift it by ≤ 2 bits.
+  - **Scale moves new proteins from "no relative" straight to "near-identical".** 1,500 uniform mini-slice proteins, nearest other member by local alignment (cover ≥ 0.8), database subsampled:
+
+    | Database | Median identity | ≥ 0.98 | ≥ 0.9 | 0.6–0.9 | No relative | 90% singletons (Good–Turing) |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 1/64 | 0.47 | 0.24 | 0.34 | 0.10 | 0.41 | 0.55 |
+    | 1/16 | 0.96 | 0.43 | 0.58 | 0.10 | 0.18 | 0.36 |
+    | 1/4 | 0.99 | 0.62 | 0.76 | 0.07 | 0.08 | 0.21 |
+    | 1/2 | 0.99 | 0.71 | 0.82 | 0.06 | 0.05 | 0.15 |
+    | 1/1 | 0.995 | 0.76 | 0.86 | 0.045 | 0.05 | 0.11 |
+
+    The share without a ≥ 90% relative falls ~0.76× per doubling; the 60–90% band thins only from 0.10 to 0.045 over 64×. The 90%-singleton share tracks the measured unseen share (Good–Turing), a little low (0.11 against 0.14). MGnify-wide it is 21% (1.22 × 10⁹ of 5.74 × 10⁹), so at release about one protein in five lacks a ≥ 90% relative, more in under-sampled biomes. This mini-slice is denser than the release average.
+  - **Recall under natural draws, not uniform identity bins.** The held-out bins (200 each) weight the 60–90% band ~20× above its natural share. Reweighted to the 1/1 distribution, recall at the release decoy bar (78.5 bits) is ~0.79, against ~0.90 at 30 bits. Of the recoverable loss (~0.16): near-identical relatives (≥ 0.98) ~0.05, 0.9–0.98 ~0.03, 0.6–0.9 ~0.03, < 0.6 ~0.04 (none ~0.05 is out of reach). **At scale, half the loss is reads with a ≥ 90% relative.** At 55 bits, 19 of 400 proteins with a ≥ 98% relative miss, with 1–7 reads and scores of 0–45. Their groups are large (median ~40 members, up to ~1,400): the sparse wide-k layer spreads √m keys over a big group, and a near-identical member may hold few of them.
+  - **Database priors per group do not help at matched chance** (decoy half A for offsets, half B for chance; recall at 80% at chance 2,000 / 500 / 200 / 50):
+
+    | Variant | Recall at 80% | All bins, chance 500 |
+    | --- | --- | --- |
+    | base | 0.71 / 0.59 / 0.55 / 0.51 | 0.66 |
+    | prior, + log2 members | 0.71 / 0.56 / 0.52 / 0.47 | 0.65 |
+    | novelty, − log2 members | 0.70 / 0.64 / 0.58 / 0.51 | 0.69 |
+    | per-rep decoy offset | 0.74 / 0.68 / 0.65 / 0.56 | 0.72 |
+    | offset + prior or novelty | within ±0.02 of offset | 0.70–0.72 |
+    | group score summed over reads | 0.48 overall at 2,000 | — |
+
+    Decoy-hit reps are large groups (median 9 members against 1 for all reps), and divergent relatives sit in small ones (a third are singleton groups at ≤ 0.75, against 1.5% at 1.0). A size prior therefore works against itself. The novelty weight gains up to +0.05, a weaker form of the offset (both charge large groups), and adds nothing on top of it; only the measured per-rep offset helps, as before. Summing evidence over reads lets sticky reps accumulate chance and is much worse.
+  - **Soft intersection is not what loses k-mers; threshold-then-random thinning is.** Groups of ≥ 8 members holding a held-out protein's relative; share of a group's n keys that the held-out protein holds (equal n means equal composition chance: 2.2–2.3× uniform for every selection):
+
+    | Keys (n = 32) | 1.0 | 0.9 | 0.85 | 0.8 | 0.75 | 0.7 | 0.6 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | union, least hash | 0.25 | 0.21 | 0.20 | 0.13 | 0.13 | 0.10 | 0.08 |
+    | share ≥ 0.25, least hash (today) | 0.63 | 0.52 | 0.45 | 0.32 | 0.27 | 0.19 | 0.15 |
+    | the nearest relative alone | 0.77 | 0.60 | 0.48 | 0.35 | 0.26 | 0.21 | 0.15 |
+    | top n by member frequency | 0.85 | 0.72 | 0.62 | 0.48 | 0.38 | 0.28 | 0.23 |
+
+    Ranking by frequency gives 1.4–1.5× today's hits per key at 0.6–0.9 (1.3× the best single member), at n 32 and 128. For queries at 0.6–0.9 it holds in every group size (8–15 members: 1.37×; > 120: 1.48×), while the union falls from 0.21 to 0.06 as groups grow. Weighting members by 1 / their MGnify90 cluster changes ≤ 0.03 (layer groups hold only 2–5 MGnify90 clusters). Since `allocate` thins by least hash per unit, the query already probes every read 5-mer; ranking keys by frequency is a build change only.
+  - **Implications for a scale-robust tier 1:**
+    1. Frequency-ranked group keys (soft intersection as a ranking, not a threshold) are the clearest per-key gain found so far, and the one that improves as groups fill in. Next: `allocate` ordered by member share, rebuilt on the held-out run, recall at release chance.
+    2. A cascade by read, not by region: a specific tier for the ≥ 90% majority, and the sensitive tier only on reads without a strong specific hit. Chance ∝ reads tested × groups, and the share needing the sensitive tier falls ~0.76× per doubling, so chance growth per doubling drops from 2× to ~1.5×. Region-level priors gave nothing at matched chance.
+    3. Homologous "chance" (the elbow) is resolved by competition once the closer relative is indexed, which scale guarantees for most reads; that is for gather/EM, not the bar.
+- **2026-11-03 — per-read binning: estimates for the user's five ideas, and a plan** (the user's ideas: (1) frequency/density-ranked group keys; (2) an information bar on reads; (3) high-AAI matching first, then a sensitive mode, ideally from one index; (4) confident matches used to place unconfident reads; (5) a sensitive, CPU-heavier pass on the rest. Same held-out run; `stage2.py`, `density.py` in the session scratchpad).
+  - **Read-level evidence today.** Representatives hold a median of 4.3 keys per 50 aa (10th percentile 1.5). A held-out read pair hits a mean of 14.7 keys on its true group at identity 1.0, 5.6 at 0.9, 3.4 at 0.8 and 1.2 at 0.7. Score ≈ 9 + 8 bits per hit, so the release bar (90.5 bits at 1% decoy share × 19,480) needs ~10 hits. Reads confidently assigned to the nearest relative's group: 0.77 / 0.46 / 0.29 / 0.13 / 0.02 at 1.0 / 0.95 / 0.9 / 0.8 / 0.7.
+  - **Modelled gains at the same bar** (score = 9 + b per hit fitted per read; it reproduces today's rates within 0.02):
+
+    | Reads confident at | 1.0 | 0.95 | 0.9 | 0.85 | 0.8 | 0.75 | 0.7 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | today | 0.77 | 0.46 | 0.29 | 0.20 | 0.13 | 0.03 | 0.02 |
+    | (1) keys ranked by frequency (hits × 1.35–1.5) | 0.82 | 0.58 | 0.41 | 0.29 | 0.26 | 0.10 | 0.07 |
+    | (3) diagonal chaining (+5 bits per chained hit) | 0.86 | 0.60 | 0.43 | 0.30 | 0.23 | 0.09 | 0.05 |
+    | both | 0.87 | 0.67 | 0.54 | 0.39 | 0.36 | 0.17 | 0.13 |
+
+    Under natural draws (Progress log above: 76% of proteins have a ≥ 98% relative), the confident share of reads with a relative goes from ~0.61 to ~0.72. The +5 bits is log2(rep length / diagonal band) ≈ log2(250 / 7); decoy hits rarely chain, so holding the bar fixed is conservative. Read hits carry no offsets yet (`FastxHits`: read, mate, frame, hash); chaining needs them, plus a 2 B offset per posting.
+  - **(4) Re-scoring unconfident reads against confirmed groups only:** 1,032 reps confirmed at stage 1. The stage-2 bar, scaled by |C at release| / |C here| for 10⁵–10⁷ confirmed groups, is 65–72.5 bits (against 90.5). It adds +0.04–0.08 of reads per bin. But as many reads went to a wrong confirmed group as to the right one (437 against 432), so stage 2 needs competition among confirmed groups (best group, or EM) and an expected-score model per region, not only a lower bar.
+  - **(5) Cost of the sensitive pass on what is left:** at a 30-bit floor, the k 5, 8× index costs ~450 CPU-h of evidence plus ~240 CPU-h of triple checks per 10 M read pairs (estimates above). On a 30–45% leftover that is ~200–300 CPU-h, and chance per read still grows with the database (~1.5× per doubling once fewer reads are left). Per-read caps (top candidates per read, then anchored alignment at ~50 µs each) keep it bounded: ~1,700 chance groups per read at 30 bits is ~85 ms per read.
+- **2026-11-03 — follow-up from the stored keys alone** (`pairs.py --key-derived`: 3-mer pairs from the 3-mers inside each group's tier 1 keys, at their positions on the representative; held-out sample, tier 1 at 30 bits). Recall at 80%, k 5, 8× index: 0.46 / 0.52 / 0.46 / 0.42 at spans 12 / 16 / 24 / 32 (189–551 entries per group), against 0.93 for dense triples from the whole sequence (7,675 per group). k 6, 4×: at most 0.31, against 0.59. Keys are ~12 (k 5) and ~24 (k 6) residues apart, so a read covers few of them. Wider windows raise the chance bar faster than they add matches. The existing k 4, 3× index is sparser still (one key per ~32 residues). Dense 4-mer anchor indexes (protein and murphy15 in 16 bits, window 4, key budget ~40) were started and then stopped before results.
+- **2026-11-03 — a 90%-AAI tier 1: verified anchors, index size and scaling** (the user's direction: target 90% AAI with a much smaller index; out-of-index misses are an index problem, not kfp's; show how the method scales with ever larger databases. Recall at "1× depth" means measured depth: a protein's reads tile it about once. Held-out run; `scheme90.py`, `scale90.py` in the session scratchpad).
+  - **Scheme.** Single k-mer anchors, hash-sampled 1 in m, on group representatives (layer groups) only. Each anchor is verified by ungapped identity on its diagonal against the representative's sequence (alignment data, external). Read pairs are 2 × 50 aa (gap 0–40) from held-out proteins, at a known identity to their nearest indexed relative. Chance comes from reversed mates.
+  - **Sensitivity barely depends on k at m ≤ 8; chance falls ~10× per k.** Read pairs with a verified anchor on the true group, at release scale (chance anchors per read pair ×3 frames):
+
+    | k | m | Release postings | Chance anchors per pair | 0.95 | 0.9 | 0.85 | 0.8 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 6 | 8 | 3.0 × 10¹⁰ | 4.6 × 10⁵ | 0.96 | 0.96 | 0.97 | 0.93 |
+    | 7 | 8 | 3.0 × 10¹⁰ | 3.3 × 10⁴ | 0.95 | 0.95 | 0.96 | 0.90 |
+    | 8 | 8 | 3.0 × 10¹⁰ | 1,870 | 0.95 | 0.96 | 0.94 | 0.87 |
+    | 9 | 8 | 3.0 × 10¹⁰ | 274 | 0.94 | 0.95 | 0.93 | 0.82 |
+    | 8 | 16 | 1.5 × 10¹⁰ | 773 | 0.91 | 0.90 | 0.84 | 0.72 |
+    | 9 | 16 | 1.5 × 10¹⁰ | 129 | 0.88 | 0.86 | 0.80 | 0.65 |
+
+    (Verification here required min(τ, 0.6 × mate) identities. Every member as a target instead costs ~6× the postings, 1.7 × 10¹¹ at k 8, m 8.) The ~0.96 ceiling against representatives is the representative's distance from some members of large, chained groups, not the k-mers.
+  - **Verification removes chance at any scale.** Identities in 50 aa needed so that a read pair has ≤ 0.01 false verified anchors: 20 (0.40) at 10³ candidates per pair, 23 (0.46) at 10⁶, 27 (0.54) at 10¹⁰, i.e. 10⁷× today's database. Reads at 90% AAI sit at a median of 0.90 identity per mate window (75th percentile 0.96). Across all runs, 0–1 of 21,513 decoy mates verified.
+  - **Scaling (k 9, the database's other groups subsampled 1/16 → 1, each read's true group kept):**
+
+    | m | Database | Groups | Verified groups per pair | Pair recall 0.9 | Recall at 1×, 0.95 / 0.9 / 0.85 | True group best, 0.9 | Ambiguous (≥ 2 within 2 identities), 0.9 |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 8 | 1/16 | 3,696 | 2.7 | 0.97 | 0.996 / 0.994 / 0.981 | 0.94 | 0.08 |
+    | 8 | 1/4 | 12,057 | 5.5 | 0.97 | 0.997 / 0.993 / 0.979 | 0.91 | 0.16 |
+    | 8 | 1 | 45,502 | 16.1 | 0.97 | 0.997 / 0.993 / 0.98 | 0.79 | 0.36 |
+    | 16 | 1/16 | 3,696 | 2.0 | 0.88 | 0.974 / 0.943 / 0.916 | 0.86 | 0.07 |
+    | 16 | 1 | 45,502 | 10.4 | 0.88 | 0.974 / 0.945 / 0.915 | 0.73 | 0.35 |
+
+    (Here τ = 24 identities absolute.) Detection (pair recall, recall at 1×, false verified) is flat with database size. What grows: chance anchors per pair (linear: 0.001 → 0.014 locally, ~274 at release for k 9, m 8), verified homologous groups per pair (2.7 → 16 over 12× groups), and ambiguity. The true group's best-identity rank falls ~0.04 per doubling at 0.9 and the ambiguous share rises ~0.07 per doubling. **At scale, the limit is assignment among close groups, not detection.**
+  - **Index size at recall 0.95 at a measured 1× (90% AAI):** k 9 at m ≈ 12 (between 0.993 at m 8 and 0.945 at m 16): ~2 × 10¹⁰ postings at the mini-slice's representative share (0.155 per protein; up to 2× at the release's 0.313). At ~6 B per posting (group id 31 bits, offset 10 bits, Elias–Fano keys ~6 bits), that is **~120 GB (up to ~240 GB)**; m 8 for margin is 180 GB (up to 360 GB). Representative sequences for verification are external (MGnify store), ~2 × 10¹¹ residues. Dropping offsets (find the anchor in the representative during verification) saves ~25%. Today's wide k 5, 8× is 494 GB lookup plus 214 GB alignment data, for 0.59 recall at 0.9 at its release bar.
+  - **Growth of the index with the database:** MGnify90 units against proteins in the mini-slice, subsampled 1/64 → 1, grow with a local exponent falling from 0.81 to 0.59 (units per protein 0.67 → 0.19). Postings follow groups, so the index grows sublinearly (~N^0.6 at this density). Verification CPU follows chance anchors (∝ N per read, ÷10 per k) plus verified homologs.
+  - **The gather model (the user's question: a per-group model of match scores, and of scores for reads matching that group).** Realistic, because every candidate is verified: each read has an identity (matches m over aligned n) on every group it anchors to, so cross-matches are observed rather than modelled. Proposed model: a mixture over present groups with abundance π_g and one divergence δ_g per group (the sample's strain against the indexed representative). P(read | g) = BetaBinomial(m; n, 1 − δ_g, ρ), where ρ absorbs conservation varying along the protein; a group-wide conservation profile is an option. EM over (π, δ) on the sparse read × candidate matrix, as Salmon or Pathoscope do with alignment scores. The explicit "expected score of g's reads on h" is only needed where an anchor was missed: P(no anchor on h | read from g) from the sampling rate and the g–h identity of that window (computable from the representatives' alignment, needed only for co-hit pairs). An "unseen relative of g" component (larger δ) holds reads below every present group's expectation. Next: a community simulation at release-like density, EM against best-identity assignment, scored by group abundance and read assignment.
+- **Phase 4: scoring without fixed units (2026-11-04, the user's request: the next phase in the plan).** Taken as phase 4, the first numbered phase not marked done, whose scoring was recorded as not written (HPC runs, 2026-11-02). The last entry's community simulation is a separate next step and was not started. Code only: no gate result yet.
+  - **`nearest.py`, three steps.** `reported`: a tree tier's tier 1 (candidate leaves, groups expanded) and tier 2, or today's tier 1 (`kfp query --aai`, every hit unit expanded to its members), as units with an abundance and their sequences. `score`: from DIAMOND's strains against reported (`--more-sensitive --id 50 --query-cover 50`, all targets), the nearest-match curves (overall, by depth and identity), read-outs at 99, 95, 90 and 80%, earth mover's distance, roll-ups (MGnify90 through membership; `--rollup name=parquet` for Pfam and KOfam), AAI against true identity, and the neighbour rule's reach on spikes with no own hit. `gate`: each tree run against the flat tier of its name.
+  - **Choices.** A unit's identity to a strain is its best member's, so a large MGnify90 unit gets credit for any near member: the plan's like-for-like expansion, and the Pitfall above applies. Earth mover's distance is 1 − the most identity-weighted flow over hits, a sparse LP with cost 1 for a pair without a hit. It is exact, and its time on a large sample is unmeasured. "Recall at matched precision" is the most recall at any cut of the abundance ranking with precision ≥ tier 1's, at tier 1's whole hit list. Roll-up labels rank as their most abundant unit and are counted per label, so a family with many leaves counts once. Query cost is wall seconds from each method's own stats, the tree's including its decoy pass.
+  - **`build.nf`.** `--built <dir> --members <table>` runs TARGETS to SCORE on built tiers, then FLAT, REPORTED, ALIGN, NEAREST and GATE; `--phase4` does the same after a build. `--built` rather than `-resume` because any script change reruns a build from PARTITION. `hpc/kfp-ablations/tree-index-benchmark/run.sh` runs it on `tree-index-build`'s tiers.
+  - **Checked (fixture, 320 proteins, 50 strains; Docker's DIAMOND).** Both entries run through to `gate.tsv`; the `tree-standard` rows compared between them (the first five) match. Flat recall at ≥ 99% is 0.12 against a ceiling of 1/8 (one identity bin in eight is 100%), and at ≥ 80% it is 0.62 against 6/8. `tests/python/test_tree_nearest.py` checks the ranking curve and the distance on hand-worked cases, including one where a greedy pairing would be wrong. The fixture's gate rows are not evidence about the method: the sample is far too small.
+  - **Not covered yet.** Strains with no background: `fmh-benchmark` and `presence-calibration`'s spike-in on `hadza10M` are not scored, because a background read's call has no truth for the precision side. No KOfam roll-up (the option is there; the subset has no KOfam table). Neighbour rule: no comparison with the main plan's index-level neighbour graph, and not how often true divergence exceeds *d̂⁺*. Tiers are paired by name, so "matched index size" is only reported, as the index-size row. `FLAT` takes one members table, so the release's buckets (phase 5) need a change. *Pending: the user's HPC run of `tree-index-benchmark`.*
+- **Phase 6b closed: spaced seeds give no gain on real homologues (2026-11-04, the user's request).** Per-layer bars and ungapped verification were already done (2026-10-31), so spaced seeds were the open item. `spaced.py` (session scratchpad): real nearest relatives from `data/mini-slice-100k` (local alignment, cover ≥ 0.8), read pairs of 2 × 50 aa (gap 0–40), no sequencing errors. Each pair's distinct seeds shared with its relative give recall at any sampling rate m exactly, as 1 − (1 − 1/m)ⁿ. Shapes were searched on one half of the proteins (span up to weight + 6, weight + 4 at w 7, weight + 3 at w 8) and read on the other. Share of read pairs with a hit at m 8:
+
+    | Weight | Seed | Chance per target | 0.95 | 0.9 | 0.85 | 0.8 | 0.75 | 0.7 |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 5 | `11111` | 1.09 × 10⁻² | 1.000 | 0.999 | 0.988 | 0.984 | 0.975 | 0.928 |
+    | 5 | `110111` | 1.02 × 10⁻² | 1.000 | 0.999 | 0.989 | 0.984 | 0.970 | 0.918 |
+    | 6 | `111111` | 8.75 × 10⁻⁴ | 0.999 | 0.998 | 0.986 | 0.962 | 0.947 | 0.866 |
+    | 6 | `1101111` | 7.65 × 10⁻⁴ | 0.999 | 0.998 | 0.985 | 0.961 | 0.940 | 0.856 |
+    | 7 | `1111111` | 7.0 × 10⁻⁵ | 0.999 | 0.996 | 0.982 | 0.925 | 0.906 | 0.797 |
+    | 7 | `11011111` | 5.8 × 10⁻⁵ | 0.999 | 0.996 | 0.981 | 0.929 | 0.897 | 0.792 |
+    | 8 | `11111111` | 3.3 × 10⁻⁶ | 0.999 | 0.994 | 0.978 | 0.885 | 0.853 | 0.722 |
+    | 8 | `110111111` | 8.3 × 10⁻⁶ | 0.999 | 0.993 | 0.976 | 0.889 | 0.841 | 0.724 |
+
+  - **Reading.** At weights 5–7 the search itself ranked the contiguous seed first, and at every weight the best spaced shape is within 0.01 at ≥ 0.8 and at most 0.012 below or 0.004 above it at 0.75–0.7. Spaced seeds earn their gain from independent substitutions; real conservation is clustered, so contiguous seeds lose little. Index changes are not worth making. Chance per target differs by up to ~20% at weights 5–7; the counts at weight 8 are too few to read.
+  - **Limits.** Few proteins at low identity: of 754 relatives, 46, 49 and 31 are in the 0.7, 0.75 and 0.8 bins, half of them in the test half, each with up to 4 read pairs (so ±~0.03 there). Read pairs carry no sequencing errors and are protein-level.
+- **Phase 6: nothing in the index depends on MGnify's clustering (2026-11-04, the user's request).** `slice.py generic` (new) writes a members table with each protein its own cluster, from a FASTA or from an existing table. `data/mini-slice-100k` (96,617 proteins, 18,316 units) was built as `standard` with and without its clusters.
+  - **Index:** the 11 index arrays compared (`hash`, `lo`, `hi`, `sign`, `kind`, `node_lo`, `node_hi`, `layer_group`, `edge_a`, `bits`, `kcode`) are byte-identical; 127,978 postings either way. Only `proteins.parquet`'s `cluster_rep` is meant to differ.
+  - **On the same reads** (500 strains, the clustered run's): tier 1's candidates (`cand_verify_0.01`) and tier 2's presence are byte-identical, and all 205,174 of tier 2's read calls match. Only unit-level scores change, as they must: with singleton units, `detected_depth1` and `cand_unit_precision` fall because "the right unit" now means the one protein.
+  - **Side finding:** `recall.py targets` picked different proteins in the two runs (cause not traced; it joins with `proteins.parquet` before sampling), so `bench.tsv`'s two runs are not the same strains. Their recall bins differ by up to 0.09 on ~60 strains each: sampling, not the index. Not fixed, because sorting first would change the strains of future runs against past ones.
+  - **CARD (version 4.0.2), a set from outside MGnify.** The protein FASTAs of the homolog, variant, overexpression and knockout models pooled: 6,329 proteins, no clustering, through `build.nf` with every default (only `--bench_targets 1000`; `https://card.mcmaster.ca/latest/data`, 4.4 MB). All three tiers built, queried and scored without a change. Candidates at 1% decoys, depth > 1 (`verify_0.01_nb`):
+
+    | Tier | Postings | Bar (bits) | 1.0 | 0.95 | 0.9 | 0.85 | 0.8 | 0.75 | 0.7 | Tier 2 read recall | Tier 2 leaf precision |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | slim | 7,272 | 0 | 0.989 | 0.933 | 0.838 | 0.829 | 0.830 | 0.767 | 0.699 | 0.761 | 0.853 |
+    | standard | 11,019 | 23.5 | 1.000 | 0.990 | 0.975 | 0.937 | 0.904 | 0.893 | 0.816 | 0.894 | 0.908 |
+    | large | 27,391 | 31.75 | 1.000 | 1.000 | 1.000 | 1.000 | 0.989 | 0.981 | 0.942 | 0.914 | 0.916 |
+
+    Read this as "it works", not as performance at scale: the index is tiny, so chance is low (`--chance-scale` 1), and 1,000 targets cover a sixth of it. Slim's bar is 0 because it saw no decoy seeds, so slim has no calibrated bar on a set this small. `release_*` columns in `bench.tsv` mean nothing here. Each protein being its own unit, unit and leaf precision coincide. Not done: viral proteins; a query from real reads; the data is not stored in the repository.
+- **Phase 4b, local part: a tree-encoded per-sample table against flat (2026-11-04, the user's request).** `uses.py` (new) on tier 2's own reference from the clustered mini-slice run above (29,236 leaves, 8.6 M residues, 2,848 read pairs from 500 strains; laptop, 2 threads). It restricts tier 1's merge tree to the candidate leaves, runs Fitch at the dense rate, and sweeps the changes back to (k-mer, leaf), which must equal the flat rows; they do at both k. On the mini-slice rather than `spike-benchmark`, because tier 2 needs a built tree index and the slice has real near relatives.
+
+    | k | Flat (k-mer, leaf) | Flat (k-mer, block): routing's table | Tree changes | Flat table build | Hash + Fitch | Sweep | Postings visited: leaf / block / tree |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 8 | 8.34 M | 378 k | 1.26 M | 0.20 s | 1.46 s | 0.45 s | 11.0 M / 92 k / 1.00 M |
+    | 5 | 8.39 M | 303 k | 1.07 M | 0.20 s | 1.47 s | 0.37 s | 24.2 M / 362 k / 2.20 M |
+
+  - **Routing: flat stays.** The tree's 6.6–7.9× saving is against a per-leaf table, but routing's table is per block and is already 3.3–3.5× smaller than the tree's changes, with 6–11× fewer postings visited. Fails the gate on table size, build and use.
+  - **Tier 2: flat stays.** Routing is 2% of tier 2's sample time (0.85 s against 42.5 s of alignment), so no table can buy much; the alignment is the lever.
+  - **Reclassification (per-leaf candidates): not decided by this.** 6.6–7.9× smaller and ~11× fewer postings than a flat per-leaf table, but ~7× the build (part of that is Python: the restricted forest and the hashing's sort; the flat table is all Rust), plus the sweep. The per-read sweep's own time was not measured, and the gate needs it. Bytes per entry were not measured either, so only entries are given.
+  - **Truth (same reference, same reads, per read mass).** Flat: `kfp-pileup route` (k 8, ≥ 3 k-mers: 2,429 of 2,848 pairs routed) + DIAMOND `--sensitive` + `call`. Tier 2 at its 1% bar. The two work at different operating points:
+
+    | | Read precision | Read recall (mass on the source's unit, over all strain reads) | Time | Peak RSS |
+    | --- | --- | --- | --- | --- |
+    | flat, `em_posterior` (`read_precision_em`) | 0.903 | 0.341 | route 0.9 s, DIAMOND 20 s (amd64 under emulation), `call` 25 s | 5.4 GB (`call`) |
+    | flat, `posterior` on kept | 0.809 | 0.596 | | |
+    | tier 2, EM weight | 0.822 | 0.748 | 45 s, decoys included | 0.70 GB |
+
+    Flat's reference comes from tier 2's own calls here, so this is not flat's own candidate set. `em_novel` takes about half of flat's EM mass (mean 0.49), which is why its precision is high and its recall low. Only 435 of 500 sources are in this reference, which caps recall on both sides. `sibling_caught_em` was not measured: tier 2's hand-off has no way to withhold siblings yet.
+  - **Chunks: outputs are not identical across budgets.** 0.25 GB (2 chunks) against 4 GB (1): 205,250 against 205,174 read calls; 7 of 2,605 called reads differ, and 43 of ~28 k present leaves. Cause: `--route-top` and `--route-max-occ` apply per chunk, so a read gets up to 16 leaves per chunk (783,157 routed pairs against 766,940). With both off (`--route-top 100000 --route-max-occ 1000000000`), the calls match exactly (217,204 each, 967,775 pairs). Exactness would need routing every chunk first and cutting per read globally before any alignment, plus global k-mer counts, so **the rule is relaxed (the user's decision, 2026-11-04): at most 1% of called reads may differ** (`recall.py chunks`, `reads_differing`; 0.27% here, 7 of 2,605). Peak RSS barely moves between budgets (0.73 GB each) on this small set, and 2 chunks was faster (19 s against 43 s; 26 s against 47 s uncapped).
+  - **Fix: `handoff/` `unit`.** Tier 2 wrote `cluster_rep` as `unit`, which `kfp-pileup call` rejects (a `u32`; MGnify ids pass it). `unit` is now dense, `cluster_rep` stays its own column. *Any existing `handoff/` needs regenerating.*
+  - **Still to do:** `hadza10M` (`tree-index-reads`, the user's run), where candidates are ~8 M units and the ratio may differ; `sibling_caught_em`; the per-read sweep's time; the precomputed node-major layout, not tested (~5–8 TB, HPC only).

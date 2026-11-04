@@ -1,9 +1,12 @@
 """Tree index, tier 2 (tier2.py): chunks along the leaf order and the routed work list."""
 
+import gzip
 import sys
+from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 from test_tree_phase0 import SCRIPT
 
 sys.path.insert(0, str(SCRIPT.parent))
@@ -73,3 +76,39 @@ def test_two_stage_rescores_only_the_pairs_that_matter() -> None:
     anchored = tier2.align_chunk(pairs, frames, seqs, m, 100, "anchored").sort("read")
     assert two["score"][0] == gapped["score"][0] > anchored["score"][0]
     assert two["score"][1] <= gapped["score"][1]  # below the floor: a lower bound, not rescored
+
+
+def test_handoff_units_fit_call(tmp_path: Path) -> None:
+    """``kfp-pileup call`` reads ``unit`` as a u32; MGnify's cluster ids pass it."""
+    big = 2**33
+    seqs = pl.DataFrame(
+        {
+            "pos": [0, 1],
+            "sequence": ["MKLV", "ACDE"],
+            "protein_id": [big, big + 5],
+            "cluster_rep": [big, big + 5],
+        }
+    )
+    reads = [tmp_path / "r1.fq.gz", tmp_path / "r2.fq.gz"]
+    for r in reads:
+        with gzip.open(r, "wt") as f:
+            f.write("@a\nACGT\n+\nIIII\n")
+    calls = pl.DataFrame({"read": [0], "pos": [1], "score": [50.0], "weight": [1.0]})
+    tier2.handoff(
+        tmp_path, seqs, np.array([0, 1]), np.array([0, 1]), [str(r) for r in reads], calls
+    )
+    refs = pl.read_csv(tmp_path / "handoff/refs.tsv", separator="\t")
+    assert refs.sort("pos")["unit"].to_list() == [0, 1]
+    assert refs.sort("pos")["cluster_rep"].to_list() == [big, big + 5]
+    got = pl.read_parquet(tmp_path / "handoff/assignments.parquet")
+    assert got["unit"].to_list() == [1]
+
+
+def test_reads_differing_counts_reads_not_rows() -> None:
+    import recall
+
+    a = pl.DataFrame({"read": [0, 0, 1, 2], "pos": [5, 6, 5, 7]})
+    # read 0 loses a leaf (two rows would not be two reads); read 3 is called only here
+    b = pl.DataFrame({"read": [0, 1, 2, 3], "pos": [5, 5, 7, 9]})
+    assert recall.reads_differing(a, b) == pytest.approx(2 / 4)
+    assert recall.reads_differing(a, a) == 0

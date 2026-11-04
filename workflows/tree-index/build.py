@@ -19,16 +19,17 @@ a leaf holds a k-mer iff the signs of the postings covering it sum to 1 (they su
   with no k-mer up to t\\_cap get a position of their own after the tree's, holding their n\\_1
   lowest hashes.
 
-Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8) and
-``kind.npy`` (u8), sorted by (hash, lo); ``node_lo.npy``, ``node_hi.npy``, ``node_level.npy``
-(internal node i of the merge tree, by positions); ``pos_size.npy`` and ``node_size.npy``
+Writes to ``--out``: ``hash.npy`` (u64), ``lo.npy``, ``hi.npy`` (u32), ``sign.npy`` (i8),
+``bits.npy`` (u8: the key's evidence per hit in quarter-bits, -log2 q0 - log2 g,
+``query.encode_bits``), ``kcode.npy`` (u8 or u16: the key's k code) and ``kind.npy`` (u8, the
+build's: merge counts it, the merged index leaves it out), sorted by (hash, lo);
+``node_lo.npy``, ``node_hi.npy``, ``node_level.npy`` (internal node i of the merge tree, by
+positions); ``pos_size.npy`` and ``node_size.npy``
 (|S\\_v|: k-mers held at each position and each internal node); ``pos_len.npy`` (each
 position's representative's length); ``edge_a.npy``, ``edge_b.npy``, ``edge_w.npy`` (the spanning
 tree's edges between positions, weighed in topology units, for the neighbour rule);
-``keys.npy``, ``key_bits.npy`` and ``key_k.npy`` (each key's evidence per hit in bits,
--log2 q0 - log2 g, and its k); ``pieces.parquet`` (lo, hi, floor,
-coherence); ``proteins.parquet`` (protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and
-``meta.json``.
+``pieces.parquet`` (lo, hi, floor, coherence; the build's, as ``kind``); ``proteins.parquet``
+(protein\\_id, cluster\\_rep, pos; -1 for no valid k-mer); and ``meta.json``.
 """
 
 import argparse
@@ -92,6 +93,7 @@ def postings(
         got = add_step(reps, need, step, "rare" in rare_first, a.window_min, log_f, extra, info)
         need = need[informative(got, len(need), rare) < a.min_kmers]
     every = np.arange(n)  # layers: every leaf, whatever its 11-mers
+    unit = None  # budget units for the layers' keys (:func:`layer_units`), made once
     for step, rare_first in zip(query.ladder(a.layers), query.ladder_flags(a.layers), strict=True):
         add_step(reps, every, step, "rare" in rare_first, a.window_min, log_f, extra, info)
         if group is not None:
@@ -99,8 +101,10 @@ def postings(
                 group, extra["pos"][-1], extra["h"][-1], a.layer_rep
             )
             if a.layer_keys:
+                if a.layer_units and unit is None:
+                    unit = layer_units(tree, group, a.layer_units)
                 extra["pos"][-1], extra["h"][-1] = allocate(
-                    group, extra["pos"][-1], extra["h"][-1], a.layer_keys
+                    group, extra["pos"][-1], extra["h"][-1], a.layer_keys, unit
                 )
     pos = np.concatenate([tree.pos[keep], *extra["pos"]])
     h = np.concatenate([tree.h[keep], *extra["h"]])
@@ -245,22 +249,86 @@ def on_reps(
     return out["pos"].to_numpy().astype(np.int64), out["h"].to_numpy()
 
 
+def wide_clusters(
+    seqs: list[bytes], k: int, share: float, t: float = 0.2, max_holders: int = 64
+) -> NDArray[np.int64]:
+    """Greedy centroid clusters of sequences (group representatives) at a wider identity than
+    the tree's groups: two sequences are linked when they share at least ``share`` of the
+    smaller one's distinct protein k-mers (k 5: ~0.7^5 = 17% survive at 70% identity, chance
+    sharing is ~0); centroids are taken longest first, each claiming its unclaimed links.
+    Shares are estimated on a FracMinHash sample of each sequence's k-mers (rate ``t``);
+    k-mers held by more than ``max_holders`` sequences are skipped (repeats, chance).
+    Returns each sequence's centroid (an index into ``seqs``). ponytail: the candidate pairs
+    are all pairs sharing a k-mer, from one self-join; at release, a seeded join by hash
+    range as the build's (docs/tree-index-plan.md, A sensitive topology at MGnify scale)."""
+    seq, h = p0.hashed(seqs, k, _core.max_hash(t))
+    df = pl.DataFrame({"s": seq, "h": h})
+    held = df.group_by("h").agg(n=pl.len()).filter(pl.col("n") <= max_holders)
+    df = df.join(held.select("h"), on="h")
+    size = pl.DataFrame({"s": np.arange(len(seqs)), "n": np.bincount(seq, minlength=len(seqs))})
+    pairs = (
+        df.join(df, on="h")
+        .filter(pl.col("s") < pl.col("s_right"))
+        .group_by("s", "s_right")
+        .agg(shared=pl.len())
+        .join(size, on="s")
+        .join(size.rename({"s": "s_right", "n": "n_right"}), on="s_right")
+        .filter(pl.col("shared") >= share * pl.min_horizontal("n", "n_right"))
+    )
+    a, b = pairs["s"].to_numpy(), pairs["s_right"].to_numpy()
+    nbr: list[list[int]] = [[] for _ in seqs]
+    for x, y in zip(a.tolist(), b.tolist(), strict=True):
+        nbr[x].append(y)
+        nbr[y].append(x)
+    centre = np.full(len(seqs), -1, dtype=np.int64)
+    for c in np.argsort([-len(x) for x in seqs], kind="stable").tolist():
+        if centre[c] >= 0:
+            continue
+        centre[c] = c
+        for y in nbr[c]:
+            if centre[y] < 0:
+                centre[y] = c
+    return centre
+
+
+def layer_units(tree: survey.Tree, group: NDArray[np.int64], spec: str) -> NDArray[np.int64]:
+    """Each position's budget unit for :func:`allocate`: ``kmer:<k>:<share>[:<t>]``, the
+    groups' representatives clustered by :func:`wide_clusters`, a unit being a cluster's
+    centroid representative (``group`` maps positions to their representative, after
+    :func:`on_reps`)."""
+    _, k, share, *t = spec.split(":")
+    reps = np.unique(group)
+    seqs = [tree.seqs[i] for i in tree.rep_by_pos[reps]]
+    centre = wide_clusters(seqs, int(k), float(share), *map(float, t))
+    unit_of_rep = np.zeros(len(group), dtype=np.int64)
+    unit_of_rep[reps] = reps[centre]
+    return unit_of_rep[group]
+
+
 ALLOC: Final = ("uniform", "fixed", "log", "sqrt")
 
 
 def allocate(
-    group: NDArray[np.int64], pos: NDArray[np.int64], h: NDArray[np.uint64], spec: str
+    group: NDArray[np.int64],
+    pos: NDArray[np.int64],
+    h: NDArray[np.uint64],
+    spec: str,
+    unit: NDArray[np.int64] | None = None,
 ) -> tuple[NDArray[np.int64], NDArray[np.uint64]]:
-    """A layer's keys on representatives thinned to ``<rule>:<mean>`` keys per group (Progress
-    log: tree-aware sampling): each representative keeps K_g of its n_g keys, the least
-    hashes (at random), K_g in proportion to n_g (``uniform``), 1 (``fixed``), 1 + ln m_g
-    (``log``) or sqrt m_g (``sqrt``), m_g the group's members, scaled so the K_g average
-    ``mean``; a representative with fewer keys than its share passes the rest on."""
+    """A layer's keys on representatives thinned to ``<rule>:<mean>`` keys per budget unit
+    (Progress log: tree-aware sampling): each unit keeps K_u of its n_u keys, the least hashes
+    (at random), K_u in proportion to n_u (``uniform``), 1 (``fixed``), 1 + ln m_u (``log``)
+    or sqrt m_u (``sqrt``), m_u the unit's members, scaled so the K_u average ``mean``; a unit
+    with fewer keys than its share passes the rest on. A unit is a group (``unit`` None) or,
+    with ``unit`` (each position's, :func:`layer_units`), a cluster of groups: its keys are
+    drawn from all its groups' and stay on their own representatives."""
     rule, mean = spec.split(":")
-    o = np.lexsort((h, pos))
-    pos, h = pos[o], h[o]
-    reps, first, n = np.unique(pos, return_index=True, return_counts=True)
-    m = np.bincount(group, minlength=len(group))[reps].astype(np.float64)
+    unit = group if unit is None else unit
+    u = unit[pos]
+    o = np.lexsort((h, u))
+    pos, h, u = pos[o], h[o], u[o]
+    reps, first, n = np.unique(u, return_index=True, return_counts=True)
+    m = np.bincount(unit, minlength=len(unit))[reps].astype(np.float64)
     w = {"uniform": n.astype(np.float64), "fixed": np.ones_like(m), "log": 1 + np.log(m),
          "sqrt": np.sqrt(m)}[rule]  # fmt: skip
     budget = float(mean) * len(reps)
@@ -584,6 +652,12 @@ def main() -> None:
         "average of mean, K_g by rule (build.ALLOC: uniform, fixed, log or sqrt of the "
         "group's members); '' keeps all",
     )  # fmt: skip
+    parser.add_argument(
+        "--layer-units", default="",
+        help="kmer:<k>:<share>: spend --layer-keys' budgets per cluster of groups (their "
+        "representatives sharing >= share of the smaller one's protein k-mers, greedy "
+        "centroids), not per group; keys stay on their own groups' representatives",
+    )  # fmt: skip
     parser.set_defaults(**MODES[parser.parse_known_args()[0].mode])
     a = parser.parse_args()
     out = Path(a.out)
@@ -600,6 +674,11 @@ def main() -> None:
     for col, dtype in (("hash", U64), ("lo", np.uint32), ("hi", np.uint32), ("sign", np.int8),
                        ("kind", np.uint8)):  # fmt: skip
         np.save(out / f"{col}.npy", table[col].to_numpy().astype(dtype))
+    # each posting carries its key's evidence and k code (no separate key table)
+    keyed = table.select("hash").join(bits, on="hash", how="left", maintain_order="left")
+    np.save(out / "bits.npy", query.encode_bits(keyed["bits"].fill_null(0.0).to_numpy()))
+    code = keyed["k"].fill_null(0).to_numpy()
+    np.save(out / "kcode.npy", code.astype(query.code_dtype(code)))
     lay, n = tree.lay, tree.forest.n
     np.save(out / "node_lo.npy", lay["lo"][n:])
     np.save(out / "node_hi.npy", lay["hi"][n:])
@@ -612,9 +691,6 @@ def main() -> None:
     np.save(out / "edge_w.npy", f.mst_w.astype(np.uint32))
     lengths = np.array([len(s) for s in tree.seqs], dtype=np.uint32)
     leafless = np.flatnonzero((tree.leaf_of < 0) & (tree.n_valid > 0)) if a.n_1 else []
-    np.save(out / "keys.npy", bits["hash"].to_numpy())
-    np.save(out / "key_bits.npy", bits["bits"].to_numpy().astype(np.float32))
-    np.save(out / "key_k.npy", bits["k"].to_numpy().astype(np.uint16))
     np.save(out / "pos_len.npy", np.concatenate([lengths[tree.rep_by_pos], lengths[leafless]]))
     # |S_v|: k-mers held at each position and each internal node (Fitch's states)
     rng = (

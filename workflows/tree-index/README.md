@@ -188,8 +188,14 @@ cluster sample almost never holds a protein's neighbouring units).
 With `--reads R1,R2` and `--built <a build run's outdir>`, a real sample goes through the built
 tiers instead (no build, no truth): TIER1 (`query.py --decoy`, `verify.py`) -> `q-<tier>/`,
 TIER2 (`tier2.py`) once per `--tier2_memory` budget (GB, default `16,4`) -> `t2-<tier>-<gb>gb/`
-with the hand-off, and CHUNKS (`recall.py chunks`) -> `chunks-<tier>.json`: whether the
-budgets' calls and assignments are identical, which they must be.
+with the hand-off, and CHUNKS (`recall.py chunks`) -> `chunks-<tier>.json`: the
+budgets' calls and assignments compared; at most 1% of called reads may differ.
+
+For laptop benchmarks with realistic neighbourhoods, `slice.py mini` cuts a built slice down to
+~300 k proteins: whole clumps of its spanning tree (each protein's layer group and the groups
+next to it), taken systematically in size order, so the neighbourhood a random protein sits in
+matches the slice's up to its 90th percentile. Build it at the target database's layer k
+(`build.py --database-proteins`). Chance seeds and bars still need the HPC runs.
 
 ```bash
 nextflow run workflows/tree-index/build.nf -profile test,laptop     # the fixture, 5 parts
@@ -232,6 +238,29 @@ Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITIO
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
 
+## Benchmark against tier 1 (`nearest.py`, phase 4)
+
+`build.nf --built <dir> --members <table>` scores tiers already built, and today's tier 1 on the
+same proteins and strains, without fixed units. On HPC:
+`hpc/kfp-ablations/tree-index-benchmark/run.sh`. DIAMOND runs in a container, so add `-profile docker`
+or `singularity`; with Docker the work directory has to be on a path Docker can mount.
+
+```
+FLAT       today's kfp index per --flat_tiers entry; kfp query --aai
+REPORTED   per tree tier (tier 1, tier 2) and flat tier: units, abundance, sequences
+ALIGN      DIAMOND: strains against what was reported
+NEAREST    nearest/<run>/: score.json (read-outs, EMD, roll-ups, cost), curves.tsv, levels.parquet,
+           aai.tsv, neighbours.tsv
+GATE       gate.tsv: each tree run against the flat tier of its name
+```
+
+## Uses beyond tier 1 (`uses.py`, phase 4b) and generic sets (phase 6)
+
+`uses.py` compares a per-sample table along tier 1's tree with the flat table it would replace,
+on tier 2's `handoff/`, and checks the two hold the same (k-mer, leaf) rows. `slice.py generic`
+makes a members table with each protein its own cluster, from a FASTA or an existing table, for a
+set with no published clustering; `build.nf --members` takes it as is.
+
 ## Tier 2 (`tier2.py`)
 
 A per-sample database over tier 1's candidates, for read classification. Tier 1 is a profile:
@@ -249,8 +278,9 @@ leaves are packed in leaf order (tier 1's tree, so relatives are adjacent and a 
 range) into chunks of at most `--chunk-residues`; one streaming pass writes their sequences in
 leaf order, and each chunk reads its range. Scores spill per chunk and are merged per read;
 decoys set the read bar. Outputs match `verify.py`'s names (`reads.parquet`, `verify.json`,
-`cand_verify_<share>.npy`), so `recall.py reads` scores them. Chunking changes memory, not
-results (checked: identical calls at 11 chunks and at one).
+`cand_verify_<share>.npy`), so `recall.py reads` scores them. Chunking changes memory and,
+slightly, results: routing's caps apply per chunk (0.27% of called reads differ on the
+mini-slice; identical with `--route-top` and `--route-max-occ` off).
 
 ```bash
 python workflows/tree-index/tier2.py --index index --members members.parquet \

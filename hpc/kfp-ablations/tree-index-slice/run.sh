@@ -31,10 +31,10 @@ STD=../release-tiers/results-standard
 compgen -G "$STD/members.bucket*.parquet" >/dev/null || { echo "no $STD/members.bucket*.parquet: run release-tiers first" >&2; exit 1; }
 [[ -f $STD/pfam.parquet ]] || { echo "no $STD/pfam.parquet (release-tiers with --pfam)" >&2; exit 1; }
 # BUILD as tree-index-build's: parts of 1 M proteins (~30 GB; components larger than a part,
-# common in a family-complete slice, cut between clusters), 96 GB up front, +96 GB per retry
+# common in a family-complete slice, cut between clusters), 128 GB up front, +128 GB per retry (peaks of 91 GB on the subset, 94.5 GB on the slice)
 cat > build.config <<'CFG'
 process {
-    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+    withName: '.*BUILD' { memory = { 128.GB * task.attempt } }
 }
 CFG
 nextflow run "$WF/tree-index/build.nf" -c ../site.config -c build.config -resume --outdir results \

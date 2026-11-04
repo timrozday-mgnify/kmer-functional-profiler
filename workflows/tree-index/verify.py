@@ -66,6 +66,20 @@ def protein_classes() -> bytes:
     return bytes(out)
 
 
+def alphabet_classes(alphabet: str) -> bytes:
+    """:func:`protein_classes` for a reduced alphabet (alphabets.CLASSES): a residue's class
+    index; anything else breaks k-mers."""
+    if alphabet == "protein":
+        return protein_classes()
+    import alphabets
+
+    out = bytearray([255] * 256)
+    for i, group in enumerate(alphabets.CLASSES[alphabet]):
+        for c in group.encode():
+            out[c] = i
+    return bytes(out)
+
+
 def blosum62() -> NDArray[np.int8]:
     """BLOSUM62 by byte pair (``a << 8 | b``); any pair with a byte outside it, stops
     included, -20, so a segment does not run across frames."""
@@ -108,13 +122,15 @@ def rep_seqs(
     positions: NDArray[np.int64],
     members: str | None = None,
     store: str | None = None,
+    own: bool = False,
 ) -> dict[int, bytes]:
     """Each of ``positions``' representative, masked: the longest protein (ties: the first) of
     its layer group's representative position if the index has groups, else of its own; read
-    from the leaf-ordered ``store`` (store.py) for just those positions, else from ``members``."""
+    from the leaf-ordered ``store`` (store.py) for just those positions, else from ``members``.
+    ``own``: each position's own, whatever its group."""
     positions = np.unique(np.asarray(positions, dtype=np.int64))
     gfile = index / "layer_group.npy"
-    group = np.load(gfile).astype(np.int64) if gfile.exists() else None
+    group = np.load(gfile).astype(np.int64) if gfile.exists() and not own else None
     need = np.unique(np.r_[positions, group[positions]]) if group is not None else positions
     if store:
         got = leaf_store.LeafStore(store).get(need)
@@ -170,6 +186,7 @@ def main() -> None:
     p.add_argument("--query", required=True, help="query.py --out: candidates are added here")
     p.add_argument("--floor", type=float, default=8.0, help="read-pair evidence to align")
     p.add_argument("--shares", default="0.01,0.05,0.1")
+    p.add_argument("--chance-scale", type=float, default=1.0, help="query.decoy_bar's scale")
     p.add_argument("--method", choices=["anchored", "full"], default="anchored")
     a = p.parse_args()
     index, qdir = query.Index(a.index), Path(a.query)
@@ -211,7 +228,7 @@ def main() -> None:
     per_read = {n: t.group_by("read").agg(pl.col("score").first()) for n, t in top.items()}
     best = {n: g.group_by("pos").agg(pl.col("score").max()) for n, g in got.items()}
     for s in map(float, a.shares.split(",")):
-        bar, _ = query.decoy_bar(best["sample"], best["decoy"], s)
+        bar, _ = query.decoy_bar(best["sample"], best["decoy"], s, scale=a.chance_scale)
         np.save(
             qdir / f"cand_verify_{s}.npy",
             np.sort(best["sample"].filter(pl.col("score") >= bar)["pos"].to_numpy()),
@@ -220,7 +237,11 @@ def main() -> None:
         g = query.gather(got["sample"].filter(pl.col("score") >= bar), 0.0)
         np.save(qdir / f"cand_vgather_{s}.npy", np.sort(g["pos"].to_numpy()))
         info |= {f"verify_{s}_bar": bar}
-        info |= {f"read_bar_{s}": query.decoy_bar(per_read["sample"], per_read["decoy"], s)[0]}
+        info |= {
+            f"read_bar_{s}": query.decoy_bar(
+                per_read["sample"], per_read["decoy"], s, scale=a.chance_scale
+            )[0]
+        }
     for f in qdir.glob("decoy_*.fq.gz"):
         f.unlink()
     (qdir / "verify.json").write_text(json.dumps(info, indent=1) + "\n")

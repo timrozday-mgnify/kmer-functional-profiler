@@ -41,7 +41,7 @@ TIERS=$(IFS=';'; echo "${tiers[*]}")
 # BUILD as tree-index-build's (parts of 1 M; 85-91 GB on the giant component's parts there)
 cat > build.config <<'CFG'
 process {
-    withName: '.*BUILD' { memory = { 96.GB * task.attempt } }
+    withName: '.*BUILD' { memory = { 128.GB * task.attempt } }
     withName: '.*QUERY' { errorStrategy = { task.attempt < 2 ? 'retry' : 'ignore' } }
 }
 CFG
