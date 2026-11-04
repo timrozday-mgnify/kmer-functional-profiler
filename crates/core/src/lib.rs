@@ -34,8 +34,9 @@ pub use kmers::{
 };
 pub use packed::{Column, PIN_BITS, PackedTable, UnitHits, unit_hits};
 pub use pseudo::{
-    Method as PseudoMethod, Params as PseudoParams, mask_repeats, pair_frames, pseudo_scores,
-    route_votes, sketch_sizes,
+    Method as PseudoMethod, Params as PseudoParams, mask_repeats, pair_feature_counts,
+    pair_features_many, pair_features_masked_many, pair_frames, pair_route, pair_route_index,
+    pseudo_scores, route_votes, sketch_sizes,
 };
 pub use route::{RouteHits, route_hits};
 pub use translate::{

@@ -168,6 +168,18 @@ def evidence_chunked(
     return pl.concat(parts).group_by("pos").agg(pl.col("score").max()).sort("pos")
 
 
+def trim(index: Index, pairs: pl.DataFrame, min_bits: float) -> pl.DataFrame:
+    """``pairs`` less its hits on keys below ``min_bits`` (promiscuous keys: each hit after a
+    read pair's first is charged log2(windows) bits, so a key carrying fewer costs a seed more
+    than it adds)."""
+    if min_bits <= 0 or not len(index.hash):
+        return pairs
+    h = pairs["hash"].to_numpy()
+    at = np.minimum(np.searchsorted(index.hash, h), len(index.hash) - 1)
+    bits = np.asarray(index.bits[at]).astype(np.float64) * BITS_STEP
+    return pairs.filter(pl.Series((index.hash[at] != h) | (bits >= min_bits)))
+
+
 def families(index: Index) -> NDArray[np.int64]:
     """Per k code, its family for per-layer bars: 0 the base and ladder, i the i-th layer."""
     layers = ladder(index.meta["params"].get("layers", "") or "")
@@ -507,6 +519,10 @@ def main() -> None:
         help="reads: seeds by evidence, at the least bits whose expected chance seeds are at "
         "most this share of the seeds (seeds.parquet)",
     )  # fmt: skip
+    parser.add_argument(
+        "--min-key-bits", default="0",
+        help="drop read hits on keys below this many bits (trim); 'auto': the per-hit charge",
+    )  # fmt: skip
     parser.add_argument("--ladder-frames", help="frames for ladder k-mers (default: --frames)")
     parser.add_argument(
         "--mode", choices=["recall", "precision"], default="recall",
@@ -545,10 +561,15 @@ def main() -> None:
             index, a.reads[0], (a.reads[1:] or [None])[0], a.frames, a.ladder_frames, a.mode
         )
         log2_w = float(np.log2(max(windows.get(index.k, 1) / max(n_reads, 1), 2)))
+        min_bits = log2_w if a.min_key_bits == "auto" else float(a.min_key_bits)
+        n_hits = pairs.height
+        pairs = trim(index, pairs, min_bits)
+        stats |= {"min_key_bits": min_bits, "trimmed_hits": n_hits - pairs.height}
         seeds = evidence_chunked(index, pairs, log2_w, clamp=a.decoy)
         if a.decoy:  # the bar from reversed reads: chance seeds counted, not modelled
             dr = reversed_reads(a.reads, out)
             d_pairs, _, _ = read_pairs(index, *dr, a.frames, a.ladder_frames, a.mode)
+            d_pairs = trim(index, d_pairs, min_bits)
             decoys = evidence_chunked(index, d_pairs, log2_w, clamp=True)
             decoys.write_parquet(out / "decoy_seeds.parquet")
             bar, curve = decoy_bar(seeds, decoys, a.chance_share, scale=a.chance_scale)

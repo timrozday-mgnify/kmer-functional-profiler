@@ -66,6 +66,20 @@ def protein_classes() -> bytes:
     return bytes(out)
 
 
+def alphabet_classes(alphabet: str) -> bytes:
+    """:func:`protein_classes` for a reduced alphabet (alphabets.CLASSES): a residue's class
+    index; anything else breaks k-mers."""
+    if alphabet == "protein":
+        return protein_classes()
+    import alphabets
+
+    out = bytearray([255] * 256)
+    for i, group in enumerate(alphabets.CLASSES[alphabet]):
+        for c in group.encode():
+            out[c] = i
+    return bytes(out)
+
+
 def blosum62() -> NDArray[np.int8]:
     """BLOSUM62 by byte pair (``a << 8 | b``); any pair with a byte outside it, stops
     included, -20, so a segment does not run across frames."""
@@ -108,13 +122,15 @@ def rep_seqs(
     positions: NDArray[np.int64],
     members: str | None = None,
     store: str | None = None,
+    own: bool = False,
 ) -> dict[int, bytes]:
     """Each of ``positions``' representative, masked: the longest protein (ties: the first) of
     its layer group's representative position if the index has groups, else of its own; read
-    from the leaf-ordered ``store`` (store.py) for just those positions, else from ``members``."""
+    from the leaf-ordered ``store`` (store.py) for just those positions, else from ``members``.
+    ``own``: each position's own, whatever its group."""
     positions = np.unique(np.asarray(positions, dtype=np.int64))
     gfile = index / "layer_group.npy"
-    group = np.load(gfile).astype(np.int64) if gfile.exists() else None
+    group = np.load(gfile).astype(np.int64) if gfile.exists() and not own else None
     need = np.unique(np.r_[positions, group[positions]]) if group is not None else positions
     if store:
         got = leaf_store.LeafStore(store).get(need)

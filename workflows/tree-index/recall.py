@@ -72,6 +72,106 @@ def targets(a: argparse.Namespace) -> None:
     print(f"{len(rows)} targets -> {a.out}")
 
 
+HOLDOUT_BINS = (1.0, 0.98, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.6)  # nearest relative's identity
+AMINO = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def nearest_relatives(
+    members: pl.DataFrame, pool: pl.DataFrame, k: int = 5, sample: int = 4, top: int = 10
+) -> pl.DataFrame:
+    """(protein_id, relative, identity, cover): each ``pool`` protein's nearest other member
+    by local alignment (BLOSUM62, gaps 11/1; identity over aligned columns, cover over the
+    pool protein), aligned against its ``top`` members by shared k-mers (codes divisible by
+    ``sample``, those held by more than 500 members dropped). ponytail: Biopython, ~1 ms an
+    alignment; fine for ~10^5."""
+    from Bio.Align import PairwiseAligner, substitution_matrices
+
+    code = {c: i for i, c in enumerate(AMINO)}
+
+    def kmers(df: pl.DataFrame) -> pl.DataFrame:
+        ids, codes = [], []
+        for pid, seq in df.select("protein_id", "sequence").iter_rows():
+            x = np.array([code.get(c, -1) for c in seq], dtype=np.int64)
+            if len(x) < k:
+                continue
+            w = np.lib.stride_tricks.sliding_window_view(x, k)
+            c = (w * 20 ** np.arange(k)).sum(1)[(w >= 0).all(1)]
+            c = np.unique(c[c % sample == 0])
+            ids.append(np.full(len(c), pid))
+            codes.append(c)
+        return pl.DataFrame({"protein_id": np.concatenate(ids), "c": np.concatenate(codes)})
+
+    held = kmers(members)
+    common = held.group_by("c").len().filter(pl.col("len") > 500).select("c")
+    held = held.join(common, on="c", how="anti")
+    hits = (
+        kmers(pool).join(held.rename({"protein_id": "relative"}), on="c")
+        .filter(pl.col("protein_id") != pl.col("relative"))
+        .group_by("protein_id", "relative").len()
+        .sort("len", descending=True).group_by("protein_id").head(top)
+    )  # fmt: skip
+    seq = dict(members.select("protein_id", "sequence").iter_rows())
+    al = PairwiseAligner(mode="local", open_gap_score=-11, extend_gap_score=-1)
+    al.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    rows = []
+    for q, t in hits.select("protein_id", "relative").iter_rows():
+        a, b = seq[q].replace("*", ""), seq[t].replace("*", "")
+        n = al.align(a, b)[0].counts()
+        cols = n.identities + n.mismatches + n.gaps
+        rows.append((q, t, n.identities / max(cols, 1), (n.identities + n.mismatches) / len(a)))
+    sch = {"protein_id": pl.Int64, "relative": pl.Int64, "identity": pl.Float64,
+           "cover": pl.Float64}  # fmt: skip
+    return (
+        pl.DataFrame(rows, schema=sch, orient="row")
+        .filter(pl.col("cover") >= 0.8)
+        .sort("identity", descending=True).group_by("protein_id").head(1)
+    )  # fmt: skip
+
+
+def holdout(a: argparse.Namespace) -> None:
+    """Held-out proteins for recall on real relatives: ``--per-bin`` proteins per bin of their
+    nearest other member's identity (:data:`HOLDOUT_BINS`, a bin from its value up), none of
+    them another's nearest relative, nor its nearest held out. Writes ``members.parquet``
+    (the rest, to build the index from), ``targets.fa`` (the held-out, to simulate reads from)
+    and ``relatives.tsv`` (protein_id, relative, identity, identity_bin; for ``score
+    --relatives``)."""
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    pool = members.filter(pl.col("sequence").str.len_chars() >= a.min_length).sample(
+        a.pool, seed=a.seed
+    )
+    near = nearest_relatives(members, pool)
+    bins = np.array(HOLDOUT_BINS)
+    near = (
+        near.with_columns(
+            identity_bin=pl.col("identity").map_elements(
+                lambda x: float(bins[bins <= x + 0.005][0]) if x + 0.005 >= bins[-1] else None,
+                return_dtype=pl.Float64,
+            )
+        )
+        .drop_nulls("identity_bin")
+        .sample(fraction=1.0, shuffle=True, seed=a.seed)
+    )
+    held, blocked, rows = set(), set(), []
+    count = dict.fromkeys(HOLDOUT_BINS, 0)
+    for q, t, ident, _, b in near.iter_rows():
+        if count[b] >= a.per_bin or q in blocked or t in held:
+            continue
+        held.add(q)
+        blocked.add(t)
+        count[b] += 1
+        rows.append((q, t, ident, b))
+    pl.DataFrame(
+        rows, schema=["protein_id", "relative", "identity", "identity_bin"], orient="row"
+    ).write_csv(out / "relatives.tsv", separator="\t")
+    members_all = pl.read_parquet(a.members)
+    members_all.filter(~pl.col("protein_id").is_in(held)).write_parquet(out / "members.parquet")
+    sel = members.filter(pl.col("protein_id").is_in(held)).sort("protein_id")
+    (out / "targets.fa").write_text("".join(f">{i}\n{s}\n" for i, s in sel.rows()))
+    print(json.dumps({"held": len(held), "per_bin": {str(k): v for k, v in count.items()}}))
+
+
 def observable(
     truth: pl.DataFrame, sources: dict[str, str], r1: str, r2: str, k: int
 ) -> pl.DataFrame:
@@ -176,6 +276,14 @@ def score(a: argparse.Namespace) -> None:
         .join(prot.rename({"protein_id": "member"}), on="member", how="left")
         .with_columns(depth_bin=pl.col("depth").cut(DEPTH_BINS, left_closed=True))
     )
+    if a.relatives:  # held out: recall is the nearest relative left in the index
+        rel = pl.read_csv(a.relatives, separator="\t").rename({"protein_id": "member"})
+        truth = (
+            truth.select("strain", "member", "depth", "depth_bin")
+            .join(rel.select("member", "relative", "identity_bin"), on="member")
+            .with_columns(member=pl.col("relative")).drop("relative")
+            .join(prot.rename({"protein_id": "member"}), on="member", how="left")
+        )  # fmt: skip
     if a.reads:
         sources = dict(read_fasta(a.targets))
         k = int(json.loads((path / "meta.json").read_text())["params"]["k"])
@@ -609,6 +717,13 @@ def main() -> None:
     p.add_argument("--n", type=int, default=2000)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("holdout")
+    p.add_argument("--members", required=True)
+    p.add_argument("--per-bin", type=int, default=250)
+    p.add_argument("--pool", type=int, default=15000, help="proteins searched for relatives")
+    p.add_argument("--min-length", type=int, default=100)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("score")
     p.add_argument("--index", required=True)
     p.add_argument("--query", required=True)
@@ -616,6 +731,7 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--reads", nargs=2, help="the sample's R1 R2, for observable k-mers")
     p.add_argument("--targets", help="targets' FASTA (with --reads)")
+    p.add_argument("--relatives", help="holdout's relatives.tsv: score on the nearest relative")
     p.add_argument("--min-hits", type=int, default=1)
     p.add_argument("--deltas", type=float, nargs="+", default=[0.0, 0.05, 0.1, 0.15, 0.3])
     p.add_argument("--caps", type=int, nargs="+", default=[16, 256])
@@ -638,9 +754,14 @@ def main() -> None:
     p.add_argument("--runs", nargs="+", required=True, help="tier2.py --out directories")
     p.add_argument("--out", required=True)
     a = parser.parse_args()
-    {"targets": targets, "score": score, "reads": reads, "summary": summary, "chunks": chunks}[
-        a.command
-    ](a)
+    {
+        "targets": targets,
+        "holdout": holdout,
+        "score": score,
+        "reads": reads,
+        "summary": summary,
+        "chunks": chunks,
+    }[a.command](a)
 
 
 if __name__ == "__main__":
