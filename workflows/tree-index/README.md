@@ -238,6 +238,22 @@ Measured locally on phase 0's core sample (1.07 M proteins, 4 threads): PARTITIO
 Parts lose the dense-topology edges between them, so a k-mer shared across parts is posted in
 each. Cuts fall between k-11 storage components, which few such edges cross.
 
+## Benchmark against tier 1 (`nearest.py`, phase 4)
+
+`build.nf --built <dir> --members <table>` scores tiers already built, and today's tier 1 on the
+same proteins and strains, without fixed units. On HPC:
+`hpc/kfp-ablations/tree-index-benchmark/run.sh`. DIAMOND runs in a container, so add `-profile docker`
+or `singularity`; with Docker the work directory has to be on a path Docker can mount.
+
+```
+FLAT       today's kfp index per --flat_tiers entry; kfp query --aai
+REPORTED   per tree tier (tier 1, tier 2) and flat tier: units, abundance, sequences
+ALIGN      DIAMOND: strains against what was reported
+NEAREST    nearest/<run>/: score.json (read-outs, EMD, roll-ups, cost), curves.tsv, levels.parquet,
+           aai.tsv, neighbours.tsv
+GATE       gate.tsv: each tree run against the flat tier of its name
+```
+
 ## Tier 2 (`tier2.py`)
 
 A per-sample database over tier 1's candidates, for read classification. Tier 1 is a profile:
