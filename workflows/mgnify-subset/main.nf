@@ -3,6 +3,12 @@
 // partitioned index build over the buckets, and the query cost study (--query).
 // See README.md.
 
+// A boolean param: Nextflow 26 keeps `--index false` from the command line as the string
+// "false", which Groovy reads as true; a config's `false` stays a Boolean.
+def flag(value) {
+    value instanceof String ? value.toBoolean() : value as boolean
+}
+
 process MEMBERSHIP {
     label 'process_medium'
 
@@ -41,7 +47,7 @@ process EXTRACT {
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
         extract --release '${params.release}' --membership ${membership} \\
         --lo ${lo} --hi ${hi} --prefix shard${shard} --buckets ${params.buckets} \\
-        ${params.pfam ? '--pfam' : '--no-pfam'}
+        ${flag(params.pfam) ? '--pfam' : '--no-pfam'}
     """
 
     stub:
@@ -64,7 +70,7 @@ process MERGE {
     script:
     def prefixes = parts.collect { it.name.tokenize('.')[0] }.unique().sort().join(' ')
     def members = (params.buckets as int) > 1 ? "members.bucket${bucket}.parquet" : 'members.parquet'
-    def pfam = params.pfam && bucket == 0 ? '--pfam pfam.parquet' : ''
+    def pfam = flag(params.pfam) && bucket == 0 ? '--pfam pfam.parquet' : ''
     """
     ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
         merge --bucket ${bucket} --members ${members} ${pfam} ${prefixes}
@@ -72,6 +78,27 @@ process MERGE {
 
     stub:
     "touch members.parquet pfam.parquet"
+}
+
+process PFAM_COVERAGE {
+    tag "1 in ${sample}"
+    label 'process_high_memory'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    val sample
+
+    output:
+    path 'pfam_coverage.tsv'
+
+    script:
+    """
+    ${params.python} ${projectDir}/mgnify_subset.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' \\
+        pfam-coverage --release '${params.release}' --sample ${sample}
+    """
+
+    stub:
+    "touch pfam_coverage.tsv"
 }
 
 process SUBSET {
@@ -470,7 +497,7 @@ process QUERY {
     # and the cgroup's peak, limit and OOM kills in ${cell}.end.json, so the cell is a result.
     status=0
     ${params.kfp} query \$idx ${r1} ${r2} --draws ${draws} --out ${cell}.profile.tsv ${params.query_args} \\
-        --em-start ${start} --stats ${cell}.json${params.query_in_memory ? ' --in-memory' : ''}${params.query_low_memory ? ' --low-memory' : ''} || status=\$?
+        --em-start ${start} --stats ${cell}.json${flag(params.query_in_memory) ? ' --in-memory' : ''}${flag(params.query_low_memory) ? ' --low-memory' : ''} || status=\$?
     ${params.python} -c "import json, sys; from kmer_functional_profiler.query import cgroup_memory, memory_cgroup; g = memory_cgroup(); print(json.dumps({'exit': int(sys.argv[1]), **(cgroup_memory(g) if g else {})}))" \$status > ${cell}.end.json
     [ \$status -eq 0 ] || rm -f ${cell}.profile.tsv
     [ \$status -eq 0 ] || [ \$status -eq 137 ] || exit \$status
@@ -529,16 +556,19 @@ workflow {
     if (members_table && !pfam_table) {
         error "--members needs --pfam_table"
     }
-    if (params.index && !members_table && ((params.buckets as int) > 1 || !params.pfam)) {
+    if (flag(params.index) && !members_table && ((params.buckets as int) > 1 || !flag(params.pfam))) {
         error "--index needs --buckets 1 and --pfam true"
     }
     // '' or 0: the sparse build (index_args alone); other rates add --t-dense
     def dense = params.t_dense.toString() in ['', 'true', 'false'] ? [''] :
         params.t_dense.toString().tokenize(',')*.trim().collect { r -> (r as double) == 0 ? '' : r }
-    if (params.build && (samples.size() > 1 || !params.pfam)) {
+    if (flag(params.build) && (samples.size() > 1 || !flag(params.pfam))) {
         error "--build needs one --sample and --pfam true"
     }
-    if ((params.index && !members_table) || params.stats || params.build) {
+    if (flag(params.pfam_coverage)) {
+        PFAM_COVERAGE(samples[0])
+    }
+    if ((flag(params.index) && !members_table) || flag(params.stats) || flag(params.build)) {
         // Even protein_id ranges; MEMBERSHIP fails if max_protein_id leaves members out.
         def width = (params.max_protein_id as long).intdiv(params.shards as int) + 1
         MEMBERSHIP(samples[0], width, file("${projectDir}/mgnify_subset.py", checkIfExists: true))
@@ -546,11 +576,11 @@ workflow {
         EXTRACT(ch_shards, MEMBERSHIP.out.membership)
         MERGE(channel.of(0..<(params.buckets as int)), EXTRACT.out.parts.flatten().collect())
     }
-    if (params.stats) {
+    if (flag(params.stats)) {
         STATS(MERGE.out.members)
         COMBINE(STATS.out.stats.flatten().collect())
     }
-    if (params.index) {
+    if (flag(params.index)) {
         SUBSET(
             channel.fromList(samples),
             members_table ? channel.value(file(members_table, checkIfExists: true)) : MERGE.out.members.first(),
@@ -558,7 +588,7 @@ workflow {
         )
         INDEX(SUBSET.out.combine(channel.fromList(dense)).map { s, m, p, d -> [s, d, m, p] }, params.index_args)
     }
-    if (params.build) {
+    if (flag(params.build)) {
         ch_members = MERGE.out.members.flatten().map { f ->
             def m = f.name =~ /bucket(\d+)/
             [m ? m[0][1] as int : 0, f]
@@ -588,7 +618,7 @@ workflow {
         DEDUP(channel.of(0..<(params.ranges as int)), ch_part_ids, ch_part_files)
         CONCAT(ch_part_ids, ch_part_files, DEDUP.out.flatten().collect(), UNITS.out)
     }
-    if (params.query) {
+    if (flag(params.query)) {
         if (!params.query_indexes) {
             error "--query needs --query_indexes, e.g. 'cost-nested/1in*/index'"
         }

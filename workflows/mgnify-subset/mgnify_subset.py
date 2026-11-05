@@ -25,6 +25,8 @@ One subcommand per pipeline step (``main.nf``):
   ``pack-range``, ``dedup``, ``concat``: the
   partitioned index build over the buckets (``kmer_functional_profiler.partition``); build
   options as ``kmer-functional-profiler index``.
+- ``pfam-coverage``: MGnify90 clusters with a Pfam hit on any member, directly from the release
+  -> ``pfam_coverage.tsv`` (all, singleton and non-singleton clusters; 1 in ``--sample``).
 - ``ladder``: nested read subsets of a paired run (``--pairs`` sizes): the pairs ranked
   below n in one shuffle seeded by ``--seed``, so each subset holds the smaller ones.
 - ``query-cost``: ``kmer-functional-profiler query --stats`` files named
@@ -286,6 +288,36 @@ def build(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
             partition.dedup(args.parts, args.range, args.ranges, args.out)
         case "concat":
             partition.concat(args.parts, args.sets, args.units, args.out, params)
+
+
+def pfam_coverage(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
+    # ponytail: one out-of-core query (at --sample 1, the join holds every Pfam hit and spills to
+    # duckdb_tmp); split by protein_id range through MEMBERSHIP if it runs out of memory or disk.
+    release = args.release
+    con.execute(
+        f"""
+        COPY (
+            WITH labelled AS (
+                SELECT DISTINCT m.cluster_rep
+                FROM read_parquet('{release}/mgy_cluster_seqs.parquet') m
+                SEMI JOIN read_parquet('{release}/mgy_proteins_pfam.parquet') p
+                    ON m.cluster_member = p.protein_id
+                WHERE m.cluster_rep % $sample = 0
+            )
+            SELECT coalesce(if(c.cluster_size = 1, 'singleton', 'non_singleton'), 'all')
+                    AS clusters_of,
+                $sample AS sample, count(*) AS clusters,
+                count(l.cluster_rep) AS with_pfam,
+                count(l.cluster_rep) / count(*) AS fraction
+            FROM read_parquet('{release}/mgy_clusters.parquet') c
+            LEFT JOIN labelled l USING (cluster_rep)
+            WHERE c.cluster_rep % $sample = 0
+            GROUP BY ROLLUP (if(c.cluster_size = 1, 'singleton', 'non_singleton'))
+            ORDER BY clusters DESC
+        ) TO '{args.out}' (FORMAT csv, DELIMITER '\t', HEADER)
+        """,
+        {"sample": args.sample},
+    )
 
 
 def ladder(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> None:
@@ -575,6 +607,10 @@ def main() -> None:
     concat_p.add_argument("--sets", nargs="+", required=True, help="dedup prefixes, in order")
     concat_p.add_argument("--units", default="units")
     concat_p.add_argument("--out", default="index")
+    p = sub.add_parser("pfam-coverage")
+    p.add_argument("--release", required=True)
+    p.add_argument("--sample", type=int, default=1)
+    p.add_argument("--out", default="pfam_coverage.tsv")
     p = sub.add_parser("ladder")
     p.add_argument("--r1", required=True)
     p.add_argument("--r2", required=True)
@@ -593,6 +629,7 @@ def main() -> None:
         "stats": stats,
         "combine": combine,
         **dict.fromkeys(build_steps, build),
+        "pfam-coverage": pfam_coverage,
         "ladder": ladder,
         "query-cost": query_cost,
         "em-starts": em_starts,
