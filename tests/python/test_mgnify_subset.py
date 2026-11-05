@@ -210,6 +210,46 @@ def test_extract_refuses_the_old_membership_layout(tmp_path: Path) -> None:
     assert result.returncode != 0 and "old layout" in result.stderr
 
 
+def test_pfam_coverage_counts_clusters_with_any_hit(tmp_path: Path) -> None:
+    # Clusters: 1 {1, 2} labelled through a non-representative with two hits; 3 {3} labelled;
+    # 4 {4, 5} and 6 {6} unlabelled.
+    release = tmp_path / "release"
+    release.mkdir()
+    members = {1: [1, 2], 3: [3], 4: [4, 5], 6: [6]}
+    pl.DataFrame(
+        [(r, m) for r, ms in members.items() for m in ms],
+        schema=["cluster_rep", "cluster_member"],
+        orient="row",
+    ).write_parquet(release / "mgy_cluster_seqs.parquet")
+    pl.DataFrame(
+        [(r, len(ms)) for r, ms in members.items()],
+        schema=["cluster_rep", "cluster_size"],
+        orient="row",
+    ).write_parquet(release / "mgy_clusters.parquet")
+    pl.DataFrame({"protein_id": [2, 2, 3]}).write_parquet(release / "mgy_proteins_pfam.parquet")
+
+    def coverage(sample: int) -> dict[str, tuple[int, int, float]]:
+        run(tmp_path, "pfam-coverage", "--release", str(release), "--sample", str(sample))
+        table = pl.read_csv(tmp_path / "pfam_coverage.tsv", separator="\t")
+        assert set(table["sample"]) == {sample}
+        return {
+            r[0]: r[1:]
+            for r in table.select("clusters_of", "clusters", "with_pfam", "fraction").rows()
+        }
+
+    assert coverage(1) == {
+        "all": (4, 2, 0.5),
+        "singleton": (2, 1, 0.5),
+        "non_singleton": (2, 1, 0.5),
+    }
+    # Reps 4 and 6: neither labelled, and rep 3's hit must not count.
+    assert coverage(2) == {
+        "all": (2, 0, 0.0),
+        "singleton": (1, 0, 0.0),
+        "non_singleton": (1, 0, 0.0),
+    }
+
+
 def test_io_errors_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.util
 

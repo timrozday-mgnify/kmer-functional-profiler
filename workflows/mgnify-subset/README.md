@@ -31,6 +31,7 @@ POOL        several runs concatenated into one sample                  (two or m
 LADDER      nested read subsets of it                                    (--query_ladder)
 QUERY       per subset x index: kmer-functional-profiler query --stats
 QUERY_COST  -> query_cost.tsv
+PFAM_COVERAGE -> pfam_coverage.tsv: clusters with a Pfam hit       (--pfam_coverage true)
 ```
 
 All members of a selected cluster are extracted, including members from other biomes,
@@ -107,6 +108,22 @@ This reads the whole sequence file once and writes it again as cluster buckets
 Predicted sizes assume one key per posting (an upper bound) and `--sets` value sets
 per posting (default 1, also an upper bound); the nested builds give the real ratio
 (`tier1_sets / postings` in `meta.json`) to re-run COMBINE with.
+
+### Pfam coverage of the clusters
+
+How many MGnify90 clusters have a Pfam hit on any member, from `mgy_cluster_seqs`,
+`mgy_proteins_pfam` and `mgy_clusters`, with no extraction. It covers the whole release
+whatever `--biome` is. `--sample 100` first gives an estimate from 1 in 100 clusters; it
+still reads the whole Pfam table, so use a local mirror:
+
+```bash
+nextflow run workflows/mgnify-subset -profile slurm --pfam_coverage true --index false \
+    --release /path/to/release --sample 1 --outdir pfam-coverage
+```
+
+`pfam_coverage.tsv` has one row each for all, singleton and non-singleton clusters:
+`clusters_of`, `sample`, `clusters`, `with_pfam`, `fraction`. At `--sample 1` for 2026_07,
+`clusters` should read 1,661,142,385 / 1,215,743,478 / 445,398,907.
 
 ### Partitioned build (phase 6)
 

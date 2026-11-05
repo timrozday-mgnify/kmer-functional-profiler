@@ -21,8 +21,7 @@ fetch_pairs pooled200M 200000000 ERR7738575 ERR7746321
 reads="$PWD/pooled200M_1.fastq.gz,$PWD/pooled200M_2.fastq.gz"
 for cap in 1000 3000 10000; do
     mkdir -p "zi$cap"
-    # a config file, not the command line: Nextflow reads a value starting with '--' as an
-    # option, and passes --index false as the string 'false', which the workflow reads as true
+    # a config file, not the command line: Nextflow reads a value starting with '--' as an option
     printf 'params.index = false\nparams.query_args = "--zi-max-iter %s"\n' "$cap" > "zi$cap/cap.config"
     (cd "zi$cap" && nextflow run "$wf/mgnify-subset" -c ../../site.config -c cap.config --query true \
         --query_indexes '../../promiscuity-novaseq/results/mgnify_index/tbase05_all_g16/index' \

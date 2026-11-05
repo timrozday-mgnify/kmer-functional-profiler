@@ -27,9 +27,7 @@ done
 tiers=$(printf '%s,' $TIERS)
 tiers=${tiers%,}
 [[ $tiers == *,* ]] && tiers="{$tiers}"  # a one-name brace group matches nothing in Nextflow
-# Config files, not the command line: Nextflow reads a value starting with '--' as an option,
-# and passes --index false as the string 'false', which the workflow reads as true (it then
-# extracts the release before querying).
+# Config files, not the command line: Nextflow reads a value starting with '--' as an option.
 wf=$(cd "$WF" && pwd)
 # the pooled sample once, for both arms (pileup-cost's pooled100M: ENA runs in ../reads/)
 fetch_pairs pooled100M 100000000 ERR7738575 ERR7746321
