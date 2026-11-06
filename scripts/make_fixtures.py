@@ -329,6 +329,20 @@ def mini_mgnify(rng: random.Random) -> None:
     )
 
 
+def mini_reannotate() -> None:
+    """A release for ``workflows/pfam-reannotate``, from ``mini_mgnify``'s members."""
+    out = OUT / "mini_reannotate"
+    out.mkdir(exist_ok=True)
+    members = pl.read_parquet(OUT / "mini_fmh" / "mgnify_members.parquet")
+    members.select("protein_id", "sequence").write_parquet(out / "mgy_protein_sequences.parquet")
+    members.select("cluster_rep", cluster_member="protein_id").write_parquet(
+        out / "mgy_cluster_seqs.parquet"
+    )
+    members.group_by("cluster_rep").len("cluster_size").sort("cluster_rep").write_parquet(
+        out / "mgy_clusters.parquet"
+    )
+
+
 if __name__ == "__main__":
     main()
     mini_release(random.Random(20260929))
@@ -336,3 +350,4 @@ if __name__ == "__main__":
     mini_pfam(random.Random(20261001))
     mini_host(random.Random(20261002))
     mini_mgnify(random.Random(20261003))
+    mini_reannotate()

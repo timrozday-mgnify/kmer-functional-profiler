@@ -25,6 +25,8 @@ for r in floor-novaseq floor-miseq floor-perfect floor-1.65M floor-26.4M index r
 done
 # when floor-novaseq has finished:
 cd kfp-ablations/floor-query-cost && sbatch run.sh
+# Pfam-A re-annotation with hits below GA, 1 in 100 representatives first (plan, phase 6):
+cd kfp-ablations/pfam-reannotate && sbatch run.sh
 # clusters with a Pfam hit (plan, phase 6), any time:
 cd kfp-ablations/pfam-coverage && sbatch run.sh
 # release tiers (plan, phase 7, step 21), then their query cost when tiers-novaseq has finished:
