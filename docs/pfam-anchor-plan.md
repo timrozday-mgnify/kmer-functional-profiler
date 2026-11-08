@@ -410,3 +410,20 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - With the chosen arms, unit assignment is 7.5–8× faster than brute force overall, and 12–14× faster in large families. The gain grows with family size, since the share falls (phase 1b). At release-sized families of millions of units, brute force is about 60 ms per million domains per hit, against a lookup plus 1% of that.
   - **Limits.** Families here have at most 3,090 units, so the share at release sizes is extrapolated. The postings are per unit, not per protein. Reads have the simulator's 0.2% sequencing errors, but no real ORF calling.
 - **Anchoring ablation (2026-11-08, the user's question).** `anchor.py seeds --unanchored`: the same seeds, read off the same HMM alignments, but keyed by residues only, so a seed matches at any column of its family. Recall (kept) is unchanged to .001 for every arm. Candidate share is unchanged for k ≥ 6 and spaced `11010010011`, and for every arm at h 2. It grows slightly for short seeds at h 1: k 5 s 1, 8.0% to 8.8%; `1101011` s 1, 9.2% to 10.1%. Postings fall by under 0.2%. So within a family, the column in the key adds almost nothing. A 5-residue seed rarely recurs at another column of the same family, so the narrowing comes from restricting to the read's family, and from reading seeds off match columns (insertions dropped). Still unmeasured: a pooled index across families, which would show what the family restriction itself is worth, and short seeds (k ≤ 4) or the largest families, where the column may matter more.
+- **Anchor residues as the first check (2026-11-08, the user's suggestion).** `anchor.py anchors`: no k-mers. For each read pair and family, take the n most informative columns the pair covers, and count each unit's matches there (its best domain). Keep the top q of units by that count, with ties at the cut, then score them as in the oracle. Columns are ranked per family by entropy across units, by entropy per bit of retention lost (phase 1b's "efficient"), or at random. 20 s, 1.0 GB. *Kept* and *share* are as in phase 2, over all 40 families.
+
+  | Columns | Keep | Strains: kept | Strains: share | Relatives: kept | Relatives: share |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | Entropy, 8 | 1% | .995 | 2.1% | .969 | 2.0% |
+  | Entropy, 16 | 0.5% | .996 | 0.8% | .978 | 0.8% |
+  | Entropy, 16 | 1% | .999 | 1.6% | .989 | 1.6% |
+  | Entropy, 24 | 0.5% | .996 | 0.7% | .989 | 0.7% |
+  | Efficient, 16 | 1% | .991 | 1.9% | .981 | 1.8% |
+  | Random, 16 | 1% | .995 | 1.8% | .973 | 1.7% |
+  | Seeds `1101011`, s 2, h 2 (phase 2) | | .965 | 1.4% | .978 | 1.9% |
+  | Seeds `11010010011`, s 1, h 2 (phase 2) | | .965 | 1.1% | .969 | 1.5% |
+
+  - **Better than seeds at the same share.** Entropy-ranked anchors keep .99–1.00 of strains' right calls at under 1% of the family, where the best seeds keep .965 at 1.1%. This passes phase 2's gate over all 40 families, not only the large ones. Ranking by count adapts to each read, while seeds need exact runs of matching residues.
+  - **Entropy beats the retention-adjusted rank.** The efficient rank is no better than random, so retention isn't worth trading for here.
+  - **Cost is linear in family size, but small.** The check reads n bytes per unit, laid out column-major. It took 0.02–0.03 ms per hit in NumPy, against 0.3–0.6 ms for brute force, on the three largest families. Part of the gain is one row per unit against every domain. The timing used each unit's first domain, while recall used the best, so the two differ slightly.
+  - **Release scale is estimated, not measured.** At 3 M units, 16 bytes per unit is about 48 MB per hit, or a few ms at memory bandwidth. Bitsets per (column, residue) would cut that to 2 bytes per unit. Seeds stay sublinear, so they may still be the first step for the very largest families.

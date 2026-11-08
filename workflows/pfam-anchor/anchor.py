@@ -617,9 +617,137 @@ def seeds(a: argparse.Namespace) -> None:
         print(table)
 
 
+# Anchor residues: the n most informative columns a read covers, as a first check. ----------
+
+ANCHOR_N = (8, 12, 16, 24)  # columns per read pair and family
+ANCHOR_SHARES = (0.005, 0.01, 0.02, 0.05, 0.1)  # units kept, by matches at the anchors
+
+
+def column_ranks(fam: Family, rng) -> dict[str, NDArray[np.float64]]:
+    """Per column, how informative it is, from one domain per unit: entropy across units, that
+    per bit of retention lost between nearest units (phase 1b's "efficient"), or random."""
+    ref = fam.matrix[fam.starts]
+    counts = np.stack([(ref == x).sum(0) for x in range(1, 21)], 1).astype(float) + 0.1
+    p = counts / counts.sum(1, keepdims=True)
+    entropy = -(p * np.log2(p)).sum(1)
+    view = SimpleNamespace(ref=ref, length=ref.shape[1] - 1)
+    same, seen = columns.Family.nearest_pairs(view)
+    retention = (same.sum(0) + 1) / (seen.sum(0) + 2)
+    lost = np.maximum(-np.log2(np.clip(retention, 1e-3, 0.999)), 0.02)
+    return {"entropy": entropy, "efficient": entropy / lost, "random": rng.random(len(entropy))}
+
+
+def anchors(a: argparse.Namespace) -> None:
+    rng = np.random.default_rng(1)
+    fams, _ = load_families(a.data)
+    hits = pl.concat(
+        read_hits(a.data, name)
+        .join(
+            pl.read_parquet(a.data / name / "oracle.parquet")
+            .filter("hit_source", pl.col("score") == "read")
+            .select("read"),
+            on="read",
+        )
+        .join(truth_of(a.data, name).select("read", "unit"), on="read")
+        .with_columns(set=pl.lit(name))
+        for name in prepare.SETS
+    )
+    rows = []
+    for (acc,), fam_hits in hits.group_by(["pfam_accession"], maintain_order=True):
+        fam = fams.get(acc)
+        if fam is None:
+            continue
+        length, n_units = fam.matrix.shape[1] - 1, len(fam.units)
+        ranks = column_ranks(fam, rng)
+        for (st, read), pair in fam_hits.group_by(["set", "read"], maintain_order=True):
+            target = pair["unit"][0]
+            hits_codes = [
+                columns.column_residues(*r, length)[0]
+                for r in pair.select("hmm_from", "ali_from", "cigar", "sequence").rows()
+            ]
+            M = np.zeros(n_units, dtype=np.int64)
+            S = np.zeros(n_units, dtype=np.int64)
+            N = 0
+            for codes in hits_codes:
+                m, s_, n = fam.score(codes, "read")
+                M, S, N = M + m, S + s_, N + n
+            ok = (S >= MIN_SHARE * N) & (S > 0)
+            ident = np.where(ok, M / max(N, 1), -1.0)
+            top = ident.max()
+            i = np.searchsorted(fam.units, target)
+            if top < 0 or i >= n_units or fam.units[i] != target:
+                rows.append((st, read, acc, None, None, top, False, None, n_units))
+                continue
+            truth_tied = bool(ok[i] and ident[i] >= top - EPS)
+            merged = np.max(np.stack(hits_codes), 0)  # the pair's residue per column
+            covered = np.flatnonzero(merged)
+            for rank_name, rank in ranks.items():
+                order = covered[np.argsort(-rank[covered], kind="stable")]
+                for n in ANCHOR_N:
+                    cols = order[:n]
+                    match = (fam.matrix[:, cols] == merged[cols]).sum(1)
+                    per_unit = np.maximum.reduceat(match, fam.starts)
+                    above = np.sort(per_unit)[::-1]
+                    for q in ANCHOR_SHARES:
+                        cut = above[min(n_units, max(1, int(np.ceil(q * n_units)))) - 1]
+                        kept = per_unit >= cut  # ties at the cut are kept
+                        hit = truth_tied and bool(kept[i])
+                        arm = f"{rank_name}_n{n}"
+                        rows.append((st, read, acc, arm, q, top, hit, int(kept.sum()), n_units))
+        print(f"PF{acc:05d}: {n_units} units", flush=True)
+    per_fam = pl.DataFrame(
+        rows,
+        schema=[
+            "set",
+            "read",
+            "pfam_accession",
+            "arm",
+            "q",
+            "top",
+            "truth_kept",
+            "candidates",
+            "units",
+        ],
+        orient="row",
+    )
+    pair_top = per_fam.group_by("set", "read").agg(best=pl.col("top").max())
+    arms = per_fam.filter(pl.col("arm").is_not_null()).join(pair_top, on=["set", "read"])
+    table = (
+        arms.group_by("set", "read", "arm", "q")
+        .agg(
+            kept=(pl.col("truth_kept") & (pl.col("top") >= pl.col("best") - EPS)).any(),
+            share=pl.col("candidates").sum() / pl.col("units").sum(),
+        )
+        .join(
+            pl.concat(
+                pl.read_parquet(a.data / name / "oracle.parquet")
+                .filter("hit_source", "right", pl.col("score") == "read")
+                .select("read", set=pl.lit(name))
+                for name in prepare.SETS
+            ),
+            on=["set", "read"],
+        )
+        .group_by("arm", "q")
+        .agg(
+            *(
+                expr.alias(f"{st}_{label}")
+                for st in prepare.SETS
+                for label, expr in (
+                    ("kept", pl.col("kept").filter(pl.col("set") == st).mean()),
+                    ("share", pl.col("share").filter(pl.col("set") == st).median()),
+                )
+            )
+        )
+        .sort("arm", "q")
+    )
+    table.write_csv(a.data / "anchors.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=200):
+        print(table)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("step", choices=["oracle", "seeds"])
+    p.add_argument("step", choices=["oracle", "seeds", "anchors"])
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
     p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
@@ -632,7 +760,7 @@ def main() -> None:
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB, help="memory watchdog's cap")
     a = p.parse_args()
     prepare.watchdog(a.max_gb)
-    {"oracle": oracle, "seeds": seeds}[a.step](a)
+    {"oracle": oracle, "seeds": seeds, "anchors": anchors}[a.step](a)
 
 
 if __name__ == "__main__":
