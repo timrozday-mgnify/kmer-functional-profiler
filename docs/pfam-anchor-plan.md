@@ -210,6 +210,36 @@ So phase 3 compares the anchored route with DIAMOND only. The tree index enters 
 - **The split:** GA hits and kfpfam's recruited hits both take the anchored route.
 - **Every read takes the unanchored route,** whether or not it has a hit. The anchored route is in addition, for reads with a hit. How the two routes' calls are reconciled for the same read is phase 4's question.
 
+## From pseudo-alignment to alignment, and the pileup as the MSA
+
+Added 2026-11-08 at the user's request; measured on the local case (Progress log, "Alignments from the pseudo-alignment").
+
+**Alignment by seed extension.** The two HMM alignments already pair most read residues with the unit's residues. A proper alignment needs only three cheap steps, with the pairs as seeds:
+
+1. **Implied pairs:** the match columns both use. These are 78–86% of the ORF's residues, placed as DIAMOND places them for 98–99%.
+2. **Fill between pairs:** along the diagonal where both sides skip the same number of residues (insert states in both). Otherwise, a global DP of the two short stretches. DP is needed in under 2.5% of hits, at under one cell per hit on average.
+3. **Extend past the first and last pair:** ungapped, X-drop, to the ORF's ends. This brings the alignment to 95–98% of the ORF, against DIAMOND's 96–98%, and reproduces 96–98% of DIAMOND's pairs at 98–99% agreement.
+
+It costs about 12 µs per hit in Python, against DIAMOND's 15–19 core-ms per read pair (under emulation). So the route's own alignment replaces DIAMOND entirely, not only DIAMOND's choice of unit.
+
+**The pileup needs no extra MSA stage.**
+
+- **Within a unit.** `kfp-pileup call` builds its pileup from DIAMOND's tabular lines: `qseqid sseqid bitscore qstart qend sstart send qframe btop` (`crates/core/src/diamond.rs`). The route can write the same lines from its own alignments, with BTOP from the residue pairs and a BLOSUM62 bit score with DIAMOND's gap costs. `call` then builds pileups, posteriors and the nucleotide pileup unchanged. Routing and DIAMOND drop out of the anchored path. Reads stacked on a target's residues are a star MSA, which is what the pileup already is.
+- **Across units of a family.** The HMM's match columns are a shared coordinate, so pileups of different targets line up column by column, as `hmmalign` output does. This gives a family-wide MSA over the domain for free, for comparing variants across related units or moving reads between them. Residues in insert states stay unaligned across units, as in Pfam's alignments. Outside the domain, only each target's own coordinates apply.
+- **An extra MSA would add little.** It would only align insert-state residues across units, and the outer parts of proteins with no domain coordinate. Neither is needed for a per-target pileup.
+
+**Limits of the measurement.**
+
+- Strains are substitution-only (`spike.py simulate`), so their reads have no indels against the source. Relatives carry real indels, and their DP rate is the same 1–2%.
+- An indel past the domain stops the ungapped extension early. Where X-drop stops before the ORF ends, a banded gapped extension is the fallback; it isn't built or measured.
+- Reads with frameshifting errors split into ORFs (DIAMOND's `-F` handles these within one alignment). Each ORF is aligned on its own, and `call` sees them as separate lines of one mate.
+- DIAMOND is the reference here, not the truth. Some of the 1–2% disagreement may be DIAMOND's.
+
+**Plan.** As phase 4b: the route writes DIAMOND-format lines per mate for every tied unit's winning protein, plus the handoff's `ref.fa`/`refs.tsv`. Then `kfp-pileup call` runs on them directly. The checks:
+- `call` accepts the lines;
+- per-target pileups agree with DIAMOND-based ones, column by column;
+- `call`'s read posteriors and per-unit identity agree with the DIAMOND path's.
+
 ## Speed: what carries over from kfpfam
 
 Added 2026-11-08 at the user's request. kfpfam's speed work (its `docs/plan.md`, "Speed plan" and Progress log) took a per-read pseudo-alignment from about 108 to 1.4–3 ns per hit. Most of it is about memory layout and batching, not k-mers, so it carries over to anchor residues and column identity. Nothing below is built or measured here.
@@ -519,3 +549,15 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **The handoff is trimmed.** Targets are each called unit's winning proteins plus its representative: 7,727 proteins for strains, against 94,468 when every member was a target. Neighbours are up to 5 near units per family by representative, and each assignment sits on its winning protein.
   - **The route is settled:** kfpfam's recruited hits with `top = 1`, reference GA and weak domains of every member, anchor residues, then column identity. The route's code defaults are still `--hits hmmsearch --ref ga`, so that earlier outputs keep their names.
   - **Not done in phase 4.** Extending past the domain. Every read through both routes, with the tree index, which comes next.
+- **Alignments from the pseudo-alignment (2026-11-08, the user's question).** `anchor.py align`, on the settled route's hits (kfpfam's recruited top, GA and weak member domains). There are 13,732 ORF hits that DIAMOND also aligns to the truth protein, built in 1.0 s, about 12 µs each.
+
+  | Stage | ORF residues aligned | Placed as DIAMOND places them | DIAMOND's pairs reproduced |
+  | --- | ---: | ---: | ---: |
+  | Implied by HMM columns | 78–86% | 98.1–99.3% | 79–87% |
+  | + filled between pairs | 79–87% | 98.0–99.3% | 80–88% |
+  | + ungapped X-drop extension (X = 15) | 95–98% | 97.9–99.3% | 96–98% |
+  | DIAMOND (`--sensitive`) | 96–98% | | |
+
+  - Ranges are over identity bins for both read sets, with no trend in identity.
+  - DP between pairs was needed for 0–2.4% of hits.
+  - See "From pseudo-alignment to alignment, and the pileup as the MSA" for what follows: the route writes `kfp-pileup call`'s DIAMOND lines itself, and the pileup needs no separate MSA.

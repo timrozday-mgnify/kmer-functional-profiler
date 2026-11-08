@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
+from Bio.Align import substitution_matrices
 from numpy.typing import NDArray
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1103,9 +1104,197 @@ def compare(a: argparse.Namespace) -> None:
     print(json.dumps(timing, indent=1))
 
 
+# From pseudo-alignment to alignment (phase 4b): fill between the HMM's pairs, then extend. ---
+
+X_DROP = 15  # BLOSUM62 points below the best before an ungapped extension stops
+GAP_OPEN, GAP_EXTEND = -11, -1
+
+
+def blosum() -> NDArray[np.int64]:
+    """BLOSUM62 on byte codes, for scoring residue pairs."""
+    m = substitution_matrices.load("BLOSUM62")
+    out = np.full((256, 256), -4, dtype=np.int64)
+    for a in m.alphabet:
+        for b in m.alphabet:
+            out[ord(a), ord(b)] = int(m[a][b])
+    return out
+
+
+def build_alignment(orf: str, prot: str, i: NDArray, j: NDArray, sub: NDArray, aligner) -> dict:
+    """ORF residue -> protein residue, per stage: ``implied`` (the HMM's match columns both
+    use), ``filled`` (gaps between consecutive pairs: along the diagonal when both sides skip
+    the same number, else a global DP of the two stretches), ``extended`` (ungapped from the
+    first and last pair to the ORF's ends, X-drop). Also the DP cells used."""
+    implied = dict(zip(i.tolist(), j.tolist(), strict=True))
+    filled = dict(implied)
+    cells = 0
+    for (i1, j1), (i2, j2) in itertools.pairwise(zip(i.tolist(), j.tolist(), strict=True)):
+        di, dj = i2 - i1, j2 - j1
+        if di == dj:
+            filled.update((i1 + k, j1 + k) for k in range(1, di))
+        elif di > 1 and dj > 1:
+            cells += (di - 1) * (dj - 1)
+            aln = aligner.align(orf[i1 + 1 : i2], prot[j1 + 1 : j2])[0]
+            for (qa, qb), (sa, _) in zip(*aln.aligned, strict=True):
+                filled.update((i1 + 1 + qa + k, j1 + 1 + sa + k) for k in range(qb - qa))
+    extended = dict(filled)
+    o, p = np.frombuffer(orf.encode(), np.uint8), np.frombuffer(prot.encode(), np.uint8)
+    for start, step in ((min(filled), -1), (max(filled), 1)):
+        s0, t0 = start, filled[start]
+        score = best = 0
+        keep = 0
+        k = 1
+        while 0 <= s0 + step * k < len(o) and 0 <= t0 + step * k < len(p):
+            score += sub[o[s0 + step * k], p[t0 + step * k]]
+            if score > best:
+                best, keep = score, k
+            elif best - score > X_DROP:
+                break
+            k += 1
+        extended.update((s0 + step * m, t0 + step * m) for m in range(1, keep + 1))
+    return {"implied": implied, "filled": filled, "extended": extended, "cells": cells}
+
+
+def align(a: argparse.Namespace) -> None:
+    """For each ORF hit that DIAMOND also aligns to the truth protein (the settled route's hits:
+    kfpfam's recruited, top only), the alignment built from the HMM's pairs at each stage,
+    against DIAMOND's: residues of the ORF aligned, the share placed as DIAMOND places them
+    (precision), and DIAMOND's pairs reproduced (recall)."""
+    from Bio.Align import PairwiseAligner
+
+    aligner = PairwiseAligner(mode="global", open_gap_score=GAP_OPEN, extend_gap_score=GAP_EXTEND)
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    sub = blosum()
+    _, domains = load_families(a.data, "weak")
+    size = lengths(a.data / "hmms.hmm")
+    ref = pl.read_parquet(a.data / "holdout/members.parquet", columns=["protein_id", "sequence"])
+    prot_seq = dict(ref.iter_rows())
+    rows = []
+    t0 = time.perf_counter()
+    n_built = 0
+    for name in prepare.SETS:
+        d = a.data / name
+        truth = truth_of(a.data, name)
+        hits = route_hits(d, "", "recruited_top")
+        dia = (
+            pl.read_parquet(d / "diamond.parquet")
+            .sort("bitscore", descending=True)
+            .unique(["read", "mate", "protein_id"], keep="first")
+            .select(
+                "read",
+                "mate",
+                relative="protein_id",
+                qstart="qstart",
+                qframe="qframe",
+                sstart="sstart",
+                dcigar="cigar",
+                dlen="length",
+            )  # fmt: skip
+        )
+        dom = domains.select(
+            relative="protein_id", pfam_accession="pfam_accession", p_from="hmm_from",
+            p_ali="ali_from", p_cigar="cigar",
+        )  # fmt: skip
+        pairs = (
+            hits.join(
+                pl.read_parquet(d / "orfs.parquet").select("orf_id", "mate", "strand", "start"),
+                on="orf_id",
+            )
+            .join(truth.select("read", "relative", "identity_bin", "read_len"), on="read")
+            .join(dia, on=["read", "mate", "relative"])
+            .join(dom, on=["relative", "pfam_accession"])
+        )  # fmt: skip
+        best: dict[tuple, tuple] = {}
+        for r in pairs.iter_rows(named=True):
+            length = size[r["pfam_accession"]]
+            pseq = prot_seq[r["relative"]]
+            _, orf_pos = columns.column_residues(
+                r["hmm_from"], r["ali_from"], r["cigar"], r["sequence"], length
+            )
+            _, p_pos = columns.column_residues(r["p_from"], r["p_ali"], r["p_cigar"], pseq, length)
+            both = (orf_pos >= 0) & (p_pos >= 0)
+            if both.sum() < 2:
+                continue
+            t1 = time.perf_counter()
+            built = build_alignment(r["sequence"], pseq, orf_pos[both], p_pos[both], sub, aligner)
+            n_built += 1
+            elapsed = time.perf_counter() - t1
+            dmap = diamond_residues(r["qstart"], r["qframe"], r["sstart"], r["dcigar"])
+            n_orf = len(r["sequence"])
+            s0, rl = r["start"], r["read_len"]
+            keys = [s0 + 3 * x + 1 if r["strand"] == "+" else rl - s0 - 3 * x for x in range(n_orf)]
+            in_dia = {x: dmap[k] for x, k in enumerate(keys) if k in dmap}
+            out = [
+                r["read"],
+                r["mate"],
+                r["orf_id"],
+                r["identity_bin"],
+                n_orf,
+                len(in_dia),
+                built["cells"],
+                elapsed,
+            ]
+            for stage in ("implied", "filled", "extended"):
+                m = built[stage]
+                shared = [x for x in m if x in in_dia]
+                agree = sum(m[x] == in_dia[x] for x in shared)
+                out += [len(m), len(shared), agree]
+            k = (name, r["orf_id"], r["pfam_accession"])
+            # repeats: several of the protein's domains are in the family; keep the best agreeing
+            if k not in best or out[-1] > best[k][-1]:
+                best[k] = (name, *out)
+        rows += best.values()
+    cols = [
+        "set",
+        "read",
+        "mate",
+        "orf_id",
+        "identity_bin",
+        "orf_len",
+        "diamond_aligned",
+        "dp_cells",
+        "seconds",
+    ]
+    for stage in ("implied", "filled", "extended"):
+        cols += [f"{stage}_aligned", f"{stage}_shared", f"{stage}_agree"]
+    df = pl.DataFrame(rows, schema=cols, orient="row")
+    df.write_parquet(a.data / "align.parquet")
+    summary = (
+        df.group_by("set", "identity_bin")
+        .agg(
+            *(
+                expr
+                for stage in ("implied", "filled", "extended")
+                for expr in (
+                    (pl.col(f"{stage}_aligned").sum() / pl.col("orf_len").sum()).alias(
+                        f"{stage}_cover"
+                    ),
+                    (pl.col(f"{stage}_agree").sum() / pl.col(f"{stage}_shared").sum()).alias(
+                        f"{stage}_precision"
+                    ),
+                    (pl.col(f"{stage}_agree").sum() / pl.col("diamond_aligned").sum()).alias(
+                        f"{stage}_recall"
+                    ),
+                )
+            ),
+            hits=pl.len(),
+            orf_len=pl.col("orf_len").mean(),
+            diamond_cover=pl.col("diamond_aligned").sum() / pl.col("orf_len").sum(),
+            dp_hits=(pl.col("dp_cells") > 0).mean(),
+            dp_cells=pl.col("dp_cells").mean(),
+            us_per_hit=pl.col("seconds").mean() * 1e6,
+        )
+        .sort("set", "identity_bin", descending=[False, True])
+    )
+    summary.write_csv(a.data / "align.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=260):
+        print(summary)
+    print(f"{n_built} alignments built in {time.perf_counter() - t0:.1f} s")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("step", choices=["oracle", "seeds", "anchors", "query", "compare"])
+    p.add_argument("step", choices=["oracle", "seeds", "anchors", "query", "compare", "align"])
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
     p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
@@ -1130,6 +1319,7 @@ def main() -> None:
         "seeds": seeds,
         "anchors": anchors,
         "query": query,
+        "align": align,
         "compare": compare,
     }
     steps[a.step](a)
