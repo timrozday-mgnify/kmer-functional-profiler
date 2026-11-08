@@ -260,6 +260,12 @@ every read -> aligned to the targets, all plausible alignments kept            (
   - DIAMOND `blastx` against the targets, as the pileup workflow runs it;
   - the tree index on the confirmed units. Tier 2, the dense index, could be used straight away, since the confirmed reference is small. Or tier 1 could route first and tier 2 align, as for the whole release. Test both against DIAMOND, on reads mapped right, time and memory. The tree index routes and scores but doesn't write alignments, so its arms hand their candidates to the aligner. The anchored route's own alignments (phase 4b) cover only reads with a hit, so they aren't a mapper for every read.
 - **This replaces mate rescue.** Phase 4b's missing mates are reads with no hit of their own, and mapping every read covers them.
+- **Tier 2 as a pseudo-alignment (measured 2026-11-08).** For reads with no anchor, tier 2's k-mer seeds play the part the HMM columns play in the anchored route.
+  1. Dense routing sends a read pair to its candidate leaves.
+  2. Exact protein 4-mer seeds between each mate's stop-free frames and a leaf's protein are kept near the best diagonal, and chained increasing in both.
+  3. The anchored route's `build_alignment` fills between seeds and extends.
+
+  The result is a full alignment in `call`'s DIAMOND format, so tier 2 is the whole mapper and DIAMOND isn't needed. It agrees with DIAMOND's alignments for 99.7% of residues, and beats DIAMOND end to end on right calls. Today's `_core.pseudo_align` returns only a score: the Rust kernel already finds the diagonal bands, so returning the chain's coordinates is the port.
 
 ## Speed: what carries over from kfpfam
 
@@ -635,3 +641,31 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - Tier 2 writing `call`'s DIAMOND lines from its alignments, so the tree index replaces DIAMOND end to end.
     - The unanchored route's confirmations, alongside the anchored ones.
     - The gather (`call`'s EM) scored on reads mapped by each mapper.
+- **Tier 2 as a pseudo-alignment, then a full alignment (2026-11-08, the user's question).** `anchor.py seedalign` and `seedlines`, on the confirmed reference at weight 0.1.
+  - **The method.** Per mate and routed protein: exact 4-mer seeds over the mate's stop-free frame stretches; seeds within 8 diagonals of the best-supported one; the longest chain increasing in both sequences (patience sort, with pairs sorted by read position, then protein position descending); then `build_alignment` as in the anchored route.
+  - **Against DIAMOND,** on its lines to proteins tier 2 alone routed the pair to (frameshifted lines skipped). Coverage is over DIAMOND's aligned length.
+
+    | Lines | Count | Found | Seeds | + filled | + extended | Precision | Recall |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Strains, pair with a Pfam hit | 39,112 | 1.000 | 77% | 91% | 99.8% | .998 | .993 |
+    | Strains, no Pfam hit | 31,217 | .998 | 69% | 87% | 99.5% | .997 | .987 |
+    | Relatives, with a hit | 20,104 | .999 | 86% | 94% | 99.7% | .997 | .989 |
+    | Relatives, no hit | 21,293 | .999 | 78% | 88% | 98.6% | .997 | .980 |
+
+    That is about 85 µs per line in Python. It is closer to DIAMOND than the HMM-anchored alignments were (98–99%), since DIAMOND also seeds and extends.
+  - **End to end.** `seedlines` writes the lines for every mate against every protein of the pair's routed leaves: 87,698 lines for strains in 8.1 s and 53,133 for relatives in 5.2 s, in Python on one thread. Then `call` runs on them, with 0 codon mismatches.
+
+    | Mapper, then `call` | Strains: mapped | Right | Precision | Right, no Pfam hit | Variants (true) | Relatives: right | Precision |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND | .728 | .571 | .784 | .527 | 6,385 (.890) | .378 | .600 |
+    | DIAMOND, `call --min-identity 0.5` | .829 | .627 | .756 | .588 | 10,327 (.846) | .409 | .534 |
+    | Tier 2 routing, then seed alignments | .797 | .620 | .778 | .569 | 6,981 (.895) | .405 | .581 |
+
+    - **Tier 2 as the mapper beats DIAMOND on right calls** (.620 against .571, .405 against .378), at nearly its precision and slightly better variant truth.
+    - It maps more mates, because a routed protein is always aligned, while DIAMOND's `--sensitive` stops at an e-value of 0.001 on short reads.
+    - It matches DIAMOND at `--min-identity 0.5` on right calls, without that arm's loss of precision and variant truth.
+  - **The mapper is settled:** tier 2 alone (dense routing), then seed alignments, then `call`. Tier 1 stays for the unanchored route on the whole release.
+  - **Next.**
+    - Port the seed chain and alignment into `_core.pseudo_align`, returning coordinates and BTOP; it computes the diagonal bands already.
+    - The unanchored route's confirmations.
+    - Scoring the gather and pileups against the truth across mappers. Done here only through `call`'s best units and variants.

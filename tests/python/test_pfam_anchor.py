@@ -176,3 +176,20 @@ def test_diamond_line_coordinates_and_btop() -> None:
         .split("\t")
     )
     assert f[3:9] == ["150", "139", "1", "3", "-1", "1C-2"]
+
+
+def test_seed_chain_keeps_one_diagonal_increasing_in_both() -> None:
+    prot = "WWACDEFGHIKLMNPQ"
+    index: dict[str, list[int]] = {}
+    for y in range(len(prot) - anchor.SEED_K + 1):
+        index.setdefault(prot[y : y + anchor.SEED_K], []).append(y)
+    i, j = anchor.seed_chain("ACDEFGHIK", prot, index)
+    assert i.tolist() == list(range(9))
+    assert j.tolist() == list(range(2, 11))
+
+
+def test_btop_residues_match_the_cigar_walk() -> None:
+    # 2 matches, a substitution, a query-only residue, a subject-only residue, 1 match
+    got = anchor.btop_residues(4, 1, 10, "2DFA--C1")
+    assert got == anchor.diamond_residues(4, 1, 10, "3M1I1D1M")
+    assert anchor.btop_residues(4, 1, 10, "2/3") is None

@@ -24,6 +24,7 @@ Writes per read set ``oracle.parquet`` (one row per pair with a hit), and ``orac
 """
 
 import argparse
+import bisect
 import gzip
 import itertools
 import json
@@ -1901,6 +1902,264 @@ def mapscore(a: argparse.Namespace) -> None:
         print(df)
 
 
+SEED_K = 4  # tier 2's pseudo-alignment seeds (verify.py, tier2.py: protein 4-mers)
+SEED_BAND = 8  # diagonals kept around the best one (tier2.py's band)
+
+
+def btop_residues(qstart: int, qframe: int, sstart: int, btop: str) -> dict[int, int] | None:
+    """As :func:`diamond_residues`, from a BTOP string; None for a frameshifted line."""
+    if "/" in btop or "\\" in btop:
+        return None
+    sign = 1 if qframe > 0 else -1
+    out, q, j, i = {}, 0, sstart - 1, 0
+    while i < len(btop):
+        if btop[i].isdigit():
+            n = i
+            while n < len(btop) and btop[n].isdigit():
+                n += 1
+            for k in range(int(btop[i:n])):
+                out[qstart + sign * 3 * (q + k)] = j + k
+            q, j = q + int(btop[i:n]), j + int(btop[i:n])
+            i = n
+        else:
+            a_, b_ = btop[i], btop[i + 1]
+            if a_ != "-" and b_ != "-":
+                out[qstart + sign * 3 * q] = j
+                q, j = q + 1, j + 1
+            elif b_ == "-":
+                q += 1
+            else:
+                j += 1
+            i += 2
+    return out
+
+
+def segments(read: str) -> list[tuple[str, str, int]]:
+    """A read's stop-free stretches in all six frames: (protein, strand, first base on that
+    strand), as ``prepare.orfs_at`` with no minimum length."""
+    return prepare.orfs_at(read, SEED_K)
+
+
+def seed_chain(seg: str, prot: str, index: dict) -> tuple[NDArray, NDArray]:
+    """Residue pairs from exact ``SEED_K``-mer seeds: those within ``SEED_BAND`` diagonals of the
+    best-supported one, chained by the longest run increasing in both sequences."""
+    hits = [
+        (x, y) for x in range(len(seg) - SEED_K + 1) for y in index.get(seg[x : x + SEED_K], ())
+    ]
+    if not hits:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    diag = np.array([y - x for x, y in hits])
+    values, counts = np.unique(diag, return_counts=True)
+    best = values[counts.argmax()]
+    pairs = list({(x + k, y + k) for (x, y), d in zip(hits, diag, strict=True)
+                  if abs(d - best) <= SEED_BAND for k in range(SEED_K)})  # fmt: skip
+    # the longest chain increasing in both: sorted by x, then y descending, so a strictly
+    # increasing run of y can't take two pairs with the same x (patience sort)
+    pairs.sort(key=lambda p: (p[0], -p[1]))
+    tails: list[int] = []  # index of the smallest tail y of each chain length
+    tail_y: list[int] = []
+    prev = [-1] * len(pairs)
+    for n, (_, y) in enumerate(pairs):
+        lo = bisect.bisect_left(tail_y, y)
+        prev[n] = tails[lo - 1] if lo else -1
+        if lo == len(tails):
+            tails.append(n)
+            tail_y.append(y)
+        else:
+            tails[lo], tail_y[lo] = n, y
+    chain, n = [], tails[-1] if tails else -1
+    while n >= 0:
+        chain.append(pairs[n])
+        n = prev[n]
+    chain.reverse()
+    return np.array([x for x, _ in chain]), np.array([y for _, y in chain])
+
+
+def seedalign(a: argparse.Namespace) -> None:
+    """Reads with no anchor: alignments from k-mer seeds, as ``align`` builds them from HMM
+    columns. For each DIAMOND line on the confirmed reference whose protein tier 2 alone also
+    routed the read pair to, the mate is aligned to that protein from scratch (``seed_chain``,
+    then ``build_alignment``: fill, extend) and compared with DIAMOND's residue pairs ->
+    ``seedalign.tsv``, by read set and whether the pair has a Pfam hit."""
+    from Bio.Align import PairwiseAligner
+
+    aligner = PairwiseAligner(mode="global", open_gap_score=GAP_OPEN, extend_gap_score=GAP_EXTEND)
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    sub = blosum()
+    rows = []
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        tree = c / "tree"
+        refs = pl.read_csv(c / "refs.tsv", separator="\t").select("seq_id", "protein_id")
+        seqs = dict(
+            pl.read_parquet(tree / "members.parquet").select("protein_id", "sequence").iter_rows()
+        )
+        names = read_names(d / "reads_1.fq.gz")
+        pair_of = {n: i for i, n in enumerate(names)}
+        mates = {}
+        for m in (1, 2):
+            with gzip.open(d / f"reads_{m}.fq.gz", "rt") as f:
+                mates[m] = [line.strip() for i, line in enumerate(f) if i % 4 == 1]
+        routed = (
+            pl.read_parquet(tree / "t2_alone/reads.parquet", columns=["read", "pos"])
+            .join(pl.read_parquet(tree / "index/proteins.parquet").filter(pl.col("pos") >= 0),
+                  on="pos")
+            .select("read", "protein_id").unique()
+        )  # fmt: skip
+        routed_set = set(routed.iter_rows())
+        src = dict(
+            pl.read_parquet(d / "oracle.parquet").filter(pl.col("score") == "read")
+            .select("read", "hit_source").iter_rows()
+        )  # fmt: skip
+        read_len = pl.read_parquet(d / "reads.parquet")["pair_bases"][0] // 2
+        index_of: dict[int, dict] = {}
+        for m in (1, 2):
+            lines = pl.read_csv(c / f"diamond_{m}.tsv", separator="\t", has_header=False,
+                                new_columns=["q", "seq_id", "bits", "qstart", "qend", "sstart",
+                                             "send", "qframe", "btop"])  # fmt: skip
+            lines = lines.join(refs, on="seq_id").unique(["q", "protein_id"], keep="first")
+            for q, pid, qstart, sstart, qframe, btop in lines.select(
+                "q", "protein_id", "qstart", "sstart", "qframe", "btop"
+            ).iter_rows():
+                read = pair_of[q]
+                if (read, pid) not in routed_set:
+                    continue
+                dia = btop_residues(qstart, qframe, sstart, btop)
+                if dia is None:
+                    continue
+                prot = seqs[pid]
+                if pid not in index_of:
+                    idx: dict[str, list[int]] = {}
+                    for y in range(len(prot) - SEED_K + 1):
+                        idx.setdefault(prot[y : y + SEED_K], []).append(y)
+                    index_of[pid] = idx
+                t0 = time.perf_counter()
+                best = None
+                for seg, strand, start in segments(mates[m][read]):
+                    i, j = seed_chain(seg, prot, index_of[pid])
+                    if len(i) >= 2 and (best is None or len(i) > len(best[1])):
+                        best = (seg, i, j, strand, start)
+                built = None
+                if best is not None:
+                    seg, i, j, strand, start = best
+                    built = build_alignment(seg, prot, i, j, sub, aligner)
+                elapsed = time.perf_counter() - t0
+                row = [name, src.get(read, False), len(dia), elapsed, built is not None]
+                for stage in ("implied", "filled", "extended"):
+                    if built is None:
+                        row += [0, 0, 0]
+                        continue
+                    pairs = built[stage]
+                    keys = {
+                        x: (start + 3 * x + 1 if strand == "+" else read_len - start - 3 * x)
+                        for x in pairs
+                    }
+                    shared = [x for x in pairs if keys[x] in dia]
+                    row += [len(pairs), len(shared), sum(dia[keys[x]] == pairs[x] for x in shared)]
+                rows.append(row)
+    cols = ["set", "hit", "diamond_aligned", "seconds", "found"]
+    for stage in ("seeds", "filled", "extended"):
+        cols += [f"{stage}_aligned", f"{stage}_shared", f"{stage}_agree"]
+    df = pl.DataFrame(rows, schema=cols, orient="row")
+    stage_exprs = [
+        e
+        for stage in ("seeds", "filled", "extended")
+        for e in (
+            (pl.col(f"{stage}_aligned").sum() / pl.col("diamond_aligned").sum()).alias(
+                f"{stage}_cover"
+            ),
+            (pl.col(f"{stage}_agree").sum() / pl.col(f"{stage}_shared").sum()).alias(
+                f"{stage}_precision"
+            ),
+            (pl.col(f"{stage}_agree").sum() / pl.col("diamond_aligned").sum()).alias(
+                f"{stage}_recall"
+            ),
+        )
+    ]
+    summary = (
+        df.group_by("set", "hit")
+        .agg(*stage_exprs, lines=pl.len(), found=pl.col("found").mean(),
+             us_per_line=pl.col("seconds").mean() * 1e6)
+        .sort("set", "hit")
+    )  # fmt: skip
+    summary.write_csv(
+        a.data / f"seedalign_{confirmed_dir(a)}.tsv", separator="\t", float_precision=4
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=250):
+        print(summary)
+
+
+def seedlines(a: argparse.Namespace) -> None:
+    """Tier 2 as the whole mapper: every read pair's routed leaves (``tier2.py --all-leaves``'s
+    ``reads.parquet``: hits within its ambiguity of the best), each mate aligned to each of the
+    leaves' proteins from k-mer seeds (``seed_chain``, ``build_alignment``), written as ``call``'s
+    DIAMOND lines -> ``<confirmed>/seed_{1,2}.tsv``; then ``kfp-pileup call`` ->
+    ``<confirmed>/call_tier2seed``, scored by ``mapcmp``."""
+    from Bio.Align import PairwiseAligner
+
+    aligner = PairwiseAligner(mode="global", open_gap_score=GAP_OPEN, extend_gap_score=GAP_EXTEND)
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    sub = blosum()
+    kfp = Path(sys.executable).with_name("kfp-pileup")
+    times = {}
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        tree = c / "tree"
+        seq_of = dict(
+            pl.read_csv(c / "refs.tsv", separator="\t").select("protein_id", "seq_id").iter_rows()
+        )
+        seqs = dict(
+            pl.read_parquet(tree / "members.parquet").select("protein_id", "sequence").iter_rows()
+        )
+        names = read_names(d / "reads_1.fq.gz")
+        mates = {}
+        for m in (1, 2):
+            with gzip.open(d / f"reads_{m}.fq.gz", "rt") as f:
+                mates[m] = [line.strip() for i, line in enumerate(f) if i % 4 == 1]
+        read_len = len(mates[1][0])
+        routed = (
+            pl.read_parquet(tree / "t2_alone/reads.parquet", columns=["read", "pos"])
+            .join(pl.read_parquet(tree / "index/proteins.parquet").filter(pl.col("pos") >= 0),
+                  on="pos")
+            .select("read", "protein_id").unique().sort("read", "protein_id")
+        )  # fmt: skip
+        t0 = time.perf_counter()
+        index_of: dict[int, dict] = {}
+        out = {1: [], 2: []}
+        for read, pid in routed.iter_rows():
+            prot = seqs[pid]
+            if pid not in index_of:
+                idx: dict[str, list[int]] = {}
+                for y in range(len(prot) - SEED_K + 1):
+                    idx.setdefault(prot[y : y + SEED_K], []).append(y)
+                index_of[pid] = idx
+            for m in (1, 2):
+                best = None
+                for seg, strand, start in segments(mates[m][read]):
+                    i, j = seed_chain(seg, prot, index_of[pid])
+                    if len(i) >= 2 and (best is None or len(i) > len(best[1])):
+                        best = (seg, i, j, strand, start)
+                if best is None:
+                    continue
+                seg, i, j, strand, start = best
+                pairs = build_alignment(seg, prot, i, j, sub, aligner)["extended"]
+                out[m].append(diamond_line(names[read], seq_of[pid], seg, prot, pairs, strand,
+                                           start, read_len, sub))  # fmt: skip
+        times[f"{name}_align_s"] = time.perf_counter() - t0
+        times[f"{name}_lines"] = len(out[1]) + len(out[2])
+        for m in (1, 2):
+            (c / f"seed_{m}.tsv").write_text("".join(out[m]))
+        t0 = time.perf_counter()
+        prepare.run(kfp, "call", c, c / "call_tier2seed", c / "seed_1.tsv", c / "seed_2.tsv",
+                    "--reads", d / "reads_1.fq.gz", "--reads", d / "reads_2.fq.gz",
+                    "--stats", c / "call_tier2seed.json")  # fmt: skip
+        times[f"{name}_call_s"] = time.perf_counter() - t0
+    (a.data / f"seedlines_times_{confirmed_dir(a)}.json").write_text(json.dumps(times, indent=1))
+    print(json.dumps(times, indent=1))
+
+
 STEPS = {
     "oracle": oracle,
     "seeds": seeds,
@@ -1916,6 +2175,8 @@ STEPS = {
     "mapcmp": mapcmp,
     "treeindex": treeindex,
     "mapscore": mapscore,
+    "seedalign": seedalign,
+    "seedlines": seedlines,
 }
 
 
