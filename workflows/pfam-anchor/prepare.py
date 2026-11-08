@@ -12,10 +12,12 @@ Steps run in order; ``all`` runs every one. Everything goes under ``--out``.
   ``truth.parquet``: strain, source protein, truth unit (the source's unit for strains, its
   nearest remaining relative's for relatives), identity bin.
 - ``search``: per read set, six-frame ORFs of both mates (split at stops, ``--min-orf`` aa) ->
-  ``orfs.parquet`` (orf_id, read pair, mate, strand, start base on that strand, length), and
+  ``orfs.parquet`` (orf_id, read pair, mate, strand, start base on that strand, length,
+  sequence), and
   their hits -> ``hits.parquet``; the same for the reads reversed (``null_*``), the null.
 - ``diamond``: both mates against the reference, DIAMOND ``blastx`` from the biocontainer,
-  best hit per mate -> ``diamond.parquet`` (read, mate, protein_id, pident, length, bitscore).
+  every hit within 10% of each mate's best score (``--top 10``) -> ``diamond.parquet`` (read,
+  mate, protein_id, then :data:`DIAMOND_FIELDS` from pident on).
 - ``report``: ``hit`` recall (a read pair has a hit on a family of its source protein, at GA and
   at any score) by read set, identity bin and where the pair lies: ``domain`` (a mate overlaps
   one of the source's GA domains by at least ``--min-orf`` residues), ``outside`` (coding, but
@@ -31,6 +33,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -48,6 +51,20 @@ BENCH = [
     *("0.7", "--substitution", "blosum62", "--depth-mu", "0.3", "--depth-sigma", "0.6"),
 ]
 DIAMOND = "quay.io/biocontainers/diamond:2.2.8--he361c42_0"
+# qstart, qend: bases on the read (qstart > qend on the reverse strand); sstart, send: residues.
+DIAMOND_FIELDS = [
+    "qseqid",
+    "sseqid",
+    "pident",
+    "length",
+    "bitscore",
+    "qstart",
+    "qend",
+    "sstart",
+    "send",
+    "qframe",
+    "cigar",
+]
 SETS = ("strains", "relatives")
 
 # Six-frame ORFs as kfpfam's measure/real_orfs.py (code 11).
@@ -62,6 +79,20 @@ RC = str.maketrans("ACGTN", "TGCAN")
 
 
 MAX_GB = 6.0  # resident memory of a step's processes before the watchdog kills them
+
+
+def watchdog(max_gb: float) -> None:
+    """Exit this process if its own resident memory passes ``max_gb`` (``run`` covers children)."""
+
+    def watch() -> None:
+        while True:
+            ps = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True)
+            if int(ps.stdout or 0) > max_gb * 2**20:
+                print(f"watchdog: over {max_gb} GB, exiting", file=sys.stderr, flush=True)
+                os._exit(3)
+            time.sleep(0.5)
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def run(*cmd: object, shell: bool = False) -> None:
@@ -253,10 +284,9 @@ def orfs(a: argparse.Namespace) -> None:
             for read, mate, seq in mates(d, null):
                 for prot, strand, start in orfs_at(seq, a.min_orf):
                     faa.write(f">{len(rows)}\n{prot}\n")
-                    rows.append((len(rows), read, mate, strand, start, len(prot)))
-        pl.DataFrame(
-            rows, schema=["orf_id", "read", "mate", "strand", "start", "length"], orient="row"
-        ).write_parquet(d / f"{prefix}orfs.parquet")
+                    rows.append((len(rows), read, mate, strand, start, len(prot), prot))
+        schema = ["orf_id", "read", "mate", "strand", "start", "length", "sequence"]
+        pl.DataFrame(rows, schema=schema, orient="row").write_parquet(d / f"{prefix}orfs.parquet")
         search(
             a,
             d / f"{prefix}orfs.faa",
@@ -300,27 +330,23 @@ def diamond(a: argparse.Namespace) -> None:
             "--out",
             f"{name}/diamond.tsv",
             "--sensitive",
-            "-k",
-            1,
+            "--top",
+            10,
             "-b",
             0.5,
             "--threads",
             a.threads,
             "--outfmt",
             6,
-            "qseqid",
-            "sseqid",
-            "pident",
-            "length",
-            "bitscore",
+            *DIAMOND_FIELDS,
         )
         hits = pl.read_csv(
             d / "diamond.tsv",
             separator="\t",
             has_header=False,
-            new_columns=["q", "protein_id", "pident", "length", "bitscore"],
+            new_columns=["q", "protein_id", *DIAMOND_FIELDS[2:]],
         )
-        hits.unique("q", keep="first", maintain_order=True).with_columns(
+        hits.with_columns(
             pl.col("q").str.split_exact("_", 1).struct.rename_fields(["read", "mate"])
         ).unnest("q").with_columns(pl.col("read", "mate").cast(pl.Int64)).write_parquet(
             d / "diamond.parquet"
@@ -446,6 +472,7 @@ def main() -> None:
     p.add_argument("--max-gb", type=float, default=MAX_GB, help="watchdog's cap per step")
     a = p.parse_args()
     globals()["MAX_GB"] = a.max_gb
+    watchdog(a.max_gb)
     for name, step in STEPS.items():
         if a.step in (name, "all"):
             step(a)

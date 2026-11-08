@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 
 SCRIPT = Path(__file__).resolve().parents[2] / "workflows" / "pfam-anchor" / "columns.py"
 spec = importlib.util.spec_from_file_location("columns", SCRIPT)
@@ -60,3 +61,37 @@ def test_orfs_split_at_stops_on_both_strands() -> None:
     assert ("PLFH", "-", 0) in orfs
     assert all(len(p) >= 2 for p, _, _ in prepare.orfs_at(seq, 2))
     assert rc == "CCATTATTTCAT"
+
+
+sys.path.insert(0, str(SCRIPT.parent))
+spec = importlib.util.spec_from_file_location("anchor", SCRIPT.with_name("anchor.py"))
+assert spec and spec.loader
+anchor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(anchor)
+
+
+def test_diamond_residues_walk_cigar_on_both_strands() -> None:
+    # + frame: codons from base 4; 2 matched, 1 query-only, 1 subject-only, 1 matched.
+    assert anchor.diamond_residues(4, 1, 10, "2M1I1D1M") == {4: 9, 7: 10, 13: 12}
+    # - frame: qstart is the highest base, codons step down.
+    assert anchor.diamond_residues(150, -1, 1, "2M") == {150: 0, 147: 1}
+
+
+def test_family_score_takes_each_units_best_domain() -> None:
+    domains = pl.DataFrame(
+        {
+            "unit": [7, 3, 7],
+            "hmm_from": [1, 1, 1],
+            "ali_from": [1, 1, 1],
+            "cigar": ["4M", "4M", "2M2D"],
+            "sequence": ["ACDE", "ACDF", "AC"],
+        }
+    )
+    fam = anchor.Family(4, domains)
+    assert fam.units.tolist() == [3, 7]
+    codes = columns.column_residues(1, 1, "4M", "ACDE", 4)[0]
+    m, s, n = fam.score(codes, "shared")
+    assert n == 4
+    # unit 3: 3 of 4; unit 7: its full domain (4 of 4) beats the half one (2 of 2 shares too few)
+    assert m.tolist() == [3, 4]
+    assert s.tolist() == [4, 4]

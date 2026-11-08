@@ -1,6 +1,6 @@
 # From raw-read Pfam hits to MGnify90 units
 
-Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share, with k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits (Progress log). The oracle, the DIAMOND comparison and read-level precision are still to do.
+Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share, with k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phase 1's oracle passed its gate the same day (Progress log). Seeds, the speed comparison and read-level precision are still to do.
 
 ## Verdict
 
@@ -30,7 +30,7 @@ Query   read -> six-frame ORFs -> Pfam hits with alignments
 
 **Column sampling.** Keys are positions, so the index can keep every s-th column, with no hash sampling. A query uses all of its columns, so any run of k + s − 1 matching columns is guaranteed a seed.
 
-**Score.** Candidates are compared over shared columns, by plain identity with a rarity likelihood ratio from the HMM's emissions as the likely tie-break (phase 1b). Reads keep every family they hit, as in [recall-first pileup](kmer-functional-profiler-plan.md): candidates are not cut by a presence call, and related families are not collapsed.
+**Score.** Candidates are compared by plain identity over all the read's columns, so a unit missing some of them loses (phase 1; identity over shared columns only, phase 1b's choice, favoured partial domains). A rarity likelihood ratio from the HMM's emissions is the likely tie-break (phase 1b). Reads keep every family they hit, as in [recall-first pileup](kmer-functional-profiler-plan.md): candidates are not cut by a presence call, and related families are not collapsed.
 
 ## What is measured so far
 
@@ -130,6 +130,8 @@ Each phase records its outcome in this plan's Progress log, and only local work 
 
 **Gate:** given a hit on the source family, oracle `right` is within 0.05 of DIAMOND's at each identity from 100% to 80%, on both simulated strains and real relatives. If not, the shared template is losing the information, and k-mers can't recover it. Stop, or fix the alignment step first.
 
+*Passed 2026-11-08 (`workflows/pfam-anchor/anchor.py oracle`), with identity over the read's columns; see Progress log. The oracle ties more units than DIAMOND, so its credit is lower.*
+
 ### Phase 1b: brute-force AAI, HMM weights and discriminating columns
 
 Added 2026-11-06 at the user's request. Runs on the same families and needs no index.
@@ -163,7 +165,7 @@ Added 2026-11-06 at the user's request. Runs on the same families and needs no i
 1. Index: per family, sorted `(seed, residues, unit)`. A plain Parquet table per family is enough here.
 2. Sweep the seed shapes that phase 1b kept, with s of 1, 2 and 4, and a minimum of 1 or 2 shared seeds per unit. Compare each with brute-force AAI on time and memory, and find the family size above which seeds pay for themselves.
 3. Add one reduced-alphabet arm (Murphy-10, from `tree-index/alphabets.py`), since low-identity seeds are the likely weak point.
-4. Score candidates by column, with phase 1b's chosen score.
+4. Score candidates by column, with phase 1's score (identity over the read's columns).
 
 **Gate:** an arm keeps at least 95% of the oracle's right calls, with median candidates per read at most 1% of the family's units for reads from known units, and at most 10% for reads from novel units. Phase 1b found no seed near 1% for novel units (.834 kept at best), so the first version of this gate could not pass. It only has to pass in families too large for brute force.
 
@@ -351,3 +353,29 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - **The null is quiet.** Reversed reads hit any family for .001 of pairs and none at GA.
   - **DIAMOND.** Best hit per pair against the reference (`blastx --sensitive -k 1`): .98–1.00 of pairs have one, and their median identity follows the bin (strains 100 to 72%, relatives 100 to 77%). This is the method-independent identity for phase 1.
   - **Crash and fix.** The first `reads` run crashed the laptop: `recall.py holdout`'s relative search joined every pool k-mer with all 295 k members at once. It now works through the pool in chunks of 500, and each `prepare.py` step runs under a watchdog that kills its process group above `--max-gb` (6 GB by default). DIAMOND's container is capped the same way, since Colima's VM can take 20 GB.
+- **Phase 1: oracle, no k-mers (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py oracle`, on phase 0's case: 16 s, 2.9 GB peak.
+  - **Method.** Every hit of a read pair, at `-E 10` and in any family, is compared with every reference GA domain of that family. Per hit, each unit takes its best domain, which must share at least 60% of the hit's columns. Per pair and family, matches are summed over the hits, and the units with the best identity are the call, with ties kept.
+  - **DIAMOND.** `prepare.py diamond` now keeps every hit within 10% of each mate's best score (`--top 10`), with coordinates and CIGAR. Per unit, DIAMOND's score is the best bitscore summed over the mates, with ties kept. *Restricted* keeps only units with a GA domain in a family the pair hits, which is the oracle's universe. It differs from all units by at most .013.
+  - **The score.** Identity over shared columns, phase 1b's choice, failed the gate on strains, 6–15 points below DIAMOND. It favours units whose domain covers only part of the read. For example, a read at 100% scored 46/48 and 47/48 on its own unit, but 48/48 and 38/38 on a partial domain. Identity over all the read's columns fixes this. A unit's missing columns then count against it, much as alignment length raises DIAMOND's bitscore.
+  - **Results.** Pairs with a hit on a family of the source:
+
+    | Identity bin | Strains: oracle right | DIAMOND | Oracle credit | DIAMOND credit | Relatives: oracle right | DIAMOND | Oracle credit | DIAMOND credit |
+    | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | 1.00 | .950 | .990 | .715 | .843 | .961 | .956 | .714 | .776 |
+    | 0.98 | .941 | .968 | .738 | .828 | .974 | .964 | .699 | .789 |
+    | 0.95 | .948 | .956 | .708 | .829 | .856 | .796 | .656 | .709 |
+    | 0.90 | .942 | .929 | .671 | .789 | .696 | .654 | .520 | .578 |
+    | 0.85 | .946 | .935 | .687 | .814 | .634 | .591 | .520 | .556 |
+    | 0.80 | .946 | .912 | .676 | .803 | .487 | .487 | .407 | .463 |
+    | 0.75 | .931 | .912 | .668 | .791 | .485 | .447 | .427 | .424 |
+    | 0.70 | .927 | .894 | .707 | .818 | .310 | .337 | .238 | .330 |
+    | 0.60 | | | | | .351 | .312 | .286 | .294 |
+
+    - **The gate passes on `right`.** Strains are at most .040 below DIAMOND (at 100%). Relatives are level with it or above, at every bin.
+    - **The oracle ties more.** It averages 2–5 tied units against DIAMOND's 1.1–2.1, since it sees only the domain's columns, not the rest of the read. So its credit is .09–.13 lower on strains and up to .09 lower on relatives. Phase 1b's likelihood-ratio tie-break, or extending past the domain (phase 4), are the ways to recover it.
+    - **Candidates are almost complete.** The truth unit qualifies on .96–1.00 of pairs. The pairs lost are those where its domain doesn't cover the read's columns.
+    - **Real relatives are the hard case.** Right falls from .96 at 100% to .49 at 80% and .31–.35 below that, for DIAMOND as much as for the oracle. A single read pair rarely separates a novel unit's nearest relative from its neighbours. Reads at GA alone change little (`right_ga` in `oracle.tsv`).
+  - **Alignment agreement (step 3).** For 10,427 ORF hits that DIAMOND also aligns to the truth protein, the residue pairs the two HMM alignments imply match DIAMOND's for 97.6–99.2% of residues. In each bin, 80–91% of hits agree completely, with no trend in identity, so the shared template loses little.
+  - **Other findings.**
+    - Short repeat families, such as PF12661 (22 columns), lose the most. Reads carry several overlapping domain hits, some of only 2–7 columns with scores below zero, and the copies of the repeat in the reference are often below GA.
+    - With the shared-column score, 48 of 633 misses at 80% and above (8%) fell only on a reference domain below GA. Phase 4's weak-domain arm covers them.
