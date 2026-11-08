@@ -403,10 +403,19 @@ ARMS = (  # (arm, shape, alphabet); greedy seeds are not anchored, so only s = 1
 
 class SeedIndex:
     """One family's postings for one shape and alphabet: sorted ``code << bits | unit``, with
-    ``code = seed * A^width + residues``; ``s`` keeps seeds whose first column divides by it."""
+    ``code = seed * A^width + residues``; ``s`` keeps seeds whose first column divides by it.
+    ``anchored=False`` (the ablation): ``code = residues``, so a seed matches at any column of
+    the family; sampling by ``s`` is then fixed at build, and queries use every seed."""
 
-    def __init__(self, fam: Family, seeds: NDArray[np.int64], letters: NDArray[np.int64]) -> None:
-        self.seeds, self.letters = seeds, letters
+    def __init__(
+        self,
+        fam: Family,
+        seeds: NDArray[np.int64],
+        letters: NDArray[np.int64],
+        anchored: bool = True,
+        s: int = 1,
+    ) -> None:
+        self.seeds, self.letters, self.anchored = seeds, letters, anchored
         self.base = int(letters.max()) + 1
         self.bits = max(1, int(len(fam.units) - 1).bit_length())
         unit_of_row = np.repeat(
@@ -417,7 +426,7 @@ class SeedIndex:
             0, len(fam.matrix), 2000
         ):  # ponytail: row chunks bound the seeds x rows block
             code = self.codes(fam.matrix[lo : lo + 2000])
-            ok = code >= 0
+            ok = (code >= 0) & (seeds[:, 0] % s == 0)
             parts.append((code[ok] << self.bits) | unit_of_row[lo : lo + 2000][np.nonzero(ok)[0]])
         self.post = np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int64)
 
@@ -425,11 +434,12 @@ class SeedIndex:
         """(rows x seeds) codes, -1 where a seed column has no residue."""
         x = self.letters[rows[:, self.seeds]]  # rows x seeds x width
         packed = (x * self.base ** np.arange(self.seeds.shape[1])).sum(2)
-        packed += np.arange(len(self.seeds)) * self.base ** self.seeds.shape[1]
+        if self.anchored:
+            packed += np.arange(len(self.seeds)) * self.base ** self.seeds.shape[1]
         return np.where((x >= 0).all(2), packed, -1)
 
     def sampled(self, s: int) -> NDArray[np.int64]:
-        if s == 1:
+        if s == 1 or not self.anchored:
             return self.post
         seed = (self.post >> self.bits) // self.base ** self.seeds.shape[1]
         return self.post[self.seeds[seed, 0] % s == 0]
@@ -469,12 +479,14 @@ def seeds(a: argparse.Namespace) -> None:
         length = fam.matrix.shape[1] - 1
         shape = shapes(length, fam.matrix[fam.starts])
         letters = {None: alphabet(None), MURPHY10: alphabet(MURPHY10)}
-        indexes = {arm: SeedIndex(fam, shape[sh], letters[al]) for arm, sh, al in ARMS}
+        indexes = {arm: SeedIndex(fam, shape[sh], letters[al], a.anchored) for arm, sh, al in ARMS}
         build = time.perf_counter() - t0
         rows_per_unit = np.diff(np.r_[fam.starts, len(fam.matrix)])
         posts = {
             (arm, s): indexes[arm].sampled(s)
-            for arm, _, _ in ARMS
+            if a.anchored
+            else SeedIndex(fam, shape[sh], letters[al], False, s).post
+            for arm, sh, al in ARMS
             for s in (SAMPLING if not arm.startswith("greedy") else (1,))
         }
         sizes += [(acc, arm, s, len(p), len(fam.units)) for (arm, s), p in posts.items()]
@@ -549,7 +561,8 @@ def seeds(a: argparse.Namespace) -> None:
             units=pl.col("units").sum(),
         )
     )
-    per_pair.write_parquet(a.data / "seeds.parquet")
+    tag = "" if a.anchored else "_unanchored"
+    per_pair.write_parquet(a.data / f"seeds{tag}.parquet")
     oracle = per_pair.filter(pl.col("arm") == "oracle").select("set", "read", oracle_right="right")
     index = (
         pl.DataFrame(
@@ -581,7 +594,7 @@ def seeds(a: argparse.Namespace) -> None:
         .join(index, on=["arm", "s"], how="left")
         .sort("arm", "s", "h")
     )
-    table.write_csv(a.data / "seeds.tsv", separator="\t", float_precision=4)
+    table.write_csv(a.data / f"seeds{tag}.tsv", separator="\t", float_precision=4)
     sp = pl.DataFrame(
         speed,
         schema=[
@@ -599,7 +612,7 @@ def seeds(a: argparse.Namespace) -> None:
         ],  # fmt: skip
         orient="row",
     )
-    sp.write_csv(a.data / "seed_speed.tsv", separator="\t", float_precision=6)
+    sp.write_csv(a.data / f"seed_speed{tag}.tsv", separator="\t", float_precision=6)
     with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=250):
         print(table)
 
@@ -610,6 +623,12 @@ def main() -> None:
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
     p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
+    p.add_argument(
+        "--unanchored",
+        dest="anchored",
+        action="store_false",
+        help="seeds: keys without their HMM column (the ablation)",
+    )
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB, help="memory watchdog's cap")
     a = p.parse_args()
     prepare.watchdog(a.max_gb)
