@@ -495,3 +495,27 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - Read hits come from `hmmsearch` with the 40 HMMs, not full Pfam-A or kfpfam's recruitment.
     - The reference has 40 families, at most 3,090 units each.
     - The handoff's targets are every member of a called unit: 94,468 proteins for strains and 72,581 for relatives. That is most of the reference at this size, so representatives only, or the members whose domains won, would be the lighter choice for the pileup.
+- **Phase 4: the anchored route's coverage arms (2026-11-08, the user's request).** `prepare.py nullref` and `prepare.py recruit`, then `anchor.py query`/`compare` with `--hits` and `--ref`. Each arm takes about 10 s.
+  - **Weak hits, read side.**
+    - `prepare.py recruit` runs kfpfam's recruitment unchanged on each read set's ORFs. `pairs.py` runs in kfpfam's pyhmmer container against the 40 HMMs, on the ORFs and on them reversed, then `recruit.py run`. It took 12 s for both sets.
+    - It kept 3,170 GA loci and 3,410 recruited ones (2 sets) for strains, and 3,015 and 2,386 for relatives. Every confirmed family had a GA read, so no family was confirmed from weak evidence.
+  - **Weak hits, reference side.** `prepare.py nullref` searches the reversed mini-slice, as pfam-reannotate's null arm does. It found 1,868 domains, none at GA, against about 108 k real domains below GA. The bar for 5% FDR among weak domains is therefore below every domain at `-E 10`, so `--ref weak` takes all of them. In a family-complete slice, almost all weak domains are real members below GA.
+  - **Results.** Weighted over identity bins. *Called* and *right* are over all pairs, *right on hit* over pairs with a hit on a family of their source. DIAMOND's right on those pairs is .942 for strains and .631 for relatives.
+
+    | Read hits / reference | Strains: called | Right | Right on hit | Precision | Relatives: called | Right | Right on hit | Precision | Handoff targets (strains) |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | GA hits only / GA | .228 | .221 | .509 | .968 | .245 | .156 | .397 | .637 | 4,378 |
+    | All `hmmsearch` hits / GA (phase 3) | .435 | .408 | .941 | .938 | .405 | .263 | .656 | .650 | 7,704 |
+    | Recruited / GA | .437 | .412 | .946 | .942 | .406 | .266 | .661 | .655 | 7,894 |
+    | All `hmmsearch` hits / weak | .435 | .416 | .958 | .955 | .405 | .266 | .654 | .658 | 7,632 |
+    | All `hmmsearch` hits / representatives | .435 | .316 | .728 | .725 | .405 | .197 | .497 | .486 | 4,250 |
+    | Recruited, top only / weak | .437 | .419 | .961 | .958 | .406 | .271 | .662 | .667 | 7,727 |
+
+    - **Weak read hits nearly double the right calls.** With them, strains go from .221 to .408–.419 right over all pairs. By status, strains' recruited calls are .919 precise against .963 for GA calls (DIAMOND .928 and .953 on the same pairs). Relatives' are .660 against .652. So weak hits add right calls far beyond the wrong ones.
+    - **Recruitment matches all `hmmsearch` hits on calls, with slightly better precision,** and it settles competing frames. `top` only is identical here, because recruitment made only 2 sets. The reversed reads have no recruitment run of their own, so these arms' null is 0.
+    - **Weak reference domains add 1.7 points on strains** (.941 to .958 right on hit) and nothing on relatives.
+    - **Representatives alone lose 16–21 points.** 12% of units with a domain have none on the representative (sizing), and members carry the variants reads match. The reference needs members.
+    - **The best arm, recruited top with weak reference domains, beats DIAMOND on reads with a hit:** .961 against .942 for strains, .662 against .631 for relatives.
+  - **The handoff is trimmed.** Targets are each called unit's winning proteins plus its representative: 7,727 proteins for strains, against 94,468 when every member was a target. Neighbours are up to 5 near units per family by representative, and each assignment sits on its winning protein.
+  - **The route is settled:** kfpfam's recruited hits with `top = 1`, reference GA and weak domains of every member, anchor residues, then column identity. The route's code defaults are still `--hits hmmsearch --ref ga`, so that earlier outputs keep their names.
+  - **Not done in phase 4.** Extending past the domain. Every read through both routes, with the tree index, which comes next.

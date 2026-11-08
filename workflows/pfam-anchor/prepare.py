@@ -24,6 +24,8 @@ Steps run in order; ``all`` runs every one. Everything goes under ``--out``.
   not that) or ``flank``. Null rows give the share of reversed pairs with any hit. With
   DIAMOND's output, also the share with a DIAMOND hit and its median identity.
   -> ``report.tsv``.
+- ``nullref`` and ``recruit`` (phase 4, not in ``all``): the reference reversed, searched, for a
+  bar on reference domains below GA; kfpfam's weak-read recruitment on each read set.
 """
 
 import argparse
@@ -51,6 +53,7 @@ BENCH = [
     *("0.7", "--substitution", "blosum62", "--depth-mu", "0.3", "--depth-sigma", "0.6"),
 ]
 DIAMOND = "quay.io/biocontainers/diamond:2.2.8--he361c42_0"
+PYHMMER = "community.wave.seqera.io/library/python_pyhmmer_pyarrow:15ad25b8fbebe783"  # kfpfam's
 # qstart, qend: bases on the read (qstart > qend on the reverse strand); sstart, send: residues.
 DIAMOND_FIELDS = [
     "qseqid",
@@ -452,7 +455,74 @@ def report(a: argparse.Namespace) -> None:
         print(out)
 
 
-STEPS = {"annotate": annotate, "reads": reads, "search": orfs, "diamond": diamond, "report": report}
+def nullref(a: argparse.Namespace) -> None:
+    """The reference proteins reversed, searched as ``annotate`` searches them ->
+    ``null_hits.parquet``: the bar for reference domains below GA (pfam-reannotate's null arm)."""
+    faa = a.out / "null_members.faa"
+    members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    faa.write_text("".join(f">{i}\n{s[::-1]}\n" for i, s in members.iter_rows()))
+    search(a, faa, a.out / "null_hits.parquet", "members_null")
+    faa.unlink()
+
+
+def recruit(a: argparse.Namespace) -> None:
+    """kfpfam's weak-read recruitment (its docs/recruit.md), unchanged, on each read set's ORFs:
+    ``pairs.py`` (pyhmmer, in its container) on the ORFs and on them reversed, against the 40
+    HMMs, then ``recruit.py run`` -> ``<set>/recruit/`` and ``<set>/recruited.parquet`` (its
+    ``hits.tsv`` with ``orf_id``, read pair and mate). kfpfam names a read ``R<pair>m<mate>``."""
+    accs = [f"PF{x:05d}" for x in pl.read_csv(a.out / "ga.tsv", separator="\t")["pfam_accession"]]
+    (a.out / "accs.txt").write_text("\n".join(accs) + "\n")
+    cap = f"{a.max_gb:g}g"
+    docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}",
+              f"--cpus={a.threads}", "-v", f"{a.out.resolve()}:/w", "-v", f"{a.kfpfam}:/k:ro",
+              PYHMMER, "python", "/k/recruit/pairs.py"]  # fmt: skip
+    prep = a.kfpfam / "data/prep"
+    for name in SETS:
+        d = a.out / name
+        r = d / "recruit"
+        r.mkdir(exist_ok=True)
+        orfs = pl.read_parquet(d / "orfs.parquet")
+        read_len = pl.read_parquet(d / "reads.parquet")["pair_bases"][0] // 2
+        orfs = orfs.with_columns(query=pl.format("R{}m{}_{}", "read", "mate", "orf_id"))
+        (r / "orfs.faa").write_text(
+            "".join(f">{q}\n{s}\n" for q, s in orfs.select("query", "sequence").iter_rows())
+        )
+        orfs.select("query", "strand", "start", read_len=pl.lit(read_len)).rename(
+            {"query": "orf"}
+        ).write_csv(r / "coords.tsv", separator="\t")
+        run(PY, a.kfpfam / "recruit/recruit.py", "reverse", r / "orfs.faa", r / "decoy.faa")
+        for kind in ("orfs", "decoy"):
+            w = f"/w/{name}/recruit/{kind}"
+            run(*docker, "/w/hmms.hmm", "/k/data/prep/models.tsv", f"{w}.faa", "all:/w/accs.txt",
+                22.25, a.threads, f"{w}.pairs.tsv")  # fmt: skip
+        run(PY, a.kfpfam / "recruit/recruit.py", "run", "--real", r / "orfs.pairs.tsv",
+            "--null", r / "decoy.pairs.tsv", "--models", prep / "models.tsv", "--prep", prep,
+            "--orfs", r / "orfs.faa", "--orf-coords", r / "coords.tsv", "--out", r)  # fmt: skip
+        hits = pl.read_csv(r / "hits.tsv", separator="\t", infer_schema_length=0)
+        ints = ["pfam_accession", "hmm_from", "hmm_to", "ali_from", "ali_to", "env_from",
+                "env_to", "top", "locus"]  # fmt: skip
+        floats = ["seq_evalue", "score", "c_evalue", "i_evalue", "weight", "p_true", "q"]
+        hits.with_columns(
+            pl.col(ints).cast(pl.Int64),
+            pl.col(floats).cast(pl.Float64),
+            above_ga=pl.col("above_ga").is_in(["True", "true", "1"]),
+            orf_id=pl.col("query").str.split("_").list.last().cast(pl.Int64),
+        ).join(orfs.select("orf_id", "read", "mate"), on="orf_id").write_parquet(
+            d / "recruited.parquet"
+        )
+        for f in ("orfs.faa", "decoy.faa", "candidates.faa"):
+            (r / f).unlink(missing_ok=True)
+
+
+STEPS = {
+    "annotate": annotate,
+    "reads": reads,
+    "search": orfs,
+    "diamond": diamond,
+    "report": report,
+    "nullref": nullref,
+    "recruit": recruit,
+}
 
 
 def main() -> None:
@@ -469,12 +539,13 @@ def main() -> None:
     p.add_argument("--min-orf", type=int, default=25)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--kfpfam", type=Path, default=Path.home() / "Documents/kfpfam")
     p.add_argument("--max-gb", type=float, default=MAX_GB, help="watchdog's cap per step")
     a = p.parse_args()
     globals()["MAX_GB"] = a.max_gb
     watchdog(a.max_gb)
     for name, step in STEPS.items():
-        if a.step in (name, "all"):
+        if a.step == name or (a.step == "all" and name not in ("nullref", "recruit")):
             step(a)
 
 

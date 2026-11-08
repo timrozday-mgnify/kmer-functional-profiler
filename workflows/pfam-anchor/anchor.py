@@ -63,6 +63,9 @@ class Family:
         unit = domains["unit"].to_numpy()
         self.starts = np.flatnonzero(np.r_[True, unit[1:] != unit[:-1]])
         self.units = unit[self.starts]  # sorted
+        self.proteins = (
+            domains["protein_id"].to_numpy() if "protein_id" in domains.columns else None
+        )
 
     def score(self, codes: NDArray[np.uint8], by: str) -> tuple[NDArray, NDArray, int]:
         """Per unit, matches and shared columns of its best domain against one hit's columns
@@ -86,16 +89,36 @@ def lengths(hmm: Path) -> dict[int, int]:
     return {acc: e.shape[0] - 1 for acc, e in columns.read_hmms(str(hmm)).items()}
 
 
-def load_families(data: Path) -> tuple[dict[int, Family], pl.DataFrame]:
-    """Families, and the reference GA domains with unit and sequence."""
+def weak_bar(data: Path, fdr: float = 0.05) -> float:
+    """The lowest domain score at which reversed reference proteins' domains are at most ``fdr``
+    of the real domains below GA scoring as high (``prepare.py nullref``; pfam-reannotate's
+    null arm), counted over all mini-slice proteins."""
+    real = pl.read_parquet(data / "hits.parquet").filter(~pl.col("above_ga"))["score"].to_numpy()
+    null = np.sort(pl.read_parquet(data / "null_hits.parquet")["score"].to_numpy())
+    for s in np.unique(np.round(real, 1)):
+        n_real = (real >= s).sum()
+        if n_real and (len(null) - np.searchsorted(null, s)) / n_real <= fdr:
+            return float(s)
+    return float("inf")
+
+
+def load_families(data: Path, ref_arm: str = "ga") -> tuple[dict[int, Family], pl.DataFrame]:
+    """Families, and the reference domains with unit and sequence: ``ga`` (GA domains), ``weak``
+    (also those below GA scoring at least :func:`weak_bar`) or ``reps`` (GA domains of
+    representatives only)."""
     ref = pl.read_parquet(
         data / "holdout/members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
     )
+    keep = pl.col("above_ga")
+    if ref_arm == "weak":
+        keep = keep | (pl.col("score") >= weak_bar(data))
     domains = (
         pl.read_parquet(data / "domains.parquet")
-        .filter("above_ga")
+        .filter(keep)
         .join(ref.rename({"cluster_rep": "unit"}), on="protein_id")
     )
+    if ref_arm == "reps":
+        domains = domains.filter(pl.col("protein_id") == pl.col("unit"))
     size = lengths(data / "hmms.hmm")
     fams = {acc: Family(size[acc], g) for (acc,), g in domains.group_by(["pfam_accession"])}
     return fams, domains
@@ -748,9 +771,12 @@ def anchors(a: argparse.Namespace) -> None:
         print(table)
 
 
-# The anchored route (phase 3): anchor residues, then column identity on the units kept. -----
+# The anchored route (phases 3-4): anchor residues, then column identity on the units kept. --
 
 AMBIGUOUS = 0.02  # identity below the best that still makes a unit a neighbour
+STATUS_ORDER = {"ga": 0, "one": 1, "set": 2, "weak": 3}  # a call's status: its strongest hit's
+HIT_SOURCES = ("hmmsearch", "ga", "recruited", "recruited_top")
+REF_ARMS = ("ga", "weak", "reps")
 
 
 class Route:
@@ -779,15 +805,17 @@ class Route:
         cut = np.partition(per_unit, len(per_unit) - k)[len(per_unit) - k]
         return np.flatnonzero(per_unit >= cut)
 
-    def identity(self, cand: NDArray[np.int64], hits_codes: list) -> tuple[NDArray, NDArray]:
+    def identity(self, cand: NDArray[np.int64], hits_codes: list) -> tuple:
         """Stage 2: per candidate unit, matches over the read's columns summed over its hits
-        (each hit on the unit's best domain), and whether it shares ``MIN_SHARE`` of them."""
+        (each hit on the unit's best domain), whether it shares ``MIN_SHARE`` of them, the
+        read's column count, and the row of the unit's domain with the most matches."""
         lengths = self.ends[cand] - self.fam.starts[cand]
         offsets = np.r_[0, np.cumsum(lengths)[:-1]]
         rows = np.repeat(self.fam.starts[cand] - offsets, lengths) + np.arange(lengths.sum())
         block = self.fam.matrix[rows]
         M = np.zeros(len(cand), dtype=np.int64)
         S = np.zeros(len(cand), dtype=np.int64)
+        per_row = np.zeros(len(rows), dtype=np.int64)
         N = 0
         for codes in hits_codes:
             idx = np.flatnonzero(codes)
@@ -795,19 +823,23 @@ class Route:
             sub = block[:, idx]
             shared = (sub > 0).sum(1, dtype=np.int64)
             match = ((sub == c) & (c != columns.OTHER)).sum(1, dtype=np.int64)
-            key = np.where(shared >= MIN_SHARE * len(idx), match * SCALE + shared, -1)
+            valid = shared >= MIN_SHARE * len(idx)
+            per_row += np.where(valid, match, 0)
+            key = np.where(valid, match * SCALE + shared, -1)
             best = np.maximum.reduceat(key, offsets)
             ok = best >= 0
             M += np.where(ok, best // SCALE, 0)
             S += np.where(ok, best % SCALE, 0)
             N += len(idx)
-        return M, (S >= MIN_SHARE * N) & (S > 0), N
+        local = np.arange(len(rows))
+        win = np.maximum.reduceat(per_row * 2**24 + (2**24 - 1 - local), offsets)
+        return M, (S >= MIN_SHARE * N) & (S > 0), N, rows[2**24 - 1 - win % 2**24]
 
 
 def route_calls(hits: pl.DataFrame, routes: dict[int, Route], n: int, keep: float) -> pl.DataFrame:
     """Per read pair: the best units over its families, ties kept, with its matches (the score),
-    columns, identity, the units within ``AMBIGUOUS`` of the best, and whether the call rests on a
-    GA hit."""
+    columns, identity, each tied unit's winning protein, the units within ``AMBIGUOUS`` of the
+    best, and the call's status (its family's strongest hit: ``ga``, ``one``, ``set``, ``weak``)."""
     rows = []
     for (read,), pair in hits.group_by(["read"], maintain_order=True):
         best, call = -1.0, None
@@ -821,51 +853,69 @@ def route_calls(hits: pl.DataFrame, routes: dict[int, Route], n: int, keep: floa
                 for r in g.select("hmm_from", "ali_from", "cigar", "sequence").rows()
             ]
             cand = route.candidates(np.max(np.stack(hits_codes), 0), n, keep)
-            M, ok, N = route.identity(cand, hits_codes)
+            M, ok, N, win = route.identity(cand, hits_codes)
             if not ok.any():
                 continue
             ident = np.where(ok, M / N, -1.0)
             top = ident.max()
             if top > best + EPS:
                 units = route.fam.units[cand]
-                tied = units[ident >= top - EPS]
-                near = units[(ident >= top - AMBIGUOUS) & (ident < top - EPS)]
+                is_top = ident >= top - EPS
+                near = units[(ident >= top - AMBIGUOUS) & ~is_top]
+                status = min(g["status"].to_list(), key=STATUS_ORDER.__getitem__)
                 best = top
-                call = (acc, int(M[ident >= top - EPS][0]), N, top, tied.tolist(), near.tolist(),
-                        bool(g["above_ga"].any()), len(cand))  # fmt: skip
+                call = (acc, int(M[is_top][0]), N, top, units[is_top].tolist(),
+                        route.fam.proteins[win[is_top]].tolist(), near.tolist(), status,
+                        len(cand))  # fmt: skip
         if call is not None:
             rows.append((read, *call))
     schema = {
         "read": pl.Int64, "pfam_accession": pl.Int32, "matches": pl.Int64, "columns": pl.Int64,
-        "identity": pl.Float64, "units": pl.List(pl.Int64), "near": pl.List(pl.Int64),
-        "ga": pl.Boolean, "candidates": pl.Int64,
+        "identity": pl.Float64, "units": pl.List(pl.Int64), "proteins": pl.List(pl.Int64),
+        "near": pl.List(pl.Int64), "status": pl.String, "candidates": pl.Int64,
     }  # fmt: skip
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
 def write_handoff(dst: Path, calls: pl.DataFrame, ref: pl.DataFrame, reads_dir: Path) -> None:
-    """``kfp-pileup reference``'s format, as tree-index tier 2 writes it (``tier2.handoff``):
-    targets are every member of a called unit; neighbours, up to ``NEIGHBOURS`` near units per
-    family not called, by their first member; ``assignments.parquet`` splits each pair equally
-    over its tied units, on each unit's first member."""
+    """``kfp-pileup reference``'s format, as tree-index tier 2 writes it (``tier2.handoff``).
+    Targets: each called unit's winning proteins and its representative. Neighbours: up to
+    ``NEIGHBOURS`` near units per family that no pair called, by representative (else their
+    first member). ``assignments.parquet`` splits a pair equally over its tied units, each on its
+    winning protein."""
     neighbours = 5  # tier2.NEIGHBOURS
     dst.mkdir(parents=True, exist_ok=True)
-    called = (
-        calls.explode("units", empty_as_null=True).select("pfam_accession", unit="units").unique()
+    won = (
+        calls.with_columns(weight=1 / pl.col("units").list.len())
+        .explode(["units", "proteins"], empty_as_null=True)
+        .select("read", "matches", "pfam_accession", "weight", unit="units", protein_id="proteins")
+    )
+    called = won.select("pfam_accession", "unit").unique("unit")
+    members = ref.rename({"cluster_rep": "unit"})
+    rep_or_first = members.sort(pl.col("protein_id") != pl.col("unit")).unique(
+        "unit", keep="first", maintain_order=True
     )
     near = (
-        calls.explode("near", empty_as_null=True).select("pfam_accession", unit="near").drop_nulls()
-        .join(called.select("unit"), on="unit", how="anti").unique()
+        calls.explode("near", empty_as_null=True).select("pfam_accession", unit="near")
+        .drop_nulls().join(called.select("unit"), on="unit", how="anti").unique("unit")
         .filter(pl.int_range(pl.len()).over("pfam_accession") < neighbours)
     )  # fmt: skip
-    members = ref.rename({"cluster_rep": "unit"})
+    targets = (
+        pl.concat(
+            [
+                members.join(won.select("protein_id").unique(), on="protein_id"),
+                rep_or_first.join(called.select("unit"), on="unit"),
+            ]
+        )
+        .unique("protein_id")
+        .join(called, on="unit")
+    )
     refs = pl.concat(
         [
-            members.join(called, on="unit").with_columns(role=pl.lit("target")),
-            members.join(near, on="unit").filter(pl.int_range(pl.len()).over("unit") == 0)
-            .with_columns(role=pl.lit("neighbour")),
+            targets.with_columns(role=pl.lit("target")),
+            rep_or_first.join(near, on="unit").with_columns(role=pl.lit("neighbour")),
         ]
-    ).unique("protein_id", keep="first", maintain_order=True).with_columns(
+    ).sort("unit", "protein_id").with_columns(
         cluster_rep=pl.col("unit"),
         unit=pl.col("unit").rank("dense").cast(pl.Int64) - 1,
         rep=pl.col("protein_id") == pl.col("unit"),
@@ -880,16 +930,8 @@ def write_handoff(dst: Path, calls: pl.DataFrame, ref: pl.DataFrame, reads_dir: 
         "unit", "cluster_rep", "protein_id", "rep", "component", "role", "seq_id", "length", "pos"
     ).write_csv(dst / "refs.tsv", separator="\t")
     (dst / "molecule.txt").write_text("protein\n")
-    first = (
-        refs.filter(pl.col("role") == "target")
-        .group_by("cluster_rep")
-        .agg(pl.col("seq_id", "unit").first())
-    )
-    weighted = calls.with_columns(weight=1 / pl.col("units").list.len())
-    weighted.explode("units", empty_as_null=True).join(
-        first, left_on="units", right_on="cluster_rep"
-    ).select(
-        pair="read", seq_id="seq_id", unit="unit", score=pl.col("matches").cast(pl.Float64),
+    won.join(refs.select("protein_id", "seq_id", "unit"), on="protein_id").select(
+        pair="read", seq_id="seq_id", unit="unit_right", score=pl.col("matches").cast(pl.Float64),
         weight="weight",
     ).sort("pair", "seq_id").write_parquet(dst / "assignments.parquet")  # fmt: skip
     want = set(calls["read"].to_list())
@@ -903,45 +945,76 @@ def write_handoff(dst: Path, calls: pl.DataFrame, ref: pl.DataFrame, reads_dir: 
                     out.writelines(rec)
 
 
+def route_hits(d: Path, prefix: str, source: str) -> pl.DataFrame | None:
+    """A read set's hits for the route, with ``status``: every ``hmmsearch`` hit (``ga`` or
+    ``weak``), GA ones only, or kfpfam's recruited loci (every target in a set, or ``top`` only).
+    None for the reversed reads under recruitment, which has no null run of its own here."""
+    orfs = pl.read_parquet(d / f"{prefix}orfs.parquet")
+    if source in ("hmmsearch", "ga"):
+        hits = pl.read_parquet(d / f"{prefix}hits.parquet").rename({"protein_id": "orf_id"})
+        if source == "ga":
+            hits = hits.filter("above_ga")
+        hits = hits.with_columns(
+            status=pl.when("above_ga").then(pl.lit("ga")).otherwise(pl.lit("weak"))
+        )
+        return hits.join(orfs, on="orf_id").sort("read", "pfam_accession", "orf_id", "domain")
+    if prefix:
+        return None
+    hits = pl.read_parquet(d / "recruited.parquet").filter(pl.col("status") != "none")
+    if source == "recruited_top":
+        hits = hits.filter(pl.col("top") == 1)
+    return (
+        hits.drop("read", "mate").join(orfs, on="orf_id")
+        .select("read", "orf_id", "pfam_accession", "hmm_from", "ali_from", "cigar", "sequence",
+                "above_ga", "status", "locus")
+        .sort("read", "pfam_accession", "orf_id", "locus")
+    )  # fmt: skip
+
+
+def tag_of(a: argparse.Namespace) -> str:
+    return "" if (a.hits, a.ref) == ("hmmsearch", "ga") else f"_{a.hits}_{a.ref}"
+
+
 def query(a: argparse.Namespace) -> None:
     t0 = time.perf_counter()
-    fams, _ = load_families(a.data)
+    fams, _ = load_families(a.data, a.ref)
     routes = {acc: Route(f) for acc, f in fams.items()}
-    build = time.perf_counter() - t0
+    timing = {"build_s": time.perf_counter() - t0, "hits": a.hits, "ref": a.ref}
     ref = pl.read_parquet(
         a.data / "holdout/members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
     )
-    timing = {"build_s": build}
+    tag = tag_of(a)
     for name, prefix in itertools.product(prepare.SETS, ("", "null_")):
         d = a.data / name
-        orfs = pl.read_parquet(d / f"{prefix}orfs.parquet")
-        hits = (
-            pl.read_parquet(d / f"{prefix}hits.parquet").rename({"protein_id": "orf_id"})
-            .join(orfs, on="orf_id").sort("read", "pfam_accession", "orf_id", "domain")
-        )  # fmt: skip
-        t1 = time.perf_counter()
-        calls = route_calls(hits, routes, a.anchors, a.keep)
+        hits = route_hits(d, prefix, a.hits)
         key = f"{name}{'_null' if prefix else ''}"
+        t1 = time.perf_counter()
+        calls = (
+            route_calls(hits, routes, a.anchors, a.keep) if hits is not None
+            else route_calls(pl.DataFrame(schema={"read": pl.Int64}), routes, a.anchors, a.keep)
+        )  # fmt: skip
         timing[f"{key}_s"] = time.perf_counter() - t1
         timing[f"{key}_pairs"] = pl.read_parquet(d / "reads.parquet").height
-        calls.write_parquet(d / f"{prefix}anchored.parquet")
+        calls.write_parquet(d / f"{prefix}anchored{tag}.parquet")
         if not prefix:
-            write_handoff(d / "handoff", calls, ref, d)
+            write_handoff(d / f"handoff{tag}", calls, ref, d)
         print(f"{key}: {calls.height} pairs called in {timing[f'{key}_s']:.1f} s", flush=True)
-    (a.data / "anchored.json").write_text(json.dumps(timing, indent=1))
+    (a.data / f"anchored{tag}.json").write_text(json.dumps(timing, indent=1))
 
 
 def compare(a: argparse.Namespace) -> None:
-    """Phase 3: the anchored route against DIAMOND (all units), by read set and identity bin,
-    over every pair and over pairs with a hit on a family of their source."""
-    timing = json.loads((a.data / "anchored.json").read_text())
+    """Phases 3-4: the anchored route against DIAMOND (all units), by read set and identity bin,
+    over every pair and over pairs with a hit on a family of their source; and by the call's
+    status."""
+    tag = tag_of(a)
+    timing = json.loads((a.data / f"anchored{tag}.json").read_text())
     ref = pl.read_parquet(a.data / "holdout/members.parquet", columns=["protein_id", "cluster_rep"])
-    out = []
+    out, by_status = [], []
     for name in prepare.SETS:
         d = a.data / name
         truth = truth_of(a.data, name)
-        calls = pl.read_parquet(d / "anchored.parquet")
-        null = pl.read_parquet(d / "null_anchored.parquet")
+        calls = pl.read_parquet(d / f"anchored{tag}.parquet")
+        null = pl.read_parquet(d / f"null_anchored{tag}.parquet")
         n_pairs = truth.height
         # the bar: fewest matches such that reversed pairs are called at most --null-rate
         bar = 0
@@ -949,14 +1022,15 @@ def compare(a: argparse.Namespace) -> None:
             if (null["matches"] >= bar).sum() / n_pairs <= a.null_rate:
                 break
             bar = m + 1
+        right = pl.col("units").list.contains(pl.col("unit"))
         anchored = (
             calls.filter(pl.col("matches") >= bar)
             .join(truth.select("read", "unit"), on="read")
             .select(
                 "read",
-                "ga",
-                right=pl.col("units").list.contains(pl.col("unit")),
-                credit=pl.col("units").list.contains(pl.col("unit")) / pl.col("units").list.len(),
+                "status",
+                right=right,
+                credit=right / pl.col("units").list.len(),
                 called=pl.lit(True),
             )  # fmt: skip
         )
@@ -964,11 +1038,9 @@ def compare(a: argparse.Namespace) -> None:
             ref.rename({"cluster_rep": "unit"}), on="protein_id"
         )
         dia_calls = diamond_calls(dia, truth, None).select(
-            "read",
-            dia_called=pl.lit(True),
-            dia_right="right",
+            "read", dia_called=pl.lit(True), dia_right="right",
             dia_credit=pl.col("right") / pl.col("ties"),
-        )
+        )  # fmt: skip
         src = (
             pl.read_parquet(d / "oracle.parquet")
             .filter(pl.col("score") == "read")
@@ -976,13 +1048,14 @@ def compare(a: argparse.Namespace) -> None:
         )
         df = (
             truth.select("read", "identity_bin")
-            .join(anchored, on="read", how="left").join(dia_calls, on="read", how="left")
+            .join(anchored, on="read", how="left")
+            .join(dia_calls, on="read", how="left")
             .join(src, on="read", how="left")
             .with_columns(
                 pl.col("called", "right", "dia_called", "dia_right", "hit_source").fill_null(False),
                 pl.col("credit", "dia_credit").fill_null(0.0),
             )
-        )  # fmt: skip
+        )
         for scope, sub in (("all", df), ("hit_source", df.filter("hit_source"))):
             out.append(
                 sub.group_by("identity_bin")
@@ -1003,17 +1076,30 @@ def compare(a: argparse.Namespace) -> None:
                     scope=pl.lit(scope),
                     bar=pl.lit(bar),
                     null_called=pl.lit((null["matches"] >= bar).sum() / n_pairs),
-                )  # fmt: skip
+                )
             )
+        by_status.append(
+            df.filter("called").group_by("status")
+            .agg(pairs=pl.len(), precision=pl.col("right").mean(), credit=pl.col("credit").mean(),
+                 dia_right=pl.col("dia_right").mean())
+            .with_columns(set=pl.lit(name), share_of_pairs=pl.col("pairs") / n_pairs)
+        )  # fmt: skip
         timing[f"{name}_ms_per_pair"] = timing[f"{name}_s"] / timing[f"{name}_pairs"] * 1e3
     table = pl.concat(out).select(
         "set", "scope", "identity_bin", pl.exclude("set", "scope", "identity_bin")
     )
     table = table.sort("set", "scope", "identity_bin", descending=[False, False, True])
-    table.write_csv(a.data / "phase3.tsv", separator="\t", float_precision=4)
-    (a.data / "anchored.json").write_text(json.dumps(timing, indent=1))
+    table.write_csv(a.data / f"phase3{tag}.tsv", separator="\t", float_precision=4)
+    status = (
+        pl.concat(by_status)
+        .select("set", "status", pl.exclude("set", "status"))
+        .sort("set", "status")
+    )
+    status.write_csv(a.data / f"status{tag}.tsv", separator="\t", float_precision=4)
+    (a.data / f"anchored{tag}.json").write_text(json.dumps(timing, indent=1))
     with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=250):
         print(table)
+        print(status)
     print(json.dumps(timing, indent=1))
 
 
@@ -1026,6 +1112,10 @@ def main() -> None:
     p.add_argument("--anchors", type=int, default=16, help="query: anchor columns per read")
     p.add_argument("--keep", type=float, default=0.01, help="query: share of units kept by anchors")
     p.add_argument("--null-rate", type=float, default=0.001, help="compare: reversed pairs called")
+    p.add_argument("--hits", choices=HIT_SOURCES, default="hmmsearch", help="query, compare")
+    p.add_argument(
+        "--ref", choices=REF_ARMS, default="ga", help="query, compare: reference domains"
+    )
     p.add_argument(
         "--unanchored",
         dest="anchored",

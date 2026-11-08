@@ -126,6 +126,7 @@ def test_route_calls_an_exact_read_to_its_own_unit() -> None:
     domains = pl.DataFrame(
         {
             "unit": [10, 20, 30, 30],
+            "protein_id": [101, 201, 301, 302],
             "hmm_from": [1, 1, 1, 1],
             "ali_from": [1, 1, 1, 1],
             "cigar": ["8M"] * 4,
@@ -142,12 +143,13 @@ def test_route_calls_an_exact_read_to_its_own_unit() -> None:
             "cigar": ["4M", "4M"],  # two mates: columns 1-4 and 5-8
             "sequence": ["ACDE", "FGHK"],
             "above_ga": [True, False],
+            "status": ["ga", "weak"],
         }
     )
     calls = anchor.route_calls(hits, {7: route}, n=8, keep=1.0)
     row = calls.row(0, named=True)
-    assert row["units"] == [20]
-    assert (row["matches"], row["columns"], row["ga"]) == (8, 8, True)
+    assert (row["units"], row["proteins"]) == ([20], [201])
+    assert (row["matches"], row["columns"], row["status"]) == (8, 8, "ga")
     assert sorted(row["near"]) == []  # the others are 7/8, beyond AMBIGUOUS
     # anchors at all 8 columns: units 10, 20, 30 match 7, 8, 6 (30's best domain); keeping the
     # top 2 of 3 keeps units 10 and 20
