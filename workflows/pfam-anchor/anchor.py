@@ -30,6 +30,7 @@ import itertools
 import json
 import math
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -1611,7 +1612,7 @@ MEMBERS_PER_UNIT = 3  # the pileup workflow's --members: sequences per target un
 
 def confirmed_dir(a: argparse.Namespace) -> str:
     """A read set's confirmed reference, by the confirmation threshold."""
-    return f"confirmed_w{a.min_weight:g}"
+    return f"confirmed_w{a.min_weight:g}" + ("_u" if a.with_unanchored else "")
 
 
 NEIGHBOURS_PER_FAMILY = 5  # tier2.NEIGHBOURS
@@ -1636,9 +1637,15 @@ def confirm(a: argparse.Namespace) -> None:
             .agg(pl.col("w").sum().alias("weight"), pl.col("pfam_accession").mode().first())
         )
         present = pl.read_parquet(d / "truth.parquet").select("unit").unique()
-        confirmed = weight.filter(pl.col("weight") >= a.min_weight).with_columns(
-            truth=pl.col("unit").is_in(present["unit"].implode())
-        )
+        confirmed = weight.filter(pl.col("weight") >= a.min_weight)
+        if a.with_unanchored:  # the unanchored route's present units too, family unknown
+            extra = pl.read_parquet(d / "unanchored.parquet").join(confirmed, on="unit", how="anti")
+            confirmed = pl.concat([
+                confirmed.with_columns(source=pl.lit("anchored")),
+                extra.with_columns(weight=pl.lit(0.0), pfam_accession=pl.lit(None, pl.Int32),
+                                   source=pl.lit("unanchored")),
+            ], how="diagonal_relaxed")  # fmt: skip
+        confirmed = confirmed.with_columns(truth=pl.col("unit").is_in(present["unit"].implode()))
         confirmed.write_parquet(d / f"{confirmed_dir(a)}.parquet")
         near = (
             calls.explode("near", empty_as_null=True).select("pfam_accession", unit="near")
@@ -2228,6 +2235,199 @@ def seedlines(a: argparse.Namespace) -> None:
     print(json.dumps(times, indent=1))
 
 
+def unanchored(a: argparse.Namespace) -> None:
+    """The unanchored route on the whole reference (``holdout/members.parquet``): the tree index's
+    standard tier in parts (partition.py, then build.py per part one at a time, merge.py,
+    store.py), then each read set through tier 1 (query.py --decoy, verify.py) and tier 2
+    (tier2.py, routed by tier 1 and dense votes) -> ``whole/``; each read set's present units
+    (tier 2's ``cand_verify_0.01``, by the units of its leaves' proteins) ->
+    ``<set>/unanchored.parquet``; times in ``whole/times.json``."""
+    w = a.data / "whole"
+    members = a.data / "holdout/members.parquet"
+    n_proteins = pl.scan_parquet(members).select(pl.len()).collect().item()
+    py = sys.executable
+    times = {}
+
+    def step(key: str, *cmd: object) -> None:
+        t0 = time.perf_counter()
+        prepare.run(*cmd)
+        times[key] = time.perf_counter() - t0
+
+    if not (w / "parts/partition.json").exists():
+        step("partition", py, TREE / "partition.py", "--members", members, "--out", w / "parts",
+             "--part-proteins", 40_000)  # fmt: skip
+    parts = sorted((w / "parts").glob("part*.parquet"))
+    for part in parts:
+        if not (w / "build" / part.stem / "proteins.parquet").exists():
+            step(f"build_{part.stem}", py, TREE / "build.py", "--members", part,
+                 "--out", w / "build" / part.stem, "--database-proteins", n_proteins)  # fmt: skip
+    if not (w / "index/parts.json").exists():
+        step("merge", py, TREE / "merge.py", "--parts", *sorted((w / "build").glob("part*")),
+             "--out", w / "index")  # fmt: skip
+    store = w / "store"
+    if not store.exists():
+        for part in parts:
+            step(f"store_{part.stem}", py, TREE / "store.py", "build",
+                 "--proteins", w / "build" / part.stem / "proteins.parquet", "--members", part,
+                 "--parts", w / "index/parts.json", "--name", part.stem, "--format", "flat",
+                 "--out", w / "store-parts" / part.stem)  # fmt: skip
+        store.mkdir()
+        for f in (w / "store-parts").glob("*/*"):
+            shutil.copy(f, store / f.name)
+    pos_units = (
+        pl.read_parquet(w / "index/proteins.parquet").filter(pl.col("pos") >= 0)
+        .join(pl.read_parquet(members, columns=["protein_id", "cluster_rep"]), on="protein_id")
+        .select("pos", unit="cluster_rep").unique()
+    )  # fmt: skip
+    for name in prepare.SETS:
+        d = a.data / name
+        reads = [d / "reads_1.fq.gz", d / "reads_2.fq.gz"]
+        q, t2 = w / f"q-{name}", w / f"t2-{name}"
+        if not (q / "verify.json").exists():
+            step(f"{name}_tier1_query", py, TREE / "query.py", "--index", w / "index",
+                 "--reads", *reads, "--decoy", "--out", q)  # fmt: skip
+            step(f"{name}_tier1_verify", py, TREE / "verify.py", "--index", w / "index",
+                 "--store", store, "--reads", *reads, "--query", q)  # fmt: skip
+        if not (t2 / "verify.json").exists():
+            step(f"{name}_tier2", py, TREE / "tier2.py", "--index", w / "index",
+                 "--store", store, "--reads", *reads, "--query", q, "--memory-gb", 3,
+                 "--no-handoff", "--out", t2)  # fmt: skip
+        present = np.load(t2 / "cand_verify_0.01.npy").astype(np.int64)  # leaf positions
+        units = (
+            pos_units.filter(pl.col("pos").is_in(pl.Series(present).implode()))
+            .select("unit")
+            .unique()
+        )
+        units.write_parquet(d / "unanchored.parquet")
+        truth = set(pl.read_parquet(d / "truth.parquet")["unit"].to_list())
+        found = units.filter(pl.col("unit").is_in(list(truth))).height
+        print(f"{name}: tier 2 present {units.height} units, {found} of {len(truth)} present "
+              f"(recall {found / len(truth):.3f}, precision {found / max(units.height, 1):.3f})",
+              flush=True)  # fmt: skip
+    (w / "times.json").write_text(json.dumps(times, indent=1))
+    print(json.dumps(times, indent=1))
+
+
+def truthscore(a: argparse.Namespace) -> None:
+    """The gather and pileups against the truth, per ``call`` arm of a confirmed reference ->
+    ``truthscore_<confirmed>.tsv``.
+
+    - Gather: each unit's EM read pairs (``units.tsv``'s ``em_pairs``; ``reads``, the posterior
+      sum before the EM, beside it) against its true depth (strains: the simulated depth of its
+      strains; relatives: their held-out protein's, on the relative's unit): Spearman over the
+      true and called units (absent as 0), the share of pairs on true units, and the units
+      with at least half a pair, true and false.
+    - Pileups, strains only: on targets that are a strain's own source protein, columns of depth
+      at least ``MIN_DEPTH_PILE``. *Consensus right* is the consensus being the strain's residue,
+      at columns where the strain differs from the reference (*variant columns*) and where it
+      doesn't; *variant recall* is the share of covered variant columns called in ``variants.tsv``
+      with the strain's residue as alt."""
+    rows = []
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        tsv = pl.read_csv(d / "truth.tsv", separator="\t")
+        if name == "relatives":
+            rel = pl.read_csv(a.data / "holdout/relatives.tsv", separator="\t")
+            unit_of = pl.read_parquet(
+                a.data / "holdout/members.parquet", columns=["protein_id", "cluster_rep"]
+            )
+            true_depth = (
+                tsv.select(protein_id=pl.col("member").cast(pl.Int64), depth="depth")
+                .join(rel.select("protein_id", "relative"), on="protein_id")
+                .join(unit_of.rename({"protein_id": "relative"}), on="relative")
+                .group_by(unit="cluster_rep").agg(pl.col("depth").sum())
+            )  # fmt: skip
+        else:
+            unit_of = pl.read_parquet(d / "truth.parquet").select("strain", "unit")
+            # truth.tsv's own unit column is the simulator's target (a protein): not the unit
+            true_depth = (
+                tsv.select("strain", "depth").join(unit_of, on="strain")
+                .group_by("unit").agg(pl.col("depth").sum())
+            )  # fmt: skip
+        refs = pl.read_csv(c / "refs.tsv", separator="\t")
+        strain = {}
+        if name == "strains":
+            for pid, cds in tsv.select(pl.col("member").cast(pl.Int64), "cds").iter_rows():
+                strain[pid] = "".join(
+                    prepare.CODON.get(cds[i : i + 3], "X") for i in range(0, len(cds) - 2, 3)
+                )
+        ref_seq = dict(
+            pl.read_parquet(
+                a.data / "holdout/members.parquet", columns=["protein_id", "sequence"]
+            ).iter_rows()
+        )
+        for arm_dir in sorted(c.glob("call_*/")):
+            arm = arm_dir.name.removeprefix("call_")
+            units = pl.read_csv(arm_dir / "units.tsv", separator="\t").select(
+                unit="cluster_rep",
+                em=pl.col("em_pairs").fill_nan(0.0).fill_null(0.0),
+                pre=pl.col("reads").fill_nan(0.0).fill_null(0.0),
+            )
+            both = true_depth.join(units, on="unit", how="full", coalesce=True).with_columns(
+                pl.col("depth", "em", "pre").fill_null(0.0)
+            )
+            true = both.filter(pl.col("depth") > 0)
+            row = {
+                "set": name,
+                "arm": arm,
+                "abundance_spearman": both.select(pl.corr("depth", "em", method="spearman")).item(),
+                "em_on_true_units": true["em"].sum() / max(both["em"].sum(), 1e-12),
+                "true_units_with_em": true.select((pl.col("em") >= 0.5).mean()).item(),
+                "false_units_with_em": both.filter(
+                    pl.col("depth") == 0, pl.col("em") >= 0.5
+                ).height,
+                "pre_em_spearman": both.select(pl.corr("depth", "pre", method="spearman")).item(),
+                "pre_em_on_true_units": true["pre"].sum() / max(both["pre"].sum(), 1e-12),
+                "true_units_with_pre_em": true.select((pl.col("pre") >= 0.5).mean()).item(),
+                "false_units_with_pre_em": both.filter(
+                    pl.col("depth") == 0, pl.col("pre") >= 0.5
+                ).height,
+            }
+            if name == "strains":
+                pile = (
+                    pl.read_parquet(arm_dir / "pileup.parquet")
+                    .group_by("seq_id", "col")
+                    .agg(
+                        depth=pl.col("weight").sum(),
+                        consensus=pl.col("residue").sort_by("weight").last(),
+                    )
+                )
+                src = refs.filter(pl.col("protein_id").is_in(list(strain))).select(
+                    "seq_id", "protein_id"
+                )
+                var = pl.read_csv(arm_dir / "variants.tsv", separator="\t").select(
+                    "seq_id", "pos", "alt"
+                )
+                called = set(var.iter_rows())
+                n = {"var_cov": 0, "var_right": 0, "var_called": 0, "same_cov": 0, "same_right": 0}
+                deep = pile.filter(pl.col("depth") >= MIN_DEPTH_PILE).join(src, on="seq_id")
+                for seq_id, col, _, cons, pid in deep.iter_rows():
+                    s, r = strain[pid], ref_seq[pid]
+                    if col >= len(s) or col >= len(r):  # pileup columns 0-based
+                        continue
+                    want = s[col]
+                    if want != r[col]:
+                        n["var_cov"] += 1
+                        n["var_right"] += cons == want
+                        n["var_called"] += (seq_id, col + 1, want) in called  # variants 1-based
+                    else:
+                        n["same_cov"] += 1
+                        n["same_right"] += cons == want
+                row |= {
+                    "variant_columns_covered": n["var_cov"],
+                    "consensus_right_at_variants": n["var_right"] / max(n["var_cov"], 1),
+                    "variant_recall": n["var_called"] / max(n["var_cov"], 1),
+                    "consensus_right_elsewhere": n["same_right"] / max(n["same_cov"], 1),
+                    "variants_true": variant_truth(a.data, name, c, var),
+                }
+            rows.append(row)
+    df = pl.DataFrame(rows)
+    df.write_csv(a.data / f"truthscore_{confirmed_dir(a)}.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=250):
+        print(df)
+
+
 STEPS = {
     "oracle": oracle,
     "seeds": seeds,
@@ -2245,6 +2445,8 @@ STEPS = {
     "mapscore": mapscore,
     "seedalign": seedalign,
     "seedlines": seedlines,
+    "unanchored": unanchored,
+    "truthscore": truthscore,
 }
 
 
@@ -2259,6 +2461,8 @@ def main() -> None:
     p.add_argument("--null-rate", type=float, default=0.001, help="compare: reversed pairs called")
     p.add_argument("--stage", choices=list(STAGE_TAG), default="extended", help="lines, pileup")
     p.add_argument("--engine", choices=["rust", "python"], default="rust", help="seedlines")
+    p.add_argument("--with-unanchored", action="store_true",
+                   help="confirm: add the unanchored route's present units")  # fmt: skip
     p.add_argument("--min-weight", type=float, default=1.0, help="confirm: called pairs per unit")
     p.add_argument("--skip-diamond", action="store_true", help="pileup: anchored lines only")
     p.add_argument(

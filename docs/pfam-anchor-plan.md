@@ -674,3 +674,44 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Tests.** 4 Rust unit tests: exact match, substitution and indel BTOP, stretch choice and offset, DP gap placement.
   - **Against the oracle.** 70,314 of 70,335 mate-1 lines are identical across both read sets. The 21 that differ have the same score and place a gap differently on a DP tie: Biopython counts a gap's first residue as the open (−11), DIAMOND's convention as 11 + g.
   - **Speed.** 87,698 strains lines in 0.52 s against 8.1 s in Python, and 53,133 for relatives in 0.35 s against 5.2 s. That is about 6 µs per line on 4 threads, including Python's per-line formatting.
+- **The unanchored route's confirmations (2026-11-08, the user's request).** `anchor.py unanchored`: the tree index's standard tier on the whole reference (293,136 proteins).
+  - **Build.** `partition.py` makes 8 parts of 13–42 k proteins, then `build.py` builds them one at a time (4.4 GB peak per part, 3–20 s each), then `merge.py` and `store.py`.
+  - **Search.** Each read set runs through tier 1 (`query.py --decoy`, `verify.py`, 9 s) and tier 2 routed by tier 1 (43–67 s). The whole run took 3.7 minutes, at a 4.8 GB peak.
+  - **Present units:** the units of tier 2's present leaves (`cand_verify_0.01`). `confirm --with-unanchored` adds them to the anchored route's confirmations.
+
+    | Units present, recall (precision) | Anchored (weight 0.1) | Unanchored | Union |
+    | --- | ---: | ---: | ---: |
+    | Strains (1,582) | .802 (.424) | .836 (.250) | .942 (.257) |
+    | Relatives (1,481) | .596 (.311) | .758 (.222) | .860 (.215) |
+
+  - **Every read mapped to the union's targets.** 11,603 targets for strains and 11,759 for relatives, against 6–7 k before. Mates whose best unit by `call`'s EM is the truth unit:
+
+    | Mapper, then `call` | Strains: anchored only | Union | No Pfam hit: anchored only | Union | Relatives: anchored only | Union | No Pfam hit: anchored only | Union |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Tier 2 + seed alignment | .620 | .670 | .570 | .662 | .405 | .550 | .355 | .598 |
+    | DIAMOND | .571 | .610 | .527 | .604 | .378 | .518 | .334 | .562 |
+
+    - **The two routes together confirm most present units,** and their targets lift right calls most for reads with no Pfam hit. Precision is the same or a little better (strains .782, relatives .634).
+    - **Tier 2 + seed alignment stays ahead of DIAMOND** on the larger reference: 153,437 lines in 0.88 s, plus tier 2 alone in 12 s, against DIAMOND's 8.6 s (emulated).
+    - The unanchored route's precision (.22–.25) costs little, because the gather sorts out extra targets.
+- **The gather and pileups against the truth (2026-11-08, the user's request).** `anchor.py truthscore`, per `call` arm, on the union reference.
+  - **Gather.** Per unit: `call`'s EM pairs (`em_pairs`) and its posterior sum before the EM (`reads`), against the true depth.
+
+    | Strains, tier 2 + seed alignment | Before the EM | After the EM |
+    | --- | ---: | ---: |
+    | Pairs on true units | .778 | .896 |
+    | True units with at least half a pair | .914 | .313 |
+    | False units with at least half a pair | ~1,100–1,300 | 139 |
+    | Spearman with true depth | .599 | .330 |
+
+    Relatives: .633 against .725 on true units, .799 against .321 of true units kept, Spearman .393 against .246. DIAMOND as the mapper gives the same picture.
+    - **`call`'s EM is too sparse at this depth.** It moves pairs onto true units, but drops two thirds of true units below half a pair. Most strains here have a handful of pairs (depth drawn lognormal, μ 0.3, σ 0.6).
+    - The posteriors before the EM keep 91% of true units, at about ten times the false units.
+    - So abundance from the EM needs work before it can be trusted for low-depth units: a weaker sparsity, a floor, or reporting both stages. That is `kfp-pileup`'s EM (refine steps 8–9), not this route. Not changed here.
+  - **Pileups (strains),** on targets that are a strain's own source protein, columns with depth at least 3:
+    - **Consensus is the strain's residue** at .992 of covered columns where the strain differs from the reference (2,082 columns with tier 2 + seed alignment), and .9998–1.000 elsewhere.
+    - **Variant recall** at those columns is .998, and **variants true** (precision) .894 (DIAMOND .988, .998 and .887).
+    - Pileup columns are 0-based, while `variants.tsv`'s `pos` is 1-based.
+  - **Truth-scoring caveats.**
+    - `truth.tsv`'s own `unit` column is the simulator's target, a protein. The truth unit is in `truth.parquet`.
+    - Relatives' "true depth" is the held-out protein's, credited to its nearest remaining relative's unit, which may not be the unit its reads best fit.
