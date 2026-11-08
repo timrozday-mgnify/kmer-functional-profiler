@@ -1463,18 +1463,20 @@ def pileup(a: argparse.Namespace) -> None:
     times = {}
     for name in prepare.SETS:
         h = a.data / name / f"handoff{ROUTE_TAG}"
-        cap = f"{a.max_gb:g}g"
-        docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}", "--cpus=4",
-                  "-v", f"{h.resolve()}:/w", "-w", "/w", prepare.DIAMOND, "diamond"]  # fmt: skip
+        h = h.resolve()
+
+        def dmnd(*cmd: object, h: Path = h) -> list[str]:
+            return prepare.tool(prepare.DIAMOND, "diamond", *cmd, mounts=(h,))
+
         if not a.skip_diamond:
-            prepare.run(*docker, "makedb", "--in", "ref.fa", "--db", "ref", "--threads", 4)
+            prepare.run(*dmnd("makedb", "--in", h / "ref.fa", "--db", h / "ref", "--threads", 4))
             t0 = time.perf_counter()
             for m in (1, 2):
-                prepare.run(*docker, "blastx", "--db", "ref", "--query", f"reads_{m}.fq.gz",
-                            "--out", f"diamond_{m}.tsv", "--outfmt", 6, "qseqid", "sseqid",
-                            "bitscore", "qstart", "qend", "sstart", "send", "qframe", "btop",
-                            "--top", 10, "-F", 15, "--sensitive", "--threads", 4,
-                            "-b", 0.5)  # fmt: skip
+                prepare.run(*dmnd("blastx", "--db", h / "ref", "--query", h / f"reads_{m}.fq.gz",
+                                  "--out", h / f"diamond_{m}.tsv", "--outfmt", 6, "qseqid",
+                                  "sseqid", "bitscore", "qstart", "qend", "sstart", "send",
+                                  "qframe", "btop", "--top", 10, "-F", 15, "--sensitive",
+                                  "--threads", 4, "-b", 0.5))  # fmt: skip
             times[f"{name}_diamond_s"] = time.perf_counter() - t0
         arms = [("diamond", "diamond")] * (not a.skip_diamond) + [
             (f"anchored{lines_tag(a)}", f"lines{lines_tag(a)}")
@@ -1700,25 +1702,19 @@ def mapall(a: argparse.Namespace) -> None:
     for name in prepare.SETS:
         d = a.data / name
         c = d / confirmed_dir(a)
-        cap = f"{a.max_gb:g}g"
-        docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}", "--cpus=4",
-                  "-v", f"{d.resolve()}:/w", "-w", "/w", prepare.DIAMOND, "diamond"]  # fmt: skip
-        prepare.run(
-            *docker,
-            "makedb",
-            "--in",
-            f"{confirmed_dir(a)}/ref.fa",
-            "--db",
-            f"{confirmed_dir(a)}/ref",
-        )
+        d, c = d.resolve(), c.resolve()
+
+        def dmnd(*cmd: object, d: Path = d) -> list[str]:
+            return prepare.tool(prepare.DIAMOND, "diamond", *cmd, mounts=(d,))
+
+        prepare.run(*dmnd("makedb", "--in", c / "ref.fa", "--db", c / "ref"))
         t0 = time.perf_counter()
-        cd = confirmed_dir(a)
         for m in (1, 2):
-            prepare.run(*docker, "blastx", "--db", f"{cd}/ref", "--query", f"reads_{m}.fq.gz",
-                        "--out", f"{cd}/diamond_{m}.tsv", "--outfmt", 6, "qseqid", "sseqid",
-                        "bitscore", "qstart", "qend", "sstart", "send", "qframe", "btop",
-                        "--top", 10, "-F", 15, "--sensitive", "--threads", 4,
-                        "-b", 0.5)  # fmt: skip
+            prepare.run(*dmnd("blastx", "--db", c / "ref", "--query", d / f"reads_{m}.fq.gz",
+                              "--out", c / f"diamond_{m}.tsv", "--outfmt", 6, "qseqid", "sseqid",
+                              "bitscore", "qstart", "qend", "sstart", "send", "qframe", "btop",
+                              "--top", 10, "-F", 15, "--sensitive", "--threads", 4,
+                              "-b", 0.5))  # fmt: skip
         times[f"{name}_diamond_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         tables = [c / f"diamond_{m}.tsv" for m in (1, 2)]
@@ -2521,8 +2517,12 @@ def main() -> None:
         help="seeds: keys without their HMM column (the ablation)",
     )
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB, help="memory watchdog's cap")
+    p.add_argument("--runtime", choices=["docker", "singularity", "none"], default="docker",
+                   help="how DIAMOND runs")  # fmt: skip
+    p.add_argument("--threads", type=int, default=4, help="outside tools' threads")
     a = p.parse_args()
     prepare.watchdog(a.max_gb)
+    prepare.MAX_GB, prepare.RUNTIME, prepare.THREADS = a.max_gb, a.runtime, a.threads
     STEPS[a.step](a)
 
 

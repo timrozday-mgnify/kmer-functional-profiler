@@ -32,6 +32,7 @@ import argparse
 import gzip
 import itertools
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -98,6 +99,28 @@ def watchdog(max_gb: float) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
+RUNTIME = "docker"  # how outside tools run: docker, singularity, or none (on the PATH)
+THREADS = 4  # their threads (and docker's --cpus)
+HMMER = "quay.io/biocontainers/hmmer:3.4--hdbdd923_2"  # pfam-reannotate's
+
+
+def tool(image: str, *cmd: object, mounts: tuple = ()) -> list[str]:
+    """An outside tool's command line for :data:`RUNTIME`. Docker and Singularity mount each of
+    ``mounts`` (and the working directory) at the same path, so paths need no rewriting;
+    docker is capped at ``MAX_GB`` (Colima's VM may take 20 of the laptop's 24 GB)."""
+    args = [str(c) for c in cmd]
+    if RUNTIME == "none":
+        return args
+    binds = sorted({str(Path(m).resolve()) for m in (*mounts, Path.cwd())})
+    if RUNTIME == "docker":
+        cap = f"{MAX_GB:g}g"
+        vols = [x for b in binds for x in ("-v", f"{b}:{b}")]
+        return ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}",
+                f"--cpus={THREADS}", *vols, "-w", str(Path.cwd()), image, *args]  # fmt: skip
+    vols = [x for b in binds for x in ("--bind", b)]
+    return ["singularity", "exec", "--cleanenv", *vols, f"docker://{image}", *args]
+
+
 def run(*cmd: object, shell: bool = False) -> None:
     """Run a step, killing its process group if its resident memory passes ``MAX_GB``
     (a run with no cap crashed the laptop). ``shell``: one bash command, with pipefail."""
@@ -152,10 +175,11 @@ def search(a: argparse.Namespace, faa: Path, out: Path, arm: str) -> None:
         n += line.startswith(">")
         residues += 0 if line.startswith(">") else len(line)
     Path(f"{tmp}.counts.tsv").write_text(f"proteins\tresidues\n{n}\t{residues}\n")
-    cmd = (
-        f"hmmsearch --notextw --cpu {a.threads} {' '.join(HMMSEARCH)} --domtblout "
-        f"'{tmp}.domtbl' '{a.out / 'hmms.hmm'}' '{faa}' | gzip -1 > '{tmp}.txt.gz'"
-    )
+    hmm = (a.out / "hmms.hmm").resolve()
+    search_cmd = tool(HMMER, "hmmsearch", "--notextw", "--cpu", a.threads, *HMMSEARCH,
+                      "--domtblout", Path(f"{tmp}.domtbl").resolve(), hmm, faa.resolve(),
+                      mounts=(a.out,))  # fmt: skip
+    cmd = f"{shlex.join(search_cmd)} | gzip -1 > {shlex.quote(str(tmp))}.txt.gz"
     run(cmd, shell=True)
     run(
         PY,
@@ -302,46 +326,37 @@ def orfs(a: argparse.Namespace) -> None:
 def diamond(a: argparse.Namespace) -> None:
     ref = pl.read_parquet(a.out / "holdout/members.parquet", columns=["protein_id", "sequence"])
     (a.out / "reference.faa").write_text("".join(f">{i}\n{s}\n" for i, s in ref.iter_rows()))
-    # The container is capped too: Colima's VM may take 20 of the laptop's 24 GB.
-    cap = f"{a.max_gb:g}g"
-    docker = [
-        "docker",
-        "run",
-        "--rm",
-        f"--memory={cap}",
-        f"--memory-swap={cap}",
-        f"--cpus={a.threads}",
-        "-v",
-        f"{a.out.resolve()}:/w",
-        "-w",
-        "/w",
-        DIAMOND,
-        "diamond",
-    ]
-    run(*docker, "makedb", "--in", "reference.faa", "--db", "reference", "--threads", a.threads)
+    out = a.out.resolve()
+
+    def dmnd(*cmd: object) -> list[str]:
+        return tool(DIAMOND, "diamond", *cmd, mounts=(out,))
+
+    run(*dmnd("makedb", "--in", out / "reference.faa", "--db", out / "reference",
+              "--threads", a.threads))  # fmt: skip
     for name in SETS:
         d = a.out / name
         with open(d / "mates.fa", "w") as f:
             f.writelines(f">{r}_{m}\n{s}\n" for r, m, s in mates(d))
         run(
-            *docker,
-            "blastx",
-            "--db",
-            "reference",
-            "--query",
-            f"{name}/mates.fa",
-            "--out",
-            f"{name}/diamond.tsv",
-            "--sensitive",
-            "--top",
-            10,
-            "-b",
-            0.5,
-            "--threads",
-            a.threads,
-            "--outfmt",
-            6,
-            *DIAMOND_FIELDS,
+            *dmnd(
+                "blastx",
+                "--db",
+                out / "reference",
+                "--query",
+                out / name / "mates.fa",
+                "--out",
+                out / name / "diamond.tsv",
+                "--sensitive",
+                "--top",
+                10,
+                "-b",
+                0.5,
+                "--threads",
+                a.threads,
+                "--outfmt",
+                6,
+                *DIAMOND_FIELDS,
+            )
         )
         hits = pl.read_csv(
             d / "diamond.tsv",
@@ -472,10 +487,7 @@ def recruit(a: argparse.Namespace) -> None:
     ``hits.tsv`` with ``orf_id``, read pair and mate). kfpfam names a read ``R<pair>m<mate>``."""
     accs = [f"PF{x:05d}" for x in pl.read_csv(a.out / "ga.tsv", separator="\t")["pfam_accession"]]
     (a.out / "accs.txt").write_text("\n".join(accs) + "\n")
-    cap = f"{a.max_gb:g}g"
-    docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}",
-              f"--cpus={a.threads}", "-v", f"{a.out.resolve()}:/w", "-v", f"{a.kfpfam}:/k:ro",
-              PYHMMER, "python", "/k/recruit/pairs.py"]  # fmt: skip
+    out, kfpfam = a.out.resolve(), a.kfpfam.resolve()
     prep = a.kfpfam / "data/prep"
     for name in SETS:
         d = a.out / name
@@ -492,9 +504,10 @@ def recruit(a: argparse.Namespace) -> None:
         ).write_csv(r / "coords.tsv", separator="\t")
         run(PY, a.kfpfam / "recruit/recruit.py", "reverse", r / "orfs.faa", r / "decoy.faa")
         for kind in ("orfs", "decoy"):
-            w = f"/w/{name}/recruit/{kind}"
-            run(*docker, "/w/hmms.hmm", "/k/data/prep/models.tsv", f"{w}.faa", "all:/w/accs.txt",
-                22.25, a.threads, f"{w}.pairs.tsv")  # fmt: skip
+            w = out / name / "recruit" / kind
+            run(*tool(PYHMMER, "python", kfpfam / "recruit/pairs.py", out / "hmms.hmm",
+                      kfpfam / "data/prep/models.tsv", f"{w}.faa", f"all:{out / 'accs.txt'}",
+                      22.25, a.threads, f"{w}.pairs.tsv", mounts=(out, kfpfam)))  # fmt: skip
         run(PY, a.kfpfam / "recruit/recruit.py", "run", "--real", r / "orfs.pairs.tsv",
             "--null", r / "decoy.pairs.tsv", "--models", prep / "models.tsv", "--prep", prep,
             "--orfs", r / "orfs.faa", "--orf-coords", r / "coords.tsv", "--out", r)  # fmt: skip
@@ -540,9 +553,12 @@ def main() -> None:
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--kfpfam", type=Path, default=Path.home() / "Documents/kfpfam")
+    p.add_argument("--runtime", choices=["docker", "singularity", "none"], default="docker",
+                   help="how hmmsearch, DIAMOND and pyhmmer run")  # fmt: skip
     p.add_argument("--max-gb", type=float, default=MAX_GB, help="watchdog's cap per step")
     a = p.parse_args()
     globals()["MAX_GB"] = a.max_gb
+    globals()["RUNTIME"], globals()["THREADS"] = a.runtime, a.threads
     watchdog(a.max_gb)
     for name, step in STEPS.items():
         if a.step == name or (a.step == "all" and name not in ("nullref", "recruit")):
