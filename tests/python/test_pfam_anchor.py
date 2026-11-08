@@ -120,3 +120,36 @@ def test_seed_index_counts_matching_seeds_and_samples_by_first_column() -> None:
     # Murphy-10 groups residues, but G and W stay in different classes: the same counts
     murphy = anchor.SeedIndex(fam, seeds, anchor.alphabet(anchor.MURPHY10))
     assert murphy.counts(murphy.post, query, 3).tolist() == [4, 3, 1]
+
+
+def test_route_calls_an_exact_read_to_its_own_unit() -> None:
+    domains = pl.DataFrame(
+        {
+            "unit": [10, 20, 30, 30],
+            "hmm_from": [1, 1, 1, 1],
+            "ali_from": [1, 1, 1, 1],
+            "cigar": ["8M"] * 4,
+            "sequence": ["ACDEFGHI", "ACDEFGHK", "WCDEFGHI", "ACDEFGWW"],
+        }
+    )
+    route = anchor.Route(anchor.Family(8, domains))
+    hits = pl.DataFrame(
+        {
+            "read": [0, 0],
+            "pfam_accession": [7, 7],
+            "hmm_from": [1, 5],
+            "ali_from": [1, 1],
+            "cigar": ["4M", "4M"],  # two mates: columns 1-4 and 5-8
+            "sequence": ["ACDE", "FGHK"],
+            "above_ga": [True, False],
+        }
+    )
+    calls = anchor.route_calls(hits, {7: route}, n=8, keep=1.0)
+    row = calls.row(0, named=True)
+    assert row["units"] == [20]
+    assert (row["matches"], row["columns"], row["ga"]) == (8, 8, True)
+    assert sorted(row["near"]) == []  # the others are 7/8, beyond AMBIGUOUS
+    # anchors at all 8 columns: units 10, 20, 30 match 7, 8, 6 (30's best domain); keeping the
+    # top 2 of 3 keeps units 10 and 20
+    merged = columns.column_residues(1, 1, "8M", "ACDEFGHK", 8)[0]
+    assert route.candidates(merged, 8, 0.5).tolist() == [0, 1]

@@ -1,6 +1,6 @@
 # From raw-read Pfam hits to MGnify90 units
 
-Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share. The method settled on 2026-11-08 is anchor residues (the read's most informative HMM columns), then column identity on the units kept (Progress log); it started as k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phase 1's oracle and phase 2's seeds passed their gates the same day (Progress log). The comparison with DIAMOND and the tree index on speed, and read-level precision, are still to do.
+Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share. The method settled on 2026-11-08 is anchor residues (the read's most informative HMM columns), then column identity on the units kept (Progress log); it started as k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phases 1–3 passed their gates the same day, with anchor residues replacing seeds after phase 2 (Progress log). Still to do: full Pfam-A and kfpfam's recruited read hits, the unanchored route alongside (phase 4), and HPC scale.
 
 ## Verdict
 
@@ -177,6 +177,8 @@ Anchor residues, then column identity on the units kept, against DIAMOND. The sa
 
 **Gate:** recall within 0.05 of DIAMOND's on reads with a hit, and at least 10× faster than DIAMOND for the unit-assignment step. Report the Pfam-search cost separately, since kfpfam is working on reducing it. Also report what share of DIAMOND's right calls have no Pfam hit, since these reads are beyond this method's reach.
 
+*Passed 2026-11-08 on the 40 families (`anchor.py query`, then `anchor.py compare`); see Progress log. The speed margin is provisional: DIAMOND ran as an x86_64 image under emulation on the laptop. Full Pfam-A read hits and kfpfam's recruited hits are not in it yet.*
+
 ### Phase 4: coverage and fallbacks
 
 Each of these is measured separately, only if phases 1–3 pass:
@@ -184,7 +186,7 @@ Each of these is measured separately, only if phases 1–3 pass:
 - **Weak hits:** reference and read domains below GA, with `pfam-reannotate`'s reversed arm setting the bar. Do they add right calls beyond the wrong ones? On the read side, kfpfam's recruitment already gives each weak hit a reversed-read q-value and a status (see "Read hits from kfpfam").
 - **Representatives or members:** representatives alone give 80% of k 6 postings but lose 12% of units with a domain. Do they lose right calls? This decides whether the all-representatives run is enough for the reference.
 - **Extending past the domain:** the anchor gives a diagonal into the protein, so reads overhanging a domain could be extended through the sequence store, with sequences held outside the index as in the tree-index design.
-- **Reads with no hit:** they go to the tree index, which needs no anchor ("Two routes"). Measure the share of reads that take each route, and that the two routes' calls combine without double-counting a read that both could call.
+- **Both routes:** every read goes through the tree index, and reads with a hit also through the anchored route ("Two routes"). Measure how often the two agree, and reconcile a read called by both, without double counting, before the pileup.
 
 ### Phase 5: HPC scale
 
@@ -203,10 +205,10 @@ Decided 2026-11-08 (the user): this method and the tree index are not competitor
 - **Reads with no Pfam hit take the unanchored route:** the kfp tree index (tiers 1 and 2), which searches the whole reference without a template. These are reads outside any domain (about half of coding pairs here, phase 0), in unannotated proteins, or too short or weak to hit.
 - **Both hand off in the same format,** a candidate unit list in `kfp-pileup reference`'s format, so the pileup and EM downstream see one stream of calls.
 
-So phase 3 compares the anchored route with DIAMOND only. The tree index enters at phase 4, as the route for reads with no hit. Open questions:
+So phase 3 compares the anchored route with DIAMOND only. The tree index enters at phase 4. The user decided both open questions on 2026-11-08:
 
-- **Where the split falls:** GA hits only, or kfpfam's recruited hits too.
-- **Overlap:** whether reads with a weak hit should take both routes, and how calls from the two are reconciled when they disagree.
+- **The split:** GA hits and kfpfam's recruited hits both take the anchored route.
+- **Every read takes the unanchored route,** whether or not it has a hit. The anchored route is in addition, for reads with a hit. How the two routes' calls are reconciled for the same read is phase 4's question.
 
 ## Speed: what carries over from kfpfam
 
@@ -462,3 +464,34 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Release scale is estimated, not measured.** At 3 M units, 16 bytes per unit is about 48 MB per hit, or a few ms at memory bandwidth. Bitsets per (column, residue) would cut that to 2 bytes per unit. Seeds stay sublinear, so they may still be the first step for the very largest families.
 - **Anchor residues chosen for phase 3; kfpfam's optimisations mapped (2026-11-08, the user's request).** Phase 3 takes anchor residues as its first stage, in place of column seeds. "Speed: what carries over from kfpfam" lists which of kfpfam's speed-ups apply: the model-side join, L2 tiles, u16 indices, NEON byte compares with a scalar oracle, and fewer read hits through the `top` frame. Nothing built yet.
 - **Tree index as the unanchored route (2026-11-08, the user's decision).** The tree index is no longer a phase 3 baseline. It takes reads with no Pfam hit, and the anchored route takes reads with one; both hand off to `kfp-pileup` in the same format. See "Two routes".
+- **Phase 3: the anchored route against DIAMOND (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py query`, then `compare`.
+  - **The route.** Per read pair and family hit (every hit at `-E 10`), stage 1 keeps the top 1% of units by matches at the read's 16 highest-entropy columns. Stage 2 is column identity over the read's columns on those units. The pair's call is its best units over all its families, with ties kept.
+  - **Outputs.** Per read set, `anchored.parquet` holds read, family, matches, columns, identity, tied units, near units (within .02), whether a GA hit carries the call, and the candidates. The handoff is in `kfp-pileup reference`'s format, as tree-index tier 2 writes it: `ref.fa`, `refs.tsv`, `molecule.txt`, `assignments.parquet` (weight split over tied units) and the called reads. The same run on reversed reads gives the null.
+  - **The bar.** Reversed reads are called for 9 of 10,146 and 10 of 11,953 pairs (.001) with no score cut, so the bar is 0 matches. Precision against chance hits isn't the limit at this database size (see "Two local limits").
+  - **Results.** Right on pairs with a hit on a family of their source, anchored against DIAMOND over all units:
+
+    | Identity bin | Strains: anchored | DIAMOND | Relatives: anchored | DIAMOND |
+    | ---: | ---: | ---: | ---: | ---: |
+    | 1.00 | .949 | .990 | .961 | .956 |
+    | 0.98 | .939 | .968 | .976 | .964 |
+    | 0.95 | .948 | .956 | .855 | .796 |
+    | 0.90 | .940 | .929 | .694 | .648 |
+    | 0.85 | .946 | .935 | .634 | .602 |
+    | 0.80 | .942 | .912 | .479 | .474 |
+    | 0.75 | .931 | .912 | .466 | .440 |
+    | 0.70 | .927 | .894 | .310 | .333 |
+    | 0.60 | | | .328 | .306 |
+
+    - **Recall passes.** The largest deficit is .041, for strains at 100%. From 90% down the anchored route matches or beats DIAMOND, except relatives at 70% (−.023). These are within .002 of phase 1's oracle, so the anchor stage loses almost nothing.
+    - **Credit is lower,** .67–.74 against .79–.84 for strains, from ties, as in phase 1.
+    - **Precision of calls** (right among called pairs) is .92–.95 for strains against DIAMOND's .92–.98. For relatives it is level with DIAMOND, .30–.97 by bin.
+    - **Reach is the large gap.** Over all pairs, the anchored route is right for .30–.55 of strains, and DIAMOND for .91–.98. Of DIAMOND's right calls, 42–69% are on pairs with no hit on a family of their source, so beyond this route. That is what the unanchored route is for ("Two routes"). Here it is also inflated by having only 40 families annotated.
+  - **Speed.**
+    - **Anchored route:** 0.15–0.16 ms per read pair over all pairs, on one thread in NumPy, plus 1.1 s to lay out the 40 families.
+    - **DIAMOND:** `blastx --sensitive --top 10` on 4 threads took 45.8 and 48.6 s, so 15.3 and 19.2 core-ms per pair. That is 95–130× slower than the unit-assignment step.
+    - **With the Pfam search,** at kfpfam's 0.53 core-ms per read, the route is about 0.7 core-ms per pair, still 20–27× faster.
+    - **Caveat:** the DIAMOND image is x86_64 under emulation on Apple silicon, which inflates its time by an unmeasured factor. The ≥ 10× gate holds unless emulation costs more than 2–3× once the Pfam search is included, or about 10× without it. The HPC run (phase 5) settles it natively.
+  - **Limits.**
+    - Read hits come from `hmmsearch` with the 40 HMMs, not full Pfam-A or kfpfam's recruitment.
+    - The reference has 40 families, at most 3,090 units each.
+    - The handoff's targets are every member of a called unit: 94,468 proteins for strains and 72,581 for relatives. That is most of the reference at this size, so representatives only, or the members whose domains won, would be the lighter choice for the pileup.
