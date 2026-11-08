@@ -1,6 +1,7 @@
 """HMM column mapping and column statistics for the Pfam-anchored unit assignment."""
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -155,3 +156,23 @@ def test_route_calls_an_exact_read_to_its_own_unit() -> None:
     # top 2 of 3 keeps units 10 and 20
     merged = columns.column_residues(1, 1, "8M", "ACDEFGHK", 8)[0]
     assert route.candidates(merged, 8, 0.5).tolist() == [0, 1]
+
+
+def test_diamond_line_coordinates_and_btop() -> None:
+    sub = anchor.blosum()
+    # + strand ORF starting at base 3: residues 0-3 on bases 4-15, frame 1; one substitution
+    f = (
+        anchor.diamond_line("r", "s0", "ACDE", "ACFE", {0: 0, 1: 1, 2: 2, 3: 3}, "+", 3, 150, sub)
+        .rstrip()
+        .split("\t")
+    )
+    assert f[3:9] == ["4", "15", "1", "4", "1", "2DF1"]
+    raw = 4 + 9 - 3 + 5  # BLOSUM62: A/A, C/C, D/F, E/E
+    assert float(f[2]) == round((anchor.LAMBDA * raw - math.log(anchor.K)) / math.log(2), 1)
+    # - strand from the read's end: qstart is the higher base; a query-only residue (C)
+    f = (
+        anchor.diamond_line("r", "s0", "ACDE", "ADE", {0: 0, 2: 1, 3: 2}, "-", 0, 150, sub)
+        .rstrip()
+        .split("\t")
+    )
+    assert f[3:9] == ["150", "139", "1", "3", "-1", "1C-2"]

@@ -27,6 +27,7 @@ import argparse
 import gzip
 import itertools
 import json
+import math
 import re
 import sys
 import time
@@ -1292,15 +1293,346 @@ def align(a: argparse.Namespace) -> None:
     print(f"{n_built} alignments built in {time.perf_counter() - t0:.1f} s")
 
 
+# Phase 4b: the route's alignments as kfp-pileup call's DIAMOND lines. ------------------------
+
+LAMBDA, K = 0.267, 0.041  # BLOSUM62 with gaps 11/1, as DIAMOND scores (gapped Karlin-Altschul)
+ROUTE_TAG = "_recruited_top_weak"  # the settled route (phase 4)
+STAGE_TAG = {"extended": "", "filled": "_filled", "implied": "_implied"}
+
+
+def lines_tag(a: argparse.Namespace) -> str:
+    """The lines' file suffix: alignment stage, then ``_c<N>`` with competitors."""
+    return STAGE_TAG[a.stage] + (f"_c{a.competitors}" if a.competitors else "")
+
+
+MIN_DEPTH_PILE = 3.0  # kfp-pileup's MIN_DEPTH: pileup columns compared
+
+
+def diamond_line(name: str, sseqid: str, orf: str, prot: str, pairs: dict, strand: str,
+                 start: int, read_len: int, sub: NDArray) -> str:  # fmt: skip
+    """One alignment in ``kfp-pileup call``'s DIAMOND fields: qseqid sseqid bitscore qstart qend
+    sstart send qframe btop. Read bases are 1-based; on the reverse strand qstart is the higher
+    one (DIAMOND's convention, checked against its own lines)."""
+    xs = sorted(pairs)
+    btop, run, raw = [], 0, 0
+    prev_x = prev_j = None
+    for x in xs:
+        j = pairs[x]
+        if prev_x is not None:
+            gq, gs = x - prev_x - 1, j - prev_j - 1  # residues in the query, subject only
+            for g, side in ((gq, "q"), (gs, "s")):
+                if g > 0:
+                    if run:
+                        btop.append(str(run))
+                        run = 0
+                    raw += GAP_OPEN + GAP_EXTEND * g
+                    skipped = orf[prev_x + 1 : x] if side == "q" else prot[prev_j + 1 : j]
+                    btop += [f"{r}-" if side == "q" else f"-{r}" for r in skipped]
+        a, b = orf[x], prot[j]
+        raw += int(sub[ord(a), ord(b)])
+        if a == b:
+            run += 1
+        else:
+            if run:
+                btop.append(str(run))
+                run = 0
+            btop.append(a + b)
+        prev_x, prev_j = x, j
+    if run:
+        btop.append(str(run))
+    bits = (LAMBDA * raw - math.log(K)) / math.log(2)
+    if strand == "+":
+        qstart, qend = start + 3 * xs[0] + 1, start + 3 * xs[-1] + 3
+        frame = (qstart - 1) % 3 + 1
+    else:
+        qstart, qend = read_len - start - 3 * xs[0], read_len - start - 3 * xs[-1] - 2
+        frame = -((read_len - qstart) % 3 + 1)
+    sstart, send = pairs[xs[0]] + 1, pairs[xs[-1]] + 1
+    fields = (name, sseqid, f"{bits:.1f}", qstart, qend, sstart, send, frame, "".join(btop))
+    return "\t".join(map(str, fields)) + "\n"
+
+
+def read_names(path: Path) -> list[str]:
+    with gzip.open(path, "rt") as f:
+        return [line[1:].split()[0] for i, line in enumerate(f) if i % 4 == 0]
+
+
+def lines(a: argparse.Namespace) -> None:
+    """Per read set, ``lines_{1,2}.tsv`` beside the settled route's handoff: each called pair's
+    mates aligned (``build_alignment``) to every tied unit's winning protein and to the near
+    units' neighbour sequences, through the mate's hits in the call's family."""
+    from Bio.Align import PairwiseAligner
+
+    aligner = PairwiseAligner(mode="global", open_gap_score=GAP_OPEN, extend_gap_score=GAP_EXTEND)
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    sub = blosum()
+    _, domains = load_families(a.data, "weak")
+    size = lengths(a.data / "hmms.hmm")
+    dom = {}
+    for k, g in domains.group_by("protein_id", "pfam_accession"):
+        dom[k] = g.select("hmm_from", "ali_from", "cigar", "sequence").rows()
+    for name in prepare.SETS:
+        d = a.data / name
+        handoff = d / f"handoff{ROUTE_TAG}"
+        t0 = time.perf_counter()
+        refs = pl.read_csv(handoff / "refs.tsv", separator="\t")
+        seq_of = dict(refs.select("protein_id", "seq_id").iter_rows())
+        rep_of = dict(
+            refs.filter(pl.col("role") == "neighbour")
+            .select("cluster_rep", "protein_id")
+            .iter_rows()
+        )
+        calls = pl.read_parquet(d / f"anchored{ROUTE_TAG}.parquet")
+        hits = route_hits(d, "", "recruited_top").join(
+            pl.read_parquet(d / "orfs.parquet").select("orf_id", "mate", "strand", "start"),
+            on="orf_id",
+        )
+        by_pair = {k[0]: g for k, g in hits.group_by(["read"])}
+        # competitors: every reference sequence of a family, by its domains' column residues
+        family_rows = {}
+        for (acc,), g in refs.filter(pl.col("role").is_in(["target", "neighbour"])).group_by(
+            ["component"]
+        ):
+            pids, rows = [], []
+            for pid in g["protein_id"].to_list():
+                for r in dom.get((pid, acc), []):
+                    pids.append(pid)
+                    rows.append(columns.column_residues(*r, size[acc])[0])
+            if rows:
+                family_rows[acc] = (np.array(pids), np.stack(rows))
+        names = read_names(d / "reads_1.fq.gz")
+        read_len = pl.read_parquet(d / "reads.parquet")["pair_bases"][0] // 2
+        out = {1: [], 2: []}
+        n_lines = 0
+        for c in calls.sort("read").iter_rows(named=True):
+            targets = list(c["proteins"]) + [rep_of[u] for u in c["near"] if u in rep_of]
+            mate_hits = by_pair[c["read"]].filter(pl.col("pfam_accession") == c["pfam_accession"])
+            length = size[c["pfam_accession"]]
+            for h in mate_hits.iter_rows(named=True):
+                _, orf_pos = columns.column_residues(
+                    h["hmm_from"], h["ali_from"], h["cigar"], h["sequence"], length
+                )
+                hit_targets = list(targets)
+                if a.competitors and c["pfam_accession"] in family_rows:
+                    pids, rows = family_rows[c["pfam_accession"]]
+                    codes = columns.column_residues(
+                        h["hmm_from"], h["ali_from"], h["cigar"], h["sequence"], length
+                    )[0]
+                    match = ((rows == codes) & (codes > 0)).sum(1)
+                    order = np.argsort(-match, kind="stable")
+                    seen = set(hit_targets)
+                    for pid in pids[order].tolist():
+                        if len(hit_targets) >= len(targets) + a.competitors:
+                            break
+                        if pid not in seen:
+                            seen.add(pid)
+                            hit_targets.append(pid)
+                for pid in hit_targets:
+                    best = None
+                    for r in dom.get((pid, c["pfam_accession"]), []):
+                        _, p_pos = columns.column_residues(*r, length)
+                        both = (orf_pos >= 0) & (p_pos >= 0)
+                        if both.sum() >= 2 and (best is None or both.sum() > best[0]):
+                            best = (both.sum(), orf_pos[both], p_pos[both], r[3])
+                    if best is None:
+                        continue
+                    built = build_alignment(h["sequence"], best[3], best[1], best[2], sub, aligner)
+                    if len(built[a.stage]) < 2:
+                        continue
+                    out[h["mate"]].append(diamond_line(
+                        names[c["read"]], seq_of[pid], h["sequence"], best[3], built[a.stage],
+                        h["strand"], h["start"], read_len, sub,
+                    ))  # fmt: skip
+                    n_lines += 1
+        for m in (1, 2):
+            (handoff / f"lines{lines_tag(a)}_{m}.tsv").write_text("".join(out[m]))
+        print(
+            f"{name}: {n_lines} lines for {calls.height} pairs in {time.perf_counter() - t0:.1f} s",
+            flush=True,
+        )
+
+
+def pileup(a: argparse.Namespace) -> None:
+    """Per read set, on the settled route's handoff: DIAMOND as the pileup workflow runs it
+    (``blastx --top 10 -F 15 --sensitive``, its fields) and the route's own lines, each through
+    ``kfp-pileup call`` -> ``call_diamond/`` and ``call_anchored/``, with times in
+    ``pileup_times.json``."""
+    kfp = Path(sys.executable).with_name("kfp-pileup")
+    times = {}
+    for name in prepare.SETS:
+        h = a.data / name / f"handoff{ROUTE_TAG}"
+        cap = f"{a.max_gb:g}g"
+        docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}", "--cpus=4",
+                  "-v", f"{h.resolve()}:/w", "-w", "/w", prepare.DIAMOND, "diamond"]  # fmt: skip
+        if not a.skip_diamond:
+            prepare.run(*docker, "makedb", "--in", "ref.fa", "--db", "ref", "--threads", 4)
+            t0 = time.perf_counter()
+            for m in (1, 2):
+                prepare.run(*docker, "blastx", "--db", "ref", "--query", f"reads_{m}.fq.gz",
+                            "--out", f"diamond_{m}.tsv", "--outfmt", 6, "qseqid", "sseqid",
+                            "bitscore", "qstart", "qend", "sstart", "send", "qframe", "btop",
+                            "--top", 10, "-F", 15, "--sensitive", "--threads", 4,
+                            "-b", 0.5)  # fmt: skip
+            times[f"{name}_diamond_s"] = time.perf_counter() - t0
+        arms = [("diamond", "diamond")] * (not a.skip_diamond) + [
+            (f"anchored{lines_tag(a)}", f"lines{lines_tag(a)}")
+        ]
+        for arm, prefix in arms:
+            t0 = time.perf_counter()
+            tables = [h / f"{prefix}_{m}.tsv" for m in (1, 2)]
+            prepare.run(
+                kfp,
+                "call",
+                h,
+                h / f"call_{arm}",
+                *tables,
+                "--reads",
+                h / "reads_1.fq.gz",
+                "--reads",
+                h / "reads_2.fq.gz",
+                "--stats",
+                h / f"call_{arm}.json",
+            )
+            times[f"{name}_call_{arm}_s"] = time.perf_counter() - t0
+    out = a.data / f"pileup_times{lines_tag(a)}.json"
+    out.write_text(json.dumps(times, indent=1))
+    print(json.dumps(times, indent=1))
+
+
+def variant_truth(data: Path, name: str, h: Path, variants: pl.DataFrame) -> float | None:
+    """Strains only: of the variants on a strain's own source protein, the share whose alt is
+    the strain's residue there (``truth.tsv``'s back-translated CDS, translated; ``pos``
+    1-based). None for relatives, whose reads are the held-out protein itself."""
+    if name != "strains":
+        return None
+    refs = pl.read_csv(h / "refs.tsv", separator="\t").select("seq_id", "protein_id")
+    truth = pl.read_csv(data / name / "truth.tsv", separator="\t").select(
+        protein_id=pl.col("member").cast(pl.Int64), cds="cds"
+    )
+    strain = {
+        pid: "".join(prepare.CODON.get(cds[i : i + 3], "X") for i in range(0, len(cds) - 2, 3))
+        for pid, cds in truth.iter_rows()
+    }
+    x = variants.join(refs, on="seq_id").filter(pl.col("protein_id").is_in(list(strain)))
+    good = [strain[pid][pos - 1 : pos] == alt for _, pos, alt, pid in x.iter_rows()]
+    return sum(good) / len(good) if good else None
+
+
+def pileupcmp(a: argparse.Namespace) -> None:
+    """``call_diamond`` against ``call_anchored`` (``pileup``; ``--stage``), per read set ->
+    ``pileup_compare.tsv``: mates kept; each mate's best unit by ``call``'s EM posterior,
+    against each other and the truth unit; pileup columns (depth >= ``MIN_DEPTH`` in both)
+    by depth and consensus; per-unit abundance and identity; variants, and on strains their
+    truth (:func:`variant_truth`)."""
+    rows = []
+    for name in prepare.SETS:
+        h = a.data / name / f"handoff{ROUTE_TAG}"
+        refs = pl.read_csv(h / "refs.tsv", separator="\t").select("unit", "cluster_rep").unique()
+        strain_unit = pl.read_parquet(a.data / name / "truth.parquet").select(
+            "strain", truth="unit"
+        )
+        best, piles, units, variants, true_share = {}, {}, {}, {}, {}
+        anchored = h / f"call_anchored{lines_tag(a)}"
+        for arm, c in (("diamond", h / "call_diamond"), ("anchored", anchored)):
+            asg = (
+                pl.read_parquet(c / "assignments.parquet")
+                .filter("kept")
+                .sort("em_posterior", descending=True)
+                .unique(["read_name", "mate"], keep="first")
+                .join(refs, on="unit")
+                .with_columns(strain=pl.col("read_name").str.extract(r"^s(\d+)_").cast(pl.Int64))
+                .join(strain_unit, on="strain")
+            )
+            best[arm] = asg.select(
+                "read_name", "mate", "cluster_rep", right=pl.col("cluster_rep") == pl.col("truth")
+            )
+            p = (
+                pl.read_parquet(c / "pileup.parquet")
+                .group_by("seq_id", "col")
+                .agg(
+                    depth=pl.col("weight").sum(),
+                    consensus=pl.col("residue").sort_by("weight").last(),
+                )
+            )
+            piles[arm] = p
+            units[arm] = pl.read_csv(c / "units.tsv", separator="\t").select(
+                "cluster_rep", "em_abundance", "identity"
+            )
+            variants[arm] = pl.read_csv(c / "variants.tsv", separator="\t").select(
+                "seq_id", "pos", "alt"
+            )
+            true_share[arm] = variant_truth(a.data, name, h, variants[arm])
+        b = best["diamond"].join(
+            best["anchored"], on=["read_name", "mate"], how="full", suffix="_a"
+        )
+        both = b.drop_nulls(["cluster_rep", "cluster_rep_a"])
+        p = piles["diamond"].join(piles["anchored"], on=["seq_id", "col"], suffix="_a")
+        deep = p.filter((pl.col("depth") >= MIN_DEPTH_PILE) & (pl.col("depth_a") >= MIN_DEPTH_PILE))
+        u = (
+            units["diamond"]
+            .join(units["anchored"], on="cluster_rep", how="full", suffix="_a")
+            .with_columns(pl.col("em_abundance", "em_abundance_a").fill_nan(0.0).fill_null(0.0))
+        )
+        v = variants["diamond"].join(variants["anchored"], on=["seq_id", "pos", "alt"], how="inner")
+        rows.append({
+            "set": name,
+            "mates_diamond": best["diamond"].height,
+            "mates_anchored": best["anchored"].height,
+            "mates_both": both.height,
+            "same_best_unit": (both["cluster_rep"] == both["cluster_rep_a"]).mean(),
+            "right_diamond": best["diamond"]["right"].mean(),
+            "right_anchored": best["anchored"]["right"].mean(),
+            "columns_diamond": piles["diamond"].height,
+            "columns_anchored": piles["anchored"].height,
+            "columns_deep_both": deep.height,
+            "depth_corr": deep.select(pl.corr("depth", "depth_a")).item(),
+            "same_consensus": (deep["consensus"] == deep["consensus_a"]).mean(),
+            "abundance_corr": u.select(pl.corr("em_abundance", "em_abundance_a")).item(),
+            "identity_mean_diff": u.drop_nulls(["identity", "identity_a"]).select(
+                (pl.col("identity_a") - pl.col("identity")).mean()
+            ).item(),
+            "variants_diamond": variants["diamond"].height,
+            "variants_anchored": variants["anchored"].height,
+            "variants_shared": v.height,
+            "variants_true_diamond": true_share["diamond"],
+            "variants_true_anchored": true_share["anchored"],
+        })  # fmt: skip
+    df = pl.DataFrame(rows)
+    df.write_csv(a.data / f"pileup_compare{lines_tag(a)}.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_cols=-1, tbl_width_chars=250, float_precision=3):
+        print(df.transpose(include_header=True, column_names="set"))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("step", choices=["oracle", "seeds", "anchors", "query", "compare", "align"])
+    p.add_argument(
+        "step",
+        choices=[
+            "oracle",
+            "seeds",
+            "anchors",
+            "query",
+            "compare",
+            "align",
+            "lines",
+            "pileup",
+            "pileupcmp",
+        ],
+    )
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
     p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
     p.add_argument("--anchors", type=int, default=16, help="query: anchor columns per read")
     p.add_argument("--keep", type=float, default=0.01, help="query: share of units kept by anchors")
     p.add_argument("--null-rate", type=float, default=0.001, help="compare: reversed pairs called")
+    p.add_argument("--stage", choices=list(STAGE_TAG), default="extended", help="lines, pileup")
+    p.add_argument("--skip-diamond", action="store_true", help="pileup: anchored lines only")
+    p.add_argument(
+        "--competitors",
+        type=int,
+        default=0,
+        help="lines: also align each mate to this many more sequences of its family",
+    )
     p.add_argument("--hits", choices=HIT_SOURCES, default="hmmsearch", help="query, compare")
     p.add_argument(
         "--ref", choices=REF_ARMS, default="ga", help="query, compare: reference domains"
@@ -1320,6 +1652,9 @@ def main() -> None:
         "anchors": anchors,
         "query": query,
         "align": align,
+        "lines": lines,
+        "pileup": pileup,
+        "pileupcmp": pileupcmp,
         "compare": compare,
     }
     steps[a.step](a)

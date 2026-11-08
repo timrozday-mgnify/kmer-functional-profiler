@@ -561,3 +561,24 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - Ranges are over identity bins for both read sets, with no trend in identity.
   - DP between pairs was needed for 0–2.4% of hits.
   - See "From pseudo-alignment to alignment, and the pileup as the MSA" for what follows: the route writes `kfp-pileup call`'s DIAMOND lines itself, and the pileup needs no separate MSA.
+- **Phase 4b: the route's alignments into `kfp-pileup call` (2026-11-08, the user's request).** `anchor.py lines` writes `call`'s DIAMOND fields from the route's own alignments (`build_alignment`), per mate, for every tied unit's winning protein and the near units' neighbour sequences. `anchor.py pileup` runs DIAMOND on the same handoff as the pileup workflow runs it (`blastx --top 10 -F 15 --sensitive`), and `call` on both sets of lines. `anchor.py pileupcmp` compares them, and `variant_truth` checks strains' variants on their own source protein against the strain's residue.
+  - **`call` accepts the lines.** It runs end to end on them, through posteriors, EM, pileups, variants, the nucleotide pileup and the consensus. There are 0 codon mismatches, against 150 with DIAMOND's lines.
+    - **Writing them:** 1.3 s for 20,187 strains lines, and 0.9 s for relatives.
+    - **`call` on them:** 5.9 and 3.3 s, against 15.6 and 8.6 s on DIAMOND's lines, which have 3–6× more alignments.
+    - The coordinate conventions were checked against DIAMOND's own lines: reverse-strand `qstart` is the higher base, and `qframe` = −((L − qstart) mod 3 + 1).
+  - **Results, strains.** Relatives are in `pileup_compare*.tsv` and agree in direction. *Right* is a mate's best unit by `call`'s EM posterior being the truth unit. *Variants true* is the share of variants on a strain's own source protein whose alt is the strain's residue.
+
+    | Lines | Mates kept | Same best unit as DIAMOND | Right | Same consensus (depth ≥ 3) | Depth corr. | Abundance corr. | Variants (shared) | Variants true |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND | 8,727 | | .798 | | | | 1,355 | .887 |
+    | Anchored, tied and near units | 5,883 | .811 | .794 | .994 | .769 | .882 | 2,329 (745) | .792 |
+    | The same, before extension | 5,908 | .793 | .769 | .996 | .758 | .809 | 1,902 (629) | .808 |
+    | + 10 competitors per mate | 5,938 | .845 | .751 | .995 | .929 | .902 | 1,083 (773) | .805 |
+    | + 30 competitors per mate | 5,948 | .867 | .751 | .995 | .929 | .906 | 1,058 (773) | .805 |
+
+    - **Consensus agrees** on 99.4–99.8% of deep columns in every arm.
+    - **Calls are as right as DIAMOND's** with tied and near units only (.794 against .798). The pileup differs, though. Each read's weight sits on its tied winners, so more columns reach `call`'s depth 3. That gives 1.7× the variants, mostly at columns where DIAMOND's depth is under 2.
+    - **Extension isn't the problem.** Stopping before it changes variant truth by only .016, and it loses right calls.
+    - **Competitors are what DIAMOND's `--top 10` provides:** alignments to every similar target. These are the reference sequences of the call's family with the most matches on the read's implied pairs. With 10 of them, depth and abundance correlate with DIAMOND's at .93 and .90, and the variant count falls to 1,083, 773 of them shared. Right drops to .751, because weight now spreads over near-identical units, much as DIAMOND's does. 30 add nothing over 10.
+    - **The gap left is mates.** DIAMOND aligns 8,727 mates; the route aligns only those with their own hit in the call's family, about 5,900. The other mate of a called pair is usually coding sequence of the same protein outside the domain, or a hit too weak for recruitment. It is placed by the pair: the fragment puts it about 100–120 residues from its mate's alignment. A banded local alignment of its ORFs against that window of the called proteins would rescue it. This is phase 4's "extending past the domain", and it is likely why variant truth stays at .805 against .887: fewer correct reads dilute wrong residues less.
+  - **Next.** Mate rescue, then this comparison again. Then the tree-index step ("Two routes").
