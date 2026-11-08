@@ -1,6 +1,6 @@
 # From raw-read Pfam hits to MGnify90 units
 
-Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share, with k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phase 1's oracle passed its gate the same day (Progress log). Seeds, the speed comparison and read-level precision are still to do.
+Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share, with k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phase 1's oracle and phase 2's seeds passed their gates the same day (Progress log). The comparison with DIAMOND and the tree index on speed, and read-level precision, are still to do.
 
 ## Verdict
 
@@ -168,6 +168,8 @@ Added 2026-11-06 at the user's request. Runs on the same families and needs no i
 4. Score candidates by column, with phase 1's score (identity over the read's columns).
 
 **Gate:** an arm keeps at least 95% of the oracle's right calls, with median candidates per read at most 1% of the family's units for reads from known units, and at most 10% for reads from novel units. Phase 1b found no seed near 1% for novel units (.834 kept at best), so the first version of this gate could not pass. It only has to pass in families too large for brute force.
+
+*Passed in large families 2026-11-08 (`workflows/pfam-anchor/anchor.py seeds`); see Progress log. Phase 3 takes `s1101011` at s 2 with 2 shared seeds, and contiguous k 5 at s 2 with 2 shared seeds as the alternative. The index is held in memory: no Parquet yet.*
 
 ### Phase 3: comparison
 
@@ -379,3 +381,31 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Other findings.**
     - Short repeat families, such as PF12661 (22 columns), lose the most. Reads carry several overlapping domain hits, some of only 2–7 columns with scores below zero, and the copies of the repeat in the reference are often below GA.
     - With the shared-column score, 48 of 633 misses at 80% and above (8%) fell only on a reference domain below GA. Phase 4's weak-domain arm covers them.
+- **Phase 2: column seeds (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py seeds`, on the pairs with a hit on a family of their source: 30 s, 1.8 GB peak.
+  - **Method.**
+    - **Index:** per family and shape, sorted postings of (seed, residues, unit), merged by unit and held in memory. Smaller s keeps only seeds whose first column is a multiple of s.
+    - **Query:** a pair uses every seed of all its hits in the family. A unit is a candidate with at least h distinct matching seeds.
+    - **Scoring:** candidates are scored as in the oracle, so *kept* is the share of the oracle's right pairs that stay right, and *share* is candidates over the family's units (median per pair).
+    - **Sets:** strains are the known-unit reads, relatives the novel-unit ones. *Large* families have at least 1,500 units: 9 of the 40, the largest 3,090.
+  - **Results.** Selected arms; all 48 are in `seeds.tsv`.
+
+    | Arm | s | h | Postings per unit | Strains: kept | Strains: share | Large: kept | Large: share | Relatives: kept | Relatives: share | Large: kept | Large: share |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | k 5 | 1 | 1 | 105 | .996 | 8.0% | .997 | 6.0% | .996 | 11.8% | .995 | 8.8% |
+    | k 5 | 2 | 2 | 53 | .971 | 2.0% | .965 | 0.9% | .979 | 2.6% | .981 | 1.5% |
+    | k 6 | 1 | 2 | 105 | .968 | 2.1% | .960 | 1.0% | .980 | 2.9% | .982 | 1.6% |
+    | k 6 | 4 | 1 | 26 | .947 | 1.9% | .940 | 0.9% | .971 | 2.7% | .969 | 1.6% |
+    | k 8 | 1 | 1 | 103 | .925 | 1.0% | .916 | 0.4% | .962 | 1.5% | .961 | 0.7% |
+    | `1101011` | 2 | 2 | 51 | .965 | 1.4% | .958 | 0.6% | .978 | 1.9% | .977 | 1.0% |
+    | `11010010011` | 1 | 2 | 97 | .965 | 1.1% | .964 | 0.4% | .969 | 1.5% | .967 | 0.7% |
+    | Greedy k 4 | 1 | 1 | 15 | .933 | 6.1% | .930 | 5.1% | .983 | 9.7% | .986 | 8.6% |
+    | Murphy-10 k 8 | 2 | 2 | 49 | .903 | 1.4% | .883 | 0.4% | .968 | 2.3% | .967 | 1.0% |
+
+    - **The gate passes in large families, not over all of them.** In large families, contiguous k 5 or k 6, and both spaced shapes, keep at least .95 at no more than 1% for strains, with relatives far inside their 10%. Over all families, the best strains arm is just above 1% (`11010010011`, s 1, h 2: .965 at 1.1%). The gate only has to hold where brute force is too slow, so it passes.
+    - **Novel reads narrow as well as known ones.** Relatives keep more than strains at a similar share. This differs from phase 1b, where novel windows were the hard case. Here, relatives' reads are the held-out protein itself, so they have no sequencing divergence, while strains are mutated to 70%. Strains at 70–80% are the weak point.
+    - **Two shared seeds beat a longer k.** At half the postings, k 5 or `1101011` at s 2 and h 2 keep 4–5 points more on strains than k 8 at h 1 (.965–.971 against .925), for a little more share (1.4–2.0% against 1.0%).
+    - **Greedy columns and Murphy-10 don't help.** Greedy seeds are 7× smaller, but at .93 kept on strains they narrow only to 6%. Murphy-10 is worse than the full alphabet at the same k, s and h.
+  - **Speed.** Brute force costs about 63 ns per reference domain per hit, so 0.25 ms per hit in the median family here. A seed lookup costs about 0.02 ms per hit, mostly Python overhead.
+    - Scoring the candidates costs brute force times their share, so seeds pay off above about 330 domain rows (about 100–150 units).
+    - With the chosen arms, unit assignment is 7.5–8× faster than brute force overall, and 12–14× faster in large families. The gain grows with family size, since the share falls (phase 1b). At release-sized families of millions of units, brute force is about 60 ms per million domains per hit, against a lookup plus 1% of that.
+  - **Limits.** Families here have at most 3,090 units, so the share at release sizes is extrapolated. The postings are per unit, not per protein. Reads have the simulator's 0.2% sequencing errors, but no real ORF calling.

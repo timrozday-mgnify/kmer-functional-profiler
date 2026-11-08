@@ -95,3 +95,28 @@ def test_family_score_takes_each_units_best_domain() -> None:
     # unit 3: 3 of 4; unit 7: its full domain (4 of 4) beats the half one (2 of 2 shares too few)
     assert m.tolist() == [3, 4]
     assert s.tolist() == [4, 4]
+
+
+def test_seed_index_counts_matching_seeds_and_samples_by_first_column() -> None:
+    domains = pl.DataFrame(
+        {
+            "unit": [1, 2, 3],
+            "hmm_from": [1, 1, 1],
+            "ali_from": [1, 1, 1],
+            "cigar": ["6M", "6M", "3M3D"],
+            "sequence": ["ACDEFG", "ACDEFW", "ACD"],
+        }
+    )
+    fam = anchor.Family(6, domains)
+    seeds = np.arange(1, 5)[:, None] + np.arange(3)  # contiguous k 3 from columns 1-4
+    index = anchor.SeedIndex(fam, seeds, anchor.alphabet(None))
+    # postings: unit 1 and 2 have 4 seeds each, unit 3 one (ACD only)
+    assert len(index.post) == 4 + 4 + 1
+    # matches: unit 2's EFW differs from the query's EFG
+    query = columns.column_residues(1, 1, "6M", "ACDEFG", 6)[0][None, :]
+    assert index.counts(index.post, query, 3).tolist() == [4, 3, 1]
+    # s 2 keeps seeds starting at column 2 and 4
+    assert index.counts(index.sampled(2), query, 3).tolist() == [2, 1, 0]
+    # Murphy-10 groups residues, but G and W stay in different classes: the same counts
+    murphy = anchor.SeedIndex(fam, seeds, anchor.alphabet(anchor.MURPHY10))
+    assert murphy.counts(murphy.post, query, 3).tolist() == [4, 3, 1]

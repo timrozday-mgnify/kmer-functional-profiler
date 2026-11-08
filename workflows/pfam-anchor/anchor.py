@@ -26,7 +26,9 @@ Writes per read set ``oracle.parquet`` (one row per pair with a hit), and ``orac
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
@@ -356,15 +358,262 @@ def oracle(a: argparse.Namespace) -> None:
             print(df)
 
 
+# Phase 2: column seeds. --------------------------------------------------------------------------
+
+MURPHY10 = "LVIM C A G ST P FYW EDNQ KR H"  # tree-index alphabets.py's murphy10
+SAMPLING = (1, 2, 4)  # index keeps seeds whose first column is a multiple of s
+MIN_SEEDS = (1, 2)  # matching seeds a unit needs to be a candidate
+
+
+def alphabet(groups: str | None) -> NDArray[np.int64]:
+    """Residue code (0-21) -> letter of the seed alphabet; -1 for no residue and OTHER."""
+    out = np.full(22, -1, dtype=np.int64)
+    if groups is None:
+        out[1:21] = np.arange(20)
+    else:
+        for g, letters in enumerate(groups.split()):
+            for x in letters:
+                out[columns.AMINO.index(x) + 1] = g
+    return out
+
+
+def shapes(length: int, ref: NDArray[np.uint8]) -> dict[str, NDArray[np.int64]]:
+    """Per shape, its seeds: (seeds x width) HMM columns. Anchored shapes have one seed per
+    first column; greedy ones are phase 1b's (``columns.greedy_seeds``)."""
+    out = {}
+    for name, pattern in (("k5", "11111"), ("k6", "111111"), ("k8", "11111111"),
+                          ("s1101011", "1101011"), ("s11010010011", "11010010011")):  # fmt: skip
+        offsets = np.flatnonzero(np.frombuffer(pattern.encode(), dtype=np.uint8) == 49)
+        out[name] = np.arange(1, length - len(pattern) + 2)[:, None] + offsets
+    unit_view = SimpleNamespace(ref=ref, length=length)
+    unit_view.pairs = columns.Family.nearest_pairs(unit_view)
+    for k in (3, 4, 5):
+        seeds = columns.greedy_seeds(unit_view, 12, k)
+        out[f"greedy_k{k}"] = np.array(seeds, dtype=np.int64).reshape(-1, k)
+    return out
+
+
+ARMS = (  # (arm, shape, alphabet); greedy seeds are not anchored, so only s = 1
+    *((s, s, None) for s in ("k5", "k6", "k8", "s1101011", "s11010010011")),
+    *((f"greedy_k{k}", f"greedy_k{k}", None) for k in (3, 4, 5)),
+    ("murphy_k6", "k6", MURPHY10),
+    ("murphy_k8", "k8", MURPHY10),
+)
+
+
+class SeedIndex:
+    """One family's postings for one shape and alphabet: sorted ``code << bits | unit``, with
+    ``code = seed * A^width + residues``; ``s`` keeps seeds whose first column divides by it."""
+
+    def __init__(self, fam: Family, seeds: NDArray[np.int64], letters: NDArray[np.int64]) -> None:
+        self.seeds, self.letters = seeds, letters
+        self.base = int(letters.max()) + 1
+        self.bits = max(1, int(len(fam.units) - 1).bit_length())
+        unit_of_row = np.repeat(
+            np.arange(len(fam.units)), np.diff(np.r_[fam.starts, len(fam.matrix)])
+        )
+        parts = []
+        for lo in range(
+            0, len(fam.matrix), 2000
+        ):  # ponytail: row chunks bound the seeds x rows block
+            code = self.codes(fam.matrix[lo : lo + 2000])
+            ok = code >= 0
+            parts.append((code[ok] << self.bits) | unit_of_row[lo : lo + 2000][np.nonzero(ok)[0]])
+        self.post = np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int64)
+
+    def codes(self, rows: NDArray[np.uint8]) -> NDArray[np.int64]:
+        """(rows x seeds) codes, -1 where a seed column has no residue."""
+        x = self.letters[rows[:, self.seeds]]  # rows x seeds x width
+        packed = (x * self.base ** np.arange(self.seeds.shape[1])).sum(2)
+        packed += np.arange(len(self.seeds)) * self.base ** self.seeds.shape[1]
+        return np.where((x >= 0).all(2), packed, -1)
+
+    def sampled(self, s: int) -> NDArray[np.int64]:
+        if s == 1:
+            return self.post
+        seed = (self.post >> self.bits) // self.base ** self.seeds.shape[1]
+        return self.post[self.seeds[seed, 0] % s == 0]
+
+    def counts(self, post: NDArray[np.int64], query: NDArray[np.uint8], n_units: int) -> NDArray:
+        """Per unit, how many of the query's distinct seed codes it has."""
+        q = np.unique(self.codes(query))
+        q = q[q >= 0]
+        lo = np.searchsorted(post, q << self.bits)
+        hi = np.searchsorted(post, (q + 1) << self.bits)
+        n = hi - lo
+        if not n.sum():
+            return np.zeros(n_units, dtype=np.int64)
+        idx = np.repeat(lo - np.r_[0, np.cumsum(n)[:-1]], n) + np.arange(n.sum())
+        return np.bincount(post[idx] & ((1 << self.bits) - 1), minlength=n_units)
+
+
+def seeds(a: argparse.Namespace) -> None:
+    fams, _ = load_families(a.data)
+    sets = []
+    for name in prepare.SETS:
+        oracle_right = pl.read_parquet(a.data / name / "oracle.parquet").filter(
+            "hit_source", pl.col("score") == "read"
+        )
+        hits = read_hits(a.data, name).join(oracle_right.select("read"), on="read")
+        truth = truth_of(a.data, name)
+        sets.append(
+            hits.join(truth.select("read", "unit"), on="read").with_columns(set=pl.lit(name))
+        )
+    hits = pl.concat(sets)
+    rows, speed, sizes = [], [], []
+    for (acc,), fam_hits in hits.group_by(["pfam_accession"], maintain_order=True):
+        fam = fams.get(acc)
+        if fam is None:
+            continue
+        t0 = time.perf_counter()
+        length = fam.matrix.shape[1] - 1
+        shape = shapes(length, fam.matrix[fam.starts])
+        letters = {None: alphabet(None), MURPHY10: alphabet(MURPHY10)}
+        indexes = {arm: SeedIndex(fam, shape[sh], letters[al]) for arm, sh, al in ARMS}
+        build = time.perf_counter() - t0
+        rows_per_unit = np.diff(np.r_[fam.starts, len(fam.matrix)])
+        posts = {
+            (arm, s): indexes[arm].sampled(s)
+            for arm, _, _ in ARMS
+            for s in (SAMPLING if not arm.startswith("greedy") else (1,))
+        }
+        sizes += [(acc, arm, s, len(p), len(fam.units)) for (arm, s), p in posts.items()]
+        brute = query = 0.0
+        n_hits = 0
+        cand_rows: dict[tuple, int] = {}
+        for (st, read), pair in fam_hits.group_by(["set", "read"], maintain_order=True):
+            target = pair["unit"][0]
+            hits_codes = [
+                columns.column_residues(*r, length)[0]
+                for r in pair.select("hmm_from", "ali_from", "cigar", "sequence").rows()
+            ]
+            t1 = time.perf_counter()
+            M = np.zeros(len(fam.units), dtype=np.int64)
+            S = np.zeros(len(fam.units), dtype=np.int64)
+            N = 0
+            for codes in hits_codes:
+                m, s_, n = fam.score(codes, "read")
+                M, S, N = M + m, S + s_, N + n
+            brute += time.perf_counter() - t1
+            n_hits += len(hits_codes)
+            ok = (S >= MIN_SHARE * N) & (S > 0)
+            ident = np.where(ok, M / max(N, 1), -1.0)
+            i = np.searchsorted(fam.units, target)
+            has_truth = i < len(fam.units) and fam.units[i] == target
+            arms = [("oracle", 1, 1, np.ones(len(fam.units), dtype=bool))]
+            query_rows = np.stack(hits_codes)  # distinct seeds over all the pair's hits
+            for (arm, s), post in posts.items():
+                t2 = time.perf_counter()
+                count = indexes[arm].counts(post, query_rows, len(fam.units))
+                query += time.perf_counter() - t2
+                for h in MIN_SEEDS:
+                    cand = count >= h
+                    arms.append((arm, s, h, cand))
+                    key = (arm, s, h)
+                    cand_rows[key] = cand_rows.get(key, 0) + int(rows_per_unit[cand].sum())
+            for arm, s, h, cand in arms:
+                okc = ok & cand
+                best = ident[okc].max() if okc.any() else -1.0
+                tied = okc & (ident >= best - EPS)
+                rows.append((st, read, acc, arm, s, h, best, bool(has_truth and tied[i]),
+                             int(tied.sum()), int(cand.sum()), len(fam.units)))  # fmt: skip
+        for (arm, s, h), n_rows in cand_rows.items():
+            speed.append(
+                (
+                    acc,
+                    len(fam.units),
+                    len(fam.matrix),
+                    n_hits,
+                    brute,
+                    query,
+                    build,
+                    arm,
+                    s,
+                    h,
+                    n_rows,
+                )
+            )
+        print(
+            f"PF{acc:05d}: {len(fam.units)} units, {n_hits} hits, build {build:.1f} s", flush=True
+        )
+    cols = ["set", "read", "pfam_accession", "arm", "s", "h", "best", "truth_tied", "ties",
+            "candidates", "units"]  # fmt: skip
+    per_fam = pl.DataFrame(rows, schema=cols, orient="row")
+    per_pair = (
+        per_fam.with_columns(top=pl.col("best").max().over("set", "read", "arm", "s", "h"))
+        .group_by("set", "read", "arm", "s", "h")
+        .agg(
+            right=(pl.col("truth_tied") & (pl.col("best") >= pl.col("top") - EPS)).any(),
+            ties=pl.col("ties").filter(pl.col("best") >= pl.col("top") - EPS).sum(),
+            share=pl.col("candidates").sum() / pl.col("units").sum(),
+            units=pl.col("units").sum(),
+        )
+    )
+    per_pair.write_parquet(a.data / "seeds.parquet")
+    oracle = per_pair.filter(pl.col("arm") == "oracle").select("set", "read", oracle_right="right")
+    index = (
+        pl.DataFrame(
+            sizes, schema=["pfam_accession", "arm", "s", "postings", "units"], orient="row"
+        )
+        .group_by("arm", "s")
+        .agg(postings_per_unit=pl.col("postings").sum() / pl.col("units").sum())
+    )
+    big = pl.col("units") >= a.large
+    table = (
+        per_pair.filter(pl.col("arm") != "oracle")
+        .join(oracle, on=["set", "read"])
+        .group_by("arm", "s", "h")
+        .agg(
+            *(
+                expr.alias(f"{st}_{label}")
+                for st in prepare.SETS
+                for label, expr in (
+                    ("kept", pl.col("right").filter(pl.col("set") == st, "oracle_right").mean()),
+                    ("share", pl.col("share").filter(pl.col("set") == st).median()),
+                    (
+                        "kept_large",
+                        pl.col("right").filter(pl.col("set") == st, "oracle_right", big).mean(),
+                    ),
+                    ("share_large", pl.col("share").filter(pl.col("set") == st, big).median()),
+                )
+            )
+        )
+        .join(index, on=["arm", "s"], how="left")
+        .sort("arm", "s", "h")
+    )
+    table.write_csv(a.data / "seeds.tsv", separator="\t", float_precision=4)
+    sp = pl.DataFrame(
+        speed,
+        schema=[
+            "pfam_accession",
+            "units",
+            "rows",
+            "hits",
+            "brute_s",
+            "query_s",
+            "build_s",
+            "arm",
+            "s",
+            "h",
+            "candidate_rows",
+        ],  # fmt: skip
+        orient="row",
+    )
+    sp.write_csv(a.data / "seed_speed.tsv", separator="\t", float_precision=6)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=250):
+        print(table)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("step", choices=["oracle"])
+    p.add_argument("step", choices=["oracle", "seeds"])
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
+    p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB, help="memory watchdog's cap")
     a = p.parse_args()
     prepare.watchdog(a.max_gb)
-    {"oracle": oracle}[a.step](a)
+    {"oracle": oracle, "seeds": seeds}[a.step](a)
 
 
 if __name__ == "__main__":
