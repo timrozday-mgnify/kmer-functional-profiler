@@ -715,3 +715,23 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Truth-scoring caveats.**
     - `truth.tsv`'s own `unit` column is the simulator's target, a protein. The truth unit is in `truth.parquet`.
     - Relatives' "true depth" is the held-out protein's, credited to its nearest remaining relative's unit, which may not be the unit its reads best fit.
+- **The EM (2026-11-08, the user's request).** The gather's apparent sparsity was mostly the components I gave `call`, not its EM.
+  - **How `call`'s EM works** (`kfp_pileup.refine`, step 8). Each read pair's sources are the units it aligns to, plus its component's novel class: a relative missing from the reference, with divergence in [0.1, 0.5]. Units' divergence is in [0.005, 0.1].
+  - **What went wrong.** My handoff set each unit's component to its Pfam family. One novel class then pooled every divergent read in a family of thousands of units, and outbid low-depth units even for reads 95–98% identical to them.
+    - Strains, family components: at 95% identity, 65% of reads went to the novel class; at 98%, 25%; at 100%, 11%.
+    - Below 90%, 94–100% went novel, which is right, since those strains are more than 10% from any unit.
+  - **Arms**, on the union reference, `call` on the same tier 2 seed-alignment lines.
+
+    | Component | Strains ≥ 95%: novel share | Units with ≥ 0.5 EM pairs | Their group | Relatives ≥ 95%: units | Group |
+    | --- | ---: | ---: | ---: | ---: | ---: |
+    | Pfam family (before) | .11–.65 | .679 | .789 | .627 | .705 |
+    | One per unit | .03–.10 | .861 | .960 | .893 | .962 |
+    | Tree-index layer group | .04–.15 | .836 | .949 | .885 | .960 |
+
+    - Before the EM, .966 of close units and .984 of their groups hold half a pair. So after the right components the EM loses little, and what it loses at unit level is mostly near-identical units sharing one group's reads. Abundance should be read per group.
+    - The cost: more false units with half a pair (strains 139 to 256, relatives 352 to 768). Divergent reads now go to near units rather than one family-wide novel pool. The share of EM pairs on true units falls slightly, from .896 to .871.
+  - **Chosen: tree-index layer groups,** which is what tree-index tier 2's own handoff uses. `treeindex` now rewrites the confirmed reference's `refs.tsv` with the groups (`regroup`), keeping the family as `family`. Union reference, tier 2 + seed alignment:
+    - true units with half an EM pair .313 to .453, overall;
+    - Spearman with true depth .330 to .431 (strains) and .246 to .311 (relatives);
+    - read calls and pileups unchanged (.673 and .550 right; consensus .992 at variant columns).
+  - **`kfp-pileup` itself is unchanged.** Its EM is fine when components are small groups of near units, as kfp's profile components and tier 2's groups are. A family as the component is outside what it assumes. A check there for very large components could warn about this.

@@ -1790,6 +1790,27 @@ def mapcmp(a: argparse.Namespace) -> None:
 TREE = prepare.ROOT / "workflows/tree-index"
 
 
+def regroup(c: Path) -> None:
+    """``call``'s components for a confirmed reference: the tree index's layer groups (each
+    unit in the group most of its proteins' leaves fall in), not Pfam families. A family-wide
+    component pools every divergent read of the family into one novel class, which then
+    outbids low-depth units even for reads 95% identical to them (Progress log, "The EM").
+    The family is kept as ``family``."""
+    refs = pl.read_csv(c / "refs.tsv", separator="\t")
+    if "family" in refs.columns:
+        return
+    group = np.load(c / "tree/index/layer_group.npy").astype(np.int64)
+    leaf = pl.read_parquet(c / "tree/index/proteins.parquet").filter(pl.col("pos") >= 0)
+    leaf = leaf.with_columns(group=pl.Series(group[leaf["pos"].to_numpy()]))
+    of_unit = (
+        refs.join(leaf.select("protein_id", "group"), on="protein_id", how="left")
+        .group_by("cluster_rep").agg(group=pl.col("group").drop_nulls().mode().first())
+    )  # fmt: skip
+    refs.join(of_unit, on="cluster_rep").with_columns(
+        family=pl.col("component"), component=pl.col("group").fill_null(-1)
+    ).drop("group").write_csv(c / "refs.tsv", separator="\t")
+
+
 def treeindex(a: argparse.Namespace) -> None:
     """Per read set: the tree index's standard tier on the confirmed reference's sequences (the
     same targets and neighbours DIAMOND searches), as one part (build.py, merge.py, store.py),
@@ -1832,6 +1853,7 @@ def treeindex(a: argparse.Namespace) -> None:
             t0 = time.perf_counter()
             prepare.run(*cmd)
             times[f"{name}_{step}_s"] = time.perf_counter() - t0
+        regroup(c)
     (a.data / f"tree_times_{confirmed_dir(a)}.json").write_text(json.dumps(times, indent=1))
     print(json.dumps(times, indent=1))
 
@@ -2368,12 +2390,29 @@ def truthscore(a: argparse.Namespace) -> None:
                 pl.col("depth", "em", "pre").fill_null(0.0)
             )
             true = both.filter(pl.col("depth") > 0)
+            # close true units (strains, or relatives, at least 95% identity): their reads belong
+            # to the unit, not the novel class; per unit and per component (call's group)
+            close = (
+                pl.read_parquet(d / "truth.parquet")
+                .group_by("unit")
+                .agg(pl.col("identity_bin").max())
+                .filter(pl.col("identity_bin") >= 0.95)
+            )
+            comp = refs.select(unit="cluster_rep", group="component").unique("unit")
+            g_em = units.join(comp, on="unit").group_by("group").agg(g_em=pl.col("em").sum())
+            near = (
+                close.join(units, on="unit", how="left").join(comp, on="unit", how="left")
+                .join(g_em, on="group", how="left")
+                .with_columns(pl.col("em", "g_em").fill_null(0.0))
+            )  # fmt: skip
             row = {
                 "set": name,
                 "arm": arm,
                 "abundance_spearman": both.select(pl.corr("depth", "em", method="spearman")).item(),
                 "em_on_true_units": true["em"].sum() / max(both["em"].sum(), 1e-12),
                 "true_units_with_em": true.select((pl.col("em") >= 0.5).mean()).item(),
+                "close_units_with_em": near.select((pl.col("em") >= 0.5).mean()).item(),
+                "close_groups_with_em": near.select((pl.col("g_em") >= 0.5).mean()).item(),
                 "false_units_with_em": both.filter(
                     pl.col("depth") == 0, pl.col("em") >= 0.5
                 ).height,
