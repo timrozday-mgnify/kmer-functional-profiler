@@ -240,6 +240,27 @@ It costs about 12 µs per hit in Python, against DIAMOND's 15–19 core-ms per r
 - per-target pileups agree with DIAMOND-based ones, column by column;
 - `call`'s read posteriors and per-unit identity agree with the DIAMOND path's.
 
+## Confirm, then map every read
+
+Decided 2026-11-08 (the user). The anchored route's job is to **confirm which units are present**, not to place every read. Once units are confirmed, all reads are treated alike:
+
+```text
+reads -> Pfam hits -> anchored route -> unit calls -> confirmed units        (confirmation)
+                                                    + unanchored route (tree index), for units no Pfam hit reaches
+confirmed units -> targets (members) + neighbours                             (the reference)
+every read -> aligned to the targets, all plausible alignments kept            (mapping)
+           -> gather: read posteriors and EM over sources                     (kfp-pileup call)
+           -> pileups, variants, consensus                                    (kfp-pileup call)
+```
+
+- **Confirmation.** A unit is confirmed by the weight of anchored calls on it, each pair's weight split over its tied units. Measure its recall and precision against the units present, and which units only the unanchored route can confirm.
+- **Mapping is the same for every read.** A read with a Pfam hit gets no special treatment here: it is aligned to the targets like a read with none. Every alignment within `--top` of a read's best is kept, so a read with several plausible targets carries all of them.
+- **Gather.** `kfp-pileup call` already resolves multiple alignments: posteriors with one column left out, then its EM over sources (steps 8–9). Nothing new is needed unless measurement says so.
+- **The mapper is the open choice:**
+  - DIAMOND `blastx` against the targets, as the pileup workflow runs it;
+  - the tree index on the confirmed units. Tier 2, the dense index, could be used straight away, since the confirmed reference is small. Or tier 1 could route first and tier 2 align, as for the whole release. Test both against DIAMOND, on reads mapped right, time and memory. The tree index routes and scores but doesn't write alignments, so its arms hand their candidates to the aligner. The anchored route's own alignments (phase 4b) cover only reads with a hit, so they aren't a mapper for every read.
+- **This replaces mate rescue.** Phase 4b's missing mates are reads with no hit of their own, and mapping every read covers them.
+
 ## Speed: what carries over from kfpfam
 
 Added 2026-11-08 at the user's request. kfpfam's speed work (its `docs/plan.md`, "Speed plan" and Progress log) took a per-read pseudo-alignment from about 108 to 1.4–3 ns per hit. Most of it is about memory layout and batching, not k-mers, so it carries over to anchor residues and column identity. Nothing below is built or measured here.
@@ -581,4 +602,36 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - **Extension isn't the problem.** Stopping before it changes variant truth by only .016, and it loses right calls.
     - **Competitors are what DIAMOND's `--top 10` provides:** alignments to every similar target. These are the reference sequences of the call's family with the most matches on the read's implied pairs. With 10 of them, depth and abundance correlate with DIAMOND's at .93 and .90, and the variant count falls to 1,083, 773 of them shared. Right drops to .751, because weight now spreads over near-identical units, much as DIAMOND's does. 30 add nothing over 10.
     - **The gap left is mates.** DIAMOND aligns 8,727 mates; the route aligns only those with their own hit in the call's family, about 5,900. The other mate of a called pair is usually coding sequence of the same protein outside the domain, or a hit too weak for recruitment. It is placed by the pair: the fragment puts it about 100–120 residues from its mate's alignment. A banded local alignment of its ORFs against that window of the called proteins would rescue it. This is phase 4's "extending past the domain", and it is likely why variant truth stays at .805 against .887: fewer correct reads dilute wrong residues less.
-  - **Next.** Mate rescue, then this comparison again. Then the tree-index step ("Two routes").
+  - **Next (superseded the same day).** Not mate rescue: every read is mapped to the confirmed units instead ("Confirm, then map every read").
+- **Confirm, then map every read (2026-11-08, the user's decision).** Unit calls from the anchored route confirm units. Every read is then aligned to the confirmed units' targets, with multiple alignments kept and resolved by `kfp-pileup call`'s posteriors and EM before the pileups. The mapper is the open choice: DIAMOND, or the tree index's tier 2 directly, or tier 1 then tier 2. See "Confirm, then map every read".
+- **Confirm, then map every read: first measurements (2026-11-08, the user's request).** `anchor.py confirm`, `mapall`, `mapcmp`, `treeindex` and `mapscore`, on the settled route's calls.
+  - **Confirmation should be liberal.** Each called pair's weight is split over its tied units, and a unit is confirmed above a total weight.
+    - A false unit costs one more target, which the gather sorts out; a missed unit loses every read it has. So the threshold is set by recall.
+    - | Weight | Strains: confirmed | Recall | Precision | Pairs whose unit is confirmed | Relatives: recall | Pairs |
+      | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+      | 2 | 832 | .462 | .879 | .626 | .325 | .403 |
+      | 1 | 1,405 | .680 | .766 | .788 | .483 | .540 |
+      | 0.1 | 2,988 | .802 | .424 | .865 | .596 | .642 |
+    - Taking 0.1, the confirmed reference has 6,762 targets (3 members per unit) for strains and 6,025 for relatives. Units with no anchored call (288 of 1,582 present for strains) need the unanchored route.
+  - **DIAMOND then `call` on every read (weight 0.1).**
+    - Strains: .728 of mates mapped and .571 right, against .672 and .546 at weight 1. Variants on strains' own proteins are .890 true, above phase 4b's .805 and level with DIAMOND's .887 there.
+    - Mates with no Pfam hit are now mapped: .649 mapped and .527 right.
+    - `call`'s `--min-identity 0.7` drops divergent mates: mapped falls from .86 at 100% to .36 at 70%, where DIAMOND on the whole reference keeps .88–.89. At 0.5, .829 mapped and .627 right, but precision falls (.756 against .784) and variant truth too (.846).
+  - **The mapper, pair level, before the gather.** All mappers use the same confirmed reference, at the tree index's 1% decoy bar.
+
+    | Mapper | Strains: called | Right | Precision | Right, no Pfam hit | Relatives: right | Precision | Time per set (s) |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND (`--sensitive --top 10 -F 15`, emulated x86) | .939 | .756 | .805 | .688 | .483 | .534 | 5.4–6.5 |
+    | Tier 1 (`query.py`, `verify.py`) | .410 | .294 | .718 | .222 | .267 | .571 | 5.4–5.9 |
+    | Tier 1, then tier 2 | .890 | .714 | .802 | .647 | .471 | .543 | 12.9–15.1 |
+    | Tier 2 alone (`tier2.py --all-leaves`) | .917 | .751 | .820 | .684 | .482 | .552 | 5.9–10.7, plus 3.3 to build |
+
+    - **Use tier 2 straight away; tier 1 adds nothing here.** On a reference this small, tier 2 alone matches DIAMOND's right calls (.751 against .756, .482 against .483) at slightly better precision. Tier 1 first is worse (.714) and slower. Tier 1's sparse keys seed only a share of a strain's reads (.410 called), and tier 2's dense routing already covers every read.
+    - `tier2.py --all-leaves`, added for this, makes every leaf a candidate and doesn't read tier 1's output.
+    - Tier 1 keeps its place where the reference is the whole release: the unanchored route, before anything is confirmed.
+    - **Tier 2 scores, but writes no alignments.** The pileup still needs alignments (`call`'s DIAMOND lines), so tier 2 as the mapper would mean either an aligner after it on its calls, or tier 2 writing BTOP from its two-stage alignment. DIAMOND alone does both in one pass. At this size the two take similar time (DIAMOND emulated), so tier 2 pays only if it writes its alignments.
+  - **What limits right calls now is confirmation,** not the mapper: .865 of strain pairs and .642 of relative pairs have their unit confirmed. The unanchored route, the tree index on the whole reference, is what adds the rest.
+  - **Next.**
+    - Tier 2 writing `call`'s DIAMOND lines from its alignments, so the tree index replaces DIAMOND end to end.
+    - The unanchored route's confirmations, alongside the anchored ones.
+    - The gather (`call`'s EM) scored on reads mapped by each mapper.

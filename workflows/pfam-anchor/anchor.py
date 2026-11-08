@@ -1603,22 +1603,325 @@ def pileupcmp(a: argparse.Namespace) -> None:
         print(df.transpose(include_header=True, column_names="set"))
 
 
+# Confirm, then map every read. ---------------------------------------------------------------
+
+MEMBERS_PER_UNIT = 3  # the pileup workflow's --members: sequences per target unit
+
+
+def confirmed_dir(a: argparse.Namespace) -> str:
+    """A read set's confirmed reference, by the confirmation threshold."""
+    return f"confirmed_w{a.min_weight:g}"
+
+
+NEIGHBOURS_PER_FAMILY = 5  # tier2.NEIGHBOURS
+
+
+def confirm(a: argparse.Namespace) -> None:
+    """Per read set: units confirmed by the settled route's calls (each called pair's weight
+    split over its tied units; confirmed at ``--min-weight``) -> ``confirmed.parquet`` (unit,
+    family, weight, truth) and ``confirmed/``, a ``kfp-pileup reference`` directory: up to
+    ``MEMBERS_PER_UNIT`` members per confirmed unit (representative first) as targets, and up to
+    ``NEIGHBOURS_PER_FAMILY`` near units per family that were not confirmed, by representative."""
+    ref = pl.read_parquet(
+        a.data / "holdout/members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
+    ).rename({"cluster_rep": "unit"})
+    for name in prepare.SETS:
+        d = a.data / name
+        calls = pl.read_parquet(d / f"anchored{ROUTE_TAG}.parquet")
+        weight = (
+            calls.with_columns(w=1 / pl.col("units").list.len())
+            .explode("units", empty_as_null=True)
+            .group_by(unit="units")
+            .agg(pl.col("w").sum().alias("weight"), pl.col("pfam_accession").mode().first())
+        )
+        present = pl.read_parquet(d / "truth.parquet").select("unit").unique()
+        confirmed = weight.filter(pl.col("weight") >= a.min_weight).with_columns(
+            truth=pl.col("unit").is_in(present["unit"].implode())
+        )
+        confirmed.write_parquet(d / f"{confirmed_dir(a)}.parquet")
+        near = (
+            calls.explode("near", empty_as_null=True).select("pfam_accession", unit="near")
+            .drop_nulls().join(confirmed.select("unit"), on="unit", how="anti").unique("unit")
+            .filter(pl.int_range(pl.len()).over("pfam_accession") < NEIGHBOURS_PER_FAMILY)
+        )  # fmt: skip
+        ordered = ref.sort(pl.col("protein_id") != pl.col("unit"), "protein_id")
+        targets = ordered.join(confirmed.select("unit", "pfam_accession"), on="unit").filter(
+            pl.int_range(pl.len()).over("unit") < MEMBERS_PER_UNIT
+        )
+        neighbours = ordered.join(near, on="unit").filter(pl.int_range(pl.len()).over("unit") < 1)
+        refs = pl.concat(
+            [
+                targets.with_columns(role=pl.lit("target")),
+                neighbours.with_columns(role=pl.lit("neighbour")),
+            ]  # fmt: skip
+        ).with_columns(
+            cluster_rep=pl.col("unit"),
+            unit=pl.col("unit").rank("dense").cast(pl.Int64) - 1,
+            rep=pl.col("protein_id") == pl.col("unit"),
+            component=pl.col("pfam_accession"),
+            seq_id=pl.format("s{}", pl.int_range(pl.len())),
+            length=pl.col("sequence").str.len_bytes(),
+            pos=pl.lit(-1),
+        )
+        out = d / confirmed_dir(a)
+        out.mkdir(exist_ok=True)
+        with open(out / "ref.fa", "w") as f:
+            f.writelines(f">{i}\n{s}\n" for i, s in refs.select("seq_id", "sequence").iter_rows())
+        refs.select(
+            "unit", "cluster_rep", "protein_id", "rep", "component", "role", "seq_id", "length",
+            "pos",
+        ).write_csv(out / "refs.tsv", separator="\t")  # fmt: skip
+        (out / "molecule.txt").write_text("protein\n")
+        n_present = present.height
+        found = confirmed.filter("truth").height
+        print(
+            f"{name}: {confirmed.height} units confirmed ({found} present: recall"
+            f" {found / n_present:.3f} of {n_present}, precision {found / confirmed.height:.3f});"
+            f" {refs.filter(pl.col('role') == 'target').height} targets,"
+            f" {neighbours.height} neighbours",
+            flush=True,
+        )
+
+
+def mapall(a: argparse.Namespace) -> None:
+    """Per read set: every read pair aligned to the confirmed reference (``confirm``) by
+    DIAMOND, as the pileup workflow runs it, then ``kfp-pileup call`` -> ``confirmed/call_diamond``;
+    times in ``mapall_times.json``."""
+    kfp = Path(sys.executable).with_name("kfp-pileup")
+    times = {}
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        cap = f"{a.max_gb:g}g"
+        docker = ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}", "--cpus=4",
+                  "-v", f"{d.resolve()}:/w", "-w", "/w", prepare.DIAMOND, "diamond"]  # fmt: skip
+        prepare.run(
+            *docker,
+            "makedb",
+            "--in",
+            f"{confirmed_dir(a)}/ref.fa",
+            "--db",
+            f"{confirmed_dir(a)}/ref",
+        )
+        t0 = time.perf_counter()
+        cd = confirmed_dir(a)
+        for m in (1, 2):
+            prepare.run(*docker, "blastx", "--db", f"{cd}/ref", "--query", f"reads_{m}.fq.gz",
+                        "--out", f"{cd}/diamond_{m}.tsv", "--outfmt", 6, "qseqid", "sseqid",
+                        "bitscore", "qstart", "qend", "sstart", "send", "qframe", "btop",
+                        "--top", 10, "-F", 15, "--sensitive", "--threads", 4,
+                        "-b", 0.5)  # fmt: skip
+        times[f"{name}_diamond_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        tables = [c / f"diamond_{m}.tsv" for m in (1, 2)]
+        prepare.run(kfp, "call", c, c / "call_diamond", *tables, "--reads", d / "reads_1.fq.gz",
+                    "--reads", d / "reads_2.fq.gz", "--stats", c / "call_diamond.json")  # fmt: skip
+        times[f"{name}_call_s"] = time.perf_counter() - t0
+    (a.data / f"mapall_times_{confirmed_dir(a)}.json").write_text(json.dumps(times, indent=1))
+    print(json.dumps(times, indent=1))
+
+
+def mapcmp(a: argparse.Namespace) -> None:
+    """Per read set and arm (``confirmed/call_*``): over every read pair, a mate is *mapped* when
+    ``call`` keeps an alignment for it and *right* when its best unit by EM posterior is the truth
+    unit; split by whether the pair has a hit on a family of its source; variants and their truth
+    on strains (:func:`variant_truth`) -> ``mapall.tsv``."""
+    rows = []
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        refs = pl.read_csv(c / "refs.tsv", separator="\t").select("unit", "cluster_rep").unique()
+        reads = pl.read_parquet(d / "reads.parquet").select("read", "strain")
+        names = pl.DataFrame(
+            {"read": range(len(n := read_names(d / "reads_1.fq.gz"))), "read_name": n}
+        )
+        truth = pl.read_parquet(d / "truth.parquet").select("strain", truth="unit")
+        src = (
+            pl.read_parquet(d / "oracle.parquet").filter(pl.col("score") == "read")
+            .select("read", "hit_source")
+        )  # fmt: skip
+        mates = (
+            reads.join(names, on="read").join(truth, on="strain").join(src, on="read", how="left")
+            .with_columns(pl.col("hit_source").fill_null(False))
+            .join(pl.DataFrame({"mate": [0, 1]}), how="cross")
+        )  # fmt: skip
+        for arm_dir in sorted(c.glob("call_*/")):
+            arm = arm_dir.name.removeprefix("call_")
+            best = (
+                pl.read_parquet(arm_dir / "assignments.parquet").filter("kept")
+                .sort("em_posterior", descending=True)
+                .unique(["read_name", "mate"], keep="first")
+                .join(refs, on="unit")
+                .select("read_name", pl.col("mate").cast(pl.Int64), "cluster_rep")
+            )  # fmt: skip
+            df = mates.join(best, on=["read_name", "mate"], how="left").with_columns(
+                mapped=pl.col("cluster_rep").is_not_null(),
+                right=(pl.col("cluster_rep") == pl.col("truth")).fill_null(False),
+            )
+            variants = pl.read_csv(arm_dir / "variants.tsv", separator="\t").select(
+                "seq_id", "pos", "alt"
+            )
+            for scope, sub in (
+                ("all", df),
+                ("hit", df.filter("hit_source")),
+                ("no_hit", df.filter(~pl.col("hit_source"))),
+            ):
+                rows.append({
+                    "set": name, "arm": arm, "scope": scope, "mates": sub.height,
+                    "mapped": sub["mapped"].mean(), "right": sub["right"].mean(),
+                    "precision": sub.filter("mapped")["right"].mean(),
+                    "variants": variants.height,
+                    "variants_true": variant_truth(a.data, name, c, variants),
+                })  # fmt: skip
+    df = pl.DataFrame(rows)
+    df.write_csv(a.data / f"mapall_{confirmed_dir(a)}.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=200):
+        print(df)
+
+
+TREE = prepare.ROOT / "workflows/tree-index"
+
+
+def treeindex(a: argparse.Namespace) -> None:
+    """Per read set: the tree index's standard tier on the confirmed reference's sequences (the
+    same targets and neighbours DIAMOND searches), as one part (build.py, merge.py, store.py),
+    then every read pair through tier 1 (query.py --decoy, verify.py), tier 1 then tier 2
+    (tier2.py), and tier 2 alone (tier2.py --all-leaves) -> ``<confirmed>/tree/``; each step's
+    time in ``tree_times.json``."""
+    times = {}
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        tree = c / "tree"
+        tree.mkdir(exist_ok=True)
+        refs = pl.read_csv(c / "refs.tsv", separator="\t").select("protein_id")
+        members = pl.read_parquet(a.data / "holdout/members.parquet").join(refs, on="protein_id")
+        members.write_parquet(tree / "members.parquet")
+        reads = [d / "reads_1.fq.gz", d / "reads_2.fq.gz"]
+        py = [sys.executable]
+        steps = [
+            ("build", [*py, TREE / "build.py", "--members", tree / "members.parquet",
+                       "--out", tree / "part0000", "--database-proteins", members.height]),
+            ("merge", [*py, TREE / "merge.py", "--parts", tree / "part0000",
+                       "--out", tree / "index"]),
+            ("store", [*py, TREE / "store.py", "build",
+                       "--proteins", tree / "part0000/proteins.parquet",
+                       "--members", tree / "members.parquet", "--parts", tree / "index/parts.json",
+                       "--name", "part0000", "--format", "flat", "--out", tree / "store"]),
+            ("tier1_query", [*py, TREE / "query.py", "--index", tree / "index", "--reads", *reads,
+                             "--decoy", "--out", tree / "q"]),
+            ("tier1_verify", [*py, TREE / "verify.py", "--index", tree / "index", "--store",
+                              tree / "store", "--reads", *reads, "--query", tree / "q"]),
+            ("tier2_after_tier1", [*py, TREE / "tier2.py", "--index", tree / "index", "--store",
+                                   tree / "store", "--reads", *reads, "--query", tree / "q",
+                                   "--memory-gb", 3, "--no-handoff", "--out", tree / "t2"]),
+            ("tier2_alone", [*py, TREE / "tier2.py", "--index", tree / "index", "--store",
+                             tree / "store", "--reads", *reads, "--query", tree / "q",
+                             "--all-leaves", "--memory-gb", 3, "--no-handoff", "--out",
+                             tree / "t2_alone"]),
+        ]  # fmt: skip
+        for step, cmd in steps:
+            t0 = time.perf_counter()
+            prepare.run(*cmd)
+            times[f"{name}_{step}_s"] = time.perf_counter() - t0
+    (a.data / f"tree_times_{confirmed_dir(a)}.json").write_text(json.dumps(times, indent=1))
+    print(json.dumps(times, indent=1))
+
+
+def mapscore(a: argparse.Namespace) -> None:
+    """Every mapper on the same confirmed reference, before the gather, per read pair: DIAMOND
+    (each unit's best bit score summed over the mates, best units tied), tier 1 (``verify.py``),
+    tier 1 then tier 2, and tier 2 alone (``tier2.py``; best-scoring leaves, ties kept). A pair is
+    *called* at the mapper's bar (the tree index's decoy bar at 1%; any line for DIAMOND) and
+    *right* when the truth unit is among its best -> ``mapscore_<confirmed>.tsv``, by read set,
+    identity bin and whether the pair has a Pfam hit on its source's family."""
+    rows = []
+    for name in prepare.SETS:
+        d = a.data / name
+        c = d / confirmed_dir(a)
+        tree = c / "tree"
+        truth = truth_of(a.data, name).select("read", "identity_bin", "unit")
+        src = (
+            pl.read_parquet(d / "oracle.parquet").filter(pl.col("score") == "read")
+            .select("read", "hit_source")
+        )  # fmt: skip
+        base = truth.join(src, on="read", how="left").with_columns(
+            pl.col("hit_source").fill_null(False)
+        )
+        names = read_names(d / "reads_1.fq.gz")
+        pair_of = pl.DataFrame({"read_name": names, "read": range(len(names))})
+        refs = pl.read_csv(c / "refs.tsv", separator="\t").select("seq_id", unit_of="cluster_rep")
+        arms = {}
+        lines = pl.concat(
+            pl.read_csv(c / f"diamond_{m}.tsv", separator="\t", has_header=False,
+                        new_columns=["read_name", "seq_id", "bitscore"], columns=[0, 1, 2])
+            .with_columns(mate=pl.lit(m))
+            for m in (1, 2)
+        )  # fmt: skip
+        per_unit = (
+            lines.join(pair_of, on="read_name").join(refs, on="seq_id")
+            .group_by("read", "mate", "unit_of").agg(pl.col("bitscore").max())
+            .group_by("read", "unit_of").agg(pl.col("bitscore").sum())
+        )  # fmt: skip
+        arms["diamond"] = (
+            per_unit.filter(pl.col("bitscore") == pl.col("bitscore").max().over("read"))
+            .group_by("read")
+            .agg(units=pl.col("unit_of"))
+        )
+        pos_units = (
+            pl.read_parquet(tree / "index/proteins.parquet").filter(pl.col("pos") >= 0)
+            .join(pl.read_parquet(tree / "members.parquet").select("protein_id", "cluster_rep"),
+                  on="protein_id")
+            .select("pos", unit_of="cluster_rep").unique()
+        )  # fmt: skip
+        for arm, qdir in (("tier1", tree / "q"), ("tier1_tier2", tree / "t2"),
+                          ("tier2_alone", tree / "t2_alone")):  # fmt: skip
+            bar = json.loads((qdir / "verify.json").read_text())["read_bar_0.01"]
+            hits = pl.read_parquet(qdir / "reads.parquet", columns=["read", "pos", "score"])
+            top = hits.filter(pl.col("score") == pl.col("score").max().over("read"))
+            arms[arm] = (
+                top.filter(pl.col("score") >= bar).join(pos_units, on="pos")
+                .group_by("read").agg(units=pl.col("unit_of").unique())
+            )  # fmt: skip
+        for arm, called in arms.items():
+            df = base.join(called, on="read", how="left").with_columns(
+                called=pl.col("units").is_not_null(),
+                right=pl.col("units").list.contains(pl.col("unit")).fill_null(False),
+                ties=pl.col("units").list.len(),
+            )
+            for scope, sub in (("all", df), ("hit", df.filter("hit_source")),
+                               ("no_hit", df.filter(~pl.col("hit_source")))):  # fmt: skip
+                rows.append({"set": name, "arm": arm, "scope": scope, "pairs": sub.height,
+                             "called": sub["called"].mean(), "right": sub["right"].mean(),
+                             "precision": sub.filter("called")["right"].mean(),
+                             "median_ties": sub.filter("called")["ties"].median()})  # fmt: skip
+    df = pl.DataFrame(rows)
+    df.write_csv(a.data / f"mapscore_{confirmed_dir(a)}.tsv", separator="\t", float_precision=4)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3, tbl_width_chars=200):
+        print(df)
+
+
+STEPS = {
+    "oracle": oracle,
+    "seeds": seeds,
+    "anchors": anchors,
+    "query": query,
+    "align": align,
+    "lines": lines,
+    "pileup": pileup,
+    "pileupcmp": pileupcmp,
+    "compare": compare,
+    "confirm": confirm,
+    "mapall": mapall,
+    "mapcmp": mapcmp,
+    "treeindex": treeindex,
+    "mapscore": mapscore,
+}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument(
-        "step",
-        choices=[
-            "oracle",
-            "seeds",
-            "anchors",
-            "query",
-            "compare",
-            "align",
-            "lines",
-            "pileup",
-            "pileupcmp",
-        ],
-    )
+    p.add_argument("step", choices=list(STEPS))
     p.add_argument("--data", type=Path, default=prepare.ROOT / "data/pfam-anchor")
     p.add_argument("--score", nargs="+", choices=SCORES, default=list(SCORES))
     p.add_argument("--large", type=int, default=1500, help="units in a large family (seeds)")
@@ -1626,6 +1929,7 @@ def main() -> None:
     p.add_argument("--keep", type=float, default=0.01, help="query: share of units kept by anchors")
     p.add_argument("--null-rate", type=float, default=0.001, help="compare: reversed pairs called")
     p.add_argument("--stage", choices=list(STAGE_TAG), default="extended", help="lines, pileup")
+    p.add_argument("--min-weight", type=float, default=1.0, help="confirm: called pairs per unit")
     p.add_argument("--skip-diamond", action="store_true", help="pileup: anchored lines only")
     p.add_argument(
         "--competitors",
@@ -1646,18 +1950,7 @@ def main() -> None:
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB, help="memory watchdog's cap")
     a = p.parse_args()
     prepare.watchdog(a.max_gb)
-    steps = {
-        "oracle": oracle,
-        "seeds": seeds,
-        "anchors": anchors,
-        "query": query,
-        "align": align,
-        "lines": lines,
-        "pileup": pileup,
-        "pileupcmp": pileupcmp,
-        "compare": compare,
-    }
-    steps[a.step](a)
+    STEPS[a.step](a)
 
 
 if __name__ == "__main__":
