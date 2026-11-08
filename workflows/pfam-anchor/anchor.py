@@ -2090,6 +2090,91 @@ def seedalign(a: argparse.Namespace) -> None:
         print(summary)
 
 
+def six_frames_joined(read: str) -> tuple[str, list[tuple[int, str, int]]]:
+    """A read's six frames translated (code 11, stops as ``*``; ``_core.translate_frames``, the
+    same as ``prepare.orfs_at``'s) and joined by ``*``, with each frame's (first index in the
+    joined query, strand, frame offset)."""
+    from kmer_functional_profiler import _core
+
+    frames = [x.decode() for x in _core.translate_frames(read.encode())]
+    spans, at = [], 0
+    for n, prot in enumerate(frames):
+        spans.append((at, "+" if n < 3 else "-", n % 3))
+        at += len(prot) + 1
+    return "*".join(frames), spans
+
+
+def rust_seed_lines(routed: pl.DataFrame, mates: dict, names: list, seqs: dict, seq_of: dict,
+                    read_len: int) -> dict[int, list[str]]:  # fmt: skip
+    """``call``'s lines for every routed (pair, protein), both mates, from ``_core.seed_align``."""
+    from kmer_functional_profiler import _core
+
+    matrix = blosum().astype(np.int8).ravel()
+    queries, spans = [], []
+    for m in (1, 2):
+        for read in mates[m]:
+            q, s = six_frames_joined(read)
+            queries.append(q.encode())
+            spans.append(s)
+    n_reads = len(mates[1])
+    pids = sorted(set(routed["protein_id"].to_list()))
+    target_of = {pid: n for n, pid in enumerate(pids)}
+    pairs = routed.sort("protein_id", "read")
+    reads_col = pairs["read"].to_numpy()
+    tgt = np.array([target_of[x] for x in pairs["protein_id"].to_list()], dtype=np.uint32)
+    pq = np.concatenate([reads_col, reads_col + n_reads]).astype(np.uint32)
+    pt = np.concatenate([tgt, tgt])
+    found, qs, qe, ts, te, raw, btop = _core.seed_align(
+        queries, [seqs[x].encode() for x in pids], pq, pt, matrix, k=SEED_K, band=SEED_BAND,
+        x_drop=X_DROP,
+    )  # fmt: skip
+    out: dict[int, list[tuple[int, str]]] = {1: [], 2: []}
+    for n in np.flatnonzero(found).tolist():
+        query = int(pq[n])
+        mate, read = (1, query) if query < n_reads else (2, query - n_reads)
+        start, strand, f = max(s for s in spans[query] if s[0] <= qs[n])
+        x0, x1 = int(qs[n]) - start, int(qe[n]) - 1 - start
+        if strand == "+":
+            qstart, qend = f + 3 * x0 + 1, f + 3 * x1 + 3
+            frame = (qstart - 1) % 3 + 1
+        else:
+            qstart, qend = read_len - f - 3 * x0, read_len - f - 3 * x1 - 2
+            frame = -((read_len - qstart) % 3 + 1)
+        bits = (LAMBDA * int(raw[n]) - math.log(K)) / math.log(2)
+        pid = pids[int(pt[n])]
+        fields = (names[read], seq_of[pid], f"{bits:.1f}", qstart, qend, int(ts[n]) + 1,
+                  int(te[n]), frame, btop[n])  # fmt: skip
+        out[mate].append((read, "\t".join(map(str, fields)) + "\n"))
+    return {m: [line for _, line in sorted(v, key=lambda x: x[0])] for m, v in out.items()}
+
+
+def python_seed_lines(routed: pl.DataFrame, mates: dict, names: list, seqs: dict, seq_of: dict,
+                      read_len: int, sub: NDArray, aligner) -> dict[int, list[str]]:  # fmt: skip
+    """The same lines from the Python oracle (``seed_chain``, ``build_alignment``)."""
+    index_of: dict[int, dict] = {}
+    out = {1: [], 2: []}
+    for read, pid in routed.iter_rows():
+        prot = seqs[pid]
+        if pid not in index_of:
+            idx: dict[str, list[int]] = {}
+            for y in range(len(prot) - SEED_K + 1):
+                idx.setdefault(prot[y : y + SEED_K], []).append(y)
+            index_of[pid] = idx
+        for m in (1, 2):
+            best = None
+            for seg, strand, start in segments(mates[m][read]):
+                i, j = seed_chain(seg, prot, index_of[pid])
+                if len(i) >= 2 and (best is None or len(i) > len(best[1])):
+                    best = (seg, i, j, strand, start)
+            if best is None:
+                continue
+            seg, i, j, strand, start = best
+            pairs = build_alignment(seg, prot, i, j, sub, aligner)["extended"]
+            out[m].append(diamond_line(names[read], seq_of[pid], seg, prot, pairs, strand,
+                                       start, read_len, sub))  # fmt: skip
+    return out
+
+
 def seedlines(a: argparse.Namespace) -> None:
     """Tier 2 as the whole mapper: every read pair's routed leaves (``tier2.py --all-leaves``'s
     ``reads.parquet``: hits within its ambiguity of the best), each mate aligned to each of the
@@ -2126,27 +2211,10 @@ def seedlines(a: argparse.Namespace) -> None:
             .select("read", "protein_id").unique().sort("read", "protein_id")
         )  # fmt: skip
         t0 = time.perf_counter()
-        index_of: dict[int, dict] = {}
-        out = {1: [], 2: []}
-        for read, pid in routed.iter_rows():
-            prot = seqs[pid]
-            if pid not in index_of:
-                idx: dict[str, list[int]] = {}
-                for y in range(len(prot) - SEED_K + 1):
-                    idx.setdefault(prot[y : y + SEED_K], []).append(y)
-                index_of[pid] = idx
-            for m in (1, 2):
-                best = None
-                for seg, strand, start in segments(mates[m][read]):
-                    i, j = seed_chain(seg, prot, index_of[pid])
-                    if len(i) >= 2 and (best is None or len(i) > len(best[1])):
-                        best = (seg, i, j, strand, start)
-                if best is None:
-                    continue
-                seg, i, j, strand, start = best
-                pairs = build_alignment(seg, prot, i, j, sub, aligner)["extended"]
-                out[m].append(diamond_line(names[read], seq_of[pid], seg, prot, pairs, strand,
-                                           start, read_len, sub))  # fmt: skip
+        if a.engine == "rust":
+            out = rust_seed_lines(routed, mates, names, seqs, seq_of, read_len)
+        else:
+            out = python_seed_lines(routed, mates, names, seqs, seq_of, read_len, sub, aligner)
         times[f"{name}_align_s"] = time.perf_counter() - t0
         times[f"{name}_lines"] = len(out[1]) + len(out[2])
         for m in (1, 2):
@@ -2190,6 +2258,7 @@ def main() -> None:
     p.add_argument("--keep", type=float, default=0.01, help="query: share of units kept by anchors")
     p.add_argument("--null-rate", type=float, default=0.001, help="compare: reversed pairs called")
     p.add_argument("--stage", choices=list(STAGE_TAG), default="extended", help="lines, pileup")
+    p.add_argument("--engine", choices=["rust", "python"], default="rust", help="seedlines")
     p.add_argument("--min-weight", type=float, default=1.0, help="confirm: called pairs per unit")
     p.add_argument("--skip-diamond", action="store_true", help="pileup: anchored lines only")
     p.add_argument(

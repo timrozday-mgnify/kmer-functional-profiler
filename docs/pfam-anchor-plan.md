@@ -669,3 +669,8 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - Port the seed chain and alignment into `_core.pseudo_align`, returning coordinates and BTOP; it computes the diagonal bands already.
     - The unanchored route's confirmations.
     - Scoring the gather and pileups against the truth across mappers. Done here only through `call`'s best units and variants.
+- **Seed alignment ported to Rust (2026-11-08, the user's request).** `crates/core/src/seedalign.rs` (`kfp::seed_align`), exposed as `_core.seed_align`; `anchor.py seedlines --engine rust` (the default) uses it, and `--engine python` keeps the oracle.
+  - **What it does.** Each mate's six frames are joined by stops, as `_core.translate_frames` makes them. Per (mate, target): exact k-mer seeds per stop-free stretch, the best diagonal ± 8, the patience-sort chain, then fill (diagonal, else affine global DP at DIAMOND's 11/1) and X-drop extension. The stretch with the longest chain wins. It returns residue ranges, the raw score and BTOP. Pairs sorted by target index each target once, in parallel over threads.
+  - **Tests.** 4 Rust unit tests: exact match, substitution and indel BTOP, stretch choice and offset, DP gap placement.
+  - **Against the oracle.** 70,314 of 70,335 mate-1 lines are identical across both read sets. The 21 that differ have the same score and place a gap differently on a DP tie: Biopython counts a gap's first residue as the open (−11), DIAMOND's convention as 11 + g.
+  - **Speed.** 87,698 strains lines in 0.52 s against 8.1 s in Python, and 53,133 for relatives in 0.35 s against 5.2 s. That is about 6 µs per line on 4 threads, including Python's per-line formatting.
