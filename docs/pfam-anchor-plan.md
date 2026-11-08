@@ -169,11 +169,11 @@ Added 2026-11-06 at the user's request. Runs on the same families and needs no i
 
 **Gate:** an arm keeps at least 95% of the oracle's right calls, with median candidates per read at most 1% of the family's units for reads from known units, and at most 10% for reads from novel units. Phase 1b found no seed near 1% for novel units (.834 kept at best), so the first version of this gate could not pass. It only has to pass in families too large for brute force.
 
-*Passed in large families 2026-11-08 (`workflows/pfam-anchor/anchor.py seeds`); see Progress log. Phase 3 takes `s1101011` at s 2 with 2 shared seeds, and contiguous k 5 at s 2 with 2 shared seeds as the alternative. The index is held in memory: no Parquet yet.*
+*Passed in large families 2026-11-08 (`workflows/pfam-anchor/anchor.py seeds`); see Progress log. Superseded the same day: anchor residues keep more at the same share and pass over all families (Progress log), so phase 3 uses them instead of seeds. The seed code stays for the very largest families, where a sublinear first step may still pay.*
 
 ### Phase 3: comparison
 
-The chosen arm against DIAMOND and tree index tiers 1 and 2, on the same reads, with the same metrics and full Pfam-A read hits.
+Anchor residues, then column identity on the units kept, against DIAMOND and tree index tiers 1 and 2. The same reads, the same metrics and full Pfam-A read hits. The first stage takes the 16 highest-entropy columns the read covers and keeps the top 0.5–1% of units by matches there (Progress log, "Anchor residues as the first check"). Report both settings, and the rarity tie-break on the second stage.
 
 **Gate:** recall within 0.05 of DIAMOND's on reads with a hit, and at least 10× faster than DIAMOND for the unit-assignment step. Report the Pfam-search cost separately, since kfpfam is working on reducing it. Also report what share of DIAMOND's right calls have no Pfam hit, since these reads are beyond this method's reach.
 
@@ -193,7 +193,27 @@ Nextflow workflow (Slurm, Singularity, `test` profile on the fixture), run by th
 1. Build from the 1-in-100 `pfam-reannotate` output, to replace the release size estimate.
 2. Run on `tree-index-slice` (4.2 M proteins), which has real near-unit density.
 3. Measure the largest families, which set worst-case query cost.
-4. Write an index format and port lookups to Rust only after this.
+4. Write an index format and port lookups to Rust only after this, with kfpfam's optimisations (see "Speed: what carries over from kfpfam").
+
+## Speed: what carries over from kfpfam
+
+Added 2026-11-08 at the user's request. kfpfam's speed work (its `docs/plan.md`, "Speed plan" and Progress log) took a per-read pseudo-alignment from about 108 to 1.4–3 ns per hit. Most of it is about memory layout and batching, not k-mers, so it carries over to anchor residues and column identity. Nothing below is built or measured here.
+
+| kfpfam | Here | Expected effect |
+| --- | --- | --- |
+| **Join from the model's side.** Reads are batched in blocks, and each model's index is scanned once per block, not once per read. | Sort a block's read hits by family, then pass over each family's column-major matrix once for all of its hits. Per hit, the cost becomes compute rather than memory. | The largest gain at release, where a family's matrix is far bigger than cache |
+| **Tiles that fit in L2.** Runs of models of about 65,536 columns; postings fetched once per tile: 7.4 → 1.4 ns per hit. | Tile a large family's units, about 64 K units × the anchor columns in L2, and run every hit in the block against the tile. | The same cache fix, for the anchor stage and the identity stage |
+| **u16 indices within a tile.** Index 1.1 → 0.62 GB. | Unit numbers within a tile as u16; residues as u8 already. | About half the memory of the unit lists |
+| **NEON `tbl` and SSE4.1, with a scalar oracle.** Identical output, tested against scalar. | Byte compares of 16 units at a time per column (`vceqq_u8`), summed into u8 counters, then the top q. The same scalar-oracle tests. | The anchor stage at about 1 byte per unit per column, at memory bandwidth |
+| **Gate masks from SIMD compares.** 26.5 → 23.2 core-s. | The top-q cut as a SIMD compare against a threshold, from a histogram of counts (counts are at most n), not a sort. | No sort in the anchor stage |
+| **Fewer read hits: the ORF rule and the `top` frame.** About 0.55× the hits; frames compete over the same bases. | Use kfpfam's `hits.tsv` `top` frame, or set, rather than every frame's hit (already in "Read hits from kfpfam"). | Fewer hits per read; every stage's cost scales with hits |
+| **Index-time cuts.** Dropping the longest lists removes 8.6% of hits for ≤ .006 recall. | The anchor columns are per family, so precompute each family's ranked columns. Drop columns with almost no entropy, such as fully conserved ones, at build time. | A smaller matrix for the anchor stage |
+| **Binary model file.** Reads in 1.1 s against 224 s as text. | Store per-family matrices in a binary, memory-mapped layout, not Parquet, once the format settles (phase 5). | Start-up, not per-read cost |
+| **Parallel build, bounded blocks.** Peak memory 4.4 → 3.8 GB. | Blocks of reads sized so that hits, counters and tiles stay under the laptop's cap. | Memory |
+
+What doesn't carry over: kfpfam's k-mer lists, window diagonals and int8 profile scoring. This method compares residues with residues, not with a profile. The exception is the rarity likelihood-ratio tie-break, which is a per-column table, like kfpfam's int8 profile, and would use the same `tbl` lookups.
+
+Order of work, after phase 3 settles the method: (1) a scalar Rust port of both stages, which must reproduce `anchor.py` exactly; (2) the model-side join and tiles; (3) NEON, then SSE4.1 or AVX2 for the HPC, each tested against scalar.
 
 ## Layout and scope
 
@@ -427,3 +447,4 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Entropy beats the retention-adjusted rank.** The efficient rank is no better than random, so retention isn't worth trading for here.
   - **Cost is linear in family size, but small.** The check reads n bytes per unit, laid out column-major. It took 0.02–0.03 ms per hit in NumPy, against 0.3–0.6 ms for brute force, on the three largest families. Part of the gain is one row per unit against every domain. The timing used each unit's first domain, while recall used the best, so the two differ slightly.
   - **Release scale is estimated, not measured.** At 3 M units, 16 bytes per unit is about 48 MB per hit, or a few ms at memory bandwidth. Bitsets per (column, residue) would cut that to 2 bytes per unit. Seeds stay sublinear, so they may still be the first step for the very largest families.
+- **Anchor residues chosen for phase 3; kfpfam's optimisations mapped (2026-11-08, the user's request).** Phase 3 takes anchor residues as its first stage, in place of column seeds. "Speed: what carries over from kfpfam" lists which of kfpfam's speed-ups apply: the model-side join, L2 tiles, u16 indices, NEON byte compares with a scalar oracle, and fewer read hits through the `top` frame. Nothing built yet.
