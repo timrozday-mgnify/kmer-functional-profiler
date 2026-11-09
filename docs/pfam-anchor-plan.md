@@ -197,6 +197,32 @@ Nextflow workflow (Slurm, Singularity, `test` profile on the fixture), run by th
 3. Measure the largest families, which set worst-case query cost.
 4. Write an index format and port lookups to Rust only after this, with kfpfam's optimisations (see "Speed: what carries over from kfpfam").
 
+### Phase 6: benchmark (requested 2026-11-09)
+
+What the user wants from the benchmarks: what is missed below 100% recall and why, recall as close to 100% as can be expected, a breakdown of computational cost, and rigorous recall and precision broken down by coverage depth and AAI, on real metagenomes and synthetic reads.
+
+1. **Reads.**
+   - **Synthetic:** today's strains and held-out relatives, with depth spread on purpose. Use a grid of depth bins (e.g. 0.5, 1, 2, 5, 10, 30×) crossed with the AAI bins (100, 98, 95, 90, 85, 80, 70%), so that every cell holds enough units for a confidence interval.
+   - **Real:** synthetic reads spiked into real metagenome backgrounds (spike-benchmark's `spike.py`; e.g. ERR10889147, kfpfam's sample, and one soil and one gut run). The spikes give truth inside real noise and real off-target reads, so precision is measured against real false positives. The unspiked real reads get a pseudo-truth: DIAMOND `--ultra-sensitive` against the full reference, plus hmmsearch on all six-frame ORFs. These are reported as agreement, not as truth.
+2. **Recall and precision, by depth × AAI.**
+   - **Per read pair:** whether the right unit or group was called.
+   - **Per unit:** whether it is present, and whether its abundance is right.
+   - **Per variant column:** consensus and variant calls.
+   - Each cell gets a Wilson interval. Precision is counted per called unit, both on spikes and on the real background, with its share of the real background's calls that the pseudo-truth doesn't support.
+3. **Misses, attributed.** For every true read pair or unit that is missed, record the first stage that lost it:
+   - no ORF or frame;
+   - no Pfam hit (the unanchored route only);
+   - anchors or seeds found no candidate;
+   - the right unit was dropped by `keep` or the anchor cut;
+   - not confirmed (`min_weight`);
+   - tier 1 or tier 2 miss;
+   - alignment or seedlines;
+   - lost in the EM (to a near-identical unit, the novel class, or a false unit).
+
+   Report this as a waterfall per depth × AAI cell, with example reads for the largest buckets. This is how to find which stage to fix to get close to 100%. The ceiling is set by reads that carry no information: too short, no overlap with the unit, or identical between units. Measure the ceiling, then report recall against it.
+4. **Cost.** Per stage: CPU-seconds, wall time and peak RSS (the Nextflow trace, plus per-step timers in the scripts), normalised to core-ms per read pair and per Mbp. Also index build time, size on disk and memory. The largest families get their own rows, because they set the worst case.
+5. **Output:** one table per measure (`bench_recall.tsv`, `bench_misses.tsv`, `bench_cost.tsv`) and a short write-up with plots.
+
 ## Two routes: anchored and unanchored
 
 Decided 2026-11-08 (the user): this method and the tree index are not competitors. They serve different reads.
