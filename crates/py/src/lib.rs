@@ -860,6 +860,91 @@ fn pseudo_align<'py>(
     Ok(got.into_pyarray(py))
 }
 
+/// Seed alignments (kfp::seed_align): each pair's best full alignment of query
+/// `queries[pair_query[i]]` (stop-free stretches joined by `*`) against `targets[pair_target[i]]`
+/// from exact k-mer seeds. Returns (found, query_start, query_end, target_start, target_end,
+/// raw, btop): residue ranges 0-based, end exclusive, on the joined query; pairs not found have
+/// zeros and an empty BTOP. Pairs sorted by target index each target once per run.
+#[pyfunction]
+#[pyo3(signature = (queries, targets, pair_query, pair_target, matrix, k=4, band=8, x_drop=15))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn seed_align<'py>(
+    py: Python<'py>,
+    queries: Vec<PyBackedBytes>,
+    targets: Vec<PyBackedBytes>,
+    pair_query: PyReadonlyArray1<'py, u32>,
+    pair_target: PyReadonlyArray1<'py, u32>,
+    matrix: PyReadonlyArray1<'py, i8>,
+    k: usize,
+    band: i64,
+    x_drop: i32,
+) -> PyResult<(
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<i32>>,
+    Vec<String>,
+)> {
+    let (pq, pt, matrix) = (
+        pair_query.as_slice()?,
+        pair_target.as_slice()?,
+        matrix.as_slice()?,
+    );
+    if pq.len() != pt.len()
+        || pq.iter().any(|&q| q as usize >= queries.len())
+        || pt.iter().any(|&t| t as usize >= targets.len())
+        || matrix.len() != 1 << 16
+        || !(1..=12).contains(&k)
+    {
+        return Err(to_py_err(Error::LengthMismatch));
+    }
+    let p = kfp::SeedParams { k, band, x_drop };
+    let got = py.detach(|| kfp::seed_align(&queries, &targets, pq, pt, &p, matrix));
+    let n = got.len();
+    let (mut found, mut qs, mut qe, mut ts, mut te, mut raw, mut btop) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    ); // fmt: skip
+    for a in got {
+        match a {
+            Some(a) => {
+                found.push(true);
+                qs.push(a.query_start);
+                qe.push(a.query_end);
+                ts.push(a.target_start);
+                te.push(a.target_end);
+                raw.push(a.raw);
+                btop.push(a.btop);
+            }
+            None => {
+                found.push(false);
+                qs.push(0);
+                qe.push(0);
+                ts.push(0);
+                te.push(0);
+                raw.push(0);
+                btop.push(String::new());
+            }
+        }
+    }
+    Ok((
+        found.into_pyarray(py),
+        qs.into_pyarray(py),
+        qe.into_pyarray(py),
+        ts.into_pyarray(py),
+        te.into_pyarray(py),
+        raw.into_pyarray(py),
+        btop,
+    ))
+}
+
 /// Dense routing (kfp::route_votes): each read's top leaves by seed votes on a diagonal band;
 /// returns (read, leaf, votes), reads in order. `modulo` > 1 indexes only hashes divisible by
 /// it (a sparse index: the pair filter after tier 1).
@@ -1131,6 +1216,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(align_identity, m)?)?;
     m.add_function(wrap_pyfunction!(align_ungapped, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_align, m)?)?;
+    m.add_function(wrap_pyfunction!(seed_align, m)?)?;
     m.add_function(wrap_pyfunction!(pseudo_sketch_sizes, m)?)?;
     m.add_function(wrap_pyfunction!(route_reads, m)?)?;
     m.add_function(wrap_pyfunction!(pair_route, m)?)?;

@@ -77,7 +77,12 @@ AMINO = "ACDEFGHIKLMNPQRSTVWY"
 
 
 def nearest_relatives(
-    members: pl.DataFrame, pool: pl.DataFrame, k: int = 5, sample: int = 4, top: int = 10
+    members: pl.DataFrame,
+    pool: pl.DataFrame,
+    k: int = 5,
+    sample: int = 4,
+    top: int = 10,
+    chunk: int = 500,
 ) -> pl.DataFrame:
     """(protein_id, relative, identity, cover): each ``pool`` protein's nearest other member
     by local alignment (BLOSUM62, gaps 11/1; identity over aligned columns, cover over the
@@ -103,12 +108,15 @@ def nearest_relatives(
 
     held = kmers(members)
     common = held.group_by("c").len().filter(pl.col("len") > 500).select("c")
-    held = held.join(common, on="c", how="anti")
-    hits = (
-        kmers(pool).join(held.rename({"protein_id": "relative"}), on="c")
+    held = held.join(common, on="c", how="anti").rename({"protein_id": "relative"})
+    # ponytail: the pool in chunks, since each k-mer can join up to 500 members (all at once,
+    # 15,000 pool proteins of the 295 k mini-slice ran a 24 GB laptop out of memory).
+    hits = pl.concat(
+        kmers(pool.slice(i, chunk)).join(held, on="c")
         .filter(pl.col("protein_id") != pl.col("relative"))
         .group_by("protein_id", "relative").len()
         .sort("len", descending=True).group_by("protein_id").head(top)
+        for i in range(0, pool.height, chunk)
     )  # fmt: skip
     seq = dict(members.select("protein_id", "sequence").iter_rows())
     al = PairwiseAligner(mode="local", open_gap_score=-11, extend_gap_score=-1)
@@ -138,9 +146,8 @@ def holdout(a: argparse.Namespace) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
-    pool = members.filter(pl.col("sequence").str.len_chars() >= a.min_length).sample(
-        a.pool, seed=a.seed
-    )
+    long = members.filter(pl.col("sequence").str.len_chars() >= a.min_length)
+    pool = long.sample(min(a.pool, long.height), seed=a.seed)
     near = nearest_relatives(members, pool)
     bins = np.array(HOLDOUT_BINS)
     near = (

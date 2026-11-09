@@ -16,7 +16,9 @@ leaves apart, so ties are shared, not broken.
    ``--route-max-occ`` times dropped), for its ``--route-top`` leaves with at least
    ``--route-votes`` (k and votes from the candidates' size by default: :func:`route_k`), joined
    with tier 1's own routed pairs; ``--route tier1`` uses tier 1's
-   pairs alone, each leaf expanded to its group.
+   pairs alone, each leaf expanded to its group. ``--all-leaves`` skips tier 1: every leaf is
+   a candidate and dense routing alone sends reads to them, for a reference that is already
+   small (the units the Pfam-anchored route confirms, docs/pfam-anchor-plan.md).
 2. **Chunks along the tree.** Candidate leaves in leaf order (tier 1's merge-tree order, so
    relatives are adjacent and a chunk is a contiguous range) are packed into chunks of at most
    ``--chunk-residues`` residues. Their sequences (each leaf's longest protein) come from the
@@ -404,6 +406,8 @@ def main() -> None:
     p.add_argument("--shares", default="0.01,0.05,0.1")
     p.add_argument("--chance-scale", type=float, default=1.0, help="query.decoy_bar's scale")
     p.add_argument("--no-handoff", action="store_true")
+    p.add_argument("--all-leaves", action="store_true",
+                   help="every leaf a candidate, no tier 1 (--query unread)")  # fmt: skip
     p.add_argument("--out", required=True)
     a = p.parse_args()
     t0 = time.perf_counter()
@@ -416,19 +420,28 @@ def main() -> None:
     matrix = verify.blosum62()
     group = groups_of(index)
     nb = neighbour_groups(index, group, a.neighbours) if a.neighbours > 0 else None
-    floor = json.loads((qdir / "verify.json").read_text())[f"read_bar_{a.share}"] - a.route_below
-    wls = {
-        name: work_list(pl.read_parquet(qdir / f), group, floor, nb)
-        for name, f in (("sample", "aligned.parquet"), ("decoy", "aligned_decoy.parquet"))
-    }
-    # the candidates: tier 1's present groups and the groups its pairs route reads to, with
-    # their spanning-tree neighbours
-    cand = np.load(qdir / f"cand_verify_{a.share}.npy").astype(np.int64)
-    cand_g = pl.DataFrame({"g": np.unique(group[cand])})
-    if nb is not None:
-        cand_g = cand_g.join(nb, on="g").select(g="nb")
-    routed_g = pl.concat([cand_g["g"], *(w["g"] for w in wls.values())]).unique().to_numpy()
-    leaves = np.flatnonzero(np.isin(group, routed_g))
+    if a.all_leaves:  # tier 2 on its own: every leaf a candidate, every read routed densely
+        if a.route != "dense":
+            sys.exit("--all-leaves routes every read itself: it needs --route dense")
+        floor = float("nan")
+        no_pairs = pl.DataFrame(schema={"read": pl.Int64, "g": pl.Int64})
+        wls = {"sample": no_pairs, "decoy": no_pairs}
+        leaves = np.arange(len(group))
+    else:
+        floor = json.loads((qdir / "verify.json").read_text())[f"read_bar_{a.share}"]
+        floor -= a.route_below
+        wls = {
+            name: work_list(pl.read_parquet(qdir / f), group, floor, nb)
+            for name, f in (("sample", "aligned.parquet"), ("decoy", "aligned_decoy.parquet"))
+        }
+        # the candidates: tier 1's present groups and the groups its pairs route reads to, with
+        # their spanning-tree neighbours
+        cand = np.load(qdir / f"cand_verify_{a.share}.npy").astype(np.int64)
+        cand_g = pl.DataFrame({"g": np.unique(group[cand])})
+        if nb is not None:
+            cand_g = cand_g.join(nb, on="g").select(g="nb")
+        routed_g = pl.concat([cand_g["g"], *(w["g"] for w in wls.values())]).unique().to_numpy()
+        leaves = np.flatnonzero(np.isin(group, routed_g))
     length = np.load(index / "pos_len.npy").astype(np.int64)
     chunk_of = chunks(leaves, length, chunk_residues)
     leaf_chunk = pl.DataFrame({"pos": leaves, "g": group[leaves], "chunk": chunk_of})

@@ -1,0 +1,592 @@
+"""The local test case for the Pfam-anchored unit assignment (docs/pfam-anchor-plan.md, phase 0).
+
+Steps run in order; ``all`` runs every one. Everything goes under ``--out``.
+
+- ``annotate``: the ``--families`` HMMs cut from ``--pfam`` -> ``hmms.hmm`` and ``ga.tsv``;
+  every ``--members`` protein searched with ``pfam-reannotate``'s thresholds -> ``hits.parquet``
+  (``reannotate.py parse``'s schema; held-out proteins included).
+- ``reads``: real relatives (``recall.py holdout``) -> ``holdout/``, whose ``members.parquet``
+  is the reference; ``domains.parquet``, the reference's hits. Two read sets, each from
+  ``spike.py simulate``: ``strains/`` (``--strains`` reference proteins with a GA domain,
+  mutated to 100-70% identity) and ``relatives/`` (the held-out proteins unchanged). Each gets
+  ``truth.parquet``: strain, source protein, truth unit (the source's unit for strains, its
+  nearest remaining relative's for relatives), identity bin.
+- ``search``: per read set, six-frame ORFs of both mates (split at stops, ``--min-orf`` aa) ->
+  ``orfs.parquet`` (orf_id, read pair, mate, strand, start base on that strand, length,
+  sequence), and
+  their hits -> ``hits.parquet``; the same for the reads reversed (``null_*``), the null.
+- ``diamond``: both mates against the reference, DIAMOND ``blastx`` from the biocontainer,
+  every hit within 10% of each mate's best score (``--top 10``) -> ``diamond.parquet`` (read,
+  mate, protein_id, then :data:`DIAMOND_FIELDS` from pident on).
+- ``report``: ``hit`` recall (a read pair has a hit on a family of its source protein, at GA and
+  at any score) by read set, identity bin and where the pair lies: ``domain`` (a mate overlaps
+  one of the source's GA domains by at least ``--min-orf`` residues), ``outside`` (coding, but
+  not that) or ``flank``. Null rows give the share of reversed pairs with any hit. With
+  DIAMOND's output, also the share with a DIAMOND hit and its median identity.
+  -> ``report.tsv``.
+- ``nullref`` and ``recruit`` (phase 4, not in ``all``): the reference reversed, searched, for a
+  bar on reference domains below GA; kfpfam's weak-read recruitment on each read set.
+"""
+
+import argparse
+import gzip
+import itertools
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import polars as pl
+
+ROOT = Path(__file__).resolve().parents[2]
+PY = sys.executable
+REANNOTATE = ROOT / "workflows/pfam-reannotate/reannotate.py"
+RECALL = ROOT / "workflows/tree-index/recall.py"
+SPIKE = ROOT / "workflows/spike-benchmark/spike.py"
+# pfam-reannotate's thresholds, and tree-index build.nf's bench_args
+HMMSEARCH = ["-E", "10", "--domE", "1000000", "-Z", "1000000", "--domZ", "1000000"]
+BENCH = [
+    *("--present", "1", "--identities", "1", "0.98", "0.95", "0.9", "0.85", "0.8", "0.75"),
+    *("0.7", "--substitution", "blosum62", "--depth-mu", "0.3", "--depth-sigma", "0.6"),
+]
+DIAMOND = "quay.io/biocontainers/diamond:2.2.8--he361c42_0"
+PYHMMER = "community.wave.seqera.io/library/python_pyhmmer_pyarrow:15ad25b8fbebe783"  # kfpfam's
+# qstart, qend: bases on the read (qstart > qend on the reverse strand); sstart, send: residues.
+DIAMOND_FIELDS = [
+    "qseqid",
+    "sseqid",
+    "pident",
+    "length",
+    "bitscore",
+    "qstart",
+    "qend",
+    "sstart",
+    "send",
+    "qframe",
+    "cigar",
+]
+SETS = ("strains", "relatives")
+
+# Six-frame ORFs as kfpfam's measure/real_orfs.py (code 11).
+CODON = dict(
+    zip(
+        ("".join(c) for c in itertools.product("TCAG", repeat=3)),
+        "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        strict=True,
+    )
+)
+RC = str.maketrans("ACGTN", "TGCAN")
+
+
+MAX_GB = 6.0  # resident memory of a step's processes before the watchdog kills them
+
+
+def watchdog(max_gb: float) -> None:
+    """Exit this process if its own resident memory passes ``max_gb`` (``run`` covers children)."""
+
+    def watch() -> None:
+        while True:
+            ps = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True)
+            if int(ps.stdout or 0) > max_gb * 2**20:
+                print(f"watchdog: over {max_gb} GB, exiting", file=sys.stderr, flush=True)
+                os._exit(3)
+            time.sleep(0.5)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+RUNTIME = "docker"  # how outside tools run: docker, singularity, or none (on the PATH)
+THREADS = 4  # their threads (and docker's --cpus)
+HMMER = "quay.io/biocontainers/hmmer:3.4--hdbdd923_2"  # pfam-reannotate's
+
+
+def tool(image: str, *cmd: object, mounts: tuple = ()) -> list[str]:
+    """An outside tool's command line for :data:`RUNTIME`. Docker and Singularity mount each of
+    ``mounts`` (and the working directory) at the same path, so paths need no rewriting;
+    docker is capped at ``MAX_GB`` (Colima's VM may take 20 of the laptop's 24 GB)."""
+    args = [str(c) for c in cmd]
+    if RUNTIME == "none":
+        return args
+    binds = sorted({str(Path(m).resolve()) for m in (*mounts, Path.cwd())})
+    if RUNTIME == "docker":
+        cap = f"{MAX_GB:g}g"
+        vols = [x for b in binds for x in ("-v", f"{b}:{b}")]
+        return ["docker", "run", "--rm", f"--memory={cap}", f"--memory-swap={cap}",
+                f"--cpus={THREADS}", *vols, "-w", str(Path.cwd()), image, *args]  # fmt: skip
+    vols = [x for b in binds for x in ("--bind", b)]
+    return ["singularity", "exec", "--cleanenv", *vols, f"docker://{image}", *args]
+
+
+def run(*cmd: object, shell: bool = False) -> None:
+    """Run a step, killing its process group if its resident memory passes ``MAX_GB``
+    (a run with no cap crashed the laptop). ``shell``: one bash command, with pipefail."""
+    text = " ".join(map(str, cmd))
+    print("+", text, flush=True)
+    args = ["bash", "-o", "pipefail", "-c", text] if shell else [str(c) for c in cmd]
+    child = subprocess.Popen(args, start_new_session=True)
+    while child.poll() is None:
+        ps = subprocess.run(["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True)
+        kb = sum(
+            int(r) for g, r in (x.split() for x in ps.stdout.splitlines()) if int(g) == child.pid
+        )
+        if kb > MAX_GB * 2**20:
+            os.killpg(child.pid, signal.SIGKILL)
+            sys.exit(f"killed at {kb / 2**20:.1f} GB (MAX_GB {MAX_GB}): {text}")
+        time.sleep(0.5)
+    if child.returncode:
+        sys.exit(f"exit {child.returncode}: {text}")
+
+
+def orfs_at(seq: str, min_len: int) -> list[tuple[str, str, int]]:
+    """(protein, strand, first base on its own strand) per ORF of at least ``min_len`` aa."""
+    out = []
+    for sign, strand in (("+", seq), ("-", seq[::-1].translate(RC))):
+        for frame in range(3):
+            prot = "".join(
+                CODON.get(strand[i : i + 3], "X") for i in range(frame, len(strand) - 2, 3)
+            )
+            at = 0
+            for p in prot.split("*"):
+                if len(p) >= min_len:
+                    out.append((p, sign, frame + 3 * at))
+                at += len(p) + 1
+    return out
+
+
+def mates(d: Path, reverse: bool = False):
+    """(read pair, mate, sequence) in file order; ``reverse``: each read reversed."""
+    with gzip.open(d / "reads_1.fq.gz", "rt") as f1, gzip.open(d / "reads_2.fq.gz", "rt") as f2:
+        for i, (a, b) in enumerate(
+            zip(itertools.islice(f1, 1, None, 4), itertools.islice(f2, 1, None, 4), strict=True)
+        ):
+            for mate, s in ((1, a.strip()), (2, b.strip())):
+                yield i, mate, s[::-1] if reverse else s
+
+
+def search(a: argparse.Namespace, faa: Path, out: Path, arm: str) -> None:
+    """hmmsearch ``faa`` (integer names) against ``hmms.hmm`` -> ``out`` hits Parquet."""
+    tmp = out.with_suffix("")
+    residues = n = 0
+    for line in faa.read_text().splitlines():
+        n += line.startswith(">")
+        residues += 0 if line.startswith(">") else len(line)
+    Path(f"{tmp}.counts.tsv").write_text(f"proteins\tresidues\n{n}\t{residues}\n")
+    hmm = (a.out / "hmms.hmm").resolve()
+    search_cmd = tool(HMMER, "hmmsearch", "--notextw", "--cpu", a.threads, *HMMSEARCH,
+                      "--domtblout", Path(f"{tmp}.domtbl").resolve(), hmm, faa.resolve(),
+                      mounts=(a.out,))  # fmt: skip
+    cmd = f"{shlex.join(search_cmd)} | gzip -1 > {shlex.quote(str(tmp))}.txt.gz"
+    run(cmd, shell=True)
+    run(
+        PY,
+        REANNOTATE,
+        "parse",
+        "--arm",
+        arm,
+        "--domtbl",
+        f"{tmp}.domtbl",
+        "--alignments",
+        f"{tmp}.txt.gz",
+        "--ga",
+        a.out / "ga.tsv",
+        "--counts",
+        f"{tmp}.counts.tsv",
+        "--out",
+        out,
+        "--stats",
+        f"{tmp}.stats.tsv",
+    )
+    for suffix in (".txt.gz", ".domtbl", ".counts.tsv"):
+        Path(f"{tmp}{suffix}").unlink()
+
+
+def annotate(a: argparse.Namespace) -> None:
+    a.out.mkdir(parents=True, exist_ok=True)
+    wanted = set(pl.read_csv(a.families, separator="\t")["pfam_accession"].to_list())
+    opener = gzip.open if a.pfam.suffix == ".gz" else open
+    with opener(a.pfam, "rt") as f, open(a.out / "hmms.hmm", "w") as out:
+        block: list[str] = []
+        for line in f:
+            block.append(line)
+            if line.startswith("//"):
+                acc = next(x for x in block if x.startswith("ACC"))
+                if int(acc.split()[1][2:].split(".")[0]) in wanted:
+                    out.writelines(block)
+                block = []
+    run(PY, REANNOTATE, "ga", "--hmm", a.out / "hmms.hmm", "--out", a.out / "ga.tsv")
+    n = pl.read_csv(a.out / "ga.tsv", separator="\t").height
+    if n != len(wanted):
+        sys.exit(f"{n} of {len(wanted)} families found in {a.pfam}")
+    faa = a.out / "members.faa"
+    members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    faa.write_text("".join(f">{i}\n{s}\n" for i, s in members.iter_rows()))
+    search(a, faa, a.out / "hits.parquet", "members")
+    faa.unlink()
+
+
+def reads(a: argparse.Namespace) -> None:
+    held = a.out / "holdout"
+    run(
+        PY,
+        RECALL,
+        "holdout",
+        "--members",
+        a.members,
+        "--per-bin",
+        a.per_bin,
+        "--pool",
+        a.pool,
+        "--seed",
+        a.seed,
+        "--out",
+        held,
+    )
+    ref = pl.read_parquet(
+        held / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
+    )
+    hits = pl.read_parquet(a.out / "hits.parquet")
+    hits.join(ref.select("protein_id"), on="protein_id").write_parquet(a.out / "domains.parquet")
+
+    pool = ref.join(hits.filter("above_ga").select("protein_id").unique(), on="protein_id")
+    chosen = pool.sample(min(a.strains, pool.height), seed=a.seed).sort("protein_id")
+    (a.out / "strains").mkdir(exist_ok=True)
+    targets = a.out / "strains/targets.fa"
+    targets.write_text("".join(f">{i}\n{s}\n" for i, _, s in chosen.iter_rows()))
+    run(
+        PY,
+        SPIKE,
+        "simulate",
+        "--targets",
+        targets,
+        *BENCH,
+        "--seed",
+        a.seed,
+        "--out",
+        a.out / "strains",
+    )
+    run(
+        PY,
+        SPIKE,
+        "simulate",
+        "--targets",
+        held / "targets.fa",
+        "--present",
+        1,
+        "--identities",
+        1,
+        "--depth-mu",
+        0.3,
+        "--depth-sigma",
+        0.6,
+        "--seed",
+        a.seed,
+        "--out",
+        a.out / "relatives",
+    )
+
+    unit = pl.read_parquet(a.members, columns=["protein_id", "cluster_rep"])
+    for name in SETS:
+        truth = pl.read_csv(a.out / name / "truth.tsv", separator="\t").select(
+            "strain", protein_id=pl.col("member").cast(pl.Int64), identity_bin="identity_bin"
+        )
+        if name == "relatives":
+            rel = pl.read_csv(held / "relatives.tsv", separator="\t")
+            truth = truth.drop("identity_bin").join(rel, on="protein_id")
+            key = "relative"
+        else:
+            key = "protein_id"
+        truth = truth.join(unit.rename({"protein_id": key, "cluster_rep": "unit"}), on=key)
+        truth.select("strain", "protein_id", "unit", "identity_bin").write_parquet(
+            a.out / name / "truth.parquet"
+        )
+
+
+def orfs(a: argparse.Namespace) -> None:
+    for name, null in itertools.product(SETS, (False, True)):
+        d = a.out / name
+        prefix = "null_" if null else ""
+        rows = []
+        with open(d / f"{prefix}orfs.faa", "w") as faa:
+            for read, mate, seq in mates(d, null):
+                for prot, strand, start in orfs_at(seq, a.min_orf):
+                    faa.write(f">{len(rows)}\n{prot}\n")
+                    rows.append((len(rows), read, mate, strand, start, len(prot), prot))
+        schema = ["orf_id", "read", "mate", "strand", "start", "length", "sequence"]
+        pl.DataFrame(rows, schema=schema, orient="row").write_parquet(d / f"{prefix}orfs.parquet")
+        search(
+            a,
+            d / f"{prefix}orfs.faa",
+            d / f"{prefix}hits.parquet",
+            f"{name}{'_null' if null else ''}",
+        )
+        (d / f"{prefix}orfs.faa").unlink()
+
+
+def diamond(a: argparse.Namespace) -> None:
+    ref = pl.read_parquet(a.out / "holdout/members.parquet", columns=["protein_id", "sequence"])
+    (a.out / "reference.faa").write_text("".join(f">{i}\n{s}\n" for i, s in ref.iter_rows()))
+    out = a.out.resolve()
+
+    def dmnd(*cmd: object) -> list[str]:
+        return tool(DIAMOND, "diamond", *cmd, mounts=(out,))
+
+    run(*dmnd("makedb", "--in", out / "reference.faa", "--db", out / "reference",
+              "--threads", a.threads))  # fmt: skip
+    for name in SETS:
+        d = a.out / name
+        with open(d / "mates.fa", "w") as f:
+            f.writelines(f">{r}_{m}\n{s}\n" for r, m, s in mates(d))
+        run(
+            *dmnd(
+                "blastx",
+                "--db",
+                out / "reference",
+                "--query",
+                out / name / "mates.fa",
+                "--out",
+                out / name / "diamond.tsv",
+                "--sensitive",
+                "--top",
+                10,
+                "-b",
+                0.5,
+                "--threads",
+                a.threads,
+                "--outfmt",
+                6,
+                *DIAMOND_FIELDS,
+            )
+        )
+        hits = pl.read_csv(
+            d / "diamond.tsv",
+            separator="\t",
+            has_header=False,
+            new_columns=["q", "protein_id", *DIAMOND_FIELDS[2:]],
+        )
+        hits.with_columns(
+            pl.col("q").str.split_exact("_", 1).struct.rename_fields(["read", "mate"])
+        ).unnest("q").with_columns(pl.col("read", "mate").cast(pl.Int64)).write_parquet(
+            d / "diamond.parquet"
+        )
+        (d / "mates.fa").unlink()
+        (d / "diamond.tsv").unlink()
+    (a.out / "reference.faa").unlink()
+
+
+def pair_hits(d: Path, prefix: str) -> pl.DataFrame:
+    """(read, pfam_accession, above_ga): every family a read pair's ORFs hit."""
+    o = pl.read_parquet(d / f"{prefix}orfs.parquet", columns=["orf_id", "read"])
+    h = pl.read_parquet(
+        d / f"{prefix}hits.parquet", columns=["protein_id", "pfam_accession", "above_ga"]
+    )
+    return (
+        h.join(o.rename({"orf_id": "protein_id"}), on="protein_id")
+        .group_by("read", "pfam_accession")
+        .agg(pl.col("above_ga").any())
+    )
+
+
+def report(a: argparse.Namespace) -> None:
+    ga = pl.read_parquet(a.out / "hits.parquet").filter("above_ga")
+    rows = []
+    for name in SETS:
+        d = a.out / name
+        truth = pl.read_parquet(d / "truth.parquet")
+        pairs = pl.read_parquet(d / "reads.parquet").join(truth, on="strain")
+        # Both mates' residue ranges on the source protein (0-based, end exclusive).
+        L = pl.col("pair_bases") // 2
+        mate_aa = [
+            ((pl.col("cds_start") + off) / 3, (pl.col("cds_start") + off + L) / 3)
+            for off in (pl.lit(0), pl.col("fragment") - L)
+        ]
+        dom = pairs.select("read", "protein_id", "cds_start", "fragment", "pair_bases").join(
+            ga.select("protein_id", "env_from", "env_to"), on="protein_id"
+        )
+        overlap = pl.max_horizontal(
+            [
+                pl.min_horizontal(hi, pl.col("env_to"))
+                - pl.max_horizontal(lo, pl.col("env_from") - 1)
+                for lo, hi in mate_aa
+            ]
+        )
+        in_domain = dom.filter(overlap >= a.min_orf).select("read").unique()
+        source = ga.select("protein_id", "pfam_accession").unique()
+        hit = (
+            pair_hits(d, "")
+            .join(pairs.select("read", "protein_id"), on="read")
+            .join(source, on=["protein_id", "pfam_accession"])
+            .group_by("read")
+            .agg(hit_any=pl.lit(True), hit_ga=pl.col("above_ga").any())
+        )
+        df = (
+            pairs.join(hit, on="read", how="left")
+            .join(in_domain.with_columns(dom=pl.lit(True)), on="read", how="left")
+            .with_columns(
+                pl.col("hit_any", "hit_ga").fill_null(False),
+                where=pl.when(pl.col("dom"))
+                .then(pl.lit("domain"))
+                .when(pl.col("coding") > 0)
+                .then(pl.lit("outside"))
+                .otherwise(pl.lit("flank")),
+            )
+        )
+        aggs = [pl.len().alias("pairs"), pl.col("hit_ga").mean(), pl.col("hit_any").mean()]
+        if (d / "diamond.parquet").exists():
+            best = (
+                pl.read_parquet(d / "diamond.parquet")
+                .sort("bitscore", descending=True)
+                .unique("read", keep="first")
+                .select("read", "pident")
+            )
+            df = df.join(best, on="read", how="left")
+            aggs += [
+                pl.col("pident").is_not_null().mean().alias("diamond_hit"),
+                pl.col("pident").median().alias("diamond_pident"),
+            ]
+        for keys in (["identity_bin", "where"], ["identity_bin"]):
+            g = df.group_by(keys).agg(aggs).with_columns(set=pl.lit(name))
+            rows.append(g if "where" in keys else g.with_columns(where=pl.lit("all")))
+        n = pairs.height
+        null = pair_hits(d, "null_").group_by("read").agg(pl.col("above_ga").any())
+        rows.append(
+            pl.DataFrame(
+                {
+                    "set": [f"{name}_null"],
+                    "where": ["all"],
+                    "pairs": [n],
+                    "hit_ga": [null["above_ga"].sum() / n],
+                    "hit_any": [null.height / n],
+                }
+            )
+        )
+    out = (
+        pl.concat(rows, how="diagonal_relaxed")
+        .select("set", "identity_bin", "where", pl.exclude("set", "identity_bin", "where"))
+        .sort("set", "where", "identity_bin", descending=[False, False, True], nulls_last=True)
+    )
+    out.write_csv(a.out / "report.tsv", separator="\t", float_precision=3)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3):
+        print(out)
+
+
+def nullref(a: argparse.Namespace) -> None:
+    """The reference proteins reversed, searched as ``annotate`` searches them ->
+    ``null_hits.parquet``: the bar for reference domains below GA (pfam-reannotate's null arm)."""
+    faa = a.out / "null_members.faa"
+    members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
+    faa.write_text("".join(f">{i}\n{s[::-1]}\n" for i, s in members.iter_rows()))
+    search(a, faa, a.out / "null_hits.parquet", "members_null")
+    faa.unlink()
+
+
+def recruit(a: argparse.Namespace) -> None:
+    """kfpfam's weak-read recruitment (its docs/recruit.md), unchanged, on each read set's ORFs:
+    ``pairs.py`` (pyhmmer, in its container) on the ORFs and on them reversed, against the 40
+    HMMs, then ``recruit.py run`` -> ``<set>/recruit/`` and ``<set>/recruited.parquet`` (its
+    ``hits.tsv`` with ``orf_id``, read pair and mate). kfpfam names a read ``R<pair>m<mate>``."""
+    accs = [f"PF{x:05d}" for x in pl.read_csv(a.out / "ga.tsv", separator="\t")["pfam_accession"]]
+    (a.out / "accs.txt").write_text("\n".join(accs) + "\n")
+    out, kfpfam = a.out.resolve(), a.kfpfam.resolve()
+    prep = a.kfpfam / "data/prep"
+    for name in SETS:
+        d = a.out / name
+        r = d / "recruit"
+        r.mkdir(exist_ok=True)
+        orfs = pl.read_parquet(d / "orfs.parquet")
+        read_len = pl.read_parquet(d / "reads.parquet")["pair_bases"][0] // 2
+        orfs = orfs.with_columns(query=pl.format("R{}m{}_{}", "read", "mate", "orf_id"))
+        (r / "orfs.faa").write_text(
+            "".join(f">{q}\n{s}\n" for q, s in orfs.select("query", "sequence").iter_rows())
+        )
+        orfs.select("query", "strand", "start", read_len=pl.lit(read_len)).rename(
+            {"query": "orf"}
+        ).write_csv(r / "coords.tsv", separator="\t")
+        run(PY, a.kfpfam / "recruit/recruit.py", "reverse", r / "orfs.faa", r / "decoy.faa")
+        for kind in ("orfs", "decoy"):
+            w = out / name / "recruit" / kind
+            run(*tool(PYHMMER, "python", kfpfam / "recruit/pairs.py", out / "hmms.hmm",
+                      kfpfam / "data/prep/models.tsv", f"{w}.faa", f"all:{out / 'accs.txt'}",
+                      22.25, a.threads, f"{w}.pairs.tsv", mounts=(out, kfpfam)))  # fmt: skip
+        run(PY, a.kfpfam / "recruit/recruit.py", "run", "--real", r / "orfs.pairs.tsv",
+            "--null", r / "decoy.pairs.tsv", "--models", prep / "models.tsv", "--prep", prep,
+            "--orfs", r / "orfs.faa", "--orf-coords", r / "coords.tsv", "--out", r)  # fmt: skip
+        hits = pl.read_csv(r / "hits.tsv", separator="\t", infer_schema_length=0)
+        ints = ["pfam_accession", "hmm_from", "hmm_to", "ali_from", "ali_to", "env_from",
+                "env_to", "top", "locus"]  # fmt: skip
+        floats = ["seq_evalue", "score", "c_evalue", "i_evalue", "weight", "p_true", "q"]
+        hits.with_columns(
+            pl.col(ints).cast(pl.Int64),
+            pl.col(floats).cast(pl.Float64),
+            above_ga=pl.col("above_ga").is_in(["True", "true", "1"]),
+            orf_id=pl.col("query").str.split("_").list.last().cast(pl.Int64),
+        ).join(orfs.select("orf_id", "read", "mate"), on="orf_id").write_parquet(
+            d / "recruited.parquet"
+        )
+        for f in ("orfs.faa", "decoy.faa", "candidates.faa"):
+            (r / f).unlink(missing_ok=True)
+
+
+def fixture(a: argparse.Namespace) -> None:
+    """The test profile's inputs from pfam-reannotate's fixture (``--release``: the release's
+    three tables) and its HMMs (``--pfam``) -> ``--members`` (protein_id, cluster_rep,
+    full_length, sequence) and ``--families`` (every HMM's accession)."""
+    seqs = pl.read_parquet(a.release / "mgy_protein_sequences.parquet")
+    members = pl.read_parquet(a.release / "mgy_cluster_seqs.parquet").rename(
+        {"cluster_member": "protein_id"}
+    )
+    a.members.parent.mkdir(parents=True, exist_ok=True)
+    members.join(seqs, on="protein_id").select(
+        "protein_id", "cluster_rep", full_length=pl.lit(True), sequence="sequence"
+    ).sort("protein_id").write_parquet(a.members)
+    lines = a.pfam.read_text().splitlines()
+    accs = [int(x.split()[1][2:].split(".")[0]) for x in lines if x.startswith("ACC")]
+    pl.DataFrame({"pfam_accession": accs, "proteins": 0}).write_csv(a.families, separator="\t")
+
+
+STEPS = {
+    "annotate": annotate,
+    "reads": reads,
+    "search": orfs,
+    "diamond": diamond,
+    "report": report,
+    "nullref": nullref,
+    "recruit": recruit,
+    "fixture": fixture,
+}
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p.add_argument("step", choices=[*STEPS, "all"])
+    p.add_argument("--out", type=Path, default=ROOT / "data/pfam-anchor")
+    p.add_argument("--members", type=Path, default=ROOT / "data/mini-slice/members.parquet")
+    p.add_argument(
+        "--families", type=Path, default=ROOT / "results-hpc/tree-index-slice/results/families.tsv"
+    )
+    p.add_argument("--pfam", type=Path, default=Path.home() / "Downloads/Pfam-A.hmm.gz")
+    p.add_argument("--strains", type=int, default=2000)
+    p.add_argument("--release", type=Path, help="fixture: pfam-reannotate's fixture tables")
+    p.add_argument("--per-bin", type=int, default=250, help="recall.py holdout's")
+    p.add_argument("--pool", type=int, default=15000, help="recall.py holdout's")
+    p.add_argument("--min-orf", type=int, default=25)
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--kfpfam", type=Path, default=Path.home() / "Documents/kfpfam")
+    p.add_argument("--runtime", choices=["docker", "singularity", "none"], default="docker",
+                   help="how hmmsearch, DIAMOND and pyhmmer run")  # fmt: skip
+    p.add_argument("--max-gb", type=float, default=MAX_GB, help="watchdog's cap per step")
+    a = p.parse_args()
+    globals()["MAX_GB"] = a.max_gb
+    globals()["RUNTIME"], globals()["THREADS"] = a.runtime, a.threads
+    watchdog(a.max_gb)
+    for name, step in STEPS.items():
+        if a.step == name or (a.step == "all" and name not in ("nullref", "recruit", "fixture")):
+            step(a)
+
+
+if __name__ == "__main__":
+    main()

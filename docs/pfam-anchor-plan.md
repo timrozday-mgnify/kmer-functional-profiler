@@ -1,0 +1,771 @@
+# From raw-read Pfam hits to MGnify90 units
+
+Plan, 2026-11-06 (the user's request): assign a read to MGnify90 units through the HMM alignments the read and the units share. The method settled on 2026-11-08 is anchor residues (the read's most informative HMM columns), then column identity on the units kept (Progress log); it started as k-mers keyed by HMM column. Includes a local test case for development. Partly tested: phase 1b ran on 2026-11-06 with windows of real proteins, and phase 0's test case was built on 2026-11-08, with simulated reads and DIAMOND's best hits, and phases 1–3 passed their gates the same day, with anchor residues replacing seeds after phase 2 (Progress log). Still to do: full Pfam-A and kfpfam's recruited read hits, the unanchored route alongside (phase 4), and HPC scale.
+
+## Verdict
+
+Worth a short local test before building anything. The sizing favours it, and there are three known limits:
+
+- **The search space falls sharply.** A read's Pfam hit picks a family and its HMM columns, so a k-mer only has to be unique among the residues at those columns. On the test case, 6-mers keyed by column have 1.82 units per key.
+- **Short k-mers become possible.** Even k = 4 has only 2.65 units per key, so k-mers short enough to survive divergence may stay selective.
+- **Reach is the first limit.** Only units with a Pfam hit can be reached: 33.5% of the release's units at GA. A read must also fall inside a domain: GA domains of the 40 test families cover 43% of the residues of proteins with a hit, though domains from other families will raise this.
+- **Resolution is the second limit.** Even an error-free 40-column window is unique to one unit only 59% of the time (p90 8 units, p99 147). Many reads will tie across units, however good the k-mers are, so ties must be kept and resolved downstream.
+- **Alignment agreement looks fine so far.** Column identity is only as good as the two HMM alignments. In phase 1b, 99% of a 40-column fragment's residues landed on the same column as in the full protein's alignment, and calls barely changed. Fragments had no sequencing errors or real ORF calling, so phase 1 still has to confirm this.
+- **Brute-force AAI is probably enough for most families.** Comparing a read against every unit of its family should cost less than the Pfam search itself, even at release, so k-mers may only be needed for the largest families (phase 1b).
+
+## The method
+
+**Common template.** An HMM match column is a shared coordinate. A CIGAR maps residues of a read or protein onto those columns, so a read and a unit can be compared column by column with no read-to-unit alignment.
+
+```text
+Build   protein domains (family, hmm_from, ali_from, cigar) + sequences
+          -> (family, column, k-mer) -> units
+
+Query   read -> six-frame ORFs -> Pfam hits with alignments
+          -> (family, column, k-mer) of each hit -> candidate units
+          -> column score per candidate -> best units, ties kept
+```
+
+**K-mers.** A k-mer is k residues at consecutive match columns, keyed by its first column. Inserted residues are skipped and a deleted column breaks the k-mer. Matches are exact against the key, with no neighbourhood list. Seeds need not be consecutive: any set of columns can form a key, and phase 1b tests which sets work best.
+
+**Column sampling.** Keys are positions, so the index can keep every s-th column, with no hash sampling. A query uses all of its columns, so any run of k + s − 1 matching columns is guaranteed a seed.
+
+**Score.** Candidates are compared by plain identity over all the read's columns, so a unit missing some of them loses (phase 1; identity over shared columns only, phase 1b's choice, favoured partial domains). A rarity likelihood ratio from the HMM's emissions is the likely tie-break (phase 1b). Reads keep every family they hit, as in [recall-first pileup](kmer-functional-profiler-plan.md): candidates are not cut by a presence call, and related families are not collapsed.
+
+## What is measured so far
+
+Local test case below, 2026-11-06. The 40 HMMs against the mini-slice took 24 s on 4 threads.
+
+| Measure | Value |
+| --- | --- |
+| Proteins, units | 294,822, 55,433 |
+| Proteins and units with a GA domain from the 40 families | 183,652, 49,673 |
+| GA domains, and all domains reported at `-E 10` | 200,134, 307,698 |
+| Mean HMM columns per GA domain | 102 |
+| Share of residues in GA domains, proteins with a hit | 43% |
+| Median units per family, median HMM length | 1,043, 138 |
+| Units with a GA domain whose representative has none | 6,145 (12%) |
+
+Column k-mers, GA domains, every column (s = 1), each unit's members merged:
+
+| k | (key, unit) postings | Keys | Units per key | Share of postings from representatives alone |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 5,277,454 | 1,994,113 | 2.65 | 0.82 |
+| 6 | 5,205,113 | 2,852,280 | 1.82 | 0.80 |
+| 8 | 5,111,374 | 3,258,683 | 1.57 | 0.78 |
+
+Expected chance of at least one seed, calculated with independent column matches. Real conservation is not independent, which is why the test case has real relatives as well as simulated strains.
+
+| Aligned columns, k | 95% | 90% | 80% | 70% | 60% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 30, k 4 | 1.00 | 1.00 | 1.00 | 0.97 | 0.86 |
+| 30, k 6 | 1.00 | 1.00 | 0.93 | 0.72 | 0.43 |
+| 30, k 8 | 1.00 | 0.96 | 0.73 | 0.40 | 0.16 |
+| 40, k 4 | 1.00 | 1.00 | 1.00 | 0.99 | 0.93 |
+| 40, k 6 | 1.00 | 1.00 | 0.97 | 0.83 | 0.54 |
+| 40, k 8 | 1.00 | 0.99 | 0.84 | 0.51 | 0.22 |
+
+Rough release size, assuming the 105 postings per unit seen here hold for all 556 M units with a GA hit: 5.8×10¹⁰ postings at k 6, s 1, and about 1.9×10¹⁰ at s 3. Singletons and short domains make this uncertain; the 1-in-100 `pfam-reannotate` run replaces it (phase 5).
+
+## Local test case
+
+Everything runs on the laptop, one job at a time, on capped threads, in about 30 minutes in total.
+
+| Piece | Source | Notes |
+| --- | --- | --- |
+| Reference proteins | `data/mini-slice/members.parquet` | Family-complete, so near units are present. Git-ignored; comes from `results-hpc/tree-index-slice` through `slice.py mini` |
+| Families | `results-hpc/tree-index-slice/results/families.tsv` | 40 families, cut from `~/Downloads/Pfam-A.hmm.gz` (Pfam 38.2) |
+| Reference alignments | `hmmsearch`, then `workflows/pfam-reannotate/reannotate.py parse` | 24 s; the same hits format as the HPC run |
+| Simulated strains | `spike.py simulate`, as in `tree-index/build.nf` | 2,000 strains, 100–70% identity, 150 bp pairs, flanks, per-pair coding truth (`reads.parquet`) |
+| Real relatives | `recall.py holdout` | Proteins held out by identity to their nearest relative, removed from the reference. Real conservation, which uniform simulation lacks |
+| Read ORFs | Six-frame translation, split at stops, at least 25 aa | Follows kfpfam's `measure/real_orfs.py`; 25 aa kept .998 of GA recall there |
+| Read hits | `hmmsearch --notextw -E 10 --domE 1000000 -Z 1000000 --domZ 1000000` | The 40 HMMs for iteration; full Pfam-A once, for wrong-family calls |
+| Null | The same reads reversed | Sets the read-level bar, as in the tree-index benchmarks |
+| Baseline | DIAMOND read to all members | DIAMOND from the biocontainer through Docker. The tree index is not a baseline: it is the route for reads with no Pfam hit ("Two routes" below) |
+
+Two local limits carry over from the tree-index work:
+
+- **Chance hits scale with the database.** The mini-slice holds 295 k proteins rather than 5.7 B, so precision is optimistic. Local results rank methods; HPC sets the bars.
+- **Families are preselected.** Reads from these families against these HMMs say nothing about reads with no family. Full Pfam-A on the reads, and the reversed reads, cover part of that.
+
+A unit test fixture also exists: `tests/data/mini_reannotate` and `tests/data/mini_fmh/Pfam-mini.hmm` (6 HMMs, 84 proteins).
+
+## Metrics
+
+Reuse the tree-index definitions (`recall.py reads`): a pair is *called* when its best score clears the reversed-read bar, and *right* when any tied best is the source's unit. Report by identity bin, per strain with intervals.
+
+Each read's outcome is split, so a failure can be traced to one stage:
+
+1. **Hit:** the read has a hit on any family of its source protein.
+2. **Candidate:** the source unit is among the candidates, given a hit.
+3. **Right:** the source unit is among the tied best, given a candidate.
+4. **Overall:** read recall and read precision by unit, plus median tied units per call.
+
+Stratify by the pair's coding share and by whether the source position lies in a domain. Also report postings, query time per read and peak memory.
+
+## Phases
+
+Each phase records its outcome in this plan's Progress log, and only local work is planned before phase 5.
+
+### Phase 0: test case
+
+`workflows/pfam-anchor/prepare.py`, with its steps as subcommands:
+
+1. Cut the 40 HMMs, annotate the mini-slice, and write `domains.parquet`.
+2. Produce strains and held-out proteins, reads, and reversed reads, reusing `spike.py` and `recall.py`.
+3. Translate reads and search them. Add `orf_id` to read, mate, frame and start mappings, since `reannotate.py parse` needs integer names. Alternatively, kfpfam's `recruit/pairs.py` writes the alignments with string ORF names (see "Read hits from kfpfam").
+4. Run DIAMOND once for the method-independent best identity of each read.
+
+**Done when:** one command rebuilds the case, and `hit` recall by identity bin is reported.
+
+*Done 2026-11-08 (`workflows/pfam-anchor/prepare.py all`); see Progress log. Full Pfam-A on the reads is not run yet: it is only needed for wrong-family calls (phase 3).*
+
+### Phase 1: oracle, no k-mers
+
+`anchor.py oracle`: every read hit against every domain of that family, by column score. This is exhaustive, but fine at this size.
+
+1. Rank units for each read and report `right` given a hit.
+2. Report the same reads through DIAMOND, restricted to those units, to isolate alignment disagreement.
+3. For pairs where both methods align the read to the same protein, report how often the two alignments place residues differently.
+
+**Gate:** given a hit on the source family, oracle `right` is within 0.05 of DIAMOND's at each identity from 100% to 80%, on both simulated strains and real relatives. If not, the shared template is losing the information, and k-mers can't recover it. Stop, or fix the alignment step first.
+
+*Passed 2026-11-08 (`workflows/pfam-anchor/anchor.py oracle`), with identity over the read's columns; see Progress log. The oracle ties more units than DIAMOND, so its credit is lower.*
+
+### Phase 1b: brute-force AAI, HMM weights and discriminating columns
+
+Added 2026-11-06 at the user's request. Runs on the same families and needs no index.
+
+1. **Is AAI against every possible match feasible?** Measure comparisons per second, and from the release's family sizes work out the cost per read hit. If it is cheap enough, k-mers may only be needed for the largest families.
+2. **Can AAI be weighted per column from the HMM?** Compare plain identity with:
+   - conservation weights (information content from the HMM's match emissions);
+   - the inverse, favouring variable columns;
+   - rarity, where a match on a residue that is rare at that column counts for more (from HMM emissions or from the units);
+   - a likelihood ratio that also penalises mismatches;
+   - BLOSUM62, as the alignment-free reference.
+3. **Which residues and columns discriminate?** For each column, measure how well it separates units (entropy across units) and how often it survives between a unit and its nearest relative (retention). The best seed columns need both. Report these by HMM conservation and by amino acid.
+4. **Which combinations discriminate?** Measure how much columns overlap in the information they give, how that varies with distance along the model, and how many columns it takes to single out a unit.
+5. **Which seed shape narrows candidates best?** A seed is a set of columns, not necessarily adjacent, compared on recall against candidates per read:
+   - contiguous k-mers, as the baseline;
+   - fixed spaced patterns;
+   - the top k columns in a window, ranked by entropy, conservation, retention or entropy per unit of retention lost;
+   - columns chosen greedily, each adding the most new information per unit of retention lost;
+   - random columns, as a control.
+
+**Tests:** reads are windows of real proteins held out of the reference: members of a known unit (truth: their own unit) and whole held-out units (truth: the nearest remaining unit). Column statistics come from the reference only. Windows use the full protein's alignment; a subset is re-aligned as fragments to measure how much that matters.
+
+**Outcome:** picks the score for phase 1's oracle and the seed shapes for phase 2's sweep.
+
+*Done 2026-11-06 (`workflows/pfam-anchor/columns.py`); see Progress log. Plain identity stays the score, with the likelihood ratio to test as a tie-break. Conservation weights are dropped. Phase 2 keeps contiguous k 5, 6 and 8, spaced `1101011` and `11010010011`, and greedy columns in 12-column windows at k 3, 4 and 5.*
+
+### Phase 2: column seeds
+
+`anchor.py build` and `anchor.py query`, in Python and NumPy.
+
+1. Index: per family, sorted `(seed, residues, unit)`. A plain Parquet table per family is enough here.
+2. Sweep the seed shapes that phase 1b kept, with s of 1, 2 and 4, and a minimum of 1 or 2 shared seeds per unit. Compare each with brute-force AAI on time and memory, and find the family size above which seeds pay for themselves.
+3. Add one reduced-alphabet arm (Murphy-10, from `tree-index/alphabets.py`), since low-identity seeds are the likely weak point.
+4. Score candidates by column, with phase 1's score (identity over the read's columns).
+
+**Gate:** an arm keeps at least 95% of the oracle's right calls, with median candidates per read at most 1% of the family's units for reads from known units, and at most 10% for reads from novel units. Phase 1b found no seed near 1% for novel units (.834 kept at best), so the first version of this gate could not pass. It only has to pass in families too large for brute force.
+
+*Passed in large families 2026-11-08 (`workflows/pfam-anchor/anchor.py seeds`); see Progress log. Superseded the same day: anchor residues keep more at the same share and pass over all families (Progress log), so phase 3 uses them instead of seeds. The seed code stays for the very largest families, where a sublinear first step may still pay.*
+
+### Phase 3: comparison
+
+Anchor residues, then column identity on the units kept, against DIAMOND. The same reads, the same metrics and full Pfam-A read hits. The first stage takes the 16 highest-entropy columns the read covers and keeps the top 0.5–1% of units by matches there (Progress log, "Anchor residues as the first check"). Report both settings, and the rarity tie-break on the second stage.
+
+**Gate:** recall within 0.05 of DIAMOND's on reads with a hit, and at least 10× faster than DIAMOND for the unit-assignment step. Report the Pfam-search cost separately, since kfpfam is working on reducing it. Also report what share of DIAMOND's right calls have no Pfam hit, since these reads are beyond this method's reach.
+
+*Passed 2026-11-08 on the 40 families (`anchor.py query`, then `anchor.py compare`); see Progress log. The speed margin is provisional: DIAMOND ran as an x86_64 image under emulation on the laptop. Full Pfam-A read hits and kfpfam's recruited hits are not in it yet.*
+
+### Phase 4: coverage and fallbacks
+
+Each of these is measured separately, only if phases 1–3 pass:
+
+- **Weak hits:** reference and read domains below GA, with `pfam-reannotate`'s reversed arm setting the bar. Do they add right calls beyond the wrong ones? On the read side, kfpfam's recruitment already gives each weak hit a reversed-read q-value and a status (see "Read hits from kfpfam").
+- **Representatives or members:** representatives alone give 80% of k 6 postings but lose 12% of units with a domain. Do they lose right calls? This decides whether the all-representatives run is enough for the reference.
+- **Extending past the domain:** the anchor gives a diagonal into the protein, so reads overhanging a domain could be extended through the sequence store, with sequences held outside the index as in the tree-index design.
+- **Both routes:** every read goes through the tree index, and reads with a hit also through the anchored route ("Two routes"). Measure how often the two agree, and reconcile a read called by both, without double counting, before the pileup.
+
+### Phase 5: HPC scale
+
+Nextflow workflow (Slurm, Singularity, `test` profile on the fixture), run by the user:
+
+1. Build from the 1-in-100 `pfam-reannotate` output, to replace the release size estimate.
+2. Run on `tree-index-slice` (4.2 M proteins), which has real near-unit density.
+3. Measure the largest families, which set worst-case query cost.
+4. Write an index format and port lookups to Rust only after this, with kfpfam's optimisations (see "Speed: what carries over from kfpfam").
+
+### Phase 6: benchmark (requested 2026-11-09)
+
+What the user wants from the benchmarks: what is missed below 100% recall and why, recall as close to 100% as can be expected, a breakdown of computational cost, and rigorous recall and precision broken down by coverage depth and AAI, on real metagenomes and synthetic reads.
+
+1. **Reads.**
+   - **Synthetic:** today's strains and held-out relatives, with depth spread on purpose. Use a grid of depth bins (e.g. 0.5, 1, 2, 5, 10, 30×) crossed with the AAI bins (100, 98, 95, 90, 85, 80, 70%), so that every cell holds enough units for a confidence interval.
+   - **Real:** synthetic reads spiked into real metagenome backgrounds (spike-benchmark's `spike.py`; e.g. ERR10889147, kfpfam's sample, and one soil and one gut run). The spikes give truth inside real noise and real off-target reads, so precision is measured against real false positives. The unspiked real reads get a pseudo-truth: DIAMOND `--ultra-sensitive` against the full reference, plus hmmsearch on all six-frame ORFs. These are reported as agreement, not as truth.
+2. **Recall and precision, by depth × AAI.**
+   - **Per read pair:** whether the right unit or group was called.
+   - **Per unit:** whether it is present, and whether its abundance is right.
+   - **Per variant column:** consensus and variant calls.
+   - Each cell gets a Wilson interval. Precision is counted per called unit, both on spikes and on the real background, with its share of the real background's calls that the pseudo-truth doesn't support.
+3. **Misses, attributed.** For every true read pair or unit that is missed, record the first stage that lost it:
+   - no ORF or frame;
+   - no Pfam hit (the unanchored route only);
+   - anchors or seeds found no candidate;
+   - the right unit was dropped by `keep` or the anchor cut;
+   - not confirmed (`min_weight`);
+   - tier 1 or tier 2 miss;
+   - alignment or seedlines;
+   - lost in the EM (to a near-identical unit, the novel class, or a false unit).
+
+   Report this as a waterfall per depth × AAI cell, with example reads for the largest buckets. This is how to find which stage to fix to get close to 100%. The ceiling is set by reads that carry no information: too short, no overlap with the unit, or identical between units. Measure the ceiling, then report recall against it.
+4. **Cost.** Per stage: CPU-seconds, wall time and peak RSS (the Nextflow trace, plus per-step timers in the scripts), normalised to core-ms per read pair and per Mbp. Also index build time, size on disk and memory. The largest families get their own rows, because they set the worst case.
+5. **Output:** one table per measure (`bench_recall.tsv`, `bench_misses.tsv`, `bench_cost.tsv`) and a short write-up with plots.
+
+## Two routes: anchored and unanchored
+
+Decided 2026-11-08 (the user): this method and the tree index are not competitors. They serve different reads.
+
+- **Reads with a Pfam hit take the anchored route:** anchor residues, then column identity, within the hit's family. The hit already gives the family and the columns, so no k-mer index over the whole reference is needed.
+- **Reads with no Pfam hit take the unanchored route:** the kfp tree index (tiers 1 and 2), which searches the whole reference without a template. These are reads outside any domain (about half of coding pairs here, phase 0), in unannotated proteins, or too short or weak to hit.
+- **Both hand off in the same format,** a candidate unit list in `kfp-pileup reference`'s format, so the pileup and EM downstream see one stream of calls.
+
+So phase 3 compares the anchored route with DIAMOND only. The tree index enters at phase 4. The user decided both open questions on 2026-11-08:
+
+- **The split:** GA hits and kfpfam's recruited hits both take the anchored route.
+- **Every read takes the unanchored route,** whether or not it has a hit. The anchored route is in addition, for reads with a hit. How the two routes' calls are reconciled for the same read is phase 4's question.
+
+## From pseudo-alignment to alignment, and the pileup as the MSA
+
+Added 2026-11-08 at the user's request; measured on the local case (Progress log, "Alignments from the pseudo-alignment").
+
+**Alignment by seed extension.** The two HMM alignments already pair most read residues with the unit's residues. A proper alignment needs only three cheap steps, with the pairs as seeds:
+
+1. **Implied pairs:** the match columns both use. These are 78–86% of the ORF's residues, placed as DIAMOND places them for 98–99%.
+2. **Fill between pairs:** along the diagonal where both sides skip the same number of residues (insert states in both). Otherwise, a global DP of the two short stretches. DP is needed in under 2.5% of hits, at under one cell per hit on average.
+3. **Extend past the first and last pair:** ungapped, X-drop, to the ORF's ends. This brings the alignment to 95–98% of the ORF, against DIAMOND's 96–98%, and reproduces 96–98% of DIAMOND's pairs at 98–99% agreement.
+
+It costs about 12 µs per hit in Python, against DIAMOND's 15–19 core-ms per read pair (under emulation). So the route's own alignment replaces DIAMOND entirely, not only DIAMOND's choice of unit.
+
+**The pileup needs no extra MSA stage.**
+
+- **Within a unit.** `kfp-pileup call` builds its pileup from DIAMOND's tabular lines: `qseqid sseqid bitscore qstart qend sstart send qframe btop` (`crates/core/src/diamond.rs`). The route can write the same lines from its own alignments, with BTOP from the residue pairs and a BLOSUM62 bit score with DIAMOND's gap costs. `call` then builds pileups, posteriors and the nucleotide pileup unchanged. Routing and DIAMOND drop out of the anchored path. Reads stacked on a target's residues are a star MSA, which is what the pileup already is.
+- **Across units of a family.** The HMM's match columns are a shared coordinate, so pileups of different targets line up column by column, as `hmmalign` output does. This gives a family-wide MSA over the domain for free, for comparing variants across related units or moving reads between them. Residues in insert states stay unaligned across units, as in Pfam's alignments. Outside the domain, only each target's own coordinates apply.
+- **An extra MSA would add little.** It would only align insert-state residues across units, and the outer parts of proteins with no domain coordinate. Neither is needed for a per-target pileup.
+
+**Limits of the measurement.**
+
+- Strains are substitution-only (`spike.py simulate`), so their reads have no indels against the source. Relatives carry real indels, and their DP rate is the same 1–2%.
+- An indel past the domain stops the ungapped extension early. Where X-drop stops before the ORF ends, a banded gapped extension is the fallback; it isn't built or measured.
+- Reads with frameshifting errors split into ORFs (DIAMOND's `-F` handles these within one alignment). Each ORF is aligned on its own, and `call` sees them as separate lines of one mate.
+- DIAMOND is the reference here, not the truth. Some of the 1–2% disagreement may be DIAMOND's.
+
+**Plan.** As phase 4b: the route writes DIAMOND-format lines per mate for every tied unit's winning protein, plus the handoff's `ref.fa`/`refs.tsv`. Then `kfp-pileup call` runs on them directly. The checks:
+- `call` accepts the lines;
+- per-target pileups agree with DIAMOND-based ones, column by column;
+- `call`'s read posteriors and per-unit identity agree with the DIAMOND path's.
+
+## Confirm, then map every read
+
+Decided 2026-11-08 (the user). The anchored route's job is to **confirm which units are present**, not to place every read. Once units are confirmed, all reads are treated alike:
+
+```text
+reads -> Pfam hits -> anchored route -> unit calls -> confirmed units        (confirmation)
+                                                    + unanchored route (tree index), for units no Pfam hit reaches
+confirmed units -> targets (members) + neighbours                             (the reference)
+every read -> aligned to the targets, all plausible alignments kept            (mapping)
+           -> gather: read posteriors and EM over sources                     (kfp-pileup call)
+           -> pileups, variants, consensus                                    (kfp-pileup call)
+```
+
+- **Confirmation.** A unit is confirmed by the weight of anchored calls on it, each pair's weight split over its tied units. Measure its recall and precision against the units present, and which units only the unanchored route can confirm.
+- **Mapping is the same for every read.** A read with a Pfam hit gets no special treatment here: it is aligned to the targets like a read with none. Every alignment within `--top` of a read's best is kept, so a read with several plausible targets carries all of them.
+- **Gather.** `kfp-pileup call` already resolves multiple alignments: posteriors with one column left out, then its EM over sources (steps 8–9). Nothing new is needed unless measurement says so.
+- **The mapper is the open choice:**
+  - DIAMOND `blastx` against the targets, as the pileup workflow runs it;
+  - the tree index on the confirmed units. Tier 2, the dense index, could be used straight away, since the confirmed reference is small. Or tier 1 could route first and tier 2 align, as for the whole release. Test both against DIAMOND, on reads mapped right, time and memory. The tree index routes and scores but doesn't write alignments, so its arms hand their candidates to the aligner. The anchored route's own alignments (phase 4b) cover only reads with a hit, so they aren't a mapper for every read.
+- **This replaces mate rescue.** Phase 4b's missing mates are reads with no hit of their own, and mapping every read covers them.
+- **Tier 2 as a pseudo-alignment (measured 2026-11-08).** For reads with no anchor, tier 2's k-mer seeds play the part the HMM columns play in the anchored route.
+  1. Dense routing sends a read pair to its candidate leaves.
+  2. Exact protein 4-mer seeds between each mate's stop-free frames and a leaf's protein are kept near the best diagonal, and chained increasing in both.
+  3. The anchored route's `build_alignment` fills between seeds and extends.
+
+  The result is a full alignment in `call`'s DIAMOND format, so tier 2 is the whole mapper and DIAMOND isn't needed. It agrees with DIAMOND's alignments for 99.7% of residues, and beats DIAMOND end to end on right calls. Today's `_core.pseudo_align` returns only a score: the Rust kernel already finds the diagonal bands, so returning the chain's coordinates is the port.
+
+## Speed: what carries over from kfpfam
+
+Added 2026-11-08 at the user's request. kfpfam's speed work (its `docs/plan.md`, "Speed plan" and Progress log) took a per-read pseudo-alignment from about 108 to 1.4–3 ns per hit. Most of it is about memory layout and batching, not k-mers, so it carries over to anchor residues and column identity. Nothing below is built or measured here.
+
+| kfpfam | Here | Expected effect |
+| --- | --- | --- |
+| **Join from the model's side.** Reads are batched in blocks, and each model's index is scanned once per block, not once per read. | Sort a block's read hits by family, then pass over each family's column-major matrix once for all of its hits. Per hit, the cost becomes compute rather than memory. | The largest gain at release, where a family's matrix is far bigger than cache |
+| **Tiles that fit in L2.** Runs of models of about 65,536 columns; postings fetched once per tile: 7.4 → 1.4 ns per hit. | Tile a large family's units, about 64 K units × the anchor columns in L2, and run every hit in the block against the tile. | The same cache fix, for the anchor stage and the identity stage |
+| **u16 indices within a tile.** Index 1.1 → 0.62 GB. | Unit numbers within a tile as u16; residues as u8 already. | About half the memory of the unit lists |
+| **NEON `tbl` and SSE4.1, with a scalar oracle.** Identical output, tested against scalar. | Byte compares of 16 units at a time per column (`vceqq_u8`), summed into u8 counters, then the top q. The same scalar-oracle tests. | The anchor stage at about 1 byte per unit per column, at memory bandwidth |
+| **Gate masks from SIMD compares.** 26.5 → 23.2 core-s. | The top-q cut as a SIMD compare against a threshold, from a histogram of counts (counts are at most n), not a sort. | No sort in the anchor stage |
+| **Fewer read hits: the ORF rule and the `top` frame.** About 0.55× the hits; frames compete over the same bases. | Use kfpfam's `hits.tsv` `top` frame, or set, rather than every frame's hit (already in "Read hits from kfpfam"). | Fewer hits per read; every stage's cost scales with hits |
+| **Index-time cuts.** Dropping the longest lists removes 8.6% of hits for ≤ .006 recall. | The anchor columns are per family, so precompute each family's ranked columns. Drop columns with almost no entropy, such as fully conserved ones, at build time. | A smaller matrix for the anchor stage |
+| **Binary model file.** Reads in 1.1 s against 224 s as text. | Store per-family matrices in a binary, memory-mapped layout, not Parquet, once the format settles (phase 5). | Start-up, not per-read cost |
+| **Parallel build, bounded blocks.** Peak memory 4.4 → 3.8 GB. | Blocks of reads sized so that hits, counters and tiles stay under the laptop's cap. | Memory |
+
+What doesn't carry over: kfpfam's k-mer lists, window diagonals and int8 profile scoring. This method compares residues with residues, not with a profile. The exception is the rarity likelihood-ratio tie-break, which is a per-column table, like kfpfam's int8 profile, and would use the same `tbl` lookups.
+
+Order of work, after phase 3 settles the method: (1) a scalar Rust port of both stages, which must reproduce `anchor.py` exactly; (2) the model-side join and tiles; (3) NEON, then SSE4.1 or AVX2 for the HPC, each tested against scalar.
+
+## Layout and scope
+
+- `workflows/pfam-anchor/`: `prepare.py`, `anchor.py`, `README.md`; Nextflow from phase 5.
+- `tests/python/test_pfam_anchor.py`: column mapping with insertions and deletions, k-mer keys, and a read whose source unit must come first on the fixture.
+- **Not in kfp's CLI:** this is a development workflow. If it succeeds, its output is a candidate unit list in `kfp-pileup reference`'s format, as tree-index tier 2 hands off.
+- **kfpfam provides the read-hit step.** The contract is the `pfam-reannotate` hits schema, with a query id, so a faster filter can replace `hmmsearch` without touching this work. Built in kfpfam on 2026-11-07: see the next section.
+
+## Read hits from kfpfam
+
+Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their alignments, and recruits reads too weak for GA to families the sample confirms, keeping sets where a read is ambiguous. The write-up is kfpfam's `docs/recruit.md`, and the measurements are in its `docs/recruit-plan.md`. All of it ran on one gut metagenome (ERR10889147, 1.07 M reads) and on simulated samples.
+
+**What it writes.**
+
+- **The steps.** Six-frame ORFs come from `measure/real_orfs.py`, which also writes each ORF's place in the read. The k-mer filter's candidates (Mode A) go to pyhmmer in `recruit/pairs.py`. `recruit/recruit.py` then recruits, against reversed ORFs as the null.
+- **`pairs.tsv`:** every (ORF, family) pair at E ≤ 1000, Z = 20 M, with the strongest domain's alignment. This is the recall-first input: no presence cut.
+- **`hits.tsv`:** recruitment's result, one row per (locus, family in its set), with these columns:
+  - `status` (`ga`, `one`, `set`, `none`) and `top`, which marks one call per locus;
+  - `weight`, P(true) and q from reversed reads;
+  - `read_from` and `read_to`, where the alignment lies on the read.
+
+**Matching this plan's hits schema.**
+
+- **Same columns.** `pfam_accession` (integer), `seq_evalue`, `score`, `c_evalue`, `i_evalue`, `hmm_from`, `hmm_to`, `env_from`, `env_to`, `ali_from`, `ali_to`, `cigar` and `above_ga`. The CIGAR uses `reannotate.py`'s convention (M, I residue only, D model only), so `columns.py`'s column mapping reads it unchanged. Checked on 50,000 reads' 16,362 hits: every hit maps consistently, and residues equal the HMM consensus at .48 (GA) and .38 (recruited) of their columns.
+- **Differences.**
+  - The query is `query`, a string ORF name (`R<read>_<n>`), not an integer `protein_id`.
+  - Files are TSV, not Parquet.
+  - There is one row per (ORF, family): the strongest domain, with no `domain` or `seq_score` columns.
+  - `above_ga` tests the domain score only.
+- **HMMs.** Pfam 38.2, from the same file as here (kfpfam's `Pfam-A.hmm.gz` links to `~/Downloads/Pfam-A.hmm.gz`), so HMM columns agree.
+- **Thresholds.** Z = 20 M and E ≤ 1000, which is wider than this plan's `-E 10` at Z = 10⁶ (equal to E ≤ 200 at Z = 20 M). On shared pairs, pyhmmer's scores and coordinates are identical to `hmmsearch` on all ORFs. The filter in front loses .003 of GA pairs and .03–.11 of the weak bins.
+- **ORFs.** At least 15 aa there, against 25 aa here. Filter on `orf_len` to match.
+
+**What was measured that bears on this plan.**
+
+- **More read hits.** On 1.07 M reads, there are 172,619 loci at GA (0.16 per read) and 108,750 recruited at an estimated 2% per-read FDR, of which 4,179 are sets. That is 0.26 hits per read in all. Phase 1b's brute-force AAI cost scales with hits per read, so its 1–9 core-ms per read becomes about 1.6–15 with recruited hits, plus a little for set members.
+- **Weak hits with a bar already exist.** Phase 4's "Weak hits" item needs a reversed-read bar for read hits below GA, and recruitment supplies one per locus.
+  - On a simulated sample of MGnify proteins at 100–50% identity, GA loci were .999 right. Recruited loci with one family were .960 right, and sets held the right family .944 of the time.
+  - Recruited reads found more domains than GA calls alone from 80% identity down, and more than doubled them at 70% and below.
+- **The reversed-read FDR is a lower bound.** On the simulations the true FDR ran 2–4 points above the estimate: .037 at an estimated .020. Two kinds of false hit come from real sequence, which reversed reads don't imitate:
+  - ORFs in other frames of real coding DNA;
+  - proteins hitting a family they aren't annotated with.
+
+  They come in runs from one region. The unit-level score here is what should remove them, so report phase 3 and 4 precision by `status`.
+- **Frames compete.** Placed on the read, 346 of 350 reads with GA calls on two ORFs had both over the same bases in different frames, never within one clan, so one frame was wrong. Only 4 were two genes. Take the `top` frame, or the set, rather than every frame's hit, or wrong frames will seed chance units.
+- **Short ORFs rarely hit.** Windows of 10, 15, 20 and 25 aa cut from GA reads got any pair .04, .29, .62 and .85 of the time. In a contig simulation, only 9 of 180 domain-bearing segments at gene boundaries got a pair. This sizes the "Few or weak hits" risk below.
+- **Cost of the read-hit step.** Filter plus pyhmmer comes to about 1.2 core-ms per read, and the reversed reads' null costs as much again. The per-read step needs only about 10,000 null reads (2% of 1.07 M gave the same counts within 1.5%), but confirming families from weak evidence needs the whole null. Recruitment itself takes 26 s per 1.07 M reads.
+
+**What changes in the phases.**
+
+- **Phase 0, step 3:** `recruit/pairs.py` in its `all:ACCS.txt` mode can search the reads against the 40 HMMs and write alignments directly, with no `hmmsearch` text parsing and no integer `orf_id`.
+- **Phase 3:** take the Pfam-search cost from kfpfam's figures.
+- **Phase 4, weak hits:** use `hits.tsv`'s `status`, `q` and `weight` as the weak-hit arm. Report right calls by status, and `pairs.tsv` against `hits.tsv` as recall-first against recruited.
+
+## Risks
+
+| Risk | Effect | Where it shows |
+| --- | --- | --- |
+| Fragment and full-protein alignments disagree | Wrong columns, lost seeds and identity | Phase 1b: 99% agree, without sequencing errors; phase 1 confirms |
+| Reads outside domains | Low reach, whatever the k-mers | `hit` stage, by domain position |
+| Few or weak hits on 30–50 aa ORFs | Reads never reach the index; weak hits add chance families | `hit` stage, reversed reads; kfpfam: a pair for .29 of 15 aa and .85 of 25 aa windows; recruitment adds 0.10 hits per read at 2% estimated FDR |
+| Wrong-frame and unannotated-family read hits | Chance units seeded from real but wrong sequence; the reversed null misses them | kfpfam simulation: true FDR 2–4 points above the reversed-read estimate; frames over the same read bases compete in `hits.tsv` |
+| Ties in conserved columns | Calls span many units | Median tied units; downstream EM or pileup |
+| Family and clan cross-talk | Read and unit annotated to related families share no columns | Full Pfam-A arm; phase 3 misses |
+| Very large families | Long postings at conserved columns | Phase 5 |
+| Pfam version change | Columns change, so the index must be rebuilt | Pin 38.2 for now |
+| Uniform simulated mutation | Overstates low-identity seeding or misstates it | Real relatives arm |
+
+## Decisions for the user
+
+1. **Gate thresholds.** The numbers in phases 1–3 are proposals.
+2. **Where it lives.** This plan puts the work in this repo, as units are this project's concept, with kfpfam supplying read hits. It could go in kfpfam instead.
+
+## Progress log
+
+- **Test case sized (2026-11-06).** The tables under "What is measured so far". Scripts were scratch only, so phase 0 still has to write them into the repo.
+- **Phase 1b: brute-force AAI, HMM weights and discriminating columns (2026-11-06, the user's request).** `workflows/pfam-anchor/columns.py`, on the 40 families' GA domains in the mini-slice, 80 s in one thread, 1 GB. 8,764 reads: windows of 40 HMM columns from real proteins, held out of the reference. *Known* (5,478): a non-reference member, truth its own unit. *Novel* (3,286): a unit held out whole, truth the remaining unit nearest over the whole domain.
+  - **Limits of this test.** Mid-sized families only (20 k–150 k annotated proteins each; the largest Pfam families are far bigger). The mini-slice has fewer near units than the release. Windows have no sequencing errors and at least 75% occupancy. Each unit is one domain. Novel truth is itself identity over the domain, which favours plain identity as a score, so known reads are the fair comparison of scores.
+  - **Brute-force AAI is feasible.** NumPy compares 2.7 GB/s on one thread, or 14.7 ms per 1 M units at 40 columns. Rough release cost, assuming read hits follow domain counts: STATS.md's top 25 families hold 438 M domains (PF00005 62.6 M), and 2.99 B proteins at about 1.75 GA domains each is about 5.2 B. A read hit then lands in a family with about 2–13 M domains, or roughly 0.5–3.6 M units at 3.5–4 domains per unit, costing 7–53 ms. At 0.17 GA hits per read (kfpfam, `ERR10889147`) that is about 1–9 core-ms per read, against 40–70 for `hmmsearch` and 29 for kfpfam's filter, so about 3–25 core-hours per 10 M reads. Worst case is about 250 ms for a hit in PF00005. Weak hits would add to this. SIMD should be several times faster (not measured).
+  - **Memory favours the matrix.** One byte per unit and column is about 100 bytes per domain here, so about 60–100 GB for representatives at release (rough), mapped per family and laid out by column so a read touches only its own columns. A k 6 index at every column has about 105 postings per unit, which is larger at any realistic bytes per posting.
+  - **Scores.** "Right" is truth among the tied best; "credit" is right divided by ties, so a score can't gain by tying more. Known reads at ≥ 90% identity, difference in credit from plain identity with standard errors over families:
+
+    | Score | Right | Credit | Unique top | Credit difference |
+    | --- | ---: | ---: | ---: | ---: |
+    | Likelihood ratio, unit frequencies | .827 | .629 | .632 | +.019 ± .003 |
+    | Likelihood ratio, HMM emissions | .827 | .628 | .630 | +.018 ± .003 |
+    | Rarity, HMM emissions | .826 | .627 | .628 | +.017 ± .003 |
+    | BLOSUM62 | .826 | .625 | .623 | +.015 ± .003 |
+    | Plain identity | .831 | .610 | .593 | — |
+    | Entropy weights | .819 | .610 | .613 | −.000 ± .001 |
+    | Inverse conservation weights | .818 | .609 | .614 | −.001 ± .001 |
+    | Conservation weights | .817 | .608 | .615 | −.002 ± .002 |
+
+    On novel reads, identity has the highest right (.690, against .595–.646) and credit (.523), with HMM ratio level (−.000 ± .005) and conservation weights worst (−.055 ± .008), though the truth favours identity there. So conservation weighting does not help. Rarity and likelihood ratios help slightly, by breaking ties. Identity is more accurate when it gives a single best unit (.855 against .848), so a ratio as a tie-break after identity is the natural next test.
+  - **Resolution per read is limited.** On known reads the true unit is among the tied best for only 83%, with about 5 ties on average. The called unit is close, though: for 93% it is within 2 points of the best whole-domain identity, on all reads of that scenario. Abundance from many reads has to resolve the rest.
+  - **Fragment alignments.** The same windows as sequences, re-aligned with `hmmsearch`: 78% hit their source family at `-E 10`, Z = 10⁶ (no null yet), at about 36 columns. Of their residues, 99% are on the same column as in the full protein's alignment, and 88–95% of fragments agree completely, at every identity. Right on known reads is unchanged at .802, and on novel reads .690 becomes .680.
+  - **Columns.** Across 6,243 columns with at least 30% occupancy, separating units and surviving divergence pull against each other: entropy against retention, Spearman −.77; entropy against HMM conservation −.68. Median entropy is 2.63 bits and median retention .80 between a unit and its nearest relative.
+
+    | HMM conservation quintile | Conservation (bits) | Entropy across units (bits) | Retention | Entropy per bit of retention lost |
+    | ---: | ---: | ---: | ---: | ---: |
+    | 1 (least) | 0.19 | 3.16 | .708 | 6.4 |
+    | 2 | 0.30 | 2.97 | .712 | 6.1 |
+    | 3 | 0.41 | 2.65 | .757 | 6.8 |
+    | 4 | 0.68 | 2.14 | .820 | 7.9 |
+    | 5 (most) | 1.58 | 1.35 | .889 | 8.1 |
+
+  - **Residues.** Value is a shared residue's rarity at its column, per bit of retention lost. Best: W 14.6 (retained .89), C 9.7 (.81), Y 9.6 (.86), F 8.9 (.83), M 8.1 (.75), P 7.9 (.85), G 7.6 (.85), H 7.6 (.78). Worst: A 5.8, E 5.7, S 5.7, I 5.9, V 5.9. These are averages over columns, and not yet used in any seed.
+  - **Combinations.** Adjacent columns are the most redundant: mutual information over the smaller entropy falls steadily from .46 at distance 1 to .41 at 4, .33 at 11 and .23 at 30, with no helical periodicity at 3–4. This also reflects shared ancestry, so it isn't specific to column pairs. Spacing columns out gains about 0.5 bits per pair at most.
+  - **Seeds.** Kept is the share of oracle-right reads with the true unit among candidates; share is median candidates as a share of the family; seeds per column sets index size.
+
+    | Seed | Hits needed | Novel: kept | Novel: share | Known: kept | Known: share | Seeds per column |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Contiguous k 4 | 1 | .979 | 16.7% | 1.00 | 17.3% | .98 |
+    | Contiguous k 5 | 1 | .940 | 7.3% | 1.00 | 7.9% | .97 |
+    | Spaced `1101011` (k 5) | 1 | .959 | 7.8% | 1.00 | 8.2% | .95 |
+    | Contiguous k 6 | 1 | .903 | 3.2% | 1.00 | 3.9% | .96 |
+    | Spaced `11010010011` (k 6) | 1 | .908 | 2.7% | 1.00 | 3.5% | .92 |
+    | Contiguous k 8 | 1 | .805 | 0.7% | .999 | 1.3% | .94 |
+    | Contiguous k 8 | 2 | .770 | 0.4% | .996 | 1.0% | .94 |
+    | Greedy, 12 columns, k 3 | 1 | .960 | 17.7% | .999 | 16.2% | .15 |
+    | Greedy, 12 columns, k 4 | 1 | .915 | 6.3% | .996 | 6.5% | .15 |
+    | Greedy, 12 columns, k 5 | 1 | .868 | 2.4% | .992 | 2.9% | .15 |
+    | Most variable, 12 columns, k 4 | 1 | .827 | 1.1% | .998 | 1.7% | .51 |
+    | Most conserved, 12 columns, k 4 | 1 | .965 | 29.0% | 1.00 | 29.3% | .51 |
+    | Random, 12 columns, k 4 | 1 | .973 | 15.0% | 1.00 | 14.8% | .91 |
+
+    - **Non-contiguous seeds:** spacing adds about 2 points of recall at the same k and a similar share (.940 to .959 at k 5). Random columns in a window do about as well as fixed spacing.
+    - **Choosing columns:** this mainly shrinks the index, not the candidates. Greedy columns use 6–7× fewer seeds than contiguous k-mers, losing about 2–4 points of novel recall at similar shares. Conserved columns alone are poor at narrowing, and variable columns alone miss diverged relatives.
+    - **Budgets:** known reads narrow to 1% with .997 kept (most variable, 12 columns, k 4, 2 hits). Novel reads keep at best .77 at 0.5%, .834 at 1%, .898 at 2%, .938 at 5%, .963 at 10% and .983 at 20%.
+    - **Family size:** families of at least 1,500 units narrow about twice as far on share (k 6 novel 1.8% against 3.8%), with novel recall about 2 points lower. Whether that continues up to the largest families is unmeasured.
+    - **Real fragment alignments:** results are similar: novel k 5 .958 and spaced `1101011` .976, at about 10% share.
+  - **Reproducing.** Scratch steps until phase 0: cut the HMMs in `results-hpc/tree-index-slice/results/families.tsv`, run `hmmsearch` with `pfam-reannotate`'s thresholds on `data/mini-slice`, then `reannotate.py parse`, then `columns.py --width 40 --per-family 150`.
+- **Read hits from kfpfam (2026-11-07, the user's request).** kfpfam's read-hit step and weak-read recruitment are built (kfpfam `docs/recruit.md`), and summarised in "Read hits from kfpfam" above. That section covers the schema mapping and the measurements that bear on phases 0, 3 and 4. Two of those measurements add risks, now in the table: the reversed-read FDR is 2–4 points optimistic, and wrong frames compete with real ones over the same read bases. Nothing in this plan's phases has run on kfpfam's output yet.
+- **Phase 0: test case (2026-11-08, the user's request).** `workflows/pfam-anchor/prepare.py`, steps `annotate`, `reads`, `search`, `diamond` and `report` (`all` runs them in order), into `data/pfam-anchor/`. About 8 minutes in all, peak 2.1 GB (holdout's relative search).
+  - **What it builds.**
+    - `hits.parquet`: the 40 HMMs on all 294,822 mini-slice proteins, the same counts as the sizing.
+    - `holdout/`: 1,686 real relatives held out of the reference (`recall.py holdout`, 250 per bin). The 85–70% bins only filled to 87–132.
+    - `domains.parquet`: the reference's hits.
+    - `strains/`: 2,000 strains of reference proteins with a GA domain, 100–70%, 11,953 pairs.
+    - `relatives/`: the held-out proteins unchanged, 10,146 pairs.
+    - Each read set gets `truth.parquet` (source protein; truth unit, the nearest remaining relative's for relatives), ORFs of at least 25 aa with read, mate, strand and start, hits for the reads and for the reads reversed, and DIAMOND's best hit per mate.
+    - `spike.py simulate`'s `reads.parquet` now also records each pair's fragment (start from the CDS, length, strand), so a pair can be placed on its source.
+  - **Hit recall.** Pairs with a mate overlapping a GA domain of the source by at least 25 residues; *any* is any hit at `-E 10`, Z = 10⁶, on a family of the source:
+
+    | Identity bin | Strains: GA | Strains: any | Relatives: GA | Relatives: any |
+    | ---: | ---: | ---: | ---: | ---: |
+    | 1.00 | .517 | .805 | .572 | .850 |
+    | 0.98 | .550 | .842 | .556 | .841 |
+    | 0.95 | .492 | .754 | .511 | .811 |
+    | 0.90 | .410 | .707 | .551 | .805 |
+    | 0.85 | .407 | .726 | .651 | .866 |
+    | 0.80 | .295 | .603 | .517 | .857 |
+    | 0.75 | .189 | .538 | .551 | .812 |
+    | 0.70 | .172 | .488 | .531 | .817 |
+    | 0.60 | | | .491 | .790 |
+
+    - **Relatives keep their hit rate.** Their reads are the held-out protein itself, so the bin is the distance to the reference, not to the HMM. Strains lose hits with identity, as uniform mutation erodes the HMM match.
+    - **Reach is low over a whole protein.** Over all pairs, `any` is .32–.58 for strains and .26–.57 for relatives. Pairs outside a domain rarely hit (under .15), and only 29–66% of pairs lie in one. Relatives' sources are drawn from all members, so some have no domain from the 40 families.
+    - **The null is quiet.** Reversed reads hit any family for .001 of pairs and none at GA.
+  - **DIAMOND.** Best hit per pair against the reference (`blastx --sensitive -k 1`): .98–1.00 of pairs have one, and their median identity follows the bin (strains 100 to 72%, relatives 100 to 77%). This is the method-independent identity for phase 1.
+  - **Crash and fix.** The first `reads` run crashed the laptop: `recall.py holdout`'s relative search joined every pool k-mer with all 295 k members at once. It now works through the pool in chunks of 500, and each `prepare.py` step runs under a watchdog that kills its process group above `--max-gb` (6 GB by default). DIAMOND's container is capped the same way, since Colima's VM can take 20 GB.
+- **Phase 1: oracle, no k-mers (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py oracle`, on phase 0's case: 16 s, 2.9 GB peak.
+  - **Method.** Every hit of a read pair, at `-E 10` and in any family, is compared with every reference GA domain of that family. Per hit, each unit takes its best domain, which must share at least 60% of the hit's columns. Per pair and family, matches are summed over the hits, and the units with the best identity are the call, with ties kept.
+  - **DIAMOND.** `prepare.py diamond` now keeps every hit within 10% of each mate's best score (`--top 10`), with coordinates and CIGAR. Per unit, DIAMOND's score is the best bitscore summed over the mates, with ties kept. *Restricted* keeps only units with a GA domain in a family the pair hits, which is the oracle's universe. It differs from all units by at most .013.
+  - **The score.** Identity over shared columns, phase 1b's choice, failed the gate on strains, 6–15 points below DIAMOND. It favours units whose domain covers only part of the read. For example, a read at 100% scored 46/48 and 47/48 on its own unit, but 48/48 and 38/38 on a partial domain. Identity over all the read's columns fixes this. A unit's missing columns then count against it, much as alignment length raises DIAMOND's bitscore.
+  - **Results.** Pairs with a hit on a family of the source:
+
+    | Identity bin | Strains: oracle right | DIAMOND | Oracle credit | DIAMOND credit | Relatives: oracle right | DIAMOND | Oracle credit | DIAMOND credit |
+    | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | 1.00 | .950 | .990 | .715 | .843 | .961 | .956 | .714 | .776 |
+    | 0.98 | .941 | .968 | .738 | .828 | .974 | .964 | .699 | .789 |
+    | 0.95 | .948 | .956 | .708 | .829 | .856 | .796 | .656 | .709 |
+    | 0.90 | .942 | .929 | .671 | .789 | .696 | .654 | .520 | .578 |
+    | 0.85 | .946 | .935 | .687 | .814 | .634 | .591 | .520 | .556 |
+    | 0.80 | .946 | .912 | .676 | .803 | .487 | .487 | .407 | .463 |
+    | 0.75 | .931 | .912 | .668 | .791 | .485 | .447 | .427 | .424 |
+    | 0.70 | .927 | .894 | .707 | .818 | .310 | .337 | .238 | .330 |
+    | 0.60 | | | | | .351 | .312 | .286 | .294 |
+
+    - **The gate passes on `right`.** Strains are at most .040 below DIAMOND (at 100%). Relatives are level with it or above, at every bin.
+    - **The oracle ties more.** It averages 2–5 tied units against DIAMOND's 1.1–2.1, since it sees only the domain's columns, not the rest of the read. So its credit is .09–.13 lower on strains and up to .09 lower on relatives. Phase 1b's likelihood-ratio tie-break, or extending past the domain (phase 4), are the ways to recover it.
+    - **Candidates are almost complete.** The truth unit qualifies on .96–1.00 of pairs. The pairs lost are those where its domain doesn't cover the read's columns.
+    - **Real relatives are the hard case.** Right falls from .96 at 100% to .49 at 80% and .31–.35 below that, for DIAMOND as much as for the oracle. A single read pair rarely separates a novel unit's nearest relative from its neighbours. Reads at GA alone change little (`right_ga` in `oracle.tsv`).
+  - **Alignment agreement (step 3).** For 10,427 ORF hits that DIAMOND also aligns to the truth protein, the residue pairs the two HMM alignments imply match DIAMOND's for 97.6–99.2% of residues. In each bin, 80–91% of hits agree completely, with no trend in identity, so the shared template loses little.
+  - **Other findings.**
+    - Short repeat families, such as PF12661 (22 columns), lose the most. Reads carry several overlapping domain hits, some of only 2–7 columns with scores below zero, and the copies of the repeat in the reference are often below GA.
+    - With the shared-column score, 48 of 633 misses at 80% and above (8%) fell only on a reference domain below GA. Phase 4's weak-domain arm covers them.
+- **Phase 2: column seeds (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py seeds`, on the pairs with a hit on a family of their source: 30 s, 1.8 GB peak.
+  - **Method.**
+    - **Index:** per family and shape, sorted postings of (seed, residues, unit), merged by unit and held in memory. Smaller s keeps only seeds whose first column is a multiple of s.
+    - **Query:** a pair uses every seed of all its hits in the family. A unit is a candidate with at least h distinct matching seeds.
+    - **Scoring:** candidates are scored as in the oracle, so *kept* is the share of the oracle's right pairs that stay right, and *share* is candidates over the family's units (median per pair).
+    - **Sets:** strains are the known-unit reads, relatives the novel-unit ones. *Large* families have at least 1,500 units: 9 of the 40, the largest 3,090.
+  - **Results.** Selected arms; all 48 are in `seeds.tsv`.
+
+    | Arm | s | h | Postings per unit | Strains: kept | Strains: share | Large: kept | Large: share | Relatives: kept | Relatives: share | Large: kept | Large: share |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | k 5 | 1 | 1 | 105 | .996 | 8.0% | .997 | 6.0% | .996 | 11.8% | .995 | 8.8% |
+    | k 5 | 2 | 2 | 53 | .971 | 2.0% | .965 | 0.9% | .979 | 2.6% | .981 | 1.5% |
+    | k 6 | 1 | 2 | 105 | .968 | 2.1% | .960 | 1.0% | .980 | 2.9% | .982 | 1.6% |
+    | k 6 | 4 | 1 | 26 | .947 | 1.9% | .940 | 0.9% | .971 | 2.7% | .969 | 1.6% |
+    | k 8 | 1 | 1 | 103 | .925 | 1.0% | .916 | 0.4% | .962 | 1.5% | .961 | 0.7% |
+    | `1101011` | 2 | 2 | 51 | .965 | 1.4% | .958 | 0.6% | .978 | 1.9% | .977 | 1.0% |
+    | `11010010011` | 1 | 2 | 97 | .965 | 1.1% | .964 | 0.4% | .969 | 1.5% | .967 | 0.7% |
+    | Greedy k 4 | 1 | 1 | 15 | .933 | 6.1% | .930 | 5.1% | .983 | 9.7% | .986 | 8.6% |
+    | Murphy-10 k 8 | 2 | 2 | 49 | .903 | 1.4% | .883 | 0.4% | .968 | 2.3% | .967 | 1.0% |
+
+    - **The gate passes in large families, not over all of them.** In large families, contiguous k 5 or k 6, and both spaced shapes, keep at least .95 at no more than 1% for strains, with relatives far inside their 10%. Over all families, the best strains arm is just above 1% (`11010010011`, s 1, h 2: .965 at 1.1%). The gate only has to hold where brute force is too slow, so it passes.
+    - **Novel reads narrow as well as known ones.** Relatives keep more than strains at a similar share. This differs from phase 1b, where novel windows were the hard case. Here, relatives' reads are the held-out protein itself, so they have no sequencing divergence, while strains are mutated to 70%. Strains at 70–80% are the weak point.
+    - **Two shared seeds beat a longer k.** At half the postings, k 5 or `1101011` at s 2 and h 2 keep 4–5 points more on strains than k 8 at h 1 (.965–.971 against .925), for a little more share (1.4–2.0% against 1.0%).
+    - **Greedy columns and Murphy-10 don't help.** Greedy seeds are 7× smaller, but at .93 kept on strains they narrow only to 6%. Murphy-10 is worse than the full alphabet at the same k, s and h.
+  - **Speed.** Brute force costs about 63 ns per reference domain per hit, so 0.25 ms per hit in the median family here. A seed lookup costs about 0.02 ms per hit, mostly Python overhead.
+    - Scoring the candidates costs brute force times their share, so seeds pay off above about 330 domain rows (about 100–150 units).
+    - With the chosen arms, unit assignment is 7.5–8× faster than brute force overall, and 12–14× faster in large families. The gain grows with family size, since the share falls (phase 1b). At release-sized families of millions of units, brute force is about 60 ms per million domains per hit, against a lookup plus 1% of that.
+  - **Limits.** Families here have at most 3,090 units, so the share at release sizes is extrapolated. The postings are per unit, not per protein. Reads have the simulator's 0.2% sequencing errors, but no real ORF calling.
+- **Anchoring ablation (2026-11-08, the user's question).** `anchor.py seeds --unanchored`: the same seeds, read off the same HMM alignments, but keyed by residues only, so a seed matches at any column of its family. Recall (kept) is unchanged to .001 for every arm. Candidate share is unchanged for k ≥ 6 and spaced `11010010011`, and for every arm at h 2. It grows slightly for short seeds at h 1: k 5 s 1, 8.0% to 8.8%; `1101011` s 1, 9.2% to 10.1%. Postings fall by under 0.2%. So within a family, the column in the key adds almost nothing. A 5-residue seed rarely recurs at another column of the same family, so the narrowing comes from restricting to the read's family, and from reading seeds off match columns (insertions dropped). Still unmeasured: a pooled index across families, which would show what the family restriction itself is worth, and short seeds (k ≤ 4) or the largest families, where the column may matter more.
+- **Anchor residues as the first check (2026-11-08, the user's suggestion).** `anchor.py anchors`: no k-mers. For each read pair and family, take the n most informative columns the pair covers, and count each unit's matches there (its best domain). Keep the top q of units by that count, with ties at the cut, then score them as in the oracle. Columns are ranked per family by entropy across units, by entropy per bit of retention lost (phase 1b's "efficient"), or at random. 20 s, 1.0 GB. *Kept* and *share* are as in phase 2, over all 40 families.
+
+  | Columns | Keep | Strains: kept | Strains: share | Relatives: kept | Relatives: share |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | Entropy, 8 | 1% | .995 | 2.1% | .969 | 2.0% |
+  | Entropy, 16 | 0.5% | .996 | 0.8% | .978 | 0.8% |
+  | Entropy, 16 | 1% | .999 | 1.6% | .989 | 1.6% |
+  | Entropy, 24 | 0.5% | .996 | 0.7% | .989 | 0.7% |
+  | Efficient, 16 | 1% | .991 | 1.9% | .981 | 1.8% |
+  | Random, 16 | 1% | .995 | 1.8% | .973 | 1.7% |
+  | Seeds `1101011`, s 2, h 2 (phase 2) | | .965 | 1.4% | .978 | 1.9% |
+  | Seeds `11010010011`, s 1, h 2 (phase 2) | | .965 | 1.1% | .969 | 1.5% |
+
+  - **Better than seeds at the same share.** Entropy-ranked anchors keep .99–1.00 of strains' right calls at under 1% of the family, where the best seeds keep .965 at 1.1%. This passes phase 2's gate over all 40 families, not only the large ones. Ranking by count adapts to each read, while seeds need exact runs of matching residues.
+  - **Entropy beats the retention-adjusted rank.** The efficient rank is no better than random, so retention isn't worth trading for here.
+  - **Cost is linear in family size, but small.** The check reads n bytes per unit, laid out column-major. It took 0.02–0.03 ms per hit in NumPy, against 0.3–0.6 ms for brute force, on the three largest families. Part of the gain is one row per unit against every domain. The timing used each unit's first domain, while recall used the best, so the two differ slightly.
+  - **Release scale is estimated, not measured.** At 3 M units, 16 bytes per unit is about 48 MB per hit, or a few ms at memory bandwidth. Bitsets per (column, residue) would cut that to 2 bytes per unit. Seeds stay sublinear, so they may still be the first step for the very largest families.
+- **Anchor residues chosen for phase 3; kfpfam's optimisations mapped (2026-11-08, the user's request).** Phase 3 takes anchor residues as its first stage, in place of column seeds. "Speed: what carries over from kfpfam" lists which of kfpfam's speed-ups apply: the model-side join, L2 tiles, u16 indices, NEON byte compares with a scalar oracle, and fewer read hits through the `top` frame. Nothing built yet.
+- **Tree index as the unanchored route (2026-11-08, the user's decision).** The tree index is no longer a phase 3 baseline. It takes reads with no Pfam hit, and the anchored route takes reads with one; both hand off to `kfp-pileup` in the same format. See "Two routes".
+- **Phase 3: the anchored route against DIAMOND (2026-11-08, the user's request).** `workflows/pfam-anchor/anchor.py query`, then `compare`.
+  - **The route.** Per read pair and family hit (every hit at `-E 10`), stage 1 keeps the top 1% of units by matches at the read's 16 highest-entropy columns. Stage 2 is column identity over the read's columns on those units. The pair's call is its best units over all its families, with ties kept.
+  - **Outputs.** Per read set, `anchored.parquet` holds read, family, matches, columns, identity, tied units, near units (within .02), whether a GA hit carries the call, and the candidates. The handoff is in `kfp-pileup reference`'s format, as tree-index tier 2 writes it: `ref.fa`, `refs.tsv`, `molecule.txt`, `assignments.parquet` (weight split over tied units) and the called reads. The same run on reversed reads gives the null.
+  - **The bar.** Reversed reads are called for 9 of 10,146 and 10 of 11,953 pairs (.001) with no score cut, so the bar is 0 matches. Precision against chance hits isn't the limit at this database size (see "Two local limits").
+  - **Results.** Right on pairs with a hit on a family of their source, anchored against DIAMOND over all units:
+
+    | Identity bin | Strains: anchored | DIAMOND | Relatives: anchored | DIAMOND |
+    | ---: | ---: | ---: | ---: | ---: |
+    | 1.00 | .949 | .990 | .961 | .956 |
+    | 0.98 | .939 | .968 | .976 | .964 |
+    | 0.95 | .948 | .956 | .855 | .796 |
+    | 0.90 | .940 | .929 | .694 | .648 |
+    | 0.85 | .946 | .935 | .634 | .602 |
+    | 0.80 | .942 | .912 | .479 | .474 |
+    | 0.75 | .931 | .912 | .466 | .440 |
+    | 0.70 | .927 | .894 | .310 | .333 |
+    | 0.60 | | | .328 | .306 |
+
+    - **Recall passes.** The largest deficit is .041, for strains at 100%. From 90% down the anchored route matches or beats DIAMOND, except relatives at 70% (−.023). These are within .002 of phase 1's oracle, so the anchor stage loses almost nothing.
+    - **Credit is lower,** .67–.74 against .79–.84 for strains, from ties, as in phase 1.
+    - **Precision of calls** (right among called pairs) is .92–.95 for strains against DIAMOND's .92–.98. For relatives it is level with DIAMOND, .30–.97 by bin.
+    - **Reach is the large gap.** Over all pairs, the anchored route is right for .30–.55 of strains, and DIAMOND for .91–.98. Of DIAMOND's right calls, 42–69% are on pairs with no hit on a family of their source, so beyond this route. That is what the unanchored route is for ("Two routes"). Here it is also inflated by having only 40 families annotated.
+  - **Speed.**
+    - **Anchored route:** 0.15–0.16 ms per read pair over all pairs, on one thread in NumPy, plus 1.1 s to lay out the 40 families.
+    - **DIAMOND:** `blastx --sensitive --top 10` on 4 threads took 45.8 and 48.6 s, so 15.3 and 19.2 core-ms per pair. That is 95–130× slower than the unit-assignment step.
+    - **With the Pfam search,** at kfpfam's 0.53 core-ms per read, the route is about 0.7 core-ms per pair, still 20–27× faster.
+    - **Caveat:** the DIAMOND image is x86_64 under emulation on Apple silicon, which inflates its time by an unmeasured factor. The ≥ 10× gate holds unless emulation costs more than 2–3× once the Pfam search is included, or about 10× without it. The HPC run (phase 5) settles it natively.
+  - **Limits.**
+    - Read hits come from `hmmsearch` with the 40 HMMs, not full Pfam-A or kfpfam's recruitment.
+    - The reference has 40 families, at most 3,090 units each.
+    - The handoff's targets are every member of a called unit: 94,468 proteins for strains and 72,581 for relatives. That is most of the reference at this size, so representatives only, or the members whose domains won, would be the lighter choice for the pileup.
+- **Phase 4: the anchored route's coverage arms (2026-11-08, the user's request).** `prepare.py nullref` and `prepare.py recruit`, then `anchor.py query`/`compare` with `--hits` and `--ref`. Each arm takes about 10 s.
+  - **Weak hits, read side.**
+    - `prepare.py recruit` runs kfpfam's recruitment unchanged on each read set's ORFs. `pairs.py` runs in kfpfam's pyhmmer container against the 40 HMMs, on the ORFs and on them reversed, then `recruit.py run`. It took 12 s for both sets.
+    - It kept 3,170 GA loci and 3,410 recruited ones (2 sets) for strains, and 3,015 and 2,386 for relatives. Every confirmed family had a GA read, so no family was confirmed from weak evidence.
+  - **Weak hits, reference side.** `prepare.py nullref` searches the reversed mini-slice, as pfam-reannotate's null arm does. It found 1,868 domains, none at GA, against about 108 k real domains below GA. The bar for 5% FDR among weak domains is therefore below every domain at `-E 10`, so `--ref weak` takes all of them. In a family-complete slice, almost all weak domains are real members below GA.
+  - **Results.** Weighted over identity bins. *Called* and *right* are over all pairs, *right on hit* over pairs with a hit on a family of their source. DIAMOND's right on those pairs is .942 for strains and .631 for relatives.
+
+    | Read hits / reference | Strains: called | Right | Right on hit | Precision | Relatives: called | Right | Right on hit | Precision | Handoff targets (strains) |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | GA hits only / GA | .228 | .221 | .509 | .968 | .245 | .156 | .397 | .637 | 4,378 |
+    | All `hmmsearch` hits / GA (phase 3) | .435 | .408 | .941 | .938 | .405 | .263 | .656 | .650 | 7,704 |
+    | Recruited / GA | .437 | .412 | .946 | .942 | .406 | .266 | .661 | .655 | 7,894 |
+    | All `hmmsearch` hits / weak | .435 | .416 | .958 | .955 | .405 | .266 | .654 | .658 | 7,632 |
+    | All `hmmsearch` hits / representatives | .435 | .316 | .728 | .725 | .405 | .197 | .497 | .486 | 4,250 |
+    | Recruited, top only / weak | .437 | .419 | .961 | .958 | .406 | .271 | .662 | .667 | 7,727 |
+
+    - **Weak read hits nearly double the right calls.** With them, strains go from .221 to .408–.419 right over all pairs. By status, strains' recruited calls are .919 precise against .963 for GA calls (DIAMOND .928 and .953 on the same pairs). Relatives' are .660 against .652. So weak hits add right calls far beyond the wrong ones.
+    - **Recruitment matches all `hmmsearch` hits on calls, with slightly better precision,** and it settles competing frames. `top` only is identical here, because recruitment made only 2 sets. The reversed reads have no recruitment run of their own, so these arms' null is 0.
+    - **Weak reference domains add 1.7 points on strains** (.941 to .958 right on hit) and nothing on relatives.
+    - **Representatives alone lose 16–21 points.** 12% of units with a domain have none on the representative (sizing), and members carry the variants reads match. The reference needs members.
+    - **The best arm, recruited top with weak reference domains, beats DIAMOND on reads with a hit:** .961 against .942 for strains, .662 against .631 for relatives.
+  - **The handoff is trimmed.** Targets are each called unit's winning proteins plus its representative: 7,727 proteins for strains, against 94,468 when every member was a target. Neighbours are up to 5 near units per family by representative, and each assignment sits on its winning protein.
+  - **The route is settled:** kfpfam's recruited hits with `top = 1`, reference GA and weak domains of every member, anchor residues, then column identity. The route's code defaults are still `--hits hmmsearch --ref ga`, so that earlier outputs keep their names.
+  - **Not done in phase 4.** Extending past the domain. Every read through both routes, with the tree index, which comes next.
+- **Alignments from the pseudo-alignment (2026-11-08, the user's question).** `anchor.py align`, on the settled route's hits (kfpfam's recruited top, GA and weak member domains). There are 13,732 ORF hits that DIAMOND also aligns to the truth protein, built in 1.0 s, about 12 µs each.
+
+  | Stage | ORF residues aligned | Placed as DIAMOND places them | DIAMOND's pairs reproduced |
+  | --- | ---: | ---: | ---: |
+  | Implied by HMM columns | 78–86% | 98.1–99.3% | 79–87% |
+  | + filled between pairs | 79–87% | 98.0–99.3% | 80–88% |
+  | + ungapped X-drop extension (X = 15) | 95–98% | 97.9–99.3% | 96–98% |
+  | DIAMOND (`--sensitive`) | 96–98% | | |
+
+  - Ranges are over identity bins for both read sets, with no trend in identity.
+  - DP between pairs was needed for 0–2.4% of hits.
+  - See "From pseudo-alignment to alignment, and the pileup as the MSA" for what follows: the route writes `kfp-pileup call`'s DIAMOND lines itself, and the pileup needs no separate MSA.
+- **Phase 4b: the route's alignments into `kfp-pileup call` (2026-11-08, the user's request).** `anchor.py lines` writes `call`'s DIAMOND fields from the route's own alignments (`build_alignment`), per mate, for every tied unit's winning protein and the near units' neighbour sequences. `anchor.py pileup` runs DIAMOND on the same handoff as the pileup workflow runs it (`blastx --top 10 -F 15 --sensitive`), and `call` on both sets of lines. `anchor.py pileupcmp` compares them, and `variant_truth` checks strains' variants on their own source protein against the strain's residue.
+  - **`call` accepts the lines.** It runs end to end on them, through posteriors, EM, pileups, variants, the nucleotide pileup and the consensus. There are 0 codon mismatches, against 150 with DIAMOND's lines.
+    - **Writing them:** 1.3 s for 20,187 strains lines, and 0.9 s for relatives.
+    - **`call` on them:** 5.9 and 3.3 s, against 15.6 and 8.6 s on DIAMOND's lines, which have 3–6× more alignments.
+    - The coordinate conventions were checked against DIAMOND's own lines: reverse-strand `qstart` is the higher base, and `qframe` = −((L − qstart) mod 3 + 1).
+  - **Results, strains.** Relatives are in `pileup_compare*.tsv` and agree in direction. *Right* is a mate's best unit by `call`'s EM posterior being the truth unit. *Variants true* is the share of variants on a strain's own source protein whose alt is the strain's residue.
+
+    | Lines | Mates kept | Same best unit as DIAMOND | Right | Same consensus (depth ≥ 3) | Depth corr. | Abundance corr. | Variants (shared) | Variants true |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND | 8,727 | | .798 | | | | 1,355 | .887 |
+    | Anchored, tied and near units | 5,883 | .811 | .794 | .994 | .769 | .882 | 2,329 (745) | .792 |
+    | The same, before extension | 5,908 | .793 | .769 | .996 | .758 | .809 | 1,902 (629) | .808 |
+    | + 10 competitors per mate | 5,938 | .845 | .751 | .995 | .929 | .902 | 1,083 (773) | .805 |
+    | + 30 competitors per mate | 5,948 | .867 | .751 | .995 | .929 | .906 | 1,058 (773) | .805 |
+
+    - **Consensus agrees** on 99.4–99.8% of deep columns in every arm.
+    - **Calls are as right as DIAMOND's** with tied and near units only (.794 against .798). The pileup differs, though. Each read's weight sits on its tied winners, so more columns reach `call`'s depth 3. That gives 1.7× the variants, mostly at columns where DIAMOND's depth is under 2.
+    - **Extension isn't the problem.** Stopping before it changes variant truth by only .016, and it loses right calls.
+    - **Competitors are what DIAMOND's `--top 10` provides:** alignments to every similar target. These are the reference sequences of the call's family with the most matches on the read's implied pairs. With 10 of them, depth and abundance correlate with DIAMOND's at .93 and .90, and the variant count falls to 1,083, 773 of them shared. Right drops to .751, because weight now spreads over near-identical units, much as DIAMOND's does. 30 add nothing over 10.
+    - **The gap left is mates.** DIAMOND aligns 8,727 mates; the route aligns only those with their own hit in the call's family, about 5,900. The other mate of a called pair is usually coding sequence of the same protein outside the domain, or a hit too weak for recruitment. It is placed by the pair: the fragment puts it about 100–120 residues from its mate's alignment. A banded local alignment of its ORFs against that window of the called proteins would rescue it. This is phase 4's "extending past the domain", and it is likely why variant truth stays at .805 against .887: fewer correct reads dilute wrong residues less.
+  - **Next (superseded the same day).** Not mate rescue: every read is mapped to the confirmed units instead ("Confirm, then map every read").
+- **Confirm, then map every read (2026-11-08, the user's decision).** Unit calls from the anchored route confirm units. Every read is then aligned to the confirmed units' targets, with multiple alignments kept and resolved by `kfp-pileup call`'s posteriors and EM before the pileups. The mapper is the open choice: DIAMOND, or the tree index's tier 2 directly, or tier 1 then tier 2. See "Confirm, then map every read".
+- **Confirm, then map every read: first measurements (2026-11-08, the user's request).** `anchor.py confirm`, `mapall`, `mapcmp`, `treeindex` and `mapscore`, on the settled route's calls.
+  - **Confirmation should be liberal.** Each called pair's weight is split over its tied units, and a unit is confirmed above a total weight.
+    - A false unit costs one more target, which the gather sorts out; a missed unit loses every read it has. So the threshold is set by recall.
+    - | Weight | Strains: confirmed | Recall | Precision | Pairs whose unit is confirmed | Relatives: recall | Pairs |
+      | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+      | 2 | 832 | .462 | .879 | .626 | .325 | .403 |
+      | 1 | 1,405 | .680 | .766 | .788 | .483 | .540 |
+      | 0.1 | 2,988 | .802 | .424 | .865 | .596 | .642 |
+    - Taking 0.1, the confirmed reference has 6,762 targets (3 members per unit) for strains and 6,025 for relatives. Units with no anchored call (288 of 1,582 present for strains) need the unanchored route.
+  - **DIAMOND then `call` on every read (weight 0.1).**
+    - Strains: .728 of mates mapped and .571 right, against .672 and .546 at weight 1. Variants on strains' own proteins are .890 true, above phase 4b's .805 and level with DIAMOND's .887 there.
+    - Mates with no Pfam hit are now mapped: .649 mapped and .527 right.
+    - `call`'s `--min-identity 0.7` drops divergent mates: mapped falls from .86 at 100% to .36 at 70%, where DIAMOND on the whole reference keeps .88–.89. At 0.5, .829 mapped and .627 right, but precision falls (.756 against .784) and variant truth too (.846).
+  - **The mapper, pair level, before the gather.** All mappers use the same confirmed reference, at the tree index's 1% decoy bar.
+
+    | Mapper | Strains: called | Right | Precision | Right, no Pfam hit | Relatives: right | Precision | Time per set (s) |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND (`--sensitive --top 10 -F 15`, emulated x86) | .939 | .756 | .805 | .688 | .483 | .534 | 5.4–6.5 |
+    | Tier 1 (`query.py`, `verify.py`) | .410 | .294 | .718 | .222 | .267 | .571 | 5.4–5.9 |
+    | Tier 1, then tier 2 | .890 | .714 | .802 | .647 | .471 | .543 | 12.9–15.1 |
+    | Tier 2 alone (`tier2.py --all-leaves`) | .917 | .751 | .820 | .684 | .482 | .552 | 5.9–10.7, plus 3.3 to build |
+
+    - **Use tier 2 straight away; tier 1 adds nothing here.** On a reference this small, tier 2 alone matches DIAMOND's right calls (.751 against .756, .482 against .483) at slightly better precision. Tier 1 first is worse (.714) and slower. Tier 1's sparse keys seed only a share of a strain's reads (.410 called), and tier 2's dense routing already covers every read.
+    - `tier2.py --all-leaves`, added for this, makes every leaf a candidate and doesn't read tier 1's output.
+    - Tier 1 keeps its place where the reference is the whole release: the unanchored route, before anything is confirmed.
+    - **Tier 2 scores, but writes no alignments.** The pileup still needs alignments (`call`'s DIAMOND lines), so tier 2 as the mapper would mean either an aligner after it on its calls, or tier 2 writing BTOP from its two-stage alignment. DIAMOND alone does both in one pass. At this size the two take similar time (DIAMOND emulated), so tier 2 pays only if it writes its alignments.
+  - **What limits right calls now is confirmation,** not the mapper: .865 of strain pairs and .642 of relative pairs have their unit confirmed. The unanchored route, the tree index on the whole reference, is what adds the rest.
+  - **Next.**
+    - Tier 2 writing `call`'s DIAMOND lines from its alignments, so the tree index replaces DIAMOND end to end.
+    - The unanchored route's confirmations, alongside the anchored ones.
+    - The gather (`call`'s EM) scored on reads mapped by each mapper.
+- **Tier 2 as a pseudo-alignment, then a full alignment (2026-11-08, the user's question).** `anchor.py seedalign` and `seedlines`, on the confirmed reference at weight 0.1.
+  - **The method.** Per mate and routed protein: exact 4-mer seeds over the mate's stop-free frame stretches; seeds within 8 diagonals of the best-supported one; the longest chain increasing in both sequences (patience sort, with pairs sorted by read position, then protein position descending); then `build_alignment` as in the anchored route.
+  - **Against DIAMOND,** on its lines to proteins tier 2 alone routed the pair to (frameshifted lines skipped). Coverage is over DIAMOND's aligned length.
+
+    | Lines | Count | Found | Seeds | + filled | + extended | Precision | Recall |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Strains, pair with a Pfam hit | 39,112 | 1.000 | 77% | 91% | 99.8% | .998 | .993 |
+    | Strains, no Pfam hit | 31,217 | .998 | 69% | 87% | 99.5% | .997 | .987 |
+    | Relatives, with a hit | 20,104 | .999 | 86% | 94% | 99.7% | .997 | .989 |
+    | Relatives, no hit | 21,293 | .999 | 78% | 88% | 98.6% | .997 | .980 |
+
+    That is about 85 µs per line in Python. It is closer to DIAMOND than the HMM-anchored alignments were (98–99%), since DIAMOND also seeds and extends.
+  - **End to end.** `seedlines` writes the lines for every mate against every protein of the pair's routed leaves: 87,698 lines for strains in 8.1 s and 53,133 for relatives in 5.2 s, in Python on one thread. Then `call` runs on them, with 0 codon mismatches.
+
+    | Mapper, then `call` | Strains: mapped | Right | Precision | Right, no Pfam hit | Variants (true) | Relatives: right | Precision |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | DIAMOND | .728 | .571 | .784 | .527 | 6,385 (.890) | .378 | .600 |
+    | DIAMOND, `call --min-identity 0.5` | .829 | .627 | .756 | .588 | 10,327 (.846) | .409 | .534 |
+    | Tier 2 routing, then seed alignments | .797 | .620 | .778 | .569 | 6,981 (.895) | .405 | .581 |
+
+    - **Tier 2 as the mapper beats DIAMOND on right calls** (.620 against .571, .405 against .378), at nearly its precision and slightly better variant truth.
+    - It maps more mates, because a routed protein is always aligned, while DIAMOND's `--sensitive` stops at an e-value of 0.001 on short reads.
+    - It matches DIAMOND at `--min-identity 0.5` on right calls, without that arm's loss of precision and variant truth.
+  - **The mapper is settled:** tier 2 alone (dense routing), then seed alignments, then `call`. Tier 1 stays for the unanchored route on the whole release.
+  - **Next.**
+    - Port the seed chain and alignment into `_core.pseudo_align`, returning coordinates and BTOP; it computes the diagonal bands already.
+    - The unanchored route's confirmations.
+    - Scoring the gather and pileups against the truth across mappers. Done here only through `call`'s best units and variants.
+- **Seed alignment ported to Rust (2026-11-08, the user's request).** `crates/core/src/seedalign.rs` (`kfp::seed_align`), exposed as `_core.seed_align`; `anchor.py seedlines --engine rust` (the default) uses it, and `--engine python` keeps the oracle.
+  - **What it does.** Each mate's six frames are joined by stops, as `_core.translate_frames` makes them. Per (mate, target): exact k-mer seeds per stop-free stretch, the best diagonal ± 8, the patience-sort chain, then fill (diagonal, else affine global DP at DIAMOND's 11/1) and X-drop extension. The stretch with the longest chain wins. It returns residue ranges, the raw score and BTOP. Pairs sorted by target index each target once, in parallel over threads.
+  - **Tests.** 4 Rust unit tests: exact match, substitution and indel BTOP, stretch choice and offset, DP gap placement.
+  - **Against the oracle.** 70,314 of 70,335 mate-1 lines are identical across both read sets. The 21 that differ have the same score and place a gap differently on a DP tie: Biopython counts a gap's first residue as the open (−11), DIAMOND's convention as 11 + g.
+  - **Speed.** 87,698 strains lines in 0.52 s against 8.1 s in Python, and 53,133 for relatives in 0.35 s against 5.2 s. That is about 6 µs per line on 4 threads, including Python's per-line formatting.
+- **The unanchored route's confirmations (2026-11-08, the user's request).** `anchor.py unanchored`: the tree index's standard tier on the whole reference (293,136 proteins).
+  - **Build.** `partition.py` makes 8 parts of 13–42 k proteins, then `build.py` builds them one at a time (4.4 GB peak per part, 3–20 s each), then `merge.py` and `store.py`.
+  - **Search.** Each read set runs through tier 1 (`query.py --decoy`, `verify.py`, 9 s) and tier 2 routed by tier 1 (43–67 s). The whole run took 3.7 minutes, at a 4.8 GB peak.
+  - **Present units:** the units of tier 2's present leaves (`cand_verify_0.01`). `confirm --with-unanchored` adds them to the anchored route's confirmations.
+
+    | Units present, recall (precision) | Anchored (weight 0.1) | Unanchored | Union |
+    | --- | ---: | ---: | ---: |
+    | Strains (1,582) | .802 (.424) | .836 (.250) | .942 (.257) |
+    | Relatives (1,481) | .596 (.311) | .758 (.222) | .860 (.215) |
+
+  - **Every read mapped to the union's targets.** 11,603 targets for strains and 11,759 for relatives, against 6–7 k before. Mates whose best unit by `call`'s EM is the truth unit:
+
+    | Mapper, then `call` | Strains: anchored only | Union | No Pfam hit: anchored only | Union | Relatives: anchored only | Union | No Pfam hit: anchored only | Union |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    | Tier 2 + seed alignment | .620 | .670 | .570 | .662 | .405 | .550 | .355 | .598 |
+    | DIAMOND | .571 | .610 | .527 | .604 | .378 | .518 | .334 | .562 |
+
+    - **The two routes together confirm most present units,** and their targets lift right calls most for reads with no Pfam hit. Precision is the same or a little better (strains .782, relatives .634).
+    - **Tier 2 + seed alignment stays ahead of DIAMOND** on the larger reference: 153,437 lines in 0.88 s, plus tier 2 alone in 12 s, against DIAMOND's 8.6 s (emulated).
+    - The unanchored route's precision (.22–.25) costs little, because the gather sorts out extra targets.
+- **The gather and pileups against the truth (2026-11-08, the user's request).** `anchor.py truthscore`, per `call` arm, on the union reference.
+  - **Gather.** Per unit: `call`'s EM pairs (`em_pairs`) and its posterior sum before the EM (`reads`), against the true depth.
+
+    | Strains, tier 2 + seed alignment | Before the EM | After the EM |
+    | --- | ---: | ---: |
+    | Pairs on true units | .778 | .896 |
+    | True units with at least half a pair | .914 | .313 |
+    | False units with at least half a pair | ~1,100–1,300 | 139 |
+    | Spearman with true depth | .599 | .330 |
+
+    Relatives: .633 against .725 on true units, .799 against .321 of true units kept, Spearman .393 against .246. DIAMOND as the mapper gives the same picture.
+    - **`call`'s EM is too sparse at this depth.** It moves pairs onto true units, but drops two thirds of true units below half a pair. Most strains here have a handful of pairs (depth drawn lognormal, μ 0.3, σ 0.6).
+    - The posteriors before the EM keep 91% of true units, at about ten times the false units.
+    - So abundance from the EM needs work before it can be trusted for low-depth units: a weaker sparsity, a floor, or reporting both stages. That is `kfp-pileup`'s EM (refine steps 8–9), not this route. Not changed here.
+  - **Pileups (strains),** on targets that are a strain's own source protein, columns with depth at least 3:
+    - **Consensus is the strain's residue** at .992 of covered columns where the strain differs from the reference (2,082 columns with tier 2 + seed alignment), and .9998–1.000 elsewhere.
+    - **Variant recall** at those columns is .998, and **variants true** (precision) .894 (DIAMOND .988, .998 and .887).
+    - Pileup columns are 0-based, while `variants.tsv`'s `pos` is 1-based.
+  - **Truth-scoring caveats.**
+    - `truth.tsv`'s own `unit` column is the simulator's target, a protein. The truth unit is in `truth.parquet`.
+    - Relatives' "true depth" is the held-out protein's, credited to its nearest remaining relative's unit, which may not be the unit its reads best fit.
+- **The EM (2026-11-08, the user's request).** The gather's apparent sparsity was mostly the components I gave `call`, not its EM.
+  - **How `call`'s EM works** (`kfp_pileup.refine`, step 8). Each read pair's sources are the units it aligns to, plus its component's novel class: a relative missing from the reference, with divergence in [0.1, 0.5]. Units' divergence is in [0.005, 0.1].
+  - **What went wrong.** My handoff set each unit's component to its Pfam family. One novel class then pooled every divergent read in a family of thousands of units, and outbid low-depth units even for reads 95–98% identical to them.
+    - Strains, family components: at 95% identity, 65% of reads went to the novel class; at 98%, 25%; at 100%, 11%.
+    - Below 90%, 94–100% went novel, which is right, since those strains are more than 10% from any unit.
+  - **Arms**, on the union reference, `call` on the same tier 2 seed-alignment lines.
+
+    | Component | Strains ≥ 95%: novel share | Units with ≥ 0.5 EM pairs | Their group | Relatives ≥ 95%: units | Group |
+    | --- | ---: | ---: | ---: | ---: | ---: |
+    | Pfam family (before) | .11–.65 | .679 | .789 | .627 | .705 |
+    | One per unit | .03–.10 | .861 | .960 | .893 | .962 |
+    | Tree-index layer group | .04–.15 | .836 | .949 | .885 | .960 |
+
+    - Before the EM, .966 of close units and .984 of their groups hold half a pair. So after the right components the EM loses little, and what it loses at unit level is mostly near-identical units sharing one group's reads. Abundance should be read per group.
+    - The cost: more false units with half a pair (strains 139 to 256, relatives 352 to 768). Divergent reads now go to near units rather than one family-wide novel pool. The share of EM pairs on true units falls slightly, from .896 to .871.
+  - **Chosen: tree-index layer groups,** which is what tree-index tier 2's own handoff uses. `treeindex` now rewrites the confirmed reference's `refs.tsv` with the groups (`regroup`), keeping the family as `family`. Union reference, tier 2 + seed alignment:
+    - true units with half an EM pair .313 to .453, overall;
+    - Spearman with true depth .330 to .431 (strains) and .246 to .311 (relatives);
+    - read calls and pileups unchanged (.673 and .550 right; consensus .992 at variant columns).
+  - **`kfp-pileup` itself is unchanged.** Its EM is fine when components are small groups of near units, as kfp's profile components and tier 2's groups are. A family as the component is outside what it assumes. A check there for very large components could warn about this.
+- **Phase 5 started (2026-11-08): outside tools made portable.** `prepare.tool` wraps `hmmsearch`, DIAMOND and kfpfam's pyhmmer for `--runtime docker|singularity|none` (both scripts), mounting the data directory at the same path, with absolute paths throughout. Locally (Docker) it reproduces the earlier DIAMOND mapping exactly. **Still to do:** `workflows/pfam-anchor/main.nf` (one process per stage, `slurm`, `singularity` and `test` profiles), `hpc/kfp-ablations/pfam-anchor/run.sh` for the tree-index slice, the sizing step on pfam-reannotate's 1-in-100 output, and a local `-profile test` run on `tests/data/mini_reannotate` (without recruitment: kfpfam's models don't know the fixture's accessions).
+
+- **Phase 5 workflow (2026-11-09): `workflows/pfam-anchor/main.nf` runs end to end.** It has one process per stage: fixture, annotate, nullref, reads, search, recruit, DIAMOND, report, oracle, anchored, compare, unanchored, confirm, tree, seedlines, mapall and score. The stages share the scripts' data directory and pass a token between them. Profiles: `slurm`, `singularity`/`docker` (which set `--runtime`), `test` (pfam-reannotate's fixture, no recruitment) and `laptop`. `hpc/kfp-ablations/pfam-anchor/run.sh` runs it on the tree-index slice, with recruitment only when `KFPFAM` is set. `-profile test,laptop` passes all 16 tasks locally. Fixes it needed:
+  - `confirm` reads the route's own tag;
+  - `annotate` takes an unzipped HMM file;
+  - the holdout pool and the strain count are capped at what the reference holds;
+  - `oracle_calls` is typed, because a set can have no rows.
+  **Still to do:** the sizing step on pfam-reannotate's 1-in-100 output, and the user's run on the slice.

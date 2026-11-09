@@ -16,6 +16,7 @@ mod kmers;
 mod packed;
 mod pseudo;
 mod route;
+mod seedalign;
 mod translate;
 mod tree;
 
@@ -39,6 +40,7 @@ pub use pseudo::{
     pseudo_scores, route_votes, sketch_sizes,
 };
 pub use route::{RouteHits, route_hits};
+pub use seedalign::{SeedAlignment, SeedParams, seed_align};
 pub use translate::{
     EDGES_MIN_LEN, FrameMode, GeneticCode, reverse_complement, six_frames, translate,
 };
