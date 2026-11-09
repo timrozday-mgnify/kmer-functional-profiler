@@ -123,3 +123,10 @@ downloaded by `common.sh`'s `fetch_reads`, shared by the runs that need them.
 The ablation configs are read from the repo (`workflows/fmh-benchmark/ablations/`), so a
 `git pull` there changes them. Re-submitting a run resumes it (`-resume`). Head jobs ask for
 7 days; lower `--time` in `run.sh` if your partition caps it.
+
+The tree index on its own, no anchoring (docs/tree-index-plan.md, Progress log, 2026-11-09:
+MGnify90 units, confirm on the representative, then the leaves), after tree-index-slice:
+
+```bash
+cd kfp-ablations/route90 && sbatch run.sh
+```
