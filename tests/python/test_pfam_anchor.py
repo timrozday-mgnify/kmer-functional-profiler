@@ -193,3 +193,34 @@ def test_btop_residues_match_the_cigar_walk() -> None:
     got = anchor.btop_residues(4, 1, 10, "2DFA--C1")
     assert got == anchor.diamond_residues(4, 1, 10, "3M1I1D1M")
     assert anchor.btop_residues(4, 1, 10, "2/3") is None
+
+
+# not "bench": fmh-benchmark's tests import their own bench.py by that name
+spec = importlib.util.spec_from_file_location("pfam_anchor_bench", SCRIPT.with_name("bench.py"))
+assert spec and spec.loader
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+
+
+def test_bench_counts_each_pair_at_the_first_stage_it_fails() -> None:
+    t, f = True, False
+    rows = [  # coding, has_orf, candidate, confirmed, aligned, kept, called, called_comp, novel
+        (0, t, t, t, t, t, 1, 9, f, "no_coding"),
+        (90, f, t, t, t, t, 1, 9, f, "no_orf"),
+        (90, t, f, t, t, t, 1, 9, f, "no_candidate"),
+        (90, t, t, f, t, t, 1, 9, f, "not_confirmed"),
+        (90, t, t, t, f, f, None, None, f, "not_aligned"),
+        (90, t, t, t, t, f, 2, 9, f, "not_kept"),
+        (90, t, t, t, t, t, 1, 9, f, "right"),
+        (90, t, t, t, t, t, 2, 9, t, "em_novel"),
+        (90, t, t, t, t, t, 2, 9, f, "em_near"),
+        (90, t, t, t, t, t, 3, 7, f, "em_other"),
+    ]
+    cols = ["coding", "has_orf", "candidate", "confirmed", "aligned", "kept", "called",
+            "called_comp", "novel", "want"]  # fmt: skip
+    df = pl.DataFrame(rows, schema=cols, orient="row").with_columns(unit=1, comp=9)
+    out = bench.stage_of(df)
+    assert out["stage"].to_list() == out["want"].to_list()
+    lo, hi = bench.wilson(5, 5)
+    assert lo is not None and hi == 1.0 and 0.5 < lo < 0.6
+    assert bench.wilson(0, 0) == (None, None)
