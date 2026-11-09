@@ -146,9 +146,8 @@ def holdout(a: argparse.Namespace) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     members = pl.read_parquet(a.members, columns=["protein_id", "sequence"])
-    pool = members.filter(pl.col("sequence").str.len_chars() >= a.min_length).sample(
-        a.pool, seed=a.seed
-    )
+    long = members.filter(pl.col("sequence").str.len_chars() >= a.min_length)
+    pool = long.sample(min(a.pool, long.height), seed=a.seed)
     near = nearest_relatives(members, pool)
     bins = np.array(HOLDOUT_BINS)
     near = (

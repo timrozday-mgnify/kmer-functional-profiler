@@ -207,7 +207,8 @@ def search(a: argparse.Namespace, faa: Path, out: Path, arm: str) -> None:
 def annotate(a: argparse.Namespace) -> None:
     a.out.mkdir(parents=True, exist_ok=True)
     wanted = set(pl.read_csv(a.families, separator="\t")["pfam_accession"].to_list())
-    with gzip.open(a.pfam, "rt") as f, open(a.out / "hmms.hmm", "w") as out:
+    opener = gzip.open if a.pfam.suffix == ".gz" else open
+    with opener(a.pfam, "rt") as f, open(a.out / "hmms.hmm", "w") as out:
         block: list[str] = []
         for line in f:
             block.append(line)
@@ -237,6 +238,8 @@ def reads(a: argparse.Namespace) -> None:
         a.members,
         "--per-bin",
         a.per_bin,
+        "--pool",
+        a.pool,
         "--seed",
         a.seed,
         "--out",
@@ -249,7 +252,7 @@ def reads(a: argparse.Namespace) -> None:
     hits.join(ref.select("protein_id"), on="protein_id").write_parquet(a.out / "domains.parquet")
 
     pool = ref.join(hits.filter("above_ga").select("protein_id").unique(), on="protein_id")
-    chosen = pool.sample(a.strains, seed=a.seed).sort("protein_id")
+    chosen = pool.sample(min(a.strains, pool.height), seed=a.seed).sort("protein_id")
     (a.out / "strains").mkdir(exist_ok=True)
     targets = a.out / "strains/targets.fa"
     targets.write_text("".join(f">{i}\n{s}\n" for i, _, s in chosen.iter_rows()))
@@ -527,6 +530,23 @@ def recruit(a: argparse.Namespace) -> None:
             (r / f).unlink(missing_ok=True)
 
 
+def fixture(a: argparse.Namespace) -> None:
+    """The test profile's inputs from pfam-reannotate's fixture (``--release``: the release's
+    three tables) and its HMMs (``--pfam``) -> ``--members`` (protein_id, cluster_rep,
+    full_length, sequence) and ``--families`` (every HMM's accession)."""
+    seqs = pl.read_parquet(a.release / "mgy_protein_sequences.parquet")
+    members = pl.read_parquet(a.release / "mgy_cluster_seqs.parquet").rename(
+        {"cluster_member": "protein_id"}
+    )
+    a.members.parent.mkdir(parents=True, exist_ok=True)
+    members.join(seqs, on="protein_id").select(
+        "protein_id", "cluster_rep", full_length=pl.lit(True), sequence="sequence"
+    ).sort("protein_id").write_parquet(a.members)
+    lines = a.pfam.read_text().splitlines()
+    accs = [int(x.split()[1][2:].split(".")[0]) for x in lines if x.startswith("ACC")]
+    pl.DataFrame({"pfam_accession": accs, "proteins": 0}).write_csv(a.families, separator="\t")
+
+
 STEPS = {
     "annotate": annotate,
     "reads": reads,
@@ -535,6 +555,7 @@ STEPS = {
     "report": report,
     "nullref": nullref,
     "recruit": recruit,
+    "fixture": fixture,
 }
 
 
@@ -548,7 +569,9 @@ def main() -> None:
     )
     p.add_argument("--pfam", type=Path, default=Path.home() / "Downloads/Pfam-A.hmm.gz")
     p.add_argument("--strains", type=int, default=2000)
+    p.add_argument("--release", type=Path, help="fixture: pfam-reannotate's fixture tables")
     p.add_argument("--per-bin", type=int, default=250, help="recall.py holdout's")
+    p.add_argument("--pool", type=int, default=15000, help="recall.py holdout's")
     p.add_argument("--min-orf", type=int, default=25)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=1)
@@ -561,7 +584,7 @@ def main() -> None:
     globals()["RUNTIME"], globals()["THREADS"] = a.runtime, a.threads
     watchdog(a.max_gb)
     for name, step in STEPS.items():
-        if a.step == name or (a.step == "all" and name not in ("nullref", "recruit")):
+        if a.step == name or (a.step == "all" and name not in ("nullref", "recruit", "fixture")):
             step(a)
 
 

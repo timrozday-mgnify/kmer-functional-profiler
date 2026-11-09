@@ -196,7 +196,15 @@ def oracle_calls(
         rows.append(
             (read, families, best, len(tied), target in tied, truth_ident >= 0, truth_ident)
         )
-    schema = ["read", "families", "best_identity", "ties", "right", "candidate", "truth_identity"]
+    schema = {
+        "read": pl.Int64,
+        "families": pl.Int64,
+        "best_identity": pl.Float64,
+        "ties": pl.Int64,
+        "right": pl.Boolean,
+        "candidate": pl.Boolean,
+        "truth_identity": pl.Float64,
+    }  # fmt: skip  (typed: a set may have no rows)
     return pl.DataFrame(rows, schema=schema, orient="row").with_columns(
         pl.col("best_identity", "truth_identity").replace(-1.0, None)
     )
@@ -1631,7 +1639,7 @@ def confirm(a: argparse.Namespace) -> None:
     ).rename({"cluster_rep": "unit"})
     for name in prepare.SETS:
         d = a.data / name
-        calls = pl.read_parquet(d / f"anchored{ROUTE_TAG}.parquet")
+        calls = pl.read_parquet(d / f"anchored{tag_of(a)}.parquet")
         weight = (
             calls.with_columns(w=1 / pl.col("units").list.len())
             .explode("units", empty_as_null=True)

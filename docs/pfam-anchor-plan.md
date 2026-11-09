@@ -736,3 +736,10 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
     - read calls and pileups unchanged (.673 and .550 right; consensus .992 at variant columns).
   - **`kfp-pileup` itself is unchanged.** Its EM is fine when components are small groups of near units, as kfp's profile components and tier 2's groups are. A family as the component is outside what it assumes. A check there for very large components could warn about this.
 - **Phase 5 started (2026-11-08): outside tools made portable.** `prepare.tool` wraps `hmmsearch`, DIAMOND and kfpfam's pyhmmer for `--runtime docker|singularity|none` (both scripts), mounting the data directory at the same path, with absolute paths throughout. Locally (Docker) it reproduces the earlier DIAMOND mapping exactly. **Still to do:** `workflows/pfam-anchor/main.nf` (one process per stage, `slurm`, `singularity` and `test` profiles), `hpc/kfp-ablations/pfam-anchor/run.sh` for the tree-index slice, the sizing step on pfam-reannotate's 1-in-100 output, and a local `-profile test` run on `tests/data/mini_reannotate` (without recruitment: kfpfam's models don't know the fixture's accessions).
+
+- **Phase 5 workflow (2026-11-09): `workflows/pfam-anchor/main.nf` runs end to end.** It has one process per stage: fixture, annotate, nullref, reads, search, recruit, DIAMOND, report, oracle, anchored, compare, unanchored, confirm, tree, seedlines, mapall and score. The stages share the scripts' data directory and pass a token between them. Profiles: `slurm`, `singularity`/`docker` (which set `--runtime`), `test` (pfam-reannotate's fixture, no recruitment) and `laptop`. `hpc/kfp-ablations/pfam-anchor/run.sh` runs it on the tree-index slice, with recruitment only when `KFPFAM` is set. `-profile test,laptop` passes all 16 tasks locally. Fixes it needed:
+  - `confirm` reads the route's own tag;
+  - `annotate` takes an unzipped HMM file;
+  - the holdout pool and the strain count are capped at what the reference holds;
+  - `oracle_calls` is typed, because a set can have no rows.
+  **Still to do:** the sizing step on pfam-reannotate's 1-in-100 output, and the user's run on the slice.
