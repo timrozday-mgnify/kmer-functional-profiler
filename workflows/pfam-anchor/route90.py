@@ -16,8 +16,10 @@ Steps, into ``--out``:
   strain, depth, aai, best (the indexed protein a perfect method would report).
 - ``build``: the compact index on pfam-anchor's reference (``compact.py shard`` per
   ``--shards``, then ``merge``).
-- ``query``: per set, ``compact.py query`` into ``<set>/c``; bars at ``--chance-scale`` (the
-  release's proteins over the reference's, by default).
+- ``query``: per set, ``compact.py query`` into ``<set>/c`` (tier 1 and confirmation: the
+  index's cost), then ``recruit.py`` into ``<set>/r`` (recruitment to the confirmed
+  representatives, a step of its own, timed apart); bars at ``--chance-scale`` (the release's
+  proteins over the reference's, by default).
 - ``score``: ``route90_recall.tsv`` (per set x depth x AAI: target recall with Wilson intervals
   over strains, read recall and precision), ``route90_targets.tsv`` (present units and their
   precision, the stage each strain is lost at) and ``route90_cost.json``. A hit is correct when
@@ -152,12 +154,19 @@ def query(a: argparse.Namespace) -> None:
     times: dict[str, object] = {"chance_scale": scale}
     for name in SETS:
         d = a.out / name
+        r = [d / "reads_1.fq.gz", d / "reads_2.fq.gz"]
         t0 = time.perf_counter()
         prepare.run(prepare.PY, TREE / "compact.py", "query", "--index", a.out / "index",
-                    "--reads", d / "reads_1.fq.gz", d / "reads_2.fq.gz", "--out", d / "c",
-                    "--floor", FLOOR, "--chance-scale", scale)  # fmt: skip
-        times[f"{name}_s"] = time.perf_counter() - t0
+                    "--reads", *r, "--out", d / "c", "--floor", FLOOR,
+                    "--chance-scale", scale)  # fmt: skip
+        times[f"{name}_index_s"] = time.perf_counter() - t0  # the index's cost: tier 1, confirm
+        t0 = time.perf_counter()
+        prepare.run(prepare.PY, TREE / "recruit.py", "--reads", *r, "--targets",
+                    d / "c/confirmed.fa", "--seeded", d / "c/seeded.tsv", "--out", d / "r",
+                    "--chance-scale", scale)  # fmt: skip
+        times[f"{name}_recruit_s"] = time.perf_counter() - t0  # a step of its own
         times[name] = json.loads((d / "c/query.json").read_text())
+        times[f"{name}_recruit"] = json.loads((d / "r/recruit.json").read_text())
     (a.out / "query_times.json").write_text(json.dumps(times, indent=1))
     print(json.dumps(times, indent=1))
 
@@ -209,15 +218,23 @@ def score(a: argparse.Namespace) -> None:
         read_strain = pl.DataFrame(
             {"read": np.arange(len(names)), "strain": [n.rsplit("_", 1)[0] for n in names]}
         )
-        units = pl.read_csv(d / "c/units.tsv", separator="\t")
+        units = pl.read_csv(d / "c/units.tsv", separator="\t")  # the confirmed
         # a unit is reported by its representative; each read pair's top units, ties kept
         top = (
-            pl.read_parquet(d / "c/reads.parquet", columns=["read", "unit"])
-            .join(units.select("unit", "protein_id"), on="unit")
+            pl.read_parquet(d / "r/reads.parquet", columns=["read", "target"])
+            .select("read", protein_id=pl.col("target").cast(pl.Int64))
+            .join(units.select("unit", "protein_id"), on="protein_id")
             .join(read_strain, on="read")
             .join(truth.select("strain", "best"), on="strain")
         )
-        present = units.filter(pl.col("reads") >= MIN_READS).select("unit", "protein_id")
+        recruited = pl.read_csv(
+            d / "r/targets.tsv", separator="\t", schema_overrides={"target": pl.Int64}
+        )
+        present = (
+            recruited.filter(pl.col("reads") >= MIN_READS)
+            .select(protein_id="target")
+            .join(units.select("unit", "protein_id"), on="protein_id")
+        )
         # every present unit against the strains whose reads hit it
         support = present.join(top.select("unit", "best").unique(), on="unit", how="left")
         ident = identities(

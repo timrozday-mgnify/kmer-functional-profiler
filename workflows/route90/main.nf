@@ -9,7 +9,7 @@
 // READS    strains and relatives at depths 0.5-30x                              route90.py reads
 // SHARD    one shard's FASTA, unit offsets and keys (k 9, 1 in 32, sqrt)        compact.py shard
 // BUILD    the shards' keys merged                                              route90.py build
-// QUERY    tier 1, confirm, recruit                                             route90.py query
+// QUERY    tier 1 and confirm (compact.py), then recruit (recruit.py, apart)     route90.py query
 // SCORE    route90_recall.tsv, route90_targets.tsv                              route90.py score
 
 nextflow.enable.dsl = 2

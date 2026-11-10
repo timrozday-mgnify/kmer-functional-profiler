@@ -23,22 +23,19 @@ for its bits.
 
 **Query:** tier 1 (each read pair's 12 frames' k-mers looked up; a (read pair, unit) with at
 least ``--floor`` bits: its keys' bits summed less log2 windows per hit beyond the first, as
-``query.evidence``); confirmation (``_core.pseudo_align`` of those pairs against the unit's
+``query.evidence``), then confirmation (``_core.pseudo_align`` of those pairs against the unit's
 representative; a unit is confirmed when its best pair beats the decoys' bar, the reads
-reversed, at ``--share`` and ``--chance-scale``); recruitment (every read pair routed by seed
-votes against the confirmed representatives, ``_core.route_reads``, then pseudo-aligned); each
-read keeps its hits within ``--ambiguous-bits`` of its best, called above a decoy read bar, and
-shared by EM. Writes ``reads.parquet`` (read, unit, score, weight), ``units.tsv`` (unit,
-protein_id: its representative, confirmed, reads: EM weight) and ``query.json``.
+reversed, at ``--share`` and ``--chance-scale``). Writes ``units.tsv`` (unit, score: its best
+pair, protein_id: its representative), and for recruitment, a step of its own (``recruit.py``):
+``confirmed.fa`` (the confirmed representatives) and ``seeded.tsv`` (read name, target: the
+sample's pairs on them); and ``query.json``.
 """
 
 import argparse
-import gzip
 import json
 import math
 import mmap
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
@@ -46,6 +43,7 @@ import build
 import numpy as np
 import polars as pl
 import query
+import recruit
 import tier2
 import verify
 from numpy.lib.format import open_memmap
@@ -302,75 +300,23 @@ def tier1(ix: Compact, r1: str, r2: str) -> tuple[pl.DataFrame, float]:
     return ev, log2_w
 
 
-def batches(r1: str, r2: str, n: int) -> Iterator[tuple[int, list[bytes], list[bytes]]]:
-    """(first read pair, mates 1, mates 2), ``n`` read pairs at a time."""
-    lo, m1, m2 = 0, [], []
-    with gzip.open(r1, "rb") as f, gzip.open(r2, "rb") as g:
-        for i, (x, y) in enumerate(zip(f, g, strict=True)):
-            if i % 4 == 1:
-                m1.append(x.strip())
-                m2.append(y.strip())
-                if len(m1) == n:
-                    yield lo, m1, m2
-                    lo, m1, m2 = lo + n, [], []
-    if m1:
-        yield lo, m1, m2
-
-
-def aligned(pairs: pl.DataFrame, frames: dict[int, bytes], seqs: dict[int, bytes],
-            batch: int) -> pl.DataFrame:  # fmt: skip
-    """(read, unit, score: bits) by the anchored pseudo-alignment."""
-    if not pairs.height:
-        return pl.DataFrame(schema={"read": pl.Int64, "unit": pl.Int64, "score": pl.Float64})
-    got = tier2.align_chunk(
-        pairs.select("read", pos="unit"), frames, seqs, verify.blosum62(), batch, "anchored"
-    )
-    return got.rename({"pos": "unit"})
-
-
 def confirm(ix: Compact, reads: list[str], seeded: pl.DataFrame,
             a: argparse.Namespace) -> pl.DataFrame:  # fmt: skip
     """(unit, score): each unit's best seeded read pair against its representative, a read
     batch at a time (only that batch's representatives in memory: at release most seeded
     units are chance hits, ~8 per read pair)."""
     out = []
-    for lo, m1, m2 in batches(*reads, a.read_batch):
+    for lo, m1, m2 in recruit.batches(*reads, a.read_batch):
         mine = seeded.filter(pl.col("read").is_between(lo, lo + len(m1) - 1))
         r = np.unique(mine["read"].to_numpy()).tolist()
         fr = _core.pair_frames([m1[i - lo] for i in r], [m2[i - lo] for i in r])
         seqs = {
             u: verify.mask(x) for u, (_, x) in ix.reps(mine["unit"].unique().to_numpy()).items()
         }
-        got = aligned(mine, dict(zip(r, fr, strict=True)), seqs, a.batch_pairs)
+        got = recruit.aligned(mine.rename({"unit": "target"}), dict(zip(r, fr, strict=True)),
+                              seqs, a.batch_pairs).rename({"target": "unit"})  # fmt: skip
         out.append(got.group_by("unit").agg(pl.col("score").max()))
     return pl.concat(out).group_by("unit").agg(pl.col("score").max())
-
-
-def recruit(reads: list[str], seqs: dict[int, bytes], seeded: pl.DataFrame,
-            a: argparse.Namespace) -> tuple[pl.DataFrame, int]:  # fmt: skip
-    """Every read pair routed by seed votes to the confirmed representatives, with its tier-1
-    pairs on them, pseudo-aligned: each read's hits within ``--ambiguous-bits`` of its best; and
-    the read pairs."""
-    units = np.array(sorted(seqs), dtype=np.int64)
-    rep_list = [seqs[u] for u in units.tolist()]
-    k = a.route_k or tier2.route_k(sum(map(len, rep_list)))
-    votes = 4 if k <= 5 else 3
-    out, n = [], 0
-    for lo, m1, m2 in batches(*reads, a.read_batch):
-        hi, n = lo + len(m1), lo + len(m1)
-        fr = _core.pair_frames(m1, m2)
-        r, leaf, _ = _core.route_reads(
-            fr, rep_list, k, verify.protein_classes(), band=8, min_votes=votes, top=a.route_top,
-            max_occ=2000,
-        )  # fmt: skip
-        pairs = pl.concat([
-            pl.DataFrame({"read": r.astype(np.int64) + lo, "unit": units[leaf]}),
-            seeded.filter(pl.col("read").is_between(lo, hi - 1)).select("read", "unit"),
-        ]).unique()  # fmt: skip
-        got = aligned(pairs, dict(zip(range(lo, hi), fr, strict=True)), seqs, a.batch_pairs)
-        top = pl.col("score").max().over("read")
-        out.append(got.filter(pl.col("score") >= top - a.ambiguous_bits))
-    return pl.concat(out), n
 
 
 def run_query(a: argparse.Namespace) -> None:
@@ -378,7 +324,7 @@ def run_query(a: argparse.Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
     info: dict[str, float | int] = {}
     reads = {"sample": a.reads, "decoy": query.reversed_reads(a.reads, out)}
-    seeded, best, calls = {}, {}, {}
+    seeded, best = {}, {}
     t = time.perf_counter()
     for name, (r1, r2) in reads.items():
         ev, info[f"{name}_log2_windows"] = tier1(ix, r1, r2)
@@ -394,31 +340,23 @@ def run_query(a: argparse.Namespace) -> None:
     confirmed = np.sort(best["sample"].filter(pl.col("score") >= bar)["unit"].to_numpy())
     info |= {"candidate_units": cand, "confirm_bar": bar, "confirmed_units": len(confirmed),
              "confirm_s": time.perf_counter() - t}  # fmt: skip
-    # recruitment: every read pair against the confirmed representatives
-    t = time.perf_counter()
+    # the confirmed units for recruitment (recruit.py, or any other recruiting tool): their
+    # representatives, and the sample's pairs on them
     rep = ix.reps(confirmed)
-    conf = {u: verify.mask(x) for u, (_, x) in rep.items()}
-    empty = pl.DataFrame(schema={"read": pl.Int64, "unit": pl.Int64, "score": pl.Float64})
-    for name, r in reads.items():
-        on = seeded[name].filter(pl.col("unit").is_in(pl.Series(confirmed).implode()))
-        calls[name], info[f"{name}_read_pairs"] = recruit(r, conf, on, a) if conf else (empty, 0)
-    per_read = {n: c.group_by("read").agg(pl.col("score").max()) for n, c in calls.items()}
-    read_bar, _ = query.decoy_bar(
-        per_read["sample"], per_read["decoy"], a.share, scale=a.chance_scale
-    )
-    called = calls["sample"].filter(pl.col("score").max().over("read") >= read_bar)
-    w = tier2.em_weights(called.rename({"unit": "pos"}), a.em_rounds).rename({"pos": "unit"})
-    w.sort("read", "unit").write_parquet(out / "reads.parquet")
-    units = (
-        pl.DataFrame({"unit": confirmed, "protein_id": [rep[u][0] for u in confirmed.tolist()]})
-        .join(w.group_by("unit").agg(reads=pl.col("weight").sum()), on="unit", how="left")
-        .with_columns(pl.col("reads").fill_null(0.0))
-    )
-    units.write_csv(out / "units.tsv", separator="\t", float_precision=3)
+    pid = {u: rep[u][0] for u in confirmed.tolist()}
+    with open(out / "confirmed.fa", "wb") as f:
+        f.writelines(b">%d\n%s\n" % (pid[u], rep[u][1]) for u in confirmed.tolist())
+    names = recruit.read_names(a.reads[0])
+    on = seeded["sample"].filter(pl.col("unit").is_in(pl.Series(confirmed).implode()))
+    pl.DataFrame({
+        "read": pl.Series(names).gather(on["read"]), "target": on["unit"].replace_strict(pid)
+    }).write_csv(out / "seeded.tsv", separator="\t")  # fmt: skip
+    best["sample"].filter(pl.col("score") >= bar).with_columns(
+        protein_id=pl.col("unit").replace_strict(pid)
+    ).sort("unit").write_csv(out / "units.tsv", separator="\t", float_precision=2)
     for f in out.glob("decoy_*.fq.gz"):
         f.unlink()
-    info |= {"read_bar": read_bar, "called_reads": called["read"].n_unique(),
-             "recruit_s": time.perf_counter() - t, "peak_rss_gb": tier2.peak_rss_gb()}  # fmt: skip
+    info["peak_rss_gb"] = tier2.peak_rss_gb()
     (out / "query.json").write_text(json.dumps(info, indent=1) + "\n")
     print(json.dumps(info))
 
@@ -438,19 +376,15 @@ def main() -> None:
     s.add_argument("--rate", type=float, default=32, help="one key per this many rep residues")
     m.add_argument("--window", type=int, default=4)
     m.add_argument("--rate", type=float, default=32)
-    q = sub.add_parser("query", help="tier 1, confirmation, recruitment")
+    q = sub.add_parser("query", help="tier 1 and confirmation")
     q.add_argument("--index", required=True)
     q.add_argument("--reads", nargs=2, required=True)
     q.add_argument("--out", required=True)
     q.add_argument("--floor", type=float, default=30.0, help="tier-1 bits a read pair needs")
     q.add_argument("--share", type=float, default=0.01, help="decoy share at the bars")
     q.add_argument("--chance-scale", type=float, default=1.0, help="query.decoy_bar's scale")
-    q.add_argument("--ambiguous-bits", type=float, default=3.0)
-    q.add_argument("--route-k", type=int, default=0, help="0: from the confirmed residues")
-    q.add_argument("--route-top", type=int, default=16)
     q.add_argument("--read-batch", type=int, default=200_000)
     q.add_argument("--batch-pairs", type=int, default=2_000_000)
-    q.add_argument("--em-rounds", type=int, default=20)
     a = p.parse_args()
     {"shard": shard, "merge": merge, "query": run_query}[a.cmd](a)
 

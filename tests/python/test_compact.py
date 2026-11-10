@@ -56,3 +56,24 @@ def test_build_keys_find_their_units(tmp_path: Path) -> None:
         q, rows_ = ix.lookup(compact.codes(h, 9))
         assert u in set(np.asarray(ix.unit[rows_]).tolist())
     assert ix.meta["postings"] == len(ix.unit)
+
+
+def test_recruit_calls_reads_to_their_proteins(tmp_path: Path) -> None:
+    data = Path(__file__).resolve().parents[1] / "data"
+    truth = pl.read_csv(data / "truth.tsv", separator="\t").filter(pl.col("mate") == 0)
+    seeded = tmp_path / "seeded.tsv"
+    first = truth.head(1)
+    pl.DataFrame({"read": [f"pair{first['read'][0]}"], "target": first["protein"]}).write_csv(
+        seeded, separator="\t"
+    )
+    run("--reads", str(data / "reads_1.fastq.gz"), str(data / "reads_2.fastq.gz"),
+        "--targets", str(data / "proteins.faa"), "--seeded", str(seeded),
+        "--out", str(tmp_path / "r"),
+        cwd=tmp_path, script=SCRIPT.with_name("recruit.py"))  # fmt: skip
+    got = pl.read_parquet(tmp_path / "r/reads.parquet")
+    assert got.height and got["name"].str.starts_with("pair").all()
+    top = got.filter(pl.col("weight") == pl.col("weight").max().over("read"))
+    want = dict(zip(truth["read"].to_list(), truth["protein"].to_list(), strict=True))
+    right = sum(want.get(r) == t for r, t in top.select("read", "target").iter_rows())
+    assert right >= 0.8 * top["read"].n_unique()
+    assert pl.read_csv(tmp_path / "r/targets.tsv", separator="\t").height == 20
