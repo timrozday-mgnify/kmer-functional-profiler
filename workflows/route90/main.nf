@@ -7,8 +7,9 @@
 //
 // HOLDOUT  held-out proteins and their nearest relative left in the reference   recall.py holdout
 // READS    strains and relatives at depths 0.5-30x                              route90.py reads
-// SHARD    one shard's FASTA, unit offsets and keys (k 9, sqrt(members)), per    compact.py shard
-//          index size: 1 in 32 (standard), 1 in 8 and 1 in 4 (the larger options)
+// SEQS     one shard of the unit-ordered FASTA, once for every index size        compact.py seqs
+// SHARD    one shard's keys (k 9, sqrt(members)), per                           compact.py shard
+//          index size: 1 in 32 (standard), 1 in 16 and 1 in 8 (the larger options)
 // BUILD    the shards' keys merged, per index size (--rates)                    route90.py build
 // QUERY    tier 1 and confirm (compact.py), then recruit (recruit.py, apart)     route90.py query
 // SCORE    route90_recall_r<rate>.tsv, route90_targets_r<rate>.tsv              route90.py score
@@ -43,15 +44,27 @@ process READS {
     script: step('reads', task, 32)
 }
 
+process SEQS {
+    label 'process_medium'
+    input: tuple val(token), val(shard)
+    output: val 'seqs'
+    script:
+    """
+    export POLARS_MAX_THREADS=${task.cpus}
+    ${python()} ${projectDir}/../tree-index/compact.py seqs --members ${data()}/holdout/members.parquet \\
+        --seqs ${data()}/seqs --shards ${params.shards} --shard ${shard}
+    """
+}
+
 process SHARD {
     label 'process_medium'
-    input: tuple val(token), val(rate), val(shard)
+    input: tuple val(rate), val(shard)
     output: val rate
     script:
     """
     export RAYON_NUM_THREADS=${task.cpus} POLARS_MAX_THREADS=${task.cpus}
-    ${python()} ${projectDir}/../tree-index/compact.py shard --members ${data()}/holdout/members.parquet \
-        --index ${data()}/index-r${rate} --shards ${params.shards} --shard ${shard} --rate ${rate}
+    ${python()} ${projectDir}/../tree-index/compact.py shard --seqs ${data()}/seqs \\
+        --index ${data()}/index-r${rate} --shard ${shard} --rate ${rate}
     """
 }
 
@@ -81,8 +94,11 @@ process SCORE {
 workflow {
     def n = params.shards as int
     held = HOLDOUT()
+    shard_ids = Channel.of(0..<n)
+    // the unit-ordered sequences, once, shared by every index size
+    seqs = SEQS(held.combine(shard_ids)).collect()
     rates = Channel.fromList(params.rates.toString().tokenize(',')*.trim())
-    built = SHARD(held.combine(rates).combine(Channel.of(0..<n)))
-        .map { [it, 1] }.groupTuple(size: n).map { it[0] }  // a rate once all its shards are built
+    built = SHARD(seqs.combine(rates).map { it[-1] }.combine(shard_ids))
+        .map { [it, 1] }.groupTuple(size: n).map { it[0] }  // a size once all its shards are built
     SCORE(QUERY(BUILD(READS(held).combine(built).map { it[1] })))
 }

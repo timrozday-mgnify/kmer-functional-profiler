@@ -1,25 +1,30 @@
 """Compact route index: MGnify90 units, k-mer keys on each unit's representative, nothing kept
 per protein (docs/tree-index-plan.md, Progress log: the compact route, 2026-11-10).
 
-**Layout** (``--index``):
+**Sequences** (``--seqs``, built once and shared by every index size, ``seqs``):
 
-- ``seqs/<shard>.fa``: the shard's proteins as FASTA, unit by unit, the unit's representative
+- ``<shard>.fa``: the shard's proteins as FASTA, unit by unit, the unit's representative
   (MGnify's ``cluster_rep``, else the longest member) first. MGnify's proteins reordered: the
-  sequences, not the index.
-- ``seqs/<shard>.units.npy`` (u64): each unit's first byte in that file, and the end.
+  sequences, not the index. Units go to shards by a hash of the representative.
+- ``<shard>.units.npy`` (u64): each unit's first byte in that file, and the end;
+  ``<shard>.members.npy`` (u32): its members.
+
+**Index** (``--index``, one per size: one key per ``--rate`` representative residues, 32 the
+standard, 16 and 8 the larger):
+
 - ``shards.npy`` (i64): each shard's first global unit, and the units in all.
 - ``keys/``: one posting per (key, unit), sorted by the key's code (its k-mer's base-20 rank,
   :func:`codes`): ``bucket.npy`` (u64: where each bucket of ``code >> suffix_bits`` starts),
   ``suffix.npy`` (the code's low bits: u16 at release), ``unit.npy`` (u32) and ``bits.npy``
   (u8 quarter-bits: -log2 q0 - log2 g, g the units holding the key). 7 B per posting at
-  release (2^27 buckets, 12-bit suffixes); ``meta.json``.
+  release (2^27 buckets, 12-bit suffixes); ``meta.json`` (``seqs``: the sequences' directory,
+  relative to the index).
 
-**Build:** ``shard`` (one per ``--shards``, independent): the shard's units (by a hash of the
-representative), their FASTA, and the keys: each representative's k-mer window minimizers
-(window ``--window``, each window's rarest k-mer among the shard's representatives), thinned to
-sqrt(members) x a mean set so the representatives carry one key per ``--rate`` residues
-(``build.allocate``). ``merge``: the shards' keys by code partition, each key's units counted
-for its bits.
+**Build:** ``seqs`` per shard, once; then per size, ``shard`` per shard (independent): the keys,
+each representative's k-mer window minimizers (window ``--window``, each window's rarest k-mer
+among the shard's representatives) thinned to sqrt(members) x a mean set so the
+representatives carry one key per ``--rate`` residues (``build.allocate``); and ``merge``: the
+shards' keys by code partition, each key's units counted for its bits.
 
 **Query:** tier 1 (each read pair's 12 frames' k-mers looked up; a (read pair, unit) with at
 least ``--floor`` bits: its keys' bits summed less log2 windows per hit beyond the first, as
@@ -35,6 +40,8 @@ import argparse
 import json
 import math
 import mmap
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Final
@@ -106,10 +113,11 @@ def code_bits(k: int) -> int:
 # ---------------------------------------------------------------- build
 
 
-def shard(a: argparse.Namespace) -> None:
-    """One shard's FASTA, unit offsets and keys (by code partition, shard-local units)."""
-    out, s = Path(a.index), a.shard
-    (out / "seqs").mkdir(parents=True, exist_ok=True)
+def seqs(a: argparse.Namespace) -> None:
+    """One shard of the sequences, built once for every index size: its units' proteins as
+    FASTA, representative first, each unit's byte offset and its members."""
+    out, s = Path(a.seqs), a.shard
+    out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     m = (
         pl.scan_parquet(a.members)
@@ -120,18 +128,42 @@ def shard(a: argparse.Namespace) -> None:
     )
     rep = m["cluster_rep"].to_numpy()
     first = np.flatnonzero(np.r_[True, rep[1:] != rep[:-1]]) if m.height else np.zeros(0, int)
-    members = np.diff(np.r_[first, m.height])
     rec = (">" + m["protein_id"].cast(pl.String) + "\n" + m["sequence"] + "\n").to_list()
     start = np.r_[0, np.cumsum([len(r) for r in rec], dtype=np.int64)]
-    with open(out / f"seqs/{s:04d}.fa", "w") as f:
+    with open(out / f"{s:04d}.fa", "w") as f:
         f.writelines(rec)
-    np.save(out / f"seqs/{s:04d}.units.npy", start[np.r_[first, len(rec)]].astype(U64))
-    reps = [x.encode() for x in m["sequence"].gather(first).to_list()]
-    del m, rec
-    got = {"shard": s, "proteins": int(members.sum()), "units": len(reps), "keys": 0}
+    np.save(out / f"{s:04d}.units.npy", start[np.r_[first, len(rec)]].astype(U64))
+    np.save(out / f"{s:04d}.members.npy", np.diff(np.r_[first, m.height]).astype(np.uint32))
+    got = {"shard": s, "shards": a.shards, "proteins": m.height, "units": len(first),
+           "seqs_s": time.perf_counter() - t0}  # fmt: skip
+    (out / f"{s:04d}.json").write_text(json.dumps(got) + "\n")
+    print(json.dumps(got))
+
+
+def shard_reps(d: Path, s: int) -> tuple[list[bytes], NDArray[np.int64]]:
+    """A sequence shard's representatives (each unit's first record) and members per unit."""
+    off = np.load(d / f"{s:04d}.units.npy").astype(np.int64)
+    members = np.load(d / f"{s:04d}.members.npy").astype(np.int64)
+    fa = (d / f"{s:04d}.fa").read_bytes()
+    reps = []
+    for lo in off[:-1].tolist():
+        a = fa.index(b"\n", lo)
+        reps.append(fa[a + 1 : fa.index(b"\n", a + 1)])
+    return reps, members
+
+
+def shard(a: argparse.Namespace) -> None:
+    """One shard's keys at this index's size, by code partition, with shard-local units: the
+    representatives read from the shared sequences (``seqs``)."""
+    out, s = Path(a.index), a.shard
+    t0 = time.perf_counter()
+    reps, members = shard_reps(Path(a.seqs), s)
+    got = {"shard": s, "units": len(reps), "keys": 0}
+    (out / "shards").mkdir(parents=True, exist_ok=True)
     if not reps:  # a shard with no units (small references)
-        (out / f"seqs/{s:04d}.json").write_text(json.dumps(got) + "\n")
+        (out / f"shards/{s:04d}.json").write_text(json.dumps(got) + "\n")
         return
+    first = np.cumsum(members) - members  # each unit's representative: its first protein
     # keys: each representative's window minimizers, the rarest among the shard's per window
     info = build.kmer_info(reps, a.k, build.residue_log_freq(reps))
     vc = info.group_by("hash").len().sort("hash")
@@ -154,18 +186,18 @@ def shard(a: argparse.Namespace) -> None:
         d.mkdir(parents=True, exist_ok=True)
         g.drop("part").write_parquet(d / f"{s:04d}.parquet")
     got |= {"keys": keys.height, "mean": mean, "shard_s": time.perf_counter() - t0}
-    (out / f"seqs/{s:04d}.json").write_text(json.dumps(got) + "\n")
+    (out / f"shards/{s:04d}.json").write_text(json.dumps(got) + "\n")
     print(json.dumps(got))
 
 
 def merge(a: argparse.Namespace) -> None:
     """The shards' keys into one sorted posting table; each key's bits from its units."""
-    out = Path(a.index)
+    out, sq = Path(a.index), Path(a.seqs)
     t0 = time.perf_counter()
-    infos = sorted(
-        (json.loads(p.read_text()) for p in (out / "seqs").glob("*.json")),
-        key=lambda x: x["shard"],
-    )
+    infos = sorted((json.loads(p.read_text()) for p in sq.glob("*.json")), key=lambda x: x["shard"])
+    built = {json.loads(p.read_text())["shard"] for p in (out / "shards").glob("*.json")}
+    if built != {x["shard"] for x in infos}:
+        sys.exit(f"keys built for shards {sorted(built)}, sequences for {len(infos)}")
     base = np.r_[0, np.cumsum([x["units"] for x in infos])].astype(np.int64)
     np.save(out / "shards.npy", base)
     files = sorted((out / "parts").glob("*/*.parquet"))
@@ -198,6 +230,7 @@ def merge(a: argparse.Namespace) -> None:
     meta = {"k": a.k, "window": a.window, "rate": a.rate, "bucket_bits": b_bits,
             "suffix_bits": s_bits, "postings": total, "units": int(base[-1]),
             "proteins": sum(x["proteins"] for x in infos), "shards": len(infos),
+            "seqs": os.path.relpath(sq.resolve(), out.resolve()),
             "bytes": {f.name: f.stat().st_size for f in keys.glob("*.npy")},
             "merge_s": time.perf_counter() - t0}  # fmt: skip
     (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
@@ -219,6 +252,7 @@ class Compact:
             load, ("bucket", "suffix", "unit", "bits")
         )
         self.base = np.load(self.path / "shards.npy")
+        self.seqs = self.path / self.meta["seqs"]  # the shared sequences (``seqs``)
         self._off: dict[int, NDArray[np.uint64]] = {}
         self._fa: dict[int, mmap.mmap] = {}
 
@@ -253,8 +287,8 @@ class Compact:
         sh = np.searchsorted(self.base, units, "right") - 1
         for s in np.unique(sh).tolist():
             if s not in self._off:
-                self._off[s] = np.load(self.path / f"seqs/{s:04d}.units.npy")
-                with open(self.path / f"seqs/{s:04d}.fa", "rb") as f:
+                self._off[s] = np.load(self.seqs / f"{s:04d}.units.npy")
+                with open(self.seqs / f"{s:04d}.fa", "rb") as f:
                     self._fa[s] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             off, fa = self._off[s], self._fa[s]
             for u in units[sh == s].tolist():
@@ -364,18 +398,20 @@ def run_query(a: argparse.Namespace) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("shard", help="one shard's FASTA, unit offsets and keys")
-    s.add_argument("--members", required=True, help="parquet: protein_id, cluster_rep, sequence")
-    s.add_argument("--shards", type=int, default=1)
-    s.add_argument("--shard", type=int, default=0)
+    sq = sub.add_parser("seqs", help="one shard of the sequences, shared by every index size")
+    sq.add_argument("--members", required=True, help="parquet: protein_id, cluster_rep, sequence")
+    sq.add_argument("--shards", type=int, default=1)
+    s = sub.add_parser("shard", help="one shard's keys at this index's size")
     m = sub.add_parser("merge", help="the shards' keys into the posting table")
+    for x in (sq, s):
+        x.add_argument("--shard", type=int, default=0)
+    for x in (sq, s, m):
+        x.add_argument("--seqs", required=True, help="the shared sequences' directory")
     for x in (s, m):
         x.add_argument("--index", required=True)
         x.add_argument("--k", type=int, default=9)
-    s.add_argument("--window", type=int, default=4, help="window minimizers' window (k-mers)")
-    s.add_argument("--rate", type=float, default=32, help="one key per this many rep residues")
-    m.add_argument("--window", type=int, default=4)
-    m.add_argument("--rate", type=float, default=32)
+        x.add_argument("--window", type=int, default=4, help="window minimizers' window (k-mers)")
+        x.add_argument("--rate", type=float, default=32, help="one key per this many rep residues")
     q = sub.add_parser("query", help="tier 1 and confirmation")
     q.add_argument("--index", required=True)
     q.add_argument("--reads", nargs=2, required=True)
@@ -386,7 +422,7 @@ def main() -> None:
     q.add_argument("--read-batch", type=int, default=200_000)
     q.add_argument("--batch-pairs", type=int, default=2_000_000)
     a = p.parse_args()
-    {"shard": shard, "merge": merge, "query": run_query}[a.cmd](a)
+    {"seqs": seqs, "shard": shard, "merge": merge, "query": run_query}[a.cmd](a)
 
 
 if __name__ == "__main__":

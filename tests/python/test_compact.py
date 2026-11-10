@@ -42,11 +42,13 @@ def test_build_keys_find_their_units(tmp_path: Path) -> None:
     pl.DataFrame(
         rows, schema=["protein_id", "cluster_rep", "sequence"], orient="row"
     ).write_parquet(members)
-    index = tmp_path / "index"
+    index, seqs = tmp_path / "index", str(tmp_path / "seqs")
     for s in (0, 1):
-        run("shard", "--members", str(members), "--index", str(index), "--shards", "2",
-            "--shard", str(s), "--rate", "8", cwd=tmp_path, script=SCRIPT)  # fmt: skip
-    run("merge", "--index", str(index), cwd=tmp_path, script=SCRIPT)
+        run("seqs", "--members", str(members), "--seqs", seqs, "--shards", "2", "--shard", str(s),
+            cwd=tmp_path, script=SCRIPT)  # fmt: skip
+        run("shard", "--seqs", seqs, "--index", str(index), "--shard", str(s), "--rate", "8",
+            cwd=tmp_path, script=SCRIPT)  # fmt: skip
+    run("merge", "--seqs", seqs, "--index", str(index), cwd=tmp_path, script=SCRIPT)
     ix = compact.Compact(index)
     reps = ix.reps(np.arange(ix.meta["units"]))
     assert len(reps) == 60 and all(pid % 1000 == 0 for pid, _ in reps.values())
