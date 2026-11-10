@@ -14,9 +14,10 @@ Steps, into ``--out``:
   protein left in the reference), each simulated at every depth of :data:`DEPTHS` (one
   ``spike.py simulate`` per depth, at that depth exactly) and merged; ``truth.parquet`` per set:
   strain, depth, aai, best (the indexed protein a perfect method would report).
-- ``build``: the compact index on pfam-anchor's reference (``compact.py shard`` per
-  ``--shards``, then ``merge``) into ``index-<tag>``, the tag naming its sparsity (``r32``, the
-  standard index, or ``r8`` and ``r4``, the larger ones: :data:`RATES`).
+- ``build``: the shared sequences (``compact.py seqs`` per ``--shards``, into ``seqs/``, once),
+  then the compact index on pfam-anchor's reference (``compact.py shard`` per shard, then
+  ``merge``) into ``index-<tag>``, the tag naming its sparsity (``r32``, the
+  standard index, or ``r16`` and ``r8``, the larger ones: :data:`RATES`).
 - ``query``: per set, ``compact.py query`` into ``<set>/c-<tag>`` (tier 1 and confirmation: the
   index's cost), then ``recruit.py`` into ``<set>/r-<tag>`` (recruitment to the confirmed
   representatives, a step of its own, timed apart); bars at ``--chance-scale`` (the release's
@@ -56,7 +57,7 @@ IDENTITIES = ("1", "0.98", "0.95", "0.9", "0.85", "0.8", "0.75", "0.7")
 SETS = ("strains", "relatives")
 RELEASE_PROTEINS = 5.74e9
 K, RATE = 9, 32  # defaults: layer k; one key per RATE representative residues, on average
-RATES = (32, 8, 4)  # the index's sizes: standard, and the larger options (keys x4 and x8)
+RATES = (32, 16, 8)  # the index's sizes: standard, and the larger options (keys x2 and x4)
 FLOOR = 30.0  # read-pair evidence (bits) before a candidate is pseudo-aligned
 LOOSE = (0.7, 0.5)  # also scored: the representative within these identities of the best
 MIN_READS = 0.5  # expected reads (EM weight) for a unit to be present
@@ -129,27 +130,31 @@ def reads(a: argparse.Namespace) -> None:
 
 
 def tag(a: argparse.Namespace) -> str:
-    """The index's name by its sparsity: ``r32`` (the default), ``r8`` or ``r4`` (the larger)."""
+    """The index's name by its sparsity: ``r32`` (the default), ``r16`` or ``r8`` (the larger)."""
     return f"r{a.rate:g}"
 
 
 def build(a: argparse.Namespace) -> None:
-    """The compact index (``compact.py shard`` per shard, then ``merge``)."""
-    w = a.out / f"index-{tag(a)}"
+    """The shared sequences (``compact.py seqs`` per shard, once for every size), then this
+    size's index (``compact.py shard`` per shard, then ``merge``)."""
+    w, sq = a.out / f"index-{tag(a)}", a.out / "seqs"
     times: dict[str, object] = {}
     py, cx = prepare.PY, TREE / "compact.py"
     for s in range(a.shards):
-        if not (w / f"seqs/{s:04d}.json").exists():
-            t0 = time.perf_counter()
-            prepare.run(py, cx, "shard", "--members", a.reference, "--index", w, "--shards",
-                        a.shards, "--shard", s, "--k", a.k, "--rate", a.rate)  # fmt: skip
-            times[f"shard_{s}"] = time.perf_counter() - t0
+        for done, cmd in (
+            (sq / f"{s:04d}.json", ["seqs", "--members", a.reference, "--shards", a.shards]),
+            (w / f"shards/{s:04d}.json", ["shard", "--index", w, "--k", a.k, "--rate", a.rate]),
+        ):
+            if not done.exists():
+                t0 = time.perf_counter()
+                prepare.run(py, cx, *cmd, "--seqs", sq, "--shard", s)
+                times[f"{cmd[0]}_{s}"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    prepare.run(py, cx, "merge", "--index", w, "--k", a.k, "--rate", a.rate)
+    prepare.run(py, cx, "merge", "--index", w, "--seqs", sq, "--k", a.k, "--rate", a.rate)
     times["merge"] = time.perf_counter() - t0
     meta = json.loads((w / "meta.json").read_text())
     times |= {"postings": meta["postings"], "index_bytes": meta["bytes"],
-              "seq_bytes": sum(f.stat().st_size for f in (w / "seqs").glob("*"))}  # fmt: skip
+              "seq_bytes": sum(f.stat().st_size for f in sq.glob("*"))}  # fmt: skip
     (a.out / f"build_times_{tag(a)}.json").write_text(json.dumps(times, indent=1))
     print(json.dumps(times, indent=1))
 
@@ -328,7 +333,7 @@ def main() -> None:
         type=float,
         default=RATE,
         choices=RATES,
-        help="one key per RATE rep residues: 32, or 8 and 4 for the larger indexes",
+        help="one key per RATE rep residues: 32, or 16 and 8 for the larger indexes",
     )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB)

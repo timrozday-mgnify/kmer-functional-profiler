@@ -11,8 +11,8 @@
 # workflows/route90: MGnify90 units, k 9, keys by sqrt(members), 30-bit floor, confirmation on
 # each unit's representative, every read pair recruited to the confirmed representatives (timed
 # apart: not the index's cost). Three index sizes, each built and queried: 1 in 32 (standard),
-# 1 in 8 and 1 in 4 (the larger options); RATES=32 (or any of them, comma-separated) for fewer.
-# Read, per size <tag> (r32, r8, r4):
+# 1 in 16 and 1 in 8 (the larger options); RATES=32 (or any of them, comma-separated) for fewer.
+# Read, per size <tag> (r32, r16, r8):
 #   results/route90_recall_<tag>.tsv   per set x depth x AAI: target recall (the representative
 #                                      within 0.9 of the best; Wilson interval), within 0.7 and
 #                                      0.5, the unit's, confirmed share, read recall, precision
@@ -25,4 +25,4 @@ source ../common.sh
 SLICE=../tree-index-slice/results
 [[ -f $SLICE/members.parquet ]] || { echo "no $SLICE/members.parquet: run tree-index-slice first" >&2; exit 1; }
 nextflow run "$WF/route90" -c ../site.config -resume --outdir results \
-    --members "$(realpath "$SLICE/members.parquet")" --rates "${RATES:-32,8,4}"
+    --members "$(realpath "$SLICE/members.parquet")" --rates "${RATES:-32,16,8}"
