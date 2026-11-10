@@ -15,15 +15,17 @@ Steps, into ``--out``:
   ``spike.py simulate`` per depth, at that depth exactly) and merged; ``truth.parquet`` per set:
   strain, depth, aai, best (the indexed protein a perfect method would report).
 - ``build``: the compact index on pfam-anchor's reference (``compact.py shard`` per
-  ``--shards``, then ``merge``).
-- ``query``: per set, ``compact.py query`` into ``<set>/c`` (tier 1 and confirmation: the
-  index's cost), then ``recruit.py`` into ``<set>/r`` (recruitment to the confirmed
+  ``--shards``, then ``merge``) into ``index-<tag>``, the tag naming its sparsity (``r32``, the
+  standard index, or ``r8`` and ``r4``, the larger ones: :data:`RATES`).
+- ``query``: per set, ``compact.py query`` into ``<set>/c-<tag>`` (tier 1 and confirmation: the
+  index's cost), then ``recruit.py`` into ``<set>/r-<tag>`` (recruitment to the confirmed
   representatives, a step of its own, timed apart); bars at ``--chance-scale`` (the release's
   proteins over the reference's, by default).
-- ``score``: ``route90_recall.tsv`` (per set x depth x AAI: target recall with Wilson intervals
-  over strains, read recall and precision), ``route90_targets.tsv`` (present units and their
-  precision, the stage each strain is lost at) and ``route90_cost.json``. A hit is correct when
-  its protein is at least ``--within`` identical to the strain's best indexed protein.
+- ``score``: ``route90_recall_<tag>.tsv`` (per set x depth x AAI: target recall with Wilson
+  intervals over strains, within 0.7 and 0.5, the unit's, read recall and precision) and
+  ``route90_targets_<tag>.tsv`` (present units and their precision, the stage each strain is
+  lost at). A hit is correct when its protein is at least ``--within`` identical to the
+  strain's best indexed protein.
 """
 
 import argparse
@@ -54,6 +56,7 @@ IDENTITIES = ("1", "0.98", "0.95", "0.9", "0.85", "0.8", "0.75", "0.7")
 SETS = ("strains", "relatives")
 RELEASE_PROTEINS = 5.74e9
 K, RATE = 9, 32  # defaults: layer k; one key per RATE representative residues, on average
+RATES = (32, 8, 4)  # the index's sizes: standard, and the larger options (keys x4 and x8)
 FLOOR = 30.0  # read-pair evidence (bits) before a candidate is pseudo-aligned
 LOOSE = (0.7, 0.5)  # also scored: the representative within these identities of the best
 MIN_READS = 0.5  # expected reads (EM weight) for a unit to be present
@@ -125,9 +128,14 @@ def reads(a: argparse.Namespace) -> None:
         ).write_parquet(a.out / name / "truth.parquet")
 
 
+def tag(a: argparse.Namespace) -> str:
+    """The index's name by its sparsity: ``r32`` (the default), ``r8`` or ``r4`` (the larger)."""
+    return f"r{a.rate:g}"
+
+
 def build(a: argparse.Namespace) -> None:
     """The compact index (``compact.py shard`` per shard, then ``merge``)."""
-    w = a.out / "index"
+    w = a.out / f"index-{tag(a)}"
     times: dict[str, object] = {}
     py, cx = prepare.PY, TREE / "compact.py"
     for s in range(a.shards):
@@ -142,7 +150,7 @@ def build(a: argparse.Namespace) -> None:
     meta = json.loads((w / "meta.json").read_text())
     times |= {"postings": meta["postings"], "index_bytes": meta["bytes"],
               "seq_bytes": sum(f.stat().st_size for f in (w / "seqs").glob("*"))}  # fmt: skip
-    (a.out / "build_times.json").write_text(json.dumps(times, indent=1))
+    (a.out / f"build_times_{tag(a)}.json").write_text(json.dumps(times, indent=1))
     print(json.dumps(times, indent=1))
 
 
@@ -156,18 +164,19 @@ def query(a: argparse.Namespace) -> None:
         d = a.out / name
         r = [d / "reads_1.fq.gz", d / "reads_2.fq.gz"]
         t0 = time.perf_counter()
-        prepare.run(prepare.PY, TREE / "compact.py", "query", "--index", a.out / "index",
-                    "--reads", *r, "--out", d / "c", "--floor", FLOOR,
+        prepare.run(prepare.PY, TREE / "compact.py", "query", "--index", a.out / f"index-{tag(a)}",
+                    "--reads", *r, "--out", d / f"c-{tag(a)}", "--floor", FLOOR,
                     "--chance-scale", scale)  # fmt: skip
         times[f"{name}_index_s"] = time.perf_counter() - t0  # the index's cost: tier 1, confirm
         t0 = time.perf_counter()
         prepare.run(prepare.PY, TREE / "recruit.py", "--reads", *r, "--targets",
-                    d / "c/confirmed.fa", "--seeded", d / "c/seeded.tsv", "--out", d / "r",
+                    d / f"c-{tag(a)}/confirmed.fa", "--seeded", d / f"c-{tag(a)}/seeded.tsv",
+                    "--out", d / f"r-{tag(a)}",
                     "--chance-scale", scale)  # fmt: skip
         times[f"{name}_recruit_s"] = time.perf_counter() - t0  # a step of its own
-        times[name] = json.loads((d / "c/query.json").read_text())
-        times[f"{name}_recruit"] = json.loads((d / "r/recruit.json").read_text())
-    (a.out / "query_times.json").write_text(json.dumps(times, indent=1))
+        times[name] = json.loads((d / f"c-{tag(a)}/query.json").read_text())
+        times[f"{name}_recruit"] = json.loads((d / f"r-{tag(a)}/recruit.json").read_text())
+    (a.out / f"query_times_{tag(a)}.json").write_text(json.dumps(times, indent=1))
     print(json.dumps(times, indent=1))
 
 
@@ -218,17 +227,17 @@ def score(a: argparse.Namespace) -> None:
         read_strain = pl.DataFrame(
             {"read": np.arange(len(names)), "strain": [n.rsplit("_", 1)[0] for n in names]}
         )
-        units = pl.read_csv(d / "c/units.tsv", separator="\t")  # the confirmed
+        units = pl.read_csv(d / f"c-{tag(a)}/units.tsv", separator="\t")  # the confirmed
         # a unit is reported by its representative; each read pair's top units, ties kept
         top = (
-            pl.read_parquet(d / "r/reads.parquet", columns=["read", "target"])
+            pl.read_parquet(d / f"r-{tag(a)}/reads.parquet", columns=["read", "target"])
             .select("read", protein_id=pl.col("target").cast(pl.Int64))
             .join(units.select("unit", "protein_id"), on="protein_id")
             .join(read_strain, on="read")
             .join(truth.select("strain", "best"), on="strain")
         )
         recruited = pl.read_csv(
-            d / "r/targets.tsv", separator="\t", schema_overrides={"target": pl.Int64}
+            d / f"r-{tag(a)}/targets.tsv", separator="\t", schema_overrides={"target": pl.Int64}
         )
         present = (
             recruited.filter(pl.col("reads") >= MIN_READS)
@@ -264,7 +273,7 @@ def score(a: argparse.Namespace) -> None:
                           found=pl.col("best").is_in(found_best["best"].implode()),
                           **{f"found_{x}": pl.col("best").is_in(v) for x, v in loose.items()})
         )  # fmt: skip
-        st.write_parquet(d / "route90_strains.parquet")
+        st.write_parquet(d / f"route90_strains_{tag(a)}.parquet")
         for (depth, aai), g in st.group_by("depth", "aai"):
             n, k = g.height, int(g["found"].sum())
             lo, hi = wilson(k, n)
@@ -287,9 +296,9 @@ def score(a: argparse.Namespace) -> None:
             "lost_after_confirm": int((st["confirmed"] & ~st["found"]).sum()),
         })  # fmt: skip
     rec = pl.DataFrame(recall_rows).sort("set", "depth", "aai", descending=[False, False, True])
-    rec.write_csv(a.out / "route90_recall.tsv", separator="\t", float_precision=3)
+    rec.write_csv(a.out / f"route90_recall_{tag(a)}.tsv", separator="\t", float_precision=3)
     pl.DataFrame(target_rows).write_csv(
-        a.out / "route90_targets.tsv", separator="\t", float_precision=3
+        a.out / f"route90_targets_{tag(a)}.tsv", separator="\t", float_precision=3
     )
     with pl.Config(tbl_rows=200, tbl_cols=20):
         print(rec)
@@ -314,7 +323,13 @@ def main() -> None:
         "--within", type=float, default=0.9, help="identity to the best target that counts"
     )
     p.add_argument("--k", type=int, default=K, help="tier 1 key length")
-    p.add_argument("--rate", type=float, default=RATE, help="one key per RATE rep residues")
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=RATE,
+        choices=RATES,
+        help="one key per RATE rep residues: 32, or 8 and 4 for the larger indexes",
+    )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB)
     a = p.parse_args()
