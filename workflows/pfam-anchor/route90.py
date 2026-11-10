@@ -51,7 +51,7 @@ DEPTHS = (0.5, 1, 2, 5, 10, 30)
 IDENTITIES = ("1", "0.98", "0.95", "0.9", "0.85", "0.8", "0.75", "0.7")
 SETS = ("strains", "relatives")
 RELEASE_PROTEINS = 5.74e9
-K, RATE = 9, 8  # layer k; one key per RATE representative residues, on average
+K, RATE = 9, 8  # defaults: layer k; one key per RATE representative residues, on average
 POOL_WINDOW = 4  # the layer's window minimizers (~2/(w+1) of k-mers), thinned by sqrt:<mean>
 FLOOR = 30.0  # read-pair evidence (bits) before a candidate is pseudo-aligned
 BTOP = re.compile(r"(\d+)|(..)")
@@ -126,7 +126,7 @@ def build(a: argparse.Namespace) -> None:
     w = a.out / "index"
     ref = pl.read_parquet(a.reference, columns=["protein_id", "cluster_rep", "sequence"])
     reps = ref.filter(pl.col("protein_id") == pl.col("cluster_rep"))
-    mean = float((reps["sequence"].str.len_chars() - K + 1).clip(1).mean()) / RATE
+    mean = float((reps["sequence"].str.len_chars() - a.k + 1).clip(1).mean()) / a.rate
     times = {"keys_per_unit": mean}
 
     def step(key: str, *cmd: object) -> None:
@@ -139,7 +139,7 @@ def build(a: argparse.Namespace) -> None:
         step("partition", py, TREE / "partition.py", "--members", a.reference, "--out", w / "parts",
              "--part-proteins", a.part_proteins)  # fmt: skip
     parts = sorted((w / "parts").glob("part*.parquet"))
-    layer = ["--mode", "standard", "--layers", f"protein:{K}:{POOL_WINDOW}:rare",
+    layer = ["--mode", "standard", "--layers", f"protein:{a.k}:{POOL_WINDOW}:rare",
              "--layer-groups", "units", "--layer-rep", "medoid", "--layer-keys", f"sqrt:{mean:.3f}",
              "--t-base", 0, "--window", 0, "--ladder=", "--n-1", 0]  # fmt: skip
     for part in parts:
@@ -363,6 +363,8 @@ def main() -> None:
     p.add_argument(
         "--within", type=float, default=0.9, help="identity to the best target that counts"
     )
+    p.add_argument("--k", type=int, default=K, help="tier 1 key length")
+    p.add_argument("--rate", type=float, default=RATE, help="one key per RATE rep residues")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--max-gb", type=float, default=prepare.MAX_GB)
     a = p.parse_args()
