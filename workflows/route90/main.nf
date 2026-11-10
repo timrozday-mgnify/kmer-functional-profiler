@@ -1,13 +1,15 @@
-// The tree index on its own, no anchoring (docs/tree-index-plan.md, Progress log: the route on
-// its own): tier 1 on MGnify90 units, confirmation on each unit's representative, pseudo-
-// alignment to every leaf of the confirmed units, full alignment of the top hits, scored by
-// depth x AAI. Each process runs one step of ../pfam-anchor/route90.py on the shared --data
-// directory and passes a token. On HPC: hpc/kfp-ablations/route90/run.sh.
+// The tree index's route on its own, on the compact index (docs/tree-index-plan.md, Progress log:
+// the compact route, 2026-11-10): tier 1 on MGnify90 units, confirmation on each unit's
+// representative, every read pair recruited to the confirmed representatives by seed votes and
+// pseudo-alignment, scored by depth x AAI. Each process runs one step of
+// ../pfam-anchor/route90.py (or ../tree-index/compact.py) on the shared --data directory and
+// passes a token. On HPC: hpc/kfp-ablations/route90/run.sh.
 //
 // HOLDOUT  held-out proteins and their nearest relative left in the reference   recall.py holdout
 // READS    strains and relatives at depths 0.5-30x                              route90.py reads
-// BUILD    the index (layer-only, k 9, 1 in 8, sqrt(members))                   route90.py build
-// QUERY    tier 1, confirm, leaves, seed alignment                              route90.py query
+// SHARD    one shard's FASTA, unit offsets and keys (k 9, 1 in 32, sqrt)        compact.py shard
+// BUILD    the shards' keys merged                                              route90.py build
+// QUERY    tier 1, confirm, recruit                                             route90.py query
 // SCORE    route90_recall.tsv, route90_targets.tsv                              route90.py score
 
 nextflow.enable.dsl = 2
@@ -21,7 +23,7 @@ def step(name, task) {
     export RAYON_NUM_THREADS=${task.cpus} POLARS_MAX_THREADS=${task.cpus}
     ${python()} ${projectDir}/../pfam-anchor/route90.py ${name} --out ${data()} \
         --holdout ${data()}/holdout --max-gb ${(task.memory.toGiga() * 0.9).round(1)} \
-        --strains ${params.strains} --part-proteins ${params.part_proteins}
+        --strains ${params.strains} --shards ${params.shards}
     """
 }
 
@@ -37,6 +39,18 @@ process READS {
     input: val token
     output: val 'reads'
     script: step('reads', task)
+}
+
+process SHARD {
+    label 'process_medium'
+    input: tuple val(token), val(shard)
+    output: val 'shard'
+    script:
+    """
+    export RAYON_NUM_THREADS=${task.cpus} POLARS_MAX_THREADS=${task.cpus}
+    ${python()} ${projectDir}/../tree-index/compact.py shard --members ${data()}/holdout/members.parquet \
+        --index ${data()}/index --shards ${params.shards} --shard ${shard}
+    """
 }
 
 process BUILD {
@@ -63,5 +77,7 @@ process SCORE {
 }
 
 workflow {
-    SCORE(QUERY(BUILD(READS(HOLDOUT()))))
+    held = HOLDOUT()
+    shards = SHARD(held.combine(Channel.of(0..<(params.shards as int))))
+    SCORE(QUERY(BUILD(READS(held).combine(shards.collect()).map { it[0] })))
 }
