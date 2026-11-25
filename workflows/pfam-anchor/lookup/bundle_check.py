@@ -1,6 +1,7 @@
 """The bundle against the prototype scan: same rows, no collapsing, so the same calls. Fails if any
 differ. MEMBERS=1: a bundle with members (--clusters) against scan MEMBERS=1, on real reads only,
-as the scan leaves a simulated read's own protein out and the bundle cannot."""
+as the scan leaves a simulated read's own protein out and the bundle cannot. FAMILIES=n: the
+slice's first n families only (a smaller bundle, when disk is short)."""
 
 import os
 import subprocess
@@ -17,16 +18,22 @@ MEMBERS = os.environ.get("MEMBERS") == "1"
 B = OUT / ("bundle_check_members" if MEMBERS else "bundle_check")
 subprocess.run(["rm", "-rf", B], check=True)
 B.mkdir()
+d = pl.read_parquet(OUT / "domains.parquet")
+fams = sorted(d["pfam_accession"].unique())[: int(os.environ.get("FAMILIES", "0")) or None]
+d = d.filter(pl.col("pfam_accession").is_in(fams))
 m = pl.read_parquet(SLICE / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"])
+m = m.join(d.select("protein_id").unique(), on="protein_id", how="semi")
 if MEMBERS:
     m.select("protein_id", "cluster_rep").write_parquet(B / "clusters.parquet")
 else:
     m = m.filter(pl.col("protein_id") == pl.col("cluster_rep"))
 m.select("protein_id", "sequence").write_parquet(B / "seqs.parquet")
-pl.read_parquet(OUT / "domains.parquet").join(
-    m.select("protein_id"), on="protein_id", how="semi"
-).write_parquet(B / "hits.parquet")
-q = pl.read_parquet(OUT / "queries.parquet").sort("qid")
+d.join(m.select("protein_id"), on="protein_id", how="semi").write_parquet(B / "hits.parquet")
+q = (
+    pl.read_parquet(OUT / "queries.parquet")
+    .sort("qid")
+    .filter(pl.col("pfam_accession").is_in(fams))
+)
 if MEMBERS:
     q = q.filter(pl.col("set") == "real")
 

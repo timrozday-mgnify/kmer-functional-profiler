@@ -1,14 +1,20 @@
 //! The self-contained index: `rows.bin`, a block per family, read one family at a time.
 //!
-//! Block (format 2): "KFAB", acc u32, columns u32, rows u32, schemes u32, members u32, then six lengths u64, then
+//! Block (format 3): "KFAB", acc u32, columns u32, rows u32, schemes u32, members u32, then seven lengths u64, then
 //!   bits      columns x 20 bytes: quarter bits of a residue at a column, from the representatives' rows before collapsing
 //!   heads     rows x 10: accession 5 bytes, hmm_from u16, sequence length u16, flanks (left << 4 | right)
 //!   labels    schemes x rows u16: 0 is unlabelled
-//!   ops       the rows' CIGARs, one after another: op << 6 | length - 1, with lengths over 62 as 63 and a u16; 0xFF ends a row
-//!   seq       the rows' residues, flanks included, 5 bits each, each row from a whole byte
-//!   clusters  members x 5 bytes: the last `members` rows are members of other proteins' clusters, sorted by cluster;
-//!             this is each one's representative. The first stage scans representatives only; the members of the
-//!             clusters it keeps join the column and banded stages (scan.rs, MEMBERS).
+//!   ops       the rows' CIGARs, one after another: op << 6 | length - 1, with lengths over 62 as 63 and a u16; 0xFF ends a row.
+//!             A member whose CIGAR is its parent's has 0xFE alone
+//!   seq       representatives' residues, flanks included, 5 bits each, each row from a whole byte; then each member's
+//!             literal residues (see runs), the same way
+//!   parents   per member, zigzag LEB128 of its parent's row less the previous member's: the last `members` rows are
+//!             members of other proteins' clusters, sorted by cluster, and the parent is the row of the cluster's
+//!             representative each is stored against, which names the cluster. The first stage
+//!             scans representatives only; the members of the clusters it keeps join the column and banded stages.
+//!   runs      per member, LEB128 pairs (copied, literal) covering its residues in order: a copied residue is the
+//!             parent's at the same place (`mapping`), a literal one is read from seq. Members differ from their
+//!             representative at a few residues, so most are copied.
 //! All little-endian. Accessions fit 5 bytes: 1.1e12.
 use crate::cand::hash;
 use crate::data::*;
@@ -22,7 +28,8 @@ use std::sync::Mutex;
 
 const MAGIC: &[u8; 4] = b"KFAB";
 const HEAD: usize = 10;
-const TOP: usize = 24 + 6 * 8; // the block's fixed header
+const TOP: usize = 24 + 7 * 8; // the block's fixed header
+const SAME_OPS: u8 = 0xFE; // a member's CIGAR is its parent's
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Row {
@@ -68,6 +75,84 @@ impl Row {
         }
         Ok((codes, pos))
     }
+}
+
+/// Where each of a row's residues falls in another row (its parent), given the parent's position at each column
+/// (`Row::columns`): through the columns both cover, and for flanks, inserts and columns the parent lacks, at the same
+/// offset from the nearest such column before (after, for the left flank). None when the rows share no column.
+pub fn mapping(r: &Row, parent_pos: &[u16]) -> Vec<Option<usize>> {
+    let (mut c, mut p, mut anchors) = (r.hmm_from as usize - 1, r.left as usize, vec![]);
+    for &(op, n) in &r.ops {
+        for _ in 0..n {
+            match op {
+                0 => {
+                    if let Some(&q) = parent_pos.get(c).filter(|&&q| q != u16::MAX) {
+                        anchors.push((p, q as usize));
+                    }
+                    c += 1;
+                    p += 1;
+                }
+                1 => p += 1,
+                _ => c += 1,
+            }
+        }
+    }
+    let mut k = 0;
+    (0..r.seq.len())
+        .map(|p| {
+            while k + 1 < anchors.len() && anchors[k + 1].0 <= p {
+                k += 1;
+            }
+            let &(a, q) = anchors.get(k)?;
+            (q + p).checked_sub(a)
+        })
+        .collect()
+}
+
+fn zigzag(x: i64) -> usize {
+    ((x << 1) ^ (x >> 63)) as usize
+}
+fn unzigzag(x: usize) -> i64 {
+    (x >> 1) as i64 ^ -((x & 1) as i64)
+}
+
+fn leb(mut x: usize, out: &mut Vec<u8>) {
+    while x >= 128 {
+        out.push(x as u8 | 128);
+        x >>= 7;
+    }
+    out.push(x as u8);
+}
+fn unleb(b: &[u8], at: &mut usize) -> Option<usize> {
+    let (mut x, mut sh) = (0usize, 0);
+    loop {
+        let y = *b.get(*at)?;
+        *at += 1;
+        x |= ((y & 127) as usize) << sh;
+        if y < 128 {
+            return Some(x);
+        }
+        sh += 7;
+        if sh > 28 {
+            return None;
+        }
+    }
+}
+
+/// A member against its parent: the runs, and the literal residues.
+fn diff(r: &Row, parent: &Row, parent_pos: &[u16]) -> (Vec<u8>, Vec<u8>) {
+    let m = mapping(r, parent_pos);
+    let same: Vec<bool> = (0..r.seq.len()).map(|p| m[p].is_some_and(|q| parent.seq.get(q) == Some(&r.seq[p]))).collect();
+    let (mut runs, mut lit, mut p) = (vec![], vec![], 0);
+    while p < same.len() {
+        let a = same[p..].iter().take_while(|&&x| x).count();
+        let b = same[p + a..].iter().take_while(|&&x| !x).count();
+        leb(a, &mut runs);
+        leb(b, &mut runs);
+        lit.extend_from_slice(&r.seq[p + a..p + a + b]);
+        p += a + b;
+    }
+    (runs, lit)
 }
 
 pub fn pack5(seq: &[u8], out: &mut Vec<u8>) {
@@ -178,24 +263,43 @@ fn collapse(cols: &[Vec<u8>], rows: &[Row], t: f32) -> Vec<usize> {
     v
 }
 
-/// `rows`: representatives, then members sorted by cluster.
+/// `rows`: representatives, then members sorted by cluster, each with a representative row of its cluster. A member is
+/// stored against whichever of its representative's rows leaves the fewest literal residues.
 fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec<u8> {
-    let (mut heads, mut labels, mut ops, mut seq, mut clusters) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut heads, mut labels, mut ops, mut seq, mut parents, mut runs) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     let members = rows.iter().filter(|r| r.cluster > 0).count();
-    assert!(rows[..rows.len() - members].iter().all(|r| r.cluster == 0), "members must come last");
-    assert!(rows[rows.len() - members..].is_sorted_by_key(|r| r.cluster), "members must be sorted by cluster");
+    let nr = rows.len() - members;
+    assert!(rows[..nr].iter().all(|r| r.cluster == 0), "members must come last");
+    assert!(rows[nr..].is_sorted_by_key(|r| r.cluster), "members must be sorted by cluster");
+    let mut of: std::collections::HashMap<u64, Vec<usize>> = Default::default();
+    rows[..nr].iter().enumerate().for_each(|(i, r)| of.entry(r.acc).or_default().push(i));
+    let mut ppos: Vec<Option<Vec<u16>>> = vec![None; nr];
+    let mut last = 0i64;
     for r in rows {
         assert!(r.left < 16 && r.right < 16 && r.acc < 1 << 40 && r.seq.len() < 65536);
         heads.extend_from_slice(&r.acc.to_le_bytes()[..5]);
         heads.extend_from_slice(&r.hmm_from.to_le_bytes());
         heads.extend_from_slice(&(r.seq.len() as u16).to_le_bytes());
         heads.push(r.left << 4 | r.right);
-        pack_ops(&r.ops, &mut ops);
-        pack5(&r.seq, &mut seq);
-        if r.cluster > 0 {
-            assert!(r.cluster < 1 << 40);
-            clusters.extend_from_slice(&r.cluster.to_le_bytes()[..5]);
+        if r.cluster == 0 {
+            pack_ops(&r.ops, &mut ops);
+            pack5(&r.seq, &mut seq);
+            continue;
         }
+        let cands = of.get(&r.cluster).unwrap_or_else(|| panic!("PF{acc:05}: {}'s representative {} has no row", r.acc, r.cluster));
+        let (i, (ru, lit)) = cands.iter().map(|&i| {
+            let pp = ppos[i].get_or_insert_with(|| rows[i].columns(len).expect("a representative's row").1);
+            (i, diff(r, &rows[i], pp))
+        }).min_by_key(|(i, (_, lit))| (lit.len(), *i)).unwrap();
+        if r.ops == rows[i].ops {
+            ops.push(SAME_OPS);
+        } else {
+            pack_ops(&r.ops, &mut ops);
+        }
+        leb(zigzag(i as i64 - last), &mut parents);
+        last = i as i64;
+        runs.extend_from_slice(&ru);
+        pack5(&lit, &mut seq);
     }
     for s in 0..schemes {
         rows.iter().for_each(|r| labels.extend_from_slice(&r.labels[s].to_le_bytes()));
@@ -204,7 +308,7 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
     for x in [acc, len as u32, rows.len() as u32, schemes as u32, members as u32] {
         o.extend_from_slice(&x.to_le_bytes());
     }
-    let parts: [&[u8]; 6] = [bits, &heads, &labels, &ops, &seq, &clusters];
+    let parts: [&[u8]; 7] = [bits, &heads, &labels, &ops, &seq, &parents, &runs];
     parts.iter().for_each(|p| o.extend_from_slice(&(p.len() as u64).to_le_bytes()));
     parts.iter().for_each(|p| o.extend_from_slice(p));
     o
@@ -223,34 +327,76 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
         return Err("not a block".into());
     }
     let (acc, len, n, schemes, members) = (u(4), u(8) as usize, u(12) as usize, u(16) as usize, u(20) as usize);
-    let sizes: Vec<usize> = (0..6).map(|i| u64::from_le_bytes(b[24 + 8 * i..32 + 8 * i].try_into().unwrap()) as usize).collect();
+    let sizes: Vec<usize> = (0..7).map(|i| u64::from_le_bytes(b[24 + 8 * i..32 + 8 * i].try_into().unwrap()) as usize).collect();
     if TOP + sizes.iter().sum::<usize>() != b.len() || sizes[0] != 20 * len || sizes[1] != HEAD * n || sizes[2] != 2 * n * schemes
-        || members > n || sizes[5] != 5 * members {
+        || members > n {
         return Err(format!("PF{acc:05}: the block's sizes do not add up"));
     }
     let mut at = TOP;
     let part: Vec<&[u8]> = sizes.iter().map(|&s| { at += s; &b[at - s..at] }).collect();
-    let (mut rows, mut o, mut q) = (Vec::with_capacity(n), 0, 0);
+    let nr = n - members;
+    let (mut rows, mut o, mut q, mut ra, mut pa, mut last): (Vec<Row>, _, _, _, _, i64) = (Vec::with_capacity(n), 0, 0, 0, 0, 0);
+    let mut ppos: Vec<Option<Vec<u16>>> = vec![None; nr];
     for i in 0..n {
         let h = &part[1][HEAD * i..HEAD * (i + 1)];
         let sl = u16::from_le_bytes([h[7], h[8]]) as usize;
-        let bytes = part[4].get(q..q + (5 * sl).div_ceil(8)).ok_or("short sequences")?;
-        q += bytes.len();
-        rows.push(Row {
+        let mut r = Row {
             acc: h[..5].iter().rev().fold(0, |a, &x| a << 8 | x as u64),
             hmm_from: u16::from_le_bytes([h[5], h[6]]),
             left: h[9] >> 4,
             right: h[9] & 15,
-            ops: unpack_ops(part[3], &mut o).ok_or("short CIGARs")?,
-            seq: unpack5(bytes, sl),
+            ops: vec![],
+            seq: vec![0; sl],
             labels: (0..schemes).map(|s| { let x = 2 * (s * n + i); u16::from_le_bytes([part[2][x], part[2][x + 1]]) }).collect(),
-            cluster: match i.checked_sub(n - members) {
-                Some(j) => part[5][5 * j..5 * j + 5].iter().rev().fold(0, |a, &x| a << 8 | x as u64),
-                None => 0,
-            },
-        });
+            cluster: 0,
+        };
+        if i >= nr && part[3].get(o) == Some(&SAME_OPS) {
+            o += 1; // the parent's, set below
+        } else {
+            r.ops = unpack_ops(part[3], &mut o).ok_or("short CIGARs")?;
+        }
+        if i < nr {
+            let bytes = part[4].get(q..q + (5 * sl).div_ceil(8)).ok_or("short sequences")?;
+            q += bytes.len();
+            r.seq = unpack5(bytes, sl);
+            rows.push(r);
+            continue;
+        }
+        let pi = last + unzigzag(unleb(part[5], &mut pa).ok_or("short parents")?);
+        last = pi;
+        let pi = usize::try_from(pi).ok().filter(|&x| x < nr).ok_or_else(|| format!("PF{acc:05}: a member's parent is not a representative"))?;
+        let parent = &rows[pi];
+        r.cluster = parent.acc;
+        if r.ops.is_empty() {
+            r.ops = parent.ops.clone();
+        }
+        let pp = match &ppos[pi] {
+            Some(x) => x,
+            None => ppos[pi].insert(parent.columns(len)?.1),
+        };
+        let m = mapping(&r, pp);
+        let (mut p, mut literal_at) = (0, vec![]);
+        while p < sl {
+            let a = unleb(part[6], &mut ra).ok_or("short runs")?;
+            let e = unleb(part[6], &mut ra).ok_or("short runs")?;
+            if p + a + e > sl {
+                return Err(format!("PF{acc:05}: a member's runs pass its end"));
+            }
+            for k in p..p + a {
+                r.seq[k] = *m[k].and_then(|x| parent.seq.get(x)).ok_or_else(|| format!("PF{acc:05}: a copied residue outside the parent"))?;
+            }
+            literal_at.extend(p + a..p + a + e);
+            p += a + e;
+        }
+        let bytes = part[4].get(q..q + (5 * literal_at.len()).div_ceil(8)).ok_or("short sequences")?;
+        q += bytes.len();
+        let got = unpack5(bytes, literal_at.len());
+        for (k, x) in literal_at.into_iter().zip(got) {
+            r.seq[k] = x;
+        }
+        rows.push(r);
     }
-    if o != part[3].len() || q != part[4].len() {
+    if o != part[3].len() || q != part[4].len() || pa != part[5].len() || ra != part[6].len() {
         return Err(format!("PF{acc:05}: bytes left over"));
     }
     Ok(Block { acc, len, reps: n - members, bits: part[0].to_vec(), rows })
@@ -427,6 +573,36 @@ mod tests {
         assert_eq!(x.reps, 40);
         assert_eq!(r[45].unit(), r[6].acc);
         assert_eq!(r[5].unit(), r[5].acc);
+    }
+    #[test]
+    fn members_are_stored_as_differences() {
+        // a representative of 3 domains' worth of residues, and a member: 4 substitutions, an insert of 2 where the
+        // representative has none, a start 5 columns later, and other flanks
+        let rnd = |n: u64, s: u64| -> Vec<u8> { (0..n).map(|k| (hash(s * 7919 + k) % 20) as u8).collect() };
+        let core = rnd(120, 1);
+        let rep = Row { acc: 7, hmm_from: 1, left: 10, right: 10, ops: vec![(0, 120)], labels: vec![],
+                        seq: [rnd(10, 2), core.clone(), rnd(10, 3)].concat(), cluster: 0 };
+        let mut mc = core[5..].to_vec();
+        for k in [3, 40, 41, 90] {
+            mc[k] = (mc[k] + 1) % 20;
+        }
+        mc.splice(60..60, [4u8, 9]);
+        let mem = Row { acc: 8, hmm_from: 6, left: 7, right: 10, ops: vec![(0, 60), (1, 2), (0, 55)], labels: vec![],
+                        seq: [rnd(7, 4), mc, rep.seq[130..140].to_vec()].concat(), cluster: 7 };
+        assert!(mem.columns(120).is_ok());
+        let v = vec![rep.clone(), mem.clone()];
+        let b = block(1, 120, 0, &v, &[0u8; 2400]);
+        let x = read_block(&b).unwrap();
+        assert_eq!(x.rows, v);
+        // literals: 7 left flank + 4 substituted + 2 inserted; the right flank is the representative's, so copied
+        let (_, lit) = diff(&mem, &rep, &rep.columns(120).unwrap().1);
+        assert_eq!(lit.len(), 13);
+        let plain = block(1, 120, 0, &[rep.clone(), Row { cluster: 0, ..mem.clone() }], &[0u8; 2400]);
+        assert!(b.len() + 40 < plain.len(), "{} against {} stored plainly", b.len(), plain.len());
+        let mut bad = b.clone();
+        let at = bad.len() - 1;
+        bad[at] = 0x7f; // the last run: past the member's end
+        assert!(read_block(&bad).is_err());
     }
     #[test]
     #[should_panic(expected = "members must come last")]

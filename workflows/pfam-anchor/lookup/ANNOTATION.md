@@ -42,7 +42,7 @@ So **about 40 GB for KO, CAZy and a few more, rows collapsed at 70%**.
 ## The bundle, built (2026-11-24)
 
 `bundle.py` builds, checks and uses it (its header has the format and the commands); `rs/src/bundle.rs` stores and reads the rows; `test_bundle.py` and `bundle_check.py` are its tests.
-Format 2 (2026-11-25) adds members: with `--clusters` and `--collapse 0`, each family's block holds the representatives' rows and then the distinct member rows of their clusters, and a call names the cluster (REPORT.md, "Members second pass"). An annotation bundle collapsed at 70% has no members, as collapsing would merge each into its representative.
+Format 3 (2026-11-25) adds members: with `--clusters` and `--collapse 0`, each family's block holds the representatives' rows and then the distinct member rows of their clusters, stored as differences from the representative (31.4 bytes a member row, measured), and a call names the cluster (REPORT.md, "Members second pass"). An annotation bundle collapsed at 70% has no members, as collapsing would merge each into its representative.
 
 - **The same calls as the prototype:** 6,779 of 6,779 reads have the same score as the scan with 10-residue flanks, and name one of its best clusters (`bundle_check.py`).
 - **Stored size (measured):** 88.8 bytes a row on the slice's 705,166 GA rows: 73 of residues at 5 bits and 16 of everything else, not the 10 assumed at first. So 102 GB for every cluster, **32 GB at 70%**, 20 GB at 60% (estimated), and about
