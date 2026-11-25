@@ -191,6 +191,8 @@ def pack(a: argparse.Namespace) -> None:
             n_unit += t.height
             n_row += d.height
             print(faa.name, t.height, d.height, flush=True)
+    if not n_row:
+        sys.exit(f"no representative in {a.out}/chunk*.faa has a domain: has prepare finished?")
     (b / "families.tsv").write_text(f"{acc}\t{lengths[acc]}\t{n_row}\t0\n")
     pack_queries(pl.read_parquet(a.out / "queries.parquet").sort("qid"), b, [acc], lengths)
     ga = int(np.fromfile(b / "reps.ga", "u1").sum())

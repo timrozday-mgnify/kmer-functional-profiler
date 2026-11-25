@@ -19,7 +19,7 @@
 #   reads, by family size), size.tsv (bytes the family needs), scan*.times.tsv (core-seconds by stage).
 # Estimates, not measured: prepare 2-8 h (streaming), align 5-10 CPU-h in all, truth about 40-80 CPU-h for PF00005,
 #   scan 2-6 CPU-h; 60 GB of disk in PF<family>/ and 64 GB of memory at most.
-# Re-running a step skips what it has finished. Needs the repo's venv (setup.sh), singularity, and cargo on the nodes (setup.sh needs it too).
+# Re-running a step skips what it has finished. Needs the repo's venv (setup.sh) and singularity, and cargo or else the Rust image, pulled once by prepare.
 set -euo pipefail
 trap 'echo "failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 export LC_ALL=C
@@ -41,13 +41,29 @@ D=$HERE/$(printf 'PF%05d' "$FAMILY")
 mkdir -p "$D"
 large () { "$PY" "$LOOKUP/large.py" "$@" --out "$D"; }
 
-# built on the node it runs on, for that node's CPU: an AVX-512 binary would crash on an older one
+# Built on the node it runs on, for that node's CPU: an AVX-512 binary would crash on an older one. With cargo, or in the
+# Rust image, which the scan then runs in too, as a binary of its glibc may not run on the node.
+command -v cargo > /dev/null || [[ ! -x $HOME/.cargo/bin/cargo ]] || PATH=$HOME/.cargo/bin:$PATH
+RUST_SIF=${RUST_SIF:-$HERE/rust.sif}
 build () {
-    export CARGO_TARGET_DIR="$D/target-$(uname -m)-$(grep -m1 -E 'model name|^CPU part' /proc/cpuinfo 2>/dev/null | cksum | cut -d' ' -f1)"
+    CPU=$(uname -m)-$(grep -m1 -E 'model name|^CPU part' /proc/cpuinfo 2>/dev/null | cksum | cut -d' ' -f1 || true)
     export RUSTFLAGS='-C target-cpu=native'
-    L=$CARGO_TARGET_DIR/release/lookup
-    command -v cargo > /dev/null || { echo "no cargo on PATH (workflows/setup.sh needs it too)" >&2; exit 1; }
-    cargo build --quiet --release --offline --manifest-path "$LOOKUP/rs/Cargo.toml"
+    if command -v cargo > /dev/null; then
+        export CARGO_TARGET_DIR=$D/target-$CPU
+        cargo build --quiet --release --offline --manifest-path "$LOOKUP/rs/Cargo.toml"
+        lookup () { "$CARGO_TARGET_DIR/release/lookup" "$@"; }
+    else
+        if [[ ! -s $RUST_SIF ]]; then
+            singularity pull "$RUST_SIF.$$" "${RUST_IMAGE:-docker://rust:1.92-slim-bookworm}"
+            mv "$RUST_SIF.$$" "$RUST_SIF"
+        fi
+        export CARGO_TARGET_DIR=$D/target-sif-$CPU CARGO_HOME=$D/cargo
+        in_sif () { singularity exec -B "$REPO,$D" "$RUST_SIF" "$@"; }
+        # its own toolchain by path: rustup would fetch the one rust-toolchain.toml names
+        in_sif sh -c 'PATH=$(echo /usr/local/rustup/toolchains/*/bin):$PATH; cargo build --quiet --release --offline --manifest-path "$1"' \
+            sh "$LOOKUP/rs/Cargo.toml"
+        lookup () { in_sif "$CARGO_TARGET_DIR/release/lookup" "$@"; }
+    fi
 }
 
 [[ ${1:-} == submit ]] || set_threads   # not in submit, whose jobs inherit its environment
@@ -63,7 +79,7 @@ submit)
     fi
     [[ $REPS == http* || -s $REPS ]] || { echo "no $REPS" >&2; exit 1; }
     [[ -s $LOOKUP/large.py ]] || { echo "no $LOOKUP/large.py: is the branch checked out in $REPO?" >&2; exit 1; }
-    command -v cargo > /dev/null || { echo "no cargo on PATH (the jobs build the scan)" >&2; exit 1; }
+    command -v cargo > /dev/null || command -v singularity > /dev/null || { echo "no cargo and no singularity on PATH (the jobs build the scan)" >&2; exit 1; }
     export KFP_RUN_DIR=$HERE
     sb () { sbatch --parsable --chdir="$HERE" ${SBATCH_ARGS:-} "$@"; }
     j=$(sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$HERE/run.sh" prepare)
@@ -84,7 +100,7 @@ prepare)
         cat=(cat "$REPS")
         [[ $REPS == http* ]] && cat=(curl -fsSL "$REPS")
         # no retry: a resumed stream would repeat or lose records, so the count is checked instead
-        "${cat[@]}" | gzip -dc | "$L" pick "$D/ids.u64" "$D/chunk" "$CHUNKS" > "$D/picked.tsv.part"
+        "${cat[@]}" | gzip -dc | lookup pick "$D/ids.u64" "$D/chunk" "$CHUNKS" > "$D/picked.tsv.part"
         read -r seen got _ < "$D/picked.tsv.part"
         [[ $seen == "$EXPECT" ]] || { echo "$REPS gave $seen records, expected $EXPECT" >&2; exit 1; }
         (( got > 0 )) || { echo "no representative has the family" >&2; exit 1; }
@@ -93,12 +109,13 @@ prepare)
     cat "$D/picked.tsv" ;;
 align) large align --chunk "${CHUNK:-${SLURM_ARRAY_TASK_ID:?an array task, or set CHUNK}}" --threads "$THREADS" --memory 20 --runtime "$RUNTIME" ;;
 pack) large pack ;;
-truth) build; "$L" truthsub "$D/bin" ;;
+truth) build; lookup truthsub "$D/bin" ;;
 scan)
     build
     export FLANK=10   # only the domain and 10 residues either side, as a self-contained index holds
-    "$L" scan "$D/bin" "$D/scan.tsv" "${CONFIGS:-100:200,500:200,2000:200,2000:1000}" 0,2,4,6
-    THREADS=1 LIMIT=${LIMIT:-200} "$L" scan "$D/bin" "$D/scan1.tsv" 500:200 0 ;;
+    lookup scan "$D/bin" "$D/scan.tsv" "${CONFIGS:-100:200,500:200,2000:200,2000:1000}" 0,2,4,6
+    export THREADS=1 LIMIT=${LIMIT:-200}
+    lookup scan "$D/bin" "$D/scan1.tsv" 500:200 0 ;;
 report) large report ;;
 *) sed -n '6,33p' "$0"; exit 1 ;;
 esac
