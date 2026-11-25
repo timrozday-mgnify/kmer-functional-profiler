@@ -769,3 +769,39 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - the holdout pool and the strain count are capped at what the reference holds;
   - `oracle_calls` is typed, because a set can have no rows.
   **Still to do:** the sizing step on pfam-reannotate's 1-in-100 output, and the user's run on the slice.
+
+- **Phase 6 built (2026-11-09): the benchmark, ready for the HPC.**
+  - **`bench.py score`** runs as the workflow's last task. It records the stage each true read pair reached (the plan's waterfall) and writes:
+    - `bench_recall.tsv`: recall per depth × AAI cell over pairs and strains with Wilson intervals, recall against DIAMOND-resolvable pairs, and the ceiling;
+    - `bench_misses.tsv`: pairs lost at each stage per cell, split by Pfam hit, with example read names;
+    - `bench_units.tsv`: unit precision, with false units apart from units the real background supports;
+    - `bench_background.tsv`: background pairs mapped, against DIAMOND's best units.
+  - **`bench.py cost`** builds `bench_cost.tsv` from the Nextflow trace and the scripts' timers: CPU-s, wall-s, peak RSS, core-ms per pair and per Mbp, and index sizes.
+  - **Reads:** `spike.py simulate --depths` draws each strain's depth from the grid 0.5, 1, 2, 5, 10, 30× (now the workflow's default; the lognormal remains without it). `--background` adds real read pairs to the strains set.
+  - **HPC:** `hpc/kfp-ablations/pfam-anchor-{gut,hadza,soil}` run the same spikes in ERR10889147, ERR7738575 and SRR12659369 (2 M pairs each), reusing the synthetic run's annotation.
+  - **Fixes:**
+    - The Nextflow task hash didn't see parameters read inside `prep()`/`anch()`, so a changed `--strains` reused old results. Every process now passes a token made from all parameters.
+    - `reads` clears the tier 1 and tier 2 queries, which `unanchored` would otherwise skip for new reads.
+    - `oracle` skips background reads.
+  - **Check:** `-profile test,laptop`, with `tests/data/reads_*` as the background, passes all 17 tasks from scratch.
+  - **Not covered yet:** a per-family cost row (the trace is per task, not per family); the write-up with plots, after the run.
+
+- **MGnify90 residue scan, one very large family at full size (2026-11-25, Codon).** `hpc/kfp-ablations/pfam-anchor-large/run.sh` with `FAMILY=5`: PF00005 (Pfam 39.0) against MGnify 2026_07, 11.5 M representatives, 14.3 M domain rows (12.2 M at GA); 2,176 real read domains from the 11 B11 libraries, each also reversed as a null; exhaustive Smith-Waterman truth over all representatives and 1 in 4, 16 and 64. Write-up: `workflows/pfam-anchor/lookup/REPORT.md`, "One very large family"; outputs in `data/pfam-anchor/lookup/large/`.
+  - **Recall:** .989 at 500:200 and **.994 at 2000:1000** (13 misses), against .9991 on the 40-family slice. Flat from 1 in 64 to full size, so the gap comes with this family or its reads, not with family size. Misses are mostly 1–4 score units under the best.
+  - **Null:** reversed reads reach at most 93; real reads at least 104. The null maximum grows with family size (80 at 1 in 64).
+  - **Cost (x86):** 2.1 ns a row on one core (the M4's 2.5), 27 ms a read domain in this, the largest family; 16 threads 1.9× slower per core (not `--exclusive`, refused there). Index for the family: 1.1 GB at 5 bits.
+  - **Decision:** 2000:1000 is the default (`bundle.py profile`, `bundle_check.py`, the HPC timing run).
+  - **Fixes to the run script:** builds the scan in the Rust image when there is no cargo, each job in its own local temp directory (two jobs sharing a target directory on `/hps` broke each other's link); `submit` cancels the jobs it queued if a later `sbatch` is refused.
+  - **Not measured:** the truth step's runtime (every job wrote one log name), PF00072, Pfam 37.4.
+
+- **MGnify90 residue scan: members second pass (2026-11-25).** The first stage scans representatives only; every member row of the clusters it keeps joins the column and banded stages. Built in the prototype (`lookup scan`, `MEMBERS=1`, after `prep.py member-seqs`) and in the bundle (`bundle.py build --clusters ... --collapse 0`, format 2). Write-up: `workflows/pfam-anchor/lookup/REPORT.md`, "Members second pass".
+  - **Simulated reads from members** (own protein left out): source cluster among the called ties **.831, against .638** with representatives only (2000:1000); .905 against .671 at 100% identity.
+  - **Real reads:** 18% score higher on a member row; none lower.
+  - **Cost:** about 0.8 ms more a read domain, in the column stage.
+  - **Size:** members are stored plainly (about 220 GB at release, estimated); as differences (about 30 GB) is the next step.
+  - **Checks:** `cargo test`, `test_bundle.py` (members case added). Not yet run: `MEMBERS=1 bundle_check.py` (needs about 1 GB of free disk).
+- **Members stored as differences (2026-11-25).** Bundle format 3: a member residue is copied from its representative's row where they agree (paired through shared columns, flanks and inserts by offset), so only runs and literal residues are stored; a CIGAR equal to the parent's is one byte, and the parent row is delta-coded.
+  - **Size:** 31.4 bytes a member row against 100.9 for a representative's (slice, first 10 families, 313,732 member rows); about 80 GB at release (estimated), against about 250 GB plain.
+  - **Exact:** the same scores as the prototype's `MEMBERS=1` scan on all 994 real reads of those families (`FAMILIES=10 MEMBERS=1 bundle_check.py`). `cargo test` covers a realistic member round trip and a corrupted run.
+  - **Not done:** the 40-family check (disk); dropping members' own accessions (5 bytes a row) or diffing CIGARs.
+- **Members smaller still (2026-11-25), bundle format 4: 21.1 bytes a member row**, from 31.4. Members no longer store their own accession (a call names the cluster): head 10 -> 5 bytes. A CIGAR that is the representative's cut to the member's columns is 2 bytes: 6.1 -> 4.2. A (copied, literal) pair of under 63 and at most 3 is one byte: runs 9.9 -> 6.7. Still exact on the 994 real reads of the first 10 families; about 53 GB at release (estimated).

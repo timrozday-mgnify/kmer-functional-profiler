@@ -273,7 +273,11 @@ def simulate(args: argparse.Namespace) -> None:
             cds = seq if nucleotide else back_translate(seq, rng)
             flank = lambda: "".join(rng.choices(BASES, k=FLANK))  # noqa: E731
             dna = flank() + cds + flank()
-            depth = min(math.exp(rng.gauss(args.depth_mu, args.depth_sigma)), args.max_depth)
+            depth = (
+                rng.choice(args.depths)
+                if args.depths
+                else min(math.exp(rng.gauss(args.depth_mu, args.depth_sigma)), args.max_depth)
+            )
             n_pairs = round(depth * len(dna) / (2 * args.read_len))
             cds_bases = 0
             for i in range(n_pairs):
@@ -699,6 +703,7 @@ def main() -> None:
     p.add_argument("--depth-mu", type=float, default=1.5)
     p.add_argument("--depth-sigma", type=float, default=1.0)
     p.add_argument("--max-depth", type=float, default=100.0)
+    p.add_argument("--depths", type=float, nargs="+", help="depths to draw from")
     p.add_argument("--read-len", type=int, default=150)
     p.add_argument("--fragment", type=int, default=350)
     p.add_argument("--error", type=float, default=0.002)

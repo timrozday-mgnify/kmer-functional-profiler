@@ -18,6 +18,7 @@
 // SEEDLINES   tier 2's seed alignments as call's lines; kfp-pileup call    anchor.py seedlines
 // MAPALL      DIAMOND on the confirmed reference; kfp-pileup call          anchor.py mapall
 // SCORE       mapping, gather and pileups against the truth                anchor.py mapcmp, truthscore
+// BENCH       phase 6: recall by depth x AAI, misses by stage, cost        bench.py score, cost
 //
 // Every step reads and writes --data (the scripts' fixed layout), so processes pass a token,
 // not files; outside tools run under --runtime (docker, singularity, or none).
@@ -33,6 +34,11 @@ params.strains  = 2000      // simulated strains (prepare.py reads)
 params.per_bin  = 250       // held-out relatives per identity bin
 params.pool     = 15000     // proteins searched for relatives
 params.min_weight = 0.1     // confirm: called pairs per unit
+params.depths   = '0.5 1 2 5 10 30'  // phase 6's depth grid; '' = the earlier lognormal
+params.background_1 = ''    // real read pairs (R1, R2) added to the strains set
+params.background_2 = ''
+params.background_pairs = 2000000
+params.annotated = ''       // another run's data directory: reuse its annotate and nullref
 params.runtime  = 'singularity'
 params.outdir   = 'results'
 params.data     = ''        // the scripts' shared data directory; '' = <outdir>/data
@@ -45,7 +51,9 @@ def prep(step, task, extra = '') {
     """${py()} ${projectDir}/prepare.py ${step} --out ${data()} --members ${file(params.members).toAbsolutePath()} \\
         --families ${file(params.families).toAbsolutePath()} --pfam ${file(params.pfam).toAbsolutePath()} \\
         --strains ${params.strains} --per-bin ${params.per_bin} --pool ${params.pool} \\
-        --threads ${task.cpus} --max-gb ${task.memory.toGiga() * 0.9} --runtime ${params.runtime} ${extra}"""
+        --threads ${task.cpus} --max-gb ${task.memory.toGiga() * 0.9} --runtime ${params.runtime} \\
+        ${params.depths ? "--depths ${params.depths}" : ''} \\
+        ${params.background_1 ? "--background ${file(params.background_1).toAbsolutePath()} ${file(params.background_2).toAbsolutePath()} --background-pairs ${params.background_pairs}" : ''} ${extra}"""
 }
 def hits() { params.recruit ? 'recruited_top' : 'hmmsearch' }
 def anch(step, task, extra = '') {
@@ -56,7 +64,8 @@ def anch(step, task, extra = '') {
 
 process FIXTURE {
     label 'process_low'
-    output: val true
+    input: val ready
+    output: val ready
     script:
     """
     ${py()} ${projectDir}/prepare.py fixture --release ${file(params.release).toAbsolutePath()} \\
@@ -65,45 +74,50 @@ process FIXTURE {
     """
 }
 
+def reuse(files) {
+    def src = file(params.annotated).toAbsolutePath()
+    "mkdir -p ${data()} && " + files.collect { "cp ${src}/${it} ${data()}/" }.join(' && ')
+}
+
 process ANNOTATE {
     label 'process_medium'
     input: val ready
-    output: val true
-    script: prep('annotate', task)
+    output: val ready
+    script: params.annotated ? reuse(['hmms.hmm', 'ga.tsv', 'hits.parquet', 'hits.stats.tsv']) : prep('annotate', task)
 }
 
 process NULLREF {
     label 'process_medium'
     input: val ready
-    output: val true
-    script: prep('nullref', task)
+    output: val ready
+    script: params.annotated ? reuse(['null_hits.parquet', 'null_hits.stats.tsv']) : prep('nullref', task)
 }
 
 process READS {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: prep('reads', task)
 }
 
 process SEARCH {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: prep('search', task)
 }
 
 process RECRUIT {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: prep('recruit', task, "--kfpfam ${file(params.kfpfam).toAbsolutePath()}")
 }
 
 process DIAMOND {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: prep('diamond', task)
 }
 
@@ -119,14 +133,14 @@ process ORACLE {
     label 'process_medium'
     publishDir params.outdir, mode: 'copy'
     input: val ready
-    output: tuple val(true), path('oracle.tsv'), path('alignment.tsv')
+    output: tuple val(ready), path('oracle.tsv'), path('alignment.tsv')
     script: "${anch('oracle', task)} && cp ${data()}/oracle.tsv ${data()}/alignment.tsv ."
 }
 
 process ANCHORED {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('query', task)
 }
 
@@ -141,35 +155,35 @@ process COMPARE {
 process UNANCHORED {
     label 'process_high'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('unanchored', task)
 }
 
 process CONFIRM {
     label 'process_low'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('confirm', task, '--with-unanchored')
 }
 
 process TREE {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('treeindex', task, '--with-unanchored')
 }
 
 process SEEDLINES {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('seedlines', task, '--with-unanchored')
 }
 
 process MAPALL {
     label 'process_medium'
     input: val ready
-    output: val true
+    output: val ready
     script: anch('mapall', task, '--with-unanchored')
 }
 
@@ -187,8 +201,25 @@ process SCORE {
     """
 }
 
+process BENCH {
+    label 'process_low'
+    publishDir params.outdir, mode: 'copy'
+    input: val ready
+    output: path 'bench_*'
+    script:
+    def args = "--data ${data()} --hits ${hits()} --ref weak --min-weight ${params.min_weight}"
+    """
+    ${py()} ${projectDir}/bench.py score ${args}
+    ${py()} ${projectDir}/bench.py cost ${args} --trace ${file(params.outdir).toAbsolutePath()}/trace.tsv
+    cp ${data()}/bench_*.tsv .
+    """
+}
+
 workflow {
-    start = params.release ? FIXTURE() : Channel.value(true)
+    // every process passes this token on: the task hash doesn't see params read inside prep()
+    // and anch(), so a changed parameter must reach every task through its input
+    token = Channel.value(params.findAll { it.key != 'outdir' }.toString().md5())
+    start = params.release ? FIXTURE(token) : token
     annotated = ANNOTATE(start)
     nullref = NULLREF(annotated)
     reads = READS(annotated)
@@ -196,13 +227,14 @@ workflow {
     hit_ready = params.recruit ? RECRUIT(searched) : searched
     dia = DIAMOND(searched)
     REPORT(dia)
-    oracle = ORACLE(dia.combine(hit_ready).map { true })
-    anchored = ANCHORED(oracle.map { it[0] }.combine(nullref).map { true })
+    oracle = ORACLE(dia.combine(hit_ready).map { it[0] })
+    anchored = ANCHORED(oracle.map { it[0] }.combine(nullref).map { it[0] })
     COMPARE(anchored)
     unanchored = UNANCHORED(reads)
-    confirmed = CONFIRM(anchored.combine(unanchored).map { true })
+    confirmed = CONFIRM(anchored.combine(unanchored).map { it[0] })
     tree = TREE(confirmed)
     seeded = SEEDLINES(tree)
     mapped = MAPALL(confirmed)
-    SCORE(seeded.combine(mapped).map { true })
+    scored = SCORE(seeded.combine(mapped).map { it[0] })
+    BENCH(scored.map { it[0] })
 }

@@ -316,7 +316,9 @@ def oracle(a: argparse.Namespace) -> None:
     summary, align = [], []
     for name in prepare.SETS:
         truth = truth_of(a.data, name)
-        hits = read_hits(a.data, name)
+        hits = read_hits(a.data, name).join(
+            truth.select("read"), on="read", how="semi"
+        )  # no background
         target = dict(truth.select("read", "unit").iter_rows())
         calls = pl.concat(
             oracle_calls(hits, fams, target, by).with_columns(score=pl.lit(by)) for by in a.score

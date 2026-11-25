@@ -33,6 +33,7 @@ import gzip
 import itertools
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -51,7 +52,7 @@ SPIKE = ROOT / "workflows/spike-benchmark/spike.py"
 HMMSEARCH = ["-E", "10", "--domE", "1000000", "-Z", "1000000", "--domZ", "1000000"]
 BENCH = [
     *("--present", "1", "--identities", "1", "0.98", "0.95", "0.9", "0.85", "0.8", "0.75"),
-    *("0.7", "--substitution", "blosum62", "--depth-mu", "0.3", "--depth-sigma", "0.6"),
+    *("0.7", "--substitution", "blosum62"),
 ]
 DIAMOND = "quay.io/biocontainers/diamond:2.2.8--he361c42_0"
 PYHMMER = "community.wave.seqera.io/library/python_pyhmmer_pyarrow:15ad25b8fbebe783"  # kfpfam's
@@ -228,8 +229,16 @@ def annotate(a: argparse.Namespace) -> None:
     faa.unlink()
 
 
+def depth_args(a: argparse.Namespace) -> list[object]:
+    """``--depths`` (phase 6's grid) or the lognormal of earlier phases."""
+    return ["--depths", *a.depths] if a.depths else ["--depth-mu", 0.3, "--depth-sigma", 0.6]
+
+
 def reads(a: argparse.Namespace) -> None:
     held = a.out / "holdout"
+    for name in SETS:  # anchor.py unanchored skips queries it finds: not for new reads
+        for q in (a.out / f"whole/q-{name}", a.out / f"whole/t2-{name}"):
+            shutil.rmtree(q, ignore_errors=True)
     run(
         PY,
         RECALL,
@@ -263,6 +272,12 @@ def reads(a: argparse.Namespace) -> None:
         "--targets",
         targets,
         *BENCH,
+        *depth_args(a),
+        *(
+            ["--background", *a.background, "--background-pairs", a.background_pairs]
+            if a.background
+            else []
+        ),
         "--seed",
         a.seed,
         "--out",
@@ -278,10 +293,7 @@ def reads(a: argparse.Namespace) -> None:
         1,
         "--identities",
         1,
-        "--depth-mu",
-        0.3,
-        "--depth-sigma",
-        0.6,
+        *depth_args(a),
         "--seed",
         a.seed,
         "--out",
@@ -572,6 +584,10 @@ def main() -> None:
     p.add_argument("--release", type=Path, help="fixture: pfam-reannotate's fixture tables")
     p.add_argument("--per-bin", type=int, default=250, help="recall.py holdout's")
     p.add_argument("--pool", type=int, default=15000, help="recall.py holdout's")
+    p.add_argument("--depths", type=float, nargs="+", help="reads: depth grid (default lognormal)")
+    p.add_argument("--background", type=Path, nargs=2, metavar=("R1", "R2"),
+                   help="reads: real read pairs added to the strains set")  # fmt: skip
+    p.add_argument("--background-pairs", type=int, default=2_000_000, help="reads: 0 = all")
     p.add_argument("--min-orf", type=int, default=25)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=1)

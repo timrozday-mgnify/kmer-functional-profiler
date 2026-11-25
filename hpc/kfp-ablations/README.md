@@ -27,6 +27,8 @@ done
 cd kfp-ablations/floor-query-cost && sbatch run.sh
 # Pfam-A re-annotation with hits below GA, 1 in 100 representatives first (plan, phase 6):
 cd kfp-ablations/pfam-reannotate && sbatch run.sh
+# MGnify90 residue scan on one very large family (workflows/pfam-anchor/lookup/REPORT.md), any time; its header says what it reads:
+cd kfp-ablations/pfam-anchor-large && FAMILY=5 PARQUETS='...' PFAM=... ./run.sh submit
 # clusters with a Pfam hit (plan, phase 6), any time:
 cd kfp-ablations/pfam-coverage && sbatch run.sh
 # release tiers (plan, phase 7, step 21), then their query cost when tiers-novaseq has finished:
