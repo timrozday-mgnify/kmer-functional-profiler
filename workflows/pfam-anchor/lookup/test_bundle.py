@@ -323,4 +323,86 @@ with tempfile.TemporaryDirectory() as tmp:
         )
         r = pl.read_parquet(d / "mp.reads.parquet").row(0, named=True)
         assert (r["protein"], r["ko"], r["ties"]) == (want, ko, 1), (b, r)
+
+    # in parts: the members fixture as two families, each built on its own and then assembled,
+    # gives each family's block byte for byte, and the same calls, as one build of both
+    sys.path.insert(0, str(BUNDLE.parent))
+    import argparse
+
+    import bundle
+
+    h2 = pl.read_parquet(d / "mh.parquet")
+    pl.concat(
+        [h2, h2.with_columns(pfam_accession=pl.lit(12, h2["pfam_accession"].dtype))]
+    ).write_parquet(d / "mh2.parquet")
+    (d / "mm2.hmm").write_text("ACC   PF00011.1\nLENG  80\n//\nACC   PF00012.1\nLENG  80\n//\n")
+    one = argparse.Namespace(
+        hits=d / "mh2.parquet",
+        seqs=d / "ms.parquet",
+        clusters=d / "mc.parquet",
+        label=[f"ko={d / 'mko.tsv'}"],
+    )
+    rows, _ = bundle.rows_of(one, {11: 80, 12: 80})
+    for f in (11, 12):
+        rows.filter(pl.col("pfam_accession") == f).write_parquet(d / f"part{f}.parquet")
+    build2 = ["--hits", d / "mh2.parquet", "--seqs", d / "ms.parquet", "--hmm", d / "mm2.hmm"]
+    build2 += ["--label", f"ko={d / 'mko.tsv'}", "--clusters", d / "mc.parquet", "--collapse", "0"]
+    run("build", *build2, "--out", d / "whole")
+    run("names", "--rows", d / "part11.parquet", d / "part12.parquet", "--out", d / "names")
+    for f in (11, 12):
+        run(
+            "build-part",
+            "--rows",
+            d / f"part{f}.parquet",
+            "--hmm",
+            d / "mm2.hmm",
+            "--names",
+            d / "names",
+            "--out",
+            d / f"p{f}",
+        )
+    run(
+        "assemble",
+        "--parts",
+        d / "p11",
+        d / "p12",
+        "--hmm",
+        d / "mm2.hmm",
+        "--names",
+        d / "names",
+        "--out",
+        d / "joined",
+    )
+    run("verify", d / "joined", says="as built")
+
+    def blocks(b: Path) -> dict[int, bytes]:
+        raw = (b / "rows.bin").read_bytes()
+        out = {}
+        for line in (b / "families.tsv").read_text().splitlines():
+            c = [int(x) for x in line.split("\t")]
+            out[c[0]] = raw[c[4] : c[4] + c[5]]
+        return out
+
+    assert blocks(d / "whole") == blocks(d / "joined") and len(blocks(d / "joined")) == 2
+    assert (d / "whole/labels.ko.txt").read_text() == (d / "joined/labels.ko.txt").read_text()
+    pl.DataFrame(
+        [("m", "PF00011", 6, "50M", x[5:55]), ("n", "PF00012", 6, "50M", x[5:55])],
+        orient="row",
+        schema=["read", "pfam", "hmm_from", "cigar", "residues"],
+    ).write_parquet(d / "mx2.parquet")
+    got = []
+    for b in ("whole", "joined"):
+        run(
+            "profile",
+            "--bundle",
+            d / b,
+            "--parquet",
+            d / "mx2.parquet",
+            "--out",
+            d / f"q{b}",
+            "--hmm",
+            d / "mm2.hmm",
+        )
+        got.append(pl.read_parquet(d / f"q{b}.reads.parquet").sort("read").drop("qid").rows())
+    assert got[0] == got[1] and got[0][0][-1] == "MGYP000000000101", got
 print("all bundle tests pass")

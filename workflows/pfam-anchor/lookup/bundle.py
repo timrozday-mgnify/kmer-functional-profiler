@@ -117,14 +117,23 @@ def place(src: Path, dst: Path) -> None:
     shutil.copyfile(src, dst)
 
 
-def build(a: argparse.Namespace) -> None:
-    out = a.out
-    if out.exists() and any(out.iterdir()):
-        sys.exit(f"{out} is not empty")
-    if a.clusters and a.collapse > 0:
-        sys.exit("--clusters keeps members, which collapsing would merge away: add --collapse 0")
-    out.mkdir(parents=True, exist_ok=True)
-    lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
+# The rows a part is built from, one per domain: residues are the domain and up to FLANK either
+# side, left and right say how many of them are flank. cluster_rep is the protein's cluster (null:
+# no members). label_<scheme>: a protein's labels in that scheme, sorted and joined by +, or null.
+PART = [
+    "protein_id",
+    "pfam_accession",
+    "hmm_from",
+    "cigar",
+    "left",
+    "right",
+    "residues",
+    "cluster_rep",
+]
+
+
+def rows_of(a: argparse.Namespace, lengths: dict[int, int]) -> tuple[pl.DataFrame, list[str]]:
+    """build's inputs (whole hits, sequences, label TSVs, clusters) as part rows."""
     hits = pl.read_parquet(
         a.hits,
         columns=[
@@ -147,6 +156,23 @@ def build(a: argparse.Namespace) -> None:
     d = hits.join(seqs, on="protein_id", how="left")
     if d["sequence"].null_count():
         sys.exit(f"{d['sequence'].null_count()} domains have no sequence in {a.seqs}")
+    n = pl.col("sequence").str.len_bytes()
+    d = d.with_columns(
+        left=pl.min_horizontal(pl.lit(FLANK), pl.col("ali_from") - 1),
+        right=pl.min_horizontal(pl.lit(FLANK), n - pl.col("ali_to")),
+    ).with_columns(
+        residues=pl.col("sequence").str.slice(
+            pl.col("ali_from") - 1 - pl.col("left"),
+            pl.col("ali_to") - pl.col("ali_from") + 1 + pl.col("left") + pl.col("right"),
+        )
+    )
+    if a.clusters:
+        c = pl.read_parquet(a.clusters, columns=["protein_id", "cluster_rep"])
+        d = d.join(c, on="protein_id", how="left")
+        if d["cluster_rep"].null_count():
+            sys.exit(f"{d['cluster_rep'].null_count()} domains have no cluster in {a.clusters}")
+    else:
+        d = d.with_columns(cluster_rep=pl.lit(None, pl.Int64))
     schemes = []
     for spec in a.label:
         name, path = spec.split("=", 1)
@@ -157,76 +183,110 @@ def build(a: argparse.Namespace) -> None:
             new_columns=["protein_id", "label"],
             schema_overrides={"label": pl.String},
         )
-        x = x.group_by("protein_id").agg(pl.col("label").unique().sort().str.join("+"))
-        names = x["label"].unique().sort().to_list()
-        if len(names) > 65535:
-            sys.exit(f"{name}: {len(names)} distinct labels, and 65,535 is the most")
-        (out / f"labels.{name}.txt").write_text("".join(f"{n}\n" for n in names))
-        number = {n: i + 1 for i, n in enumerate(names)}
-        x = x.select(
-            "protein_id",
-            pl.col("label").replace_strict(number, return_dtype=pl.Int64).alias(f"l{len(schemes)}"),
+        x = x.group_by("protein_id").agg(
+            pl.col("label").unique().sort().str.join("+").alias(f"label_{name}")
         )
-        d = d.join(x, on="protein_id", how="left").with_columns(
-            pl.col(f"l{len(schemes)}").fill_null(0)
-        )
+        d = d.join(x, on="protein_id", how="left")
         schemes.append(name)
+    return d.select(*PART, *(f"label_{s}" for s in schemes)), schemes
+
+
+def names_of(d: pl.DataFrame, schemes: list[str]) -> dict[str, list[str]]:
+    """Each scheme's label names, sorted: a label's number is its place here, from 1."""
+    out = {}
+    for s in schemes:
+        names = d[f"label_{s}"].drop_nulls().unique().sort().to_list()
+        if len(names) > 65535:
+            sys.exit(f"{s}: {len(names)} distinct labels, and 65,535 is the most")
+        out[s] = names
+    return out
+
+
+def write_part(
+    d: pl.DataFrame,
+    names: dict[str, list[str]],
+    lengths: dict[int, int],
+    collapse: float,
+    out: Path,
+) -> None:
+    """Part rows -> out/rows.bin and out/families.tsv, through bundle-build, family by family."""
+    schemes = list(names)
+    unknown = set(d["pfam_accession"].unique()) - set(lengths)
+    if unknown:
+        sys.exit(f"{len(unknown)} families are not in the models, PF{min(unknown):05d} for one")
+    members = d["cluster_rep"].is_not_null() & (d["cluster_rep"] != d["protein_id"])
+    if collapse > 0 and members.any():
+        sys.exit("members are only kept uncollapsed: collapse 0")
     cols = [f"l{i}" for i in range(len(schemes))]
-    if a.clusters:
-        c = pl.read_parquet(a.clusters, columns=["protein_id", "cluster_rep"])
-        d = d.join(c, on="protein_id", how="left")
-        if d["cluster_rep"].null_count():
-            sys.exit(f"{d['cluster_rep'].null_count()} domains have no cluster in {a.clusters}")
-        d = d.with_columns(
-            cluster=pl.when(pl.col("protein_id") == pl.col("cluster_rep"))
-            .then(0)
-            .otherwise(pl.col("cluster_rep"))
-        ).drop("cluster_rep")
-        # a member row only where it differs from the cluster's others: residues, start or labels
-        key = pl.col("sequence").str.slice(
-            pl.col("ali_from") - 1, pl.col("ali_to") - pl.col("ali_from") + 1
-        )
-        members = (
-            d.filter(pl.col("cluster") > 0)
-            .sort("pfam_accession", "cluster", "protein_id", "ali_from")
-            .with_columns(key=key)
-            .unique(
-                ["pfam_accession", "cluster", "key", "hmm_from", *cols],
-                keep="first",
-                maintain_order=True,
+    d = d.with_columns(
+        *(
+            pl.col(f"label_{s}")
+            .replace_strict(
+                {n: i + 1 for i, n in enumerate(names[s])}, default=0, return_dtype=pl.Int64
             )
-            .drop("key")
+            .fill_null(0)  # unlabelled
+            .alias(c)
+            for s, c in zip(schemes, cols, strict=True)
+        ),
+        cluster=pl.when(members).then(pl.col("cluster_rep")).otherwise(0),
+    )
+    # a member row only where it differs from the cluster's others: residues, start or labels
+    domain = pl.col("residues").str.slice(
+        pl.col("left"), pl.col("residues").str.len_bytes() - pl.col("left") - pl.col("right")
+    )
+    m = (
+        d.filter(pl.col("cluster") > 0)
+        .sort("pfam_accession", "cluster", "protein_id")
+        .with_columns(key=domain)
+        .unique(
+            ["pfam_accession", "cluster", "key", "hmm_from", *cols],
+            keep="first",
+            maintain_order=True,
         )
-        d = pl.concat([d.filter(pl.col("cluster") == 0), members])
-    else:
-        d = d.with_columns(cluster=pl.lit(0, pl.Int64))
-    d = d.sort("pfam_accession", pl.col("cluster") > 0, "cluster", "protein_id", "ali_from")
-    p = subprocess.Popen([LOOKUP, "bundle-build", out, str(a.collapse)], stdin=subprocess.PIPE)
+        .drop("key")
+    )
+    d = pl.concat([d.filter(pl.col("cluster") == 0), m]).sort(
+        "pfam_accession", pl.col("cluster") > 0, "cluster", "protein_id", "hmm_from"
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    p = subprocess.Popen([LOOKUP, "bundle-build", out, str(collapse)], stdin=subprocess.PIPE)
     assert p.stdin
     try:
         for (acc,), g in d.group_by("pfam_accession", maintain_order=True):
             p.stdin.write(struct.pack("<IIII", acc, lengths[acc], g.height, len(schemes)))
-            for pid, hf, af, at, cg, seq, cl, *lab in g.select(
-                "protein_id",
-                "hmm_from",
-                "ali_from",
-                "ali_to",
-                "cigar",
-                "sequence",
-                "cluster",
-                *cols,
+            for pid, hf, cg, left, right, res, cl, *lab in g.select(
+                "protein_id", "hmm_from", "cigar", "left", "right", "residues", "cluster", *cols
             ).iter_rows():
-                left, right = min(FLANK, af - 1), min(FLANK, len(seq) - at)
-                p.stdin.write(
-                    record(
-                        pid, hf, left, right, cg, seq[af - 1 - left : at + right], tuple(lab), cl
-                    )
-                )
+                p.stdin.write(record(pid, hf, left, right, cg, res, tuple(lab), cl))
         p.stdin.close()
     except BrokenPipeError:
         pass
     if p.wait():
         sys.exit("bundle-build failed")
+
+
+def finish(
+    a: argparse.Namespace, out: Path, parts: list[Path], names: dict[str, list[str]]
+) -> None:
+    """Parts -> one bundle in out: rows.bin and families.tsv joined (offsets shifted), label names,
+    the models, kfpfam's files and the manifest."""
+    if parts != [out]:
+        seen: set[int] = set()
+        with open(out / "rows.bin", "wb") as rows, open(out / "families.tsv", "w") as tsv:
+            at = 0
+            for part in parts:
+                for line in (part / "families.tsv").read_text().splitlines():
+                    c = line.split("\t")
+                    if int(c[0]) in seen:
+                        sys.exit(f"PF{int(c[0]):05d} is in two parts")
+                    seen.add(int(c[0]))
+                    c[4] = str(int(c[4]) + at)
+                    tsv.write("\t".join(c) + "\n")
+                with open(part / "rows.bin", "rb") as f:
+                    shutil.copyfileobj(f, rows, 1 << 24)
+                at = rows.tell()
+    for s, ns in names.items():
+        (out / f"labels.{s}.txt").write_text("".join(f"{n}\n" for n in ns))
     place(a.hmm, out / "hmm/Pfam-A.hmm")
     if a.kfpfam_index:
         place(a.kfpfam_index, out / "kfpfam/index.tidx")
@@ -249,7 +309,7 @@ def build(a: argparse.Namespace) -> None:
         "mgnify": a.mgnify,
         "flank": FLANK,
         "collapse": a.collapse,
-        "schemes": schemes,
+        "schemes": list(names),
         "families": fams.height,
         "rows": int(fams["column_3"].sum()),
         "rows_before_collapse": int(fams["column_4"].sum()),
@@ -264,9 +324,77 @@ def build(a: argparse.Namespace) -> None:
         f"{manifest['rows']} rows of {manifest['rows_before_collapse']} in {fams.height} families, "
         f"and {manifest['member_rows']} member rows "
         f"({manifest['member_rows_unreached']} unreached), "
-        f"{b / n:.1f} bytes a row, "
+        f"{b / max(n, 1):.1f} bytes a row, "
         f"{sum(f['bytes'] for f in files.values()) / 1e9:.2f} GB in all"
     )
+
+
+def empty(out: Path) -> None:
+    if out.exists() and any(out.iterdir()):
+        sys.exit(f"{out} is not empty")
+    out.mkdir(parents=True, exist_ok=True)
+
+
+def build(a: argparse.Namespace) -> None:
+    if a.clusters and a.collapse > 0:
+        sys.exit("--clusters keeps members, which collapsing would merge away: add --collapse 0")
+    empty(a.out)
+    lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
+    d, schemes = rows_of(a, lengths)
+    names = names_of(d, schemes)
+    write_part(d, names, lengths, a.collapse, a.out)
+    finish(a, a.out, [a.out], names)
+
+
+def read_names(d: Path | None, schemes: list[str]) -> dict[str, list[str]]:
+    if not schemes:
+        return {}
+    if d is None:
+        sys.exit(f"label columns {schemes} need --names, the label names of the whole bundle")
+    return {s: (d / f"labels.{s}.txt").read_text().splitlines() for s in schemes}
+
+
+def part_schemes(rows: list[Path]) -> list[str]:
+    return [
+        c.removeprefix("label_") for c in pq.read_schema(rows[0]).names if c.startswith("label_")
+    ]
+
+
+def names_cmd(a: argparse.Namespace) -> None:
+    """Every scheme's label names over all the rows: one numbering for every part."""
+    schemes = part_schemes(a.rows)
+    a.out.mkdir(parents=True, exist_ok=True)
+    for s in schemes:
+        names = (
+            pl.scan_parquet(a.rows).select(pl.col(f"label_{s}")).drop_nulls().unique()
+            .sort(f"label_{s}").collect()[f"label_{s}"].to_list()
+        )  # fmt: skip
+        if len(names) > 65535:
+            sys.exit(f"{s}: {len(names)} distinct labels, and 65,535 is the most")
+        (a.out / f"labels.{s}.txt").write_text("".join(f"{n}\n" for n in names))
+    print(f"{len(schemes)} schemes: {', '.join(schemes) or 'none'}")
+
+
+def build_part(a: argparse.Namespace) -> None:
+    """Part rows (lookup-index's SPLIT) -> one part, its families whole."""
+    empty(a.out)
+    lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
+    schemes = part_schemes(a.rows)
+    d = pl.read_parquet(a.rows, columns=[*PART, *(f"label_{s}" for s in schemes)])
+    write_part(d, read_names(a.names, schemes), lengths, a.collapse, a.out)
+
+
+def assemble(a: argparse.Namespace) -> None:
+    empty(a.out)
+    schemes = (
+        sorted(
+            p.name.removeprefix("labels.").removesuffix(".txt")
+            for p in a.names.glob("labels.*.txt")
+        )
+        if a.names
+        else []
+    )
+    finish(a, a.out, a.parts, read_names(a.names, schemes))
 
 
 def manifest_of(d: Path) -> dict:
@@ -421,6 +549,28 @@ def main() -> None:
     b.add_argument("--kfpfam-prep", type=Path)
     b.add_argument("--mgnify", default="")
     b.add_argument("--pfam", default="")
+    nm = sub.add_parser("names")
+    nm.set_defaults(run=names_cmd)
+    nm.add_argument("--rows", type=Path, nargs="+", required=True)
+    nm.add_argument("--out", type=Path, required=True)
+    bp = sub.add_parser("build-part")
+    bp.set_defaults(run=build_part)
+    bp.add_argument("--rows", type=Path, nargs="+", required=True, help="part rows (bundle.PART)")
+    bp.add_argument("--hmm", type=Path, required=True)
+    bp.add_argument("--out", type=Path, required=True)
+    bp.add_argument("--names", type=Path, help="labels.<scheme>.txt of the whole bundle")
+    bp.add_argument("--collapse", type=float, default=0.0)
+    asm = sub.add_parser("assemble")
+    asm.set_defaults(run=assemble)
+    asm.add_argument("--parts", type=Path, nargs="+", required=True)
+    asm.add_argument("--hmm", type=Path, required=True)
+    asm.add_argument("--out", type=Path, required=True)
+    asm.add_argument("--names", type=Path)
+    asm.add_argument("--collapse", type=float, default=0.0, help="what the parts were built with")
+    asm.add_argument("--kfpfam-index", type=Path)
+    asm.add_argument("--kfpfam-prep", type=Path)
+    asm.add_argument("--mgnify", default="")
+    asm.add_argument("--pfam", default="")
     v = sub.add_parser("verify")
     v.set_defaults(run=verify)
     v.add_argument("bundle", type=Path)
