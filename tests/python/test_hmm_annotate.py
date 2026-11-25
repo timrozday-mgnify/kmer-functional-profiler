@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -59,6 +60,37 @@ def test_thresholds_fail_on_a_model_with_none(tmp_path: Path) -> None:
     (tmp_path / "t.tsv").write_text("model\tthreshold\tscore_type\nPF90001\t1\tfull\n")
     with pytest.raises(subprocess.CalledProcessError):
         thresholds(tmp_path, "--table", "t.tsv")
+
+
+def test_seed_settings_for_each_kind_of_threshold(tmp_path: Path) -> None:
+    (tmp_path / "models.tsv").write_text(
+        "acc\tname\tlength\n"
+        + "".join(f"M{i}\tM{i}\t{n}\n" for i, n in enumerate([20, 300, 90, 90]))
+    )
+    (tmp_path / "t.tsv").write_text(
+        "model\tname\tseq\tdom\nM0\tM0\t25.0\t8.0\nM1\tM1\t-inf\t400.0\n"
+        "M2\tM2\t21.0\t-inf\nM3\tM3\tinf\tinf\n"
+    )
+    run(tmp_path, "seeds.py", "bars", "--models", "models.tsv", "--thresholds", "t.tsv",
+        "--ga", "ga.tsv", "--gapped", "g.txt")  # fmt: skip
+    # the domain's threshold, or the sequence's if that is the only one; capped, and never infinite
+    ga = [x.split("\t") for x in (tmp_path / "ga.tsv").read_text().splitlines()]
+    assert ga == [[f"M{i}", x, x] for i, x in enumerate(["8.0", "30.0", "21.0", "30.0"])]
+    g = list(map(float, (tmp_path / "g.txt").read_text().split()))
+    assert g[0] == pytest.approx(15.50, abs=0.01)  # under the one bar, as a short repeat's is
+    assert all(x > 21.25 for x in g[1:])
+    run(tmp_path, "seeds.py", "bars", "--models", "models.tsv", "--thresholds", "t.tsv",
+        "--ga", "ga.tsv", "--gapped", "g.txt", "--slack", 14)  # fmt: skip
+    slack = list(map(float, (tmp_path / "g.txt").read_text().split()))
+    assert slack[0] == g[0] and slack[1] > 400 and 21.25 <= slack[2] < g[2]
+    # quality falls from 24 to 0 over the grid of T: 9 / .936 is reached at 14.4 steps
+    quality = np.arange(24, -1, -1, dtype="<f4")
+    np.concatenate([np.zeros(25, "<f4"), quality]).tofile(tmp_path / "s.f32")
+    run(tmp_path, "seeds.py", "choose", "--table", "s.f32", "--shape", "10110001", "--theta", 9,
+        "--out", "T.txt")  # fmt: skip
+    assert float((tmp_path / "T.txt").read_text()) == pytest.approx(
+        4.5 + 0.25 * (24 - 9 / 0.936), abs=1e-3
+    )
 
 
 def test_check_summary_totals_and_puts_the_worst_model_first(tmp_path: Path) -> None:
@@ -149,6 +181,12 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
     labels = pl.read_parquet(tmp_path / "l.parquet")
     assert sorted(labels.rows()) == sorted(set(d.select("protein_id", "model").rows()))
 
+    # every model on every protein, with no prefilter, is the same
+    every = searched(tmp_path, seqs, range(0), "--all-pairs")
+    assert every.sort(every.columns).equals(d.sort(d.columns))
+    stats = pl.read_csv(tmp_path / "s.tsv", separator="\t")
+    assert stats.select("proteins", "too_long", "pairs").row(0) == (len(seqs), 0, 6 * len(seqs))
+
     # the check finds it whole, and finds what is missing when a model is left out
     check = (
         "annotate.py", "check", "--faa", "p.faa", "--hmm", HMM, "--thresholds", "thresholds.tsv",
@@ -182,4 +220,6 @@ def test_proteins_too_long_for_hmmer_are_counted_not_searched(tmp_path: Path) ->
     filler = "GSTNQDEKRA"
     long = {1: filler * 6_800 + seqs[hit], 2: filler * 10_000 + seqs[hit], 3: "M" * 50}
     assert set(searched(tmp_path, long, range(6))["protein_id"]) == {1}
+    assert pl.read_csv(tmp_path / "s.tsv", separator="\t")["too_long"].item() == 1
+    assert set(searched(tmp_path, long, range(0), "--all-pairs")["protein_id"]) == {1}
     assert pl.read_csv(tmp_path / "s.tsv", separator="\t")["too_long"].item() == 1

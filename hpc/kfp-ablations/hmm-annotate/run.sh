@@ -6,9 +6,10 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --export=ALL
-# Every MGnify protein against an HMM collection, kfpfam's prefilter then HMMER on its candidates
-# (workflows/hmm-annotate/README.md). Inputs, as environment variables:
-#   SIF=<kfpfam-filter.sif>        kfpfam's image, 86f2a63 or later; ../images/kfpfam-filter.{tar,sif} by default
+# Every MGnify protein against an HMM collection, kfpfam's prefilter then HMMER on its candidates,
+# or hmmsearch alone (workflows/hmm-annotate/README.md). Inputs, as environment variables:
+#   ENGINE=kfpfam-top              kfpfam's top mode, kfpfam-fast, or hmmsearch: every model, no prefilter
+#   SIF=<kfpfam-filter.sif>        kfpfam's image, e54c21a or later (both engines); ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
 #                                  the index must be of the models the reads are aligned to
@@ -18,14 +19,17 @@
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
 #                                  cat profiles/K*.hmm > kofam.hmm
 #   SAMPLE=1000                    1 in N proteins, and full hmmsearch on 1 in CHECK (10) of those
+#                                  (0 for ENGINE=hmmsearch)
 #   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
 #                                  reads most of the release's 1 TB of sequences, as samples are spread out
 # First, and look at check.tsv and trace.tsv before the whole:
 #   PFAM=38.2 sbatch run.sh
 #   PFAM=39.0 sbatch --dependency=afterany:<that job> run.sh
-#   PFAM=39.0 SAMPLE=1 sbatch run.sh
+#   PFAM=39.0 ENGINE=kfpfam-fast sbatch --dependency=afterany:<that job> run.sh
+#   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
+#   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
 # One at a time in this directory: they share its work/ and -resume cache.
-# Read results-<collection><release>-<sample>/ (results-pfam39.0-1000, results-kofam-1000):
+# Read results-<collection><release>-<engine>-<sample>/ (results-pfam39.0-hmmsearch-1000):
 #   check.tsv       kfpfam's recall of the passing domains of full hmmsearch, all and by model
 #   compare.tsv     the same against the release's own table (38.2)
 #   summary.tsv     proteins, residues, pairs, domains passing
@@ -33,7 +37,8 @@
 #   domains/        lookup-index's input (Pfam)
 #   labels/         protein_id, model (KOfam: lookup-index's LABELS)
 # Cost, estimates to be replaced by the 1-in-1,000 run's trace:
-#   SAMPLE=1 pfam   not measured on proteins. hmmsearch alone would be about 113,000 core-hours at
+#   SAMPLE=1 pfam   on the laptop top was 1.6 times hmmsearch's speed, fast 9 times (README);
+#                   x86 not measured. hmmsearch would be about 113,000 core-hours at
 #                   laptop speed (pfam-reannotate's 63,600 for 38.2's 30,134 models, 39.0 has 53,275)
 #   check           about 10 core-hours at SAMPLE=1000 CHECK=10 (hmmsearch, laptop speed)
 #   disk            domains about 64 bytes a row (laptop), so some 250 GB for Pfam over every protein
@@ -44,8 +49,10 @@ source ../common.sh
 SIF=${SIF:-$(sif kfpfam-filter)}
 collection=${COLLECTION:-pfam}
 sample=${SAMPLE:-1000}
-check=$([[ $sample == 1 ]] && echo 0 || echo "${CHECK:-10}")
-args=()
+engine=${ENGINE:-kfpfam-top}
+check=$([[ $sample == 1 || $engine == hmmsearch ]] && echo 0 || echo "${CHECK:-10}")
+args=(--engine "${engine%%-*}")
+if [[ $engine == kfpfam-* ]]; then args+=(--kfpfam_mode "${engine#*-}"); fi
 name=$collection
 case $collection in
     pfam)
@@ -67,4 +74,4 @@ esac
 nextflow run "$WF/hmm-annotate" -c ../site.config \
     ${RELEASE:+--release "$RELEASE"} --kfpfam_sif "$(realpath "$SIF")" "${args[@]}" \
     --targets all --sample "$sample" --check_sample "$check" \
-    --outdir "results-$name-$sample" -resume
+    --outdir "results-$name-$engine-$sample" -resume

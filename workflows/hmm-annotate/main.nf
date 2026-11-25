@@ -1,5 +1,5 @@
-// MGnify proteins -> any HMM collection, by kfpfam's prefilter and HMMER on its candidates.
-// See README.md. PLAN and FASTA are pfam-reannotate's.
+// MGnify proteins -> any HMM collection, by kfpfam's prefilter and HMMER on its candidates,
+// or by HMMER alone (--engine hmmsearch). See README.md. PLAN and FASTA are pfam-reannotate's.
 
 include { PLAN; FASTA; flag } from '../pfam-reannotate/main'
 
@@ -16,11 +16,12 @@ process PREP {
     output:
     path 'models.{hmm,h3m,h3i,h3f,h3p}', emit: hmm
     path 'prep', emit: prep
-    path 'index.tidx', emit: index
+    path 'index', emit: index  // the filter's tiled index and gapped bars; empty for hmmsearch
     path 'thresholds.tsv', emit: thresholds
     path 'hmm.sha256', emit: sha256
 
     script:
+    def kfpfam = params.kfpfam_modes[params.kfpfam_mode]
     def source = table ? "--table ${table}" : "--cutoff ${params.cutoff}"
     """
     if [[ ${hmm} == *.gz ]]; then gunzip -c ${hmm} > tmp.hmm; else cp -L ${hmm} tmp.hmm; fi
@@ -28,13 +29,22 @@ process PREP {
     ${params.kfpfam_python} ${params.kfpfam_prep_py} models.hmm - prep
     ${params.kfpfam_python} tables.py thresholds --hmm models.hmm --models prep/models.tsv ${source}
     ${params.kfpfam_python} annotate.py press --hmm models.hmm --models prep/models.tsv --out models
-    ${params.kfpfam_filter} build prep 4 ${params.kfpfam_bits} index.idx
-    ${params.kfpfam_filter} tile prep index.idx index.tidx
-    rm index.idx
+    mkdir index
+    if [[ ${params.engine} == kfpfam ]]; then
+        export RAYON_NUM_THREADS=${task.cpus}
+        ${params.kfpfam_python} seeds.py bars --models prep/models.tsv --thresholds thresholds.tsv \\
+            --ga ga.tsv --gapped index/gapped.txt --slack ${kfpfam.slack}
+        ${params.kfpfam_filter} seeds prep ga.tsv seeds.f32 ${params.kfpfam_seed}
+        ${params.kfpfam_python} seeds.py choose --table seeds.f32 --shape ${params.kfpfam_seed} \\
+            --theta ${kfpfam.theta} --out T.txt
+        FILTER_T_FILE=T.txt ${params.kfpfam_filter} build prep ${params.kfpfam_seed} 0 index.idx
+        ${params.kfpfam_filter} tile prep index.idx index/index.tidx
+        rm index.idx seeds.f32
+    fi
     """
 
     stub:
-    "mkdir prep; touch models.hmm models.h3m models.h3i models.h3f models.h3p index.tidx thresholds.tsv hmm.sha256"
+    "mkdir prep index; touch models.hmm models.h3m models.h3i models.h3f models.h3p thresholds.tsv hmm.sha256"
 }
 
 process SEARCH {
@@ -60,13 +70,19 @@ process SEARCH {
     // The filter writes each block's pairs to the pipe as numbers, and HMMER searches them while the
     // next block is filtered, as in the raw-reads pipeline's KFPFAM_HMMER. Both use every core.
     script:
+    def kfpfam = params.kfpfam_modes[params.kfpfam_mode]
+    def prefilter = """\
+        RAYON_NUM_THREADS=${task.cpus} FILTER_MIN_GAPPED=${kfpfam.min_gapped} \\
+        FILTER_GAPPED_FILE=${index}/gapped.txt FILTER_BAND=${params.kfpfam_band} \\
+        FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
+        ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
+        ${params.kfpfam_block} ${faa} /dev/stdout |""".stripIndent()
     """
     set -o pipefail
-    RAYON_NUM_THREADS=${task.cpus} FILTER_MIN_GAPPED=${params.kfpfam_min_gapped} FILTER_BINARY=1 \\
-        ${params.kfpfam_filter} join ${prep} ${index} ${params.kfpfam_bar} ${params.kfpfam_gate} \\
-        ${params.kfpfam_block} ${faa} /dev/stdout \\
-        | ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
+    ${params.engine == 'kfpfam' ? prefilter : ''} \\
+        ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
             --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
+            ${params.engine == 'kfpfam' ? '' : '--all-pairs'} \\
             ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
             --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv
     if [[ \$(sed -n 2p chunk${chunk}.stats.tsv | cut -f1,2) != \$(sed -n 2p ${counts}) ]]; then
@@ -167,6 +183,12 @@ workflow {
     if (!(params.targets in ['reps', 'all'])) {
         error "--targets ${params.targets}: reps or all"
     }
+    if (!(params.engine in ['kfpfam', 'hmmsearch'])) {
+        error "--engine ${params.engine}: kfpfam or hmmsearch"
+    }
+    if (!(params.kfpfam_mode in params.kfpfam_modes)) {
+        error "--kfpfam_mode ${params.kfpfam_mode}: ${params.kfpfam_modes.keySet().join(' or ')}"
+    }
     if (!params.hmm) {
         error "--hmm: the collection's HMM file, plain or gzipped"
     }
@@ -183,7 +205,8 @@ workflow {
     // inputs, so that containers see them and -resume reruns what an edit changes
     def annotate = file("${projectDir}/annotate.py", checkIfExists: true)
     def tables = file("${projectDir}/tables.py", checkIfExists: true)
-    PREP(file(params.hmm, checkIfExists: true), table, [annotate, tables])
+    def seeds = file("${projectDir}/seeds.py", checkIfExists: true)
+    PREP(file(params.hmm, checkIfExists: true), table, [annotate, tables, seeds])
     ch_chunks = PLAN().splitCsv(sep: '\t', header: true)
         .map { r -> ['real', r.chunk as int, r.lo as long, r.hi as long, r.proteins as long] }
     FASTA(ch_chunks)

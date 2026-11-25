@@ -1,4 +1,4 @@
-"""HMMER on kfpfam's candidate (protein, model) pairs: domain rows with alignments, and labels.
+"""HMMER on kfpfam's candidate (protein, model) pairs, or on all: domain rows, and labels.
 
 Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``main.nf``:
 
@@ -7,6 +7,7 @@ Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``mai
 - ``search``: pairs on stdin, from kfpfam's ``filter join`` run with ``FILTER_BINARY=1`` beside this
   script on the same FASTA (``protein_id`` as the name) -> ``--domains`` Parquet, ``--labels``
   Parquet (protein_id, model; proteins passing the model's thresholds), one-row ``--stats`` TSV.
+  With ``--all-pairs``, every protein against every model as ``hmmsearch`` does, and no stdin.
 - ``check``: 1 in N of the same proteins against every model, without kfpfam -> per model, what
   passes and how much of it ``search`` has.
 
@@ -129,14 +130,14 @@ def pipeline(z: float) -> Pipeline:
     return LOCAL.pipeline
 
 
-def search_model(profile, block, threshold, a: argparse.Namespace) -> list[tuple]:
-    """One model on its candidates: one row per domain kept."""
+def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> list[tuple]:
+    """One model on its candidates: a row per domain kept. `seqs`: the block by name, if made."""
     model, _, seq_t, dom_t = threshold
     rows = []
     hits = pipeline(a.z).search_hmm(profile, block)
     if not len(hits):
         return rows
-    seqs = {text(s.name): s for s in block}
+    seqs = seqs or {text(s.name): s for s in block}
     for hit in hits:
         for d in hit.domains:
             passes = hit.score >= seq_t and d.score >= dom_t
@@ -250,23 +251,34 @@ def batches(blocks, size: int, counts: Counter) -> Iterator[dict[int, list]]:
         yield targets
 
 
+def every_pair(proteins: SequenceFile, optimized: list, counts: Counter) -> Iterator[tuple]:
+    """Jobs of every model on every protein, as one block they share: hmmsearch."""
+    block = proteins.read_block()
+    counts["proteins"], counts["residues"] = len(block), sum(map(len, block))
+    kept = DigitalSequenceBlock(ALPHABET, [s for s in block if len(s) <= HMMER_MAX])
+    counts["too_long"] = len(block) - len(kept)
+    counts["pairs"] = len(kept) * len(optimized)
+    seqs = {text(s.name): s for s in kept}
+    if seqs:
+        yield from ((m, profile, kept, seqs) for m, profile in enumerate(optimized))
+
+
 def run(jobs, thresholds, pool, output: Output, a: argparse.Namespace) -> None:
-    """Every (model number, profile, its proteins) of jobs, written in their order, so output does
-    not depend on threads. A model may be in jobs once: a profile is reconfigured for each target,
-    so two threads can't share one."""
+    """Every (model number, profile, block of proteins, the block by name or None) of jobs, written
+    in their order, so output does not depend on threads. A model may be in jobs once: a profile is
+    reconfigured for each target, so two threads can't share one."""
 
     def work(group):
-        return [search_model(p, b, thresholds[m], a) for m, p, b in group]
+        return [search_model(p, b, seqs, thresholds[m], a) for m, p, b, seqs in group]
 
     def collect(future) -> None:
         for rows in future.result():
             output.add(rows)
 
     pending, group, n = deque(), [], 0
-    for m, profile, seqs in jobs:
-        # Built here, not in the worker: blocks built across 6 threads ran about 40x slower
-        group.append((m, profile, DigitalSequenceBlock(ALPHABET, seqs)))
-        n += len(seqs)
+    for job in jobs:
+        group.append(job)
+        n += len(job[2])
         if n >= JOB:
             pending.append(pool.submit(work, group))
             group, n = [], 0
@@ -288,10 +300,18 @@ def search(a: argparse.Namespace) -> None:
     counts = Counter()
     output = Output(a.domains)
     with open_proteins(a.faa) as proteins, ThreadPoolExecutor(a.threads) as pool:
-        blocks = read_blocks(sys.stdin.buffer, proteins)
-        for targets in batches(blocks, BATCH, counts):
-            jobs = ((m, optimized[m], targets[m]) for m in sorted(targets) if targets[m])
-            run(jobs, thresholds, pool, output, a)
+        if a.all_pairs:
+            run(every_pair(proteins, optimized, counts), thresholds, pool, output, a)
+        else:
+            blocks = read_blocks(sys.stdin.buffer, proteins)
+            for targets in batches(blocks, BATCH, counts):
+                # built here, not in the workers: across 6 threads blocks ran about 40x slower
+                jobs = (
+                    (m, optimized[m], DigitalSequenceBlock(ALPHABET, targets[m]), None)
+                    for m in sorted(targets)
+                    if targets[m]
+                )
+                run(jobs, thresholds, pool, output, a)
     output.close(a.labels)
     used = resource.getrusage(resource.RUSAGE_SELF)
     row = {
@@ -362,6 +382,7 @@ def main() -> None:
     x.add_argument("--domains", type=Path, help="not written if this is left out")
     x.add_argument("--labels", type=Path, required=True)
     x.add_argument("--stats", type=Path, required=True)
+    x.add_argument("--all-pairs", action="store_true", help="no prefilter: hmmsearch")
     x.add_argument("--weak-evalue", type=float, default=0, help="0: passing domains only")
     c = sub.add_parser("check")
     c.set_defaults(run=check)

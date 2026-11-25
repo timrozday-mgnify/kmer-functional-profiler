@@ -11,8 +11,8 @@
 #   SIF=<kfp-lookup.sif>         workflows/pfam-anchor/lookup/Dockerfile's image; ../images/kfp-lookup.{tar,sif} by default
 #   HMM=<Pfam-A.hmm[.gz]>        the file hmm-annotate searched, and the one the reads are aligned to:
 #                                $B11_DIR/pfam/39.0/Pfam-A.hmm, or the FTP site's 39.0 (it is checked)
-#   PFAM=../hmm-annotate/results-pfam39.0-1
-#   KOFAM=../hmm-annotate/results-kofam-1   its labels; KOFAM= (empty) for a bundle with none
+#   PFAM=../hmm-annotate/results-pfam39.0-hmmsearch-1   or the engine's it was run with
+#   KOFAM=../hmm-annotate/results-kofam-kfpfam-top-1   its labels; KOFAM= (empty) for a bundle with none
 #   SAMPLE_PARQUET=<*_pfam_alignments.parquet>   optional: profiled with the bundle at the end
 #   RELEASE=<mirror>             a local mirror instead of the FTP site
 #   PFAM_VERSION=39.0 MGNIFY_VERSION=2026_07     recorded in the bundle
@@ -29,8 +29,8 @@
 source ../common.sh
 : "${HMM:?the Pfam-A.hmm that was annotated with}"
 SIF=${SIF:-$(sif kfp-lookup)}
-PFAM=${PFAM:-../hmm-annotate/results-pfam39.0-1}
-KOFAM=${KOFAM-../hmm-annotate/results-kofam-1}
+PFAM=${PFAM:-../hmm-annotate/results-pfam39.0-hmmsearch-1}
+KOFAM=${KOFAM-../hmm-annotate/results-kofam-kfpfam-top-1}
 nextflow run "$WF/lookup-index" -c ../site.config ${RELEASE:+--release "$RELEASE"} \
     --lookup_sif "$(realpath "$SIF")" --hmm "$(realpath "$HMM")" --pfam "$(realpath "$PFAM")" \
     ${KOFAM:+--labels "ko=$(realpath "$KOFAM")"} \
