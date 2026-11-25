@@ -6,6 +6,12 @@ WF=$REPO/workflows
 [[ -f run.sh && -f ../site.config ]] || { echo "submit from the run's directory: cd <run> && sbatch run.sh" >&2; exit 1; }
 [[ -x $REPO/.venv/bin/kmer-functional-profiler ]] || { echo "no venv in $REPO: run $WF/setup.sh first" >&2; exit 1; }
 command -v nextflow >/dev/null || { echo "nextflow not on PATH" >&2; exit 1; }
+# 26.04.1 resumes a task whose script changed only by a parameter, so a run of other settings gives this one's results
+# (25.10.4, 26.10.0 and 26.10.2 don't)
+if [[ $(nextflow -version) == *"version 26.04."* ]]; then
+    echo "Nextflow 26.04 reuses tasks of other parameters on -resume: set NXF_VER=26.10.2 or 25.10.4" >&2
+    exit 1
+fi
 export NXF_OPTS='-Xms1g -Xmx4g'
 SUBSET=../../mgnify-proteins-subset/results/lin100-dense  # members.parquet, pfam.parquet at 1 in 100
 

@@ -8,6 +8,7 @@ Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``mai
   script on the same FASTA (``protein_id`` as the name) -> ``--domains`` Parquet, ``--labels``
   Parquet (protein_id, model; proteins passing the model's thresholds), one-row ``--stats`` TSV.
   With ``--all-pairs``, every protein against every model as ``hmmsearch`` does, and no stdin.
+  ``--near``: also (protein_id, model) within ``--near-slack`` bits of passing, for ``members.py``.
 - ``check``: 1 in N of the same proteins against every model, without kfpfam -> per model, what
   passes and how much of it ``search`` has.
 
@@ -130,17 +131,21 @@ def pipeline(z: float) -> Pipeline:
     return LOCAL.pipeline
 
 
-def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> list[tuple]:
-    """One model on its candidates: a row per domain kept. `seqs`: the block by name, if made."""
+def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> tuple[list, set]:
+    """One model on its candidates: a row per domain kept, and the proteins near passing.
+    `seqs`: the block by name, if made."""
     model, _, seq_t, dom_t = threshold
-    rows = []
+    rows: list[tuple] = []
+    near: set[tuple[int, str]] = set()
     hits = pipeline(a.z).search_hmm(profile, block)
     if not len(hits):
-        return rows
+        return rows, near
     seqs = seqs or {text(s.name): s for s in block}
     for hit in hits:
         for d in hit.domains:
             passes = hit.score >= seq_t and d.score >= dom_t
+            if a.near and hit.score >= seq_t - a.near_slack and d.score >= dom_t - a.near_slack:
+                near.add((pid(hit), model))
             if not passes and not d.i_evalue <= a.weak_evalue:
                 continue
             ali = d.alignment
@@ -156,7 +161,7 @@ def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> list
                     ALPHABET.decode(seq.sequence[start:stop]),
                 )
             )  # fmt: skip
-    return rows
+    return rows, near
 
 
 class Output:
@@ -165,6 +170,7 @@ class Output:
     def __init__(self, domains: Path | None) -> None:
         self.rows: list[tuple] = []
         self.labels: set[tuple[int, str]] = set()
+        self.near: set[tuple[int, str]] = set()
         self.domains = self.passing = 0
         self.writer = domains and pq.ParquetWriter(
             domains,
@@ -174,7 +180,8 @@ class Output:
             use_dictionary=["model", "passes"],
         )
 
-    def add(self, rows: list[tuple]) -> None:
+    def add(self, rows: list[tuple], near: set[tuple[int, str]]) -> None:
+        self.near |= near
         self.domains += len(rows)
         for r in rows:
             if r[12]:
@@ -189,13 +196,14 @@ class Output:
         self.writer.write_table(table(self.rows, SCHEMA))
         self.rows = []
 
-    def close(self, labels: Path) -> None:
+    def close(self, labels: Path, near: Path | None) -> None:
         if self.writer:
             self.flush()
             self.writer.close()
-        pq.write_table(
-            table(sorted(self.labels), LABELS), labels, compression="zstd", use_dictionary=["model"]
-        )
+        for found, path in (self.labels, labels), (self.near, near):
+            if path:
+                t = table(sorted(found), LABELS)
+                pq.write_table(t, path, compression="zstd", use_dictionary=["model"])
 
 
 def table(rows: list[tuple], schema: pa.Schema) -> pa.Table:
@@ -272,8 +280,8 @@ def run(jobs, thresholds, pool, output: Output, a: argparse.Namespace) -> None:
         return [search_model(p, b, seqs, thresholds[m], a) for m, p, b, seqs in group]
 
     def collect(future) -> None:
-        for rows in future.result():
-            output.add(rows)
+        for found in future.result():
+            output.add(*found)
 
     pending, group, n = deque(), [], 0
     for job in jobs:
@@ -312,7 +320,7 @@ def search(a: argparse.Namespace) -> None:
                     if targets[m]
                 )
                 run(jobs, thresholds, pool, output, a)
-    output.close(a.labels)
+    output.close(a.labels, a.near)
     used = resource.getrusage(resource.RUSAGE_SELF)
     row = {
         **{k: counts[k] for k in ("proteins", "residues", "too_long", "pairs")},
@@ -382,6 +390,8 @@ def main() -> None:
     x.add_argument("--domains", type=Path, help="not written if this is left out")
     x.add_argument("--labels", type=Path, required=True)
     x.add_argument("--stats", type=Path, required=True)
+    x.add_argument("--near", type=Path)
+    x.add_argument("--near-slack", type=float, default=8)
     x.add_argument("--all-pairs", action="store_true", help="no prefilter: hmmsearch")
     x.add_argument("--weak-evalue", type=float, default=0, help="0: passing domains only")
     c = sub.add_parser("check")

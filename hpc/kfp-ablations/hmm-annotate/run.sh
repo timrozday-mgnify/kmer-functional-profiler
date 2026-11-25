@@ -9,6 +9,8 @@
 # Every MGnify protein against an HMM collection, kfpfam's prefilter then HMMER on its candidates,
 # or hmmsearch alone (workflows/hmm-annotate/README.md). Inputs, as environment variables:
 #   ENGINE=kfpfam-top              kfpfam's top mode, kfpfam-fast, or hmmsearch: every model, no prefilter
+#   MEMBERS=true                   representatives by ENGINE, then their members by HMMER alone, on the models the
+#                                  representative nearly passes. Every protein still, at a fraction of the cost
 #   SIF=<kfpfam-filter.sif>        kfpfam's image, e54c21a or later (both engines); ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
@@ -19,7 +21,7 @@
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
 #                                  cat profiles/K*.hmm > kofam.hmm
 #   SAMPLE=1000                    1 in N proteins, and full hmmsearch on 1 in CHECK (10) of those
-#                                  (0 for ENGINE=hmmsearch)
+#                                  (none for ENGINE=hmmsearch, but its MEMBERS)
 #   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
 #                                  reads most of the release's 1 TB of sequences, as samples are spread out
 # First, and look at check.tsv and trace.tsv before the whole:
@@ -27,9 +29,11 @@
 #   PFAM=39.0 sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=kfpfam-fast sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
+#   PFAM=39.0 ENGINE=kfpfam-fast MEMBERS=true sbatch --dependency=afterany:<that job> run.sh   # check.members.tsv
 #   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
 # One at a time in this directory: they share its work/ and -resume cache.
-# Read results-<collection><release>-<engine>-<sample>/ (results-pfam39.0-hmmsearch-1000):
+# Read results-<collection><release>-<engine>[-members]-<sample>/ (results-pfam39.0-hmmsearch-1000):
+#   check.members.tsv  with MEMBERS, the members' recall; check.tsv is the representatives'
 #   check.tsv       kfpfam's recall of the passing domains of full hmmsearch, all and by model
 #   compare.tsv     the same against the release's own table (38.2)
 #   summary.tsv     proteins, residues, pairs, domains passing
@@ -50,7 +54,8 @@ SIF=${SIF:-$(sif kfpfam-filter)}
 collection=${COLLECTION:-pfam}
 sample=${SAMPLE:-1000}
 engine=${ENGINE:-kfpfam-top}
-check=$([[ $sample == 1 || $engine == hmmsearch ]] && echo 0 || echo "${CHECK:-10}")
+check=${CHECK:-10}
+if [[ $sample == 1 || ( $engine == hmmsearch && ${MEMBERS:-false} != true ) ]]; then check=0; fi
 args=(--engine "${engine%%-*}")
 if [[ $engine == kfpfam-* ]]; then args+=(--kfpfam_mode "${engine#*-}"); fi
 name=$collection
@@ -58,7 +63,9 @@ case $collection in
     pfam)
         release=${PFAM:-39.0}
         name=pfam$release
-        args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
+        if [[ ${MEMBERS:-false} != true ]]; then
+            args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
+        fi
         args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam$release/Pfam-A.hmm.gz}")
         ;;
     kofam)
@@ -71,7 +78,12 @@ case $collection in
         args+=(--hmm "$HMM" ${THRESHOLDS:+--thresholds "$THRESHOLDS"})
         ;;
 esac
+targets=all
+if [[ ${MEMBERS:-false} == true ]]; then
+    targets=reps engine=$engine-members
+    args+=(--members true)
+fi
 nextflow run "$WF/hmm-annotate" -c ../site.config \
     ${RELEASE:+--release "$RELEASE"} --kfpfam_sif "$(realpath "$SIF")" "${args[@]}" \
-    --targets all --sample "$sample" --check_sample "$check" \
+    --targets "$targets" --sample "$sample" --check_sample "$check" \
     --outdir "results-$name-$engine-$sample" -resume

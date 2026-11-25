@@ -818,5 +818,7 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **Tried, not built:**
     - HMMER's Forward filter (F3) from GA − 4 bits: its stage 30 → 21 CPU-s, 5 of 17,629 domains lost;
     - seed thresholds for a stretch of 100 or 200 residues, not 50: the same cost for the same recall; a stricter Viterbi filter (F2): loses 3% or more;
-    - members' candidates from their representative's hits (score ≥ GA − 8, HMMER only): 35× `hmmsearch` on 45,756 members, 8 of 19,954 domains missed. 40-family slice, so members of those families only. Representatives hold 23% of MGnify's residues, so all proteins would be about 23× (representatives at `fast`'s 9.4×), or 4× with `hmmsearch` on them.
   - **Not measured:** any of it on x86, Pfam 39.0, KOfam.
+  - **`--members` built (2026-11-25, the user's request).** `--targets reps --members true`: representatives by either engine, then HMMER alone on their members, for the models the representative passes to within 8 bits. Through the workflow on 49,998 proteins: 12 of 16,143 member domains missed (0.07%) with `hmmsearch` or `top` on representatives, 228 (1.4%, 196 in one cluster) with `fast`. `lookup-index` reads the two sets of ranges. Not built: `hmmsearch` for the representatives of large clusters only, which would remove most of what `fast` loses there.
+  - **`fast` on real reads:** 400,000 ORFs of ERR10889147, 2,725 pairs at GA: 69× `hmmsearch`, 3 missed (top 14×, 0; r999 39×, 2). Added as the B11 arm `kfpfam_fast` (nar-review-response, not in git).
+  - **Nextflow 26.04.1's `-resume` reuses a task whose script changed only by a `params` value** (minimal case; 25.10.4, 26.10.0 and 26.10.2 don't; inputs and `ext.args` are tracked). `hpc/kfp-ablations/common.sh` refuses 26.04.

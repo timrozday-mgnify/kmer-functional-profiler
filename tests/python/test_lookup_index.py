@@ -51,8 +51,29 @@ def test_groups_fail_on_a_missing_chunk_or_another_hmm_file(tmp_path: Path) -> N
         groups(tmp_path, hmm=tmp_path / "other.hmm")
 
 
-def test_split_gives_every_domain_its_cluster_labels_and_group(tmp_path: Path) -> None:
-    g = groups(tmp_path)
+def two_sets(cwd: Path) -> Path:
+    """The annotation as a run of representatives and then members: odd ids, in wider ranges."""
+    out = cwd / "pfam2"
+    shutil.copytree(PFAM, out)
+    r = pl.read_csv(out / "ranges.tsv", separator="\t")
+    top = r["hi"].max()
+    with open(out / "ranges.members.tsv", "w") as f:
+        f.write("chunk\tlo\thi\n")
+        for i, (lo, hi) in enumerate([(0, top // 2), (top // 2, top)]):
+            f.write(f"m{i}\t{lo}\t{hi}\n")
+            d = pl.read_parquet(PFAM / "domains" / "*.parquet")
+            d = d.filter(pl.col("protein_id") % 2 == 1, pl.col("protein_id").is_between(lo, hi - 1))
+            d.write_parquet(out / "domains" / f"chunkm{i}.domains.parquet")
+    for c in r["chunk"]:
+        path = out / "domains" / f"chunk{c}.domains.parquet"
+        pl.read_parquet(path).filter(pl.col("protein_id") % 2 == 0).write_parquet(path)
+    return out
+
+
+@pytest.mark.parametrize("sets", [1, 2])
+def test_split_gives_every_domain_its_cluster_labels_and_group(tmp_path: Path, sets: int) -> None:
+    pfam = two_sets(tmp_path) if sets == 2 else PFAM
+    g = groups(tmp_path, pfam=pfam)
     clusters = pl.read_parquet(RELEASE / "mgy_cluster_seqs.parquet").rename(
         {"cluster_member": "protein_id"}
     )
@@ -60,7 +81,7 @@ def test_split_gives_every_domain_its_cluster_labels_and_group(tmp_path: Path) -
     clusters.write_parquet(tmp_path / "membership/shard_000000.parquet")
     got = []
     for batch, lo, hi in pl.read_csv(tmp_path / "batches.tsv", separator="\t").iter_rows():
-        run(tmp_path, "split", "--pfam", PFAM, "--label", f"ko={KO}", "--groups", "groups.tsv",
+        run(tmp_path, "split", "--pfam", pfam, "--label", f"ko={KO}", "--groups", "groups.tsv",
             "--membership", "membership", "--lo", lo, "--hi", hi, "--out", f"b{batch}")  # fmt: skip
         for f in sorted((tmp_path / f"b{batch}").glob("group=*/*.parquet")):
             group = int(f.parent.name.removeprefix("group="))

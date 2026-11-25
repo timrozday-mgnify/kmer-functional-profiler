@@ -32,8 +32,12 @@ def connect(args: argparse.Namespace) -> duckdb.DuckDBPyConnection:
 
 def chunks(annotation: Path, kind: str) -> list[tuple[int, int, Path]]:
     """(lo, hi, file) of every chunk of an hmm-annotate output, by protein_id."""
-    with open(annotation / "ranges.tsv") as f:
-        rows = list(csv.DictReader(f, delimiter="\t"))
+    # a run of representatives and then their members has two sets of ranges, which overlap
+    rows = []
+    for name in ("ranges.tsv", "ranges.members.tsv"):
+        if (annotation / name).is_file():
+            with open(annotation / name) as f:
+                rows += csv.DictReader(f, delimiter="\t")
     out = [
         (int(r["lo"]), int(r["hi"]), annotation / kind / f"chunk{r['chunk']}.{kind}.parquet")
         for r in rows
@@ -95,9 +99,13 @@ def groups(args: argparse.Namespace) -> None:
             heapq.heappush(loads, (load + n, g))
     with open(args.out / "batches.tsv", "w") as out:
         out.write("batch\tlo\thi\n")
-        for b, i in enumerate(range(0, len(found), args.batch_chunks)):
-            part = found[i : i + args.batch_chunks]
-            out.write(f"{b}\t{part[0][0]}\t{part[-1][1]}\n")
+        # disjoint, whatever the chunks: `split` takes a batch's rows by protein_id
+        cuts = [lo for lo, _, _ in found[:: args.batch_chunks]]
+        ends = [*cuts[1:], max(hi for _, hi, _ in found)]
+        for b, (lo, hi) in enumerate(
+            (lo, hi) for lo, hi in zip(cuts, ends, strict=True) if lo < hi
+        ):
+            out.write(f"{b}\t{lo}\t{hi}\n")
     print(f"{sum(n for _, n in counts)} rows, {len(counts)} families, the largest {counts[0]}")
 
 
@@ -129,11 +137,11 @@ def split(args: argparse.Namespace) -> None:
                 FROM read_parquet('{args.membership}/shard_*.parquet') WHERE {in_range}
             ) m USING (protein_id)
             {" ".join(joins)}
-            WHERE d.passes
+            WHERE d.passes AND d.{in_range}
         ) TO '{args.out}' (FORMAT parquet, COMPRESSION zstd, PARTITION_BY ("group"))
         """
     )
-    expected = con.sql(f"SELECT count(*) FROM {rows} WHERE passes").fetchone()[0]
+    expected = con.sql(f"SELECT count(*) FROM {rows} WHERE passes AND {in_range}").fetchone()[0]
     if not expected:  # a batch with no domain at all writes nothing
         args.out.mkdir(exist_ok=True)
         return

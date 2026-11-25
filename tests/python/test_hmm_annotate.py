@@ -133,6 +133,49 @@ def test_compare_counts_shared_missing_and_extra_domains(tmp_path: Path) -> None
     ]  # fmt: skip
 
 
+def test_members_pairs_are_their_representatives(tmp_path: Path) -> None:
+    models_tsv(tmp_path)
+    thresholds(tmp_path)
+    release = PROTEINS.parent
+    clusters = pl.read_parquet(release / "mgy_cluster_seqs.parquet")
+    members = clusters.filter(pl.col("cluster_member") != pl.col("cluster_rep"))
+    reps = clusters["cluster_rep"].unique().sort()
+    near = pl.DataFrame(
+        {"protein_id": reps, "model": [MODELS[i % 6][0] for i in range(len(reps))]}
+    ).filter(pl.col("protein_id") != reps[0])  # one with no hit
+    near.write_parquet(tmp_path / "near.parquet")
+    width, check = 40, 5
+    cut, end = reps[len(reps) // 2], reps[-1] + 1
+    for b, (lo, hi) in enumerate([(0, cut), (cut, end)]):
+        run(tmp_path, "members.py", "pairs", "--release", release, "--near", "near.parquet",
+            "--lo", lo, "--hi", hi, "--check-sample", check, "--width", width,
+            "--out", f"pairs{b}", "--shards", f"shards{b}.txt")  # fmt: skip
+    shards = sorted(
+        {int(x) for b in "01" for x in (tmp_path / f"shards{b}.txt").read_text().split()}
+    )
+    seqs = dict(pl.read_parquet(PROTEINS).select("protein_id", "sequence").iter_rows())
+    got, names = [], []
+    for shard in shards:
+        run(tmp_path, "members.py", "fasta", "--release", release, "--pairs", "pairs0", "pairs1",
+            "--shard", shard, "--width", width, "--thresholds", "thresholds.tsv",
+            "--out", "m.faa", "--pairs-out", "m.pairs")  # fmt: skip
+        lines = (tmp_path / "m.faa").read_text().splitlines()
+        ids = [int(x[1:]) for x in lines[::2]]
+        assert ids == sorted(ids) and {i // width for i in ids} == {shard}
+        assert lines[1::2] == [seqs[i] for i in ids]
+        raw = (tmp_path / "m.pairs").read_bytes()
+        n, residues, size = struct.unpack("<3Q", raw[:24])
+        assert (n, residues, len(raw) - 24) == (len(ids), sum(map(len, lines[1::2])), size)
+        pairs = np.frombuffer(raw, "<u4", offset=24).reshape(-1, 2)
+        assert (np.diff(pairs[:, 1].astype(int)) >= 0).all()
+        got += [(ids[i], MODELS[m][0]) for i, m in pairs]
+        names += ids
+    candidates = members.join(near, left_on="cluster_rep", right_on="protein_id")
+    assert sorted(got) == sorted(candidates.select("cluster_member", "model").rows())
+    checked = members.filter(pl.col("cluster_member") % check == 0)["cluster_member"]
+    assert sorted(names) == sorted({*candidates["cluster_member"], *checked})
+
+
 def stream(lengths: list[int], block: int, models: range) -> bytes:
     """Every (protein, model) pair, as `filter join` writes them."""
     out = b""
@@ -183,6 +226,17 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
         assert r["residues"] == seq[r["ali_from"] - 1 - r["left"] : r["ali_to"] + r["right"]]
     labels = pl.read_parquet(tmp_path / "l.parquet")
     assert sorted(labels.rows()) == sorted(set(d.select("protein_id", "model").rows()))
+
+    # near: what passes, and what would with the slack
+    t = (tmp_path / "thresholds.tsv").read_text()
+    (tmp_path / "thresholds.tsv").write_text(t.replace("Mini1\t25.0\t25.0", "Mini1\t999\t999"))
+    for slack in (0, 974):
+        searched(tmp_path, seqs, range(6), "--near", "n.parquet", "--near-slack", slack)
+        kept = pl.col("model") != "PF90001" if slack == 0 else pl.lit(True)
+        near = pl.read_parquet(tmp_path / "n.parquet").rows()
+        assert set(near) >= set(labels.filter(kept).rows())
+        assert any(m == "PF90001" for _, m in near) == (slack > 0)
+    (tmp_path / "thresholds.tsv").write_text(t)
 
     # every model on every protein, with no prefilter, is the same
     every = searched(tmp_path, seqs, range(0), "--all-pairs")

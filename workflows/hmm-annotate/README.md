@@ -11,6 +11,9 @@ PLAN           ids of the targets -> ranges.tsv, protein_id ranges of ~--chunk_p
 FASTA          per range: the sequences                                                   (pfam-reannotate's)
 SEARCH         per range: filter join | annotate.py search -> domains/ and labels/
                (--engine hmmsearch: annotate.py search --all-pairs, no index)
+MEMBER_PAIRS   with --members: the models each representative nearly passes -> its members' pairs, by member id
+MEMBER_FASTA   per --member_width ids: those members' sequences and pairs
+MEMBER_SEARCH  per --member_width ids: HMMER on the pairs -> domains/ and labels/
 CHECK          per range: 1 in --check_sample proteins against every model, no prefilter  (--check_sample N)
 COMPARE        per range: the passing domains against the release's own Pfam table     (--compare_release true)
 SUMMARY        -> summary.tsv, one total row
@@ -19,7 +22,7 @@ CHECK_SUMMARY  -> check.tsv and compare.tsv, recall against each, worst model fi
 
 ## Setup
 
-Needs Java 17+, Nextflow, [uv](https://docs.astral.sh/uv/) and kfpfam's image.
+Needs Java 17+, Nextflow (not 26.04, whose `-resume` reuses tasks run with other parameters), [uv](https://docs.astral.sh/uv/) and kfpfam's image.
 
 ```bash
 bash workflows/setup.sh   # creates .venv in the repo root
@@ -59,7 +62,8 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | `--cutoff` | `gathering` | The HMM file's own thresholds: `gathering`, `trusted` or `noise` |
 | `--thresholds` | | Or a TSV with a header: model, threshold, `full` or `domain`. KOfam's `ko_list` as it is |
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |
-| `--sample` | `1000` | 1 in N targets by `protein_id` |
+| `--members` | `false` | With `--targets reps`: their members too, so every protein. A member (90% identity) is searched with HMMER against only the models its representative passes to within `--member_slack` (8) bits |
+| `--sample` | `1000` | 1 in N targets by `protein_id`; with `--members`, 1 in N clusters |
 | `--check_sample` | `0` | 1 in N of those also against every model, without the prefilter; `0`: none |
 | `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.2 |
 | `--domains` | `true` | Write the domain rows; labels are always written |
@@ -82,12 +86,14 @@ passes, and shows only with `--weak_evalue`.
   those are. `cigar` is `M`, `I` and `D` against the model.
 - **`labels/chunkN.labels.parquet`**: `protein_id`, `model`, for proteins passing the model's
   thresholds.
+- **`ranges.tsv`**, and **`ranges.members.tsv`** with `--members` (chunks `mN`): the `protein_id` range of each chunk.
+  `lookup-index` reads both.
 - **`thresholds.tsv`**: the thresholds used (`inf`: never passes; `-inf`: not used).
 - **`hmm.sha256`**: of the HMM file, unzipped. `lookup-index` checks its models against it.
 - **`summary.tsv`**: proteins, residues, proteins over 100,000 residues (HMMER's limit, not
   searched), candidate pairs, domains and proteins passing, and pyhmmer's core-seconds.
 - **`check.tsv`**: per model, passing (protein, model) pairs and domains by full `hmmsearch`, how many
-  `SEARCH` found, and how many it has that `hmmsearch` doesn't (`extra`, none expected).
+  `SEARCH` found, and how many it has that `hmmsearch` doesn't (`extra`, none expected). `check.members.tsv`: of the members.
 
 - **`compare.tsv`**: the same columns with the release's own Pfam table as the truth; a domain is the same if
   its envelope is. Use it with Pfam 38.2 only, and `--cutoff gathering`, as the table was made.
@@ -130,3 +136,19 @@ Why this is not the 30× of reads:
 - top's bars are for reads, so it sends HMMER 2.2 M pairs, 170 times the passing ones;
 - `hmmsearch` is at its best on this CPU: on those pieces, all of it, top is 6.8× faster. Codon's x86
   (AVX-512 for kfpfam, SSE for HMMER) should favour kfpfam. Not measured on proteins.
+
+`--members`, 49,998 proteins in 8,953 clusters of the 40-family slice, the same models, through the
+workflow; domains missed against `hmmsearch` on every protein (357 CPU-s), none extra:
+
+| Representatives by | representatives missed, of 5,115 | members missed, of 16,143 |
+| --- | ---: | ---: |
+| `hmmsearch` | 0 | 12 (0.07%) |
+| `kfpfam`, `top` | 1 | 12 (0.07%) |
+| `kfpfam`, `fast` | 6 (0.12%) | 228 (1.4%), 196 of them in one cluster of 574 |
+
+Members cost about 9 CPU-s, 35× less than `hmmsearch` on them, whatever the representatives' engine. A
+representative missed loses its cluster's domain, so `fast`'s loss is the same rate in expectation but
+comes in clusters; looser bars (`slack` 14 or 18) did not change it. The slice is of chosen families with
+large clusters: 1 in 1,000 clusters and `check.members.tsv` give it for the release. Estimated for the
+release at 38.2 and laptop speed: 63,600 core-h by `hmmsearch`; with `--members` about 16,000 with
+`hmmsearch` on the representatives (23% of the residues) and 2,500 with `fast`. 39.0 has 1.8× the models.
