@@ -149,16 +149,13 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
 
 
 @needs_pyhmmer
-def test_proteins_too_long_for_the_filter_or_hmmer(tmp_path: Path) -> None:
+def test_proteins_too_long_for_hmmer_are_counted_not_searched(tmp_path: Path) -> None:
     models_tsv(tmp_path)
     thresholds(tmp_path)
     run(tmp_path, "annotate.py", "press", "--hmm", HMM, "--models", "models.tsv", "--out", "m")
     seqs = dict(pl.read_parquet(PROTEINS).select("protein_id", "sequence").iter_rows())
-    d = searched(tmp_path, seqs, range(6))
-    hit = d["protein_id"][0]
+    hit = searched(tmp_path, seqs, range(6))["protein_id"][0]
     filler = "GSTNQDEKRA"
     long = {1: filler * 6_800 + seqs[hit], 2: filler * 10_000 + seqs[hit], 3: "M" * 50}
-    # no pairs from the filter: the long protein is found all the same, the longest is counted
-    d = searched(tmp_path, long, range(0))
-    assert set(d["protein_id"]) == {1}
+    assert set(searched(tmp_path, long, range(6))["protein_id"]) == {1}
     assert pl.read_csv(tmp_path / "s.tsv", separator="\t")["too_long"].item() == 1

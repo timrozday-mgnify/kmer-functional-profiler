@@ -23,8 +23,8 @@ bash workflows/setup.sh   # creates .venv in the repo root
 ```
 
 kfpfam's image is published nowhere. Build it where Docker is, from kfpfam's `prep-any-hmm` branch
-or later (older ones need `ACC` and `GA` lines, which KOfam's profiles lack), and convert it on the
-HPC:
+or later, and convert it on the HPC. Older ones need `ACC` and `GA` lines, which KOfam's profiles
+lack, and panic on a protein over 65,535 residues.
 
 ```bash
 docker build -f docker/filter.Dockerfile --platform linux/amd64 -t kfpfam-filter <kfpfam checkout>

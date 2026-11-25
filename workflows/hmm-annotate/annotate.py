@@ -15,9 +15,7 @@ at least the ``dom`` one (``tables.py thresholds``). Only passing domains are wr
 ``--weak-evalue`` also asks for those with an independent E-value at most that. E-values are at a
 fixed Z, so they compare across chunks.
 
-kfpfam numbers positions in 16 bits, so proteins over 65,535 residues are searched against every
-model instead. HMMER takes at most 100,000 residues: longer ones are not searched, and counted
-(``too_long``).
+HMMER takes at most 100,000 residues: longer proteins are not searched, and counted (``too_long``).
 
 The pair stream's reader and the thread jobs are from the raw-reads pipeline's ``hmmer_pairs.py``.
 """
@@ -44,8 +42,7 @@ from pyhmmer.plan7 import HMMFile, HMMPressedFile, OptimizedProfile, Pipeline
 
 ALPHABET = Alphabet.amino()
 FLANK = 10  # residues kept either side of a domain: bundle.py's FLANK
-FILTER_MAX = 65_535  # residues: longer proteins' positions wrap in kfpfam's filter
-HMMER_MAX = 100_000
+HMMER_MAX = 100_000  # residues
 BATCH = 2_000_000  # streamed pairs searched together
 JOB = 512  # pairs per thread job, so that small models don't cost more in hand-over than in HMMER
 ROW_GROUP = 65_536  # domains held before they are written
@@ -229,27 +226,23 @@ def read_blocks(stream, proteins: SequenceFile) -> Iterator[tuple]:
         sys.exit("the filter's output stops before the last protein")
 
 
-def batches(blocks, size: int, models: int, counts: Counter) -> Iterator[dict[int, list]]:
+def batches(blocks, size: int, counts: Counter) -> Iterator[dict[int, list]]:
     """Candidate proteins by model, of as many blocks as make `size` pairs."""
     targets, n = defaultdict(list), 0
     for block, pairs in blocks:
         counts["proteins"] += len(block)
         lengths = [len(s) for s in block]
         counts["residues"] += sum(lengths)
-        long = {i for i, x in enumerate(lengths) if x > FILTER_MAX}
-        counts["too_long"] += sum(lengths[i] > HMMER_MAX for i in long)
-        whole = [block[i] for i in sorted(long) if lengths[i] <= HMMER_MAX]
+        long = {i for i, x in enumerate(lengths) if x > HMMER_MAX}
+        counts["too_long"] += len(long)
         ids, ms = pairs[::2], pairs[1::2]
         i = 0
         while i < len(ms):
             end = bisect_right(ms, ms[i], i)
             targets[ms[i]].extend([block[k] for k in ids[i:end] if k not in long])
             i = end
-        if whole:
-            for m in range(models):
-                targets[m].extend(whole)
-        n += len(ms) + models * len(whole)
-        counts["pairs"] += len(ms) + models * len(whole)
+        n += len(ms)
+        counts["pairs"] += len(ms)
         if n >= size:
             yield targets
             targets, n = defaultdict(list), 0
@@ -296,7 +289,7 @@ def search(a: argparse.Namespace) -> None:
     output = Output(a.domains)
     with open_proteins(a.faa) as proteins, ThreadPoolExecutor(a.threads) as pool:
         blocks = read_blocks(sys.stdin.buffer, proteins)
-        for targets in batches(blocks, BATCH, len(optimized), counts):
+        for targets in batches(blocks, BATCH, counts):
             jobs = ((m, optimized[m], targets[m]) for m in sorted(targets) if targets[m])
             run(jobs, thresholds, pool, output, a)
     output.close(a.labels)
