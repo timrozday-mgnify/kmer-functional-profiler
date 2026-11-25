@@ -13,7 +13,7 @@
 #   RELEASE      release directory or URL with mgy_proteins_pfam.parquet (default: the FTP site; about 110 GB, scanned)
 #   REPS         mgy_clusters.fa.gz (default: $RELEASE's). A URL is streamed (157 GB), never stored
 #   PER_LIBRARY  reads per library (200)   CHUNKS  alignment tasks (30)   EXPECT  records REPS must hold (1661142385)
-#   SBATCH_ARGS  extra sbatch options for every job, a partition say
+#   SBATCH_ARGS  extra sbatch options for every job, a partition say. A log name needs %j, or the jobs overwrite each other's
 # Steps: prepare -> align (array) -> pack -> truth -> scan -> report; ./run.sh STEP runs one here.
 # Read: PF<family>/report.tsv (recall by subsample, K and SECOND), report_by_library.tsv, null.tsv (best score of reversed
 #   reads, by family size), size.tsv (bytes the family needs), scan*.times.tsv (core-seconds by stage).
@@ -23,7 +23,9 @@
 set -euo pipefail
 trap 'echo "failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 export LC_ALL=C
-HERE=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}
+# a job runs a copy of this script, so submit says where it is. Not SLURM_SUBMIT_DIR: submitting from an interactive
+# job, that is where the interactive job was started
+HERE=${KFP_RUN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 cd "$HERE"
 REPO=$(cd "${REPO:-../../../kmer-functional-profiler}" && pwd)
 LOOKUP=$REPO/workflows/pfam-anchor/lookup
@@ -34,8 +36,7 @@ REPS=${REPS:-$RELEASE/mgy_clusters.fa.gz}
 EXPECT=${EXPECT:-1661142385}
 CHUNKS=${CHUNKS:-30}
 RUNTIME=${RUNTIME:-singularity}
-THREADS=${THREADS:-${SLURM_CPUS_PER_TASK:-4}}
-export THREADS
+set_threads () { export THREADS=${THREADS:-${SLURM_CPUS_PER_TASK:-4}}; }
 D=$HERE/$(printf 'PF%05d' "$FAMILY")
 mkdir -p "$D"
 large () { "$PY" "$LOOKUP/large.py" "$@" --out "$D"; }
@@ -49,20 +50,29 @@ build () {
     cargo build --quiet --release --offline --manifest-path "$LOOKUP/rs/Cargo.toml"
 }
 
+[[ ${1:-} == submit ]] || set_threads   # not in submit, whose jobs inherit its environment
+
 case ${1:-} in
 submit)
     : "${PARQUETS:?set PARQUETS}" "${PFAM:?set PFAM}"
     [[ -x $PY ]] || { echo "no $PY: run $REPO/workflows/setup.sh first" >&2; exit 1; }
     [[ -s $PFAM ]] || { echo "no $PFAM" >&2; exit 1; }
     compgen -G "$PARQUETS" > /dev/null || { echo "nothing matches $PARQUETS" >&2; exit 1; }
-    sb () { sbatch --parsable ${SBATCH_ARGS:-} "$@"; }
-    j=$(sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$0" prepare)
-    a=$(sb --dependency="afterok:$j" --array="0-$((CHUNKS - 1))" --cpus-per-task=4 --mem=24G --time=12:00:00 "$0" align)
-    p=$(sb --dependency="afterok:$a" --cpus-per-task=2 --mem=48G --time=12:00:00 "$0" pack)
-    t=$(sb --dependency="afterok:$p" --cpus-per-task=48 --mem=48G --time=12:00:00 "$0" truth)
+    if [[ $RELEASE != http* ]]; then
+        [[ -s $RELEASE/mgy_proteins_pfam.parquet ]] || { echo "no $RELEASE/mgy_proteins_pfam.parquet" >&2; exit 1; }
+    fi
+    [[ $REPS == http* || -s $REPS ]] || { echo "no $REPS" >&2; exit 1; }
+    [[ -s $LOOKUP/large.py ]] || { echo "no $LOOKUP/large.py: is the branch checked out in $REPO?" >&2; exit 1; }
+    command -v cargo > /dev/null || { echo "no cargo on PATH (the jobs build the scan)" >&2; exit 1; }
+    export KFP_RUN_DIR=$HERE
+    sb () { sbatch --parsable --chdir="$HERE" ${SBATCH_ARGS:-} "$@"; }
+    j=$(sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$HERE/run.sh" prepare)
+    a=$(sb --dependency="afterok:$j" --array="0-$((CHUNKS - 1))" --cpus-per-task=4 --mem=24G --time=12:00:00 "$HERE/run.sh" align)
+    p=$(sb --dependency="afterok:$a" --cpus-per-task=2 --mem=48G --time=12:00:00 "$HERE/run.sh" pack)
+    t=$(sb --dependency="afterok:$p" --cpus-per-task=48 --mem=48G --time=12:00:00 "$HERE/run.sh" truth)
     # alone on a node, as it is timed
-    s=$(sb --dependency="afterok:$p" --cpus-per-task=16 --mem=64G --time=12:00:00 --exclusive "$0" scan)
-    r=$(sb --dependency="afterok:$t:$s" --cpus-per-task=1 --mem=16G --time=1:00:00 "$0" report)
+    s=$(sb --dependency="afterok:$p" --cpus-per-task=16 --mem=64G --time=12:00:00 --exclusive "$HERE/run.sh" scan)
+    r=$(sb --dependency="afterok:$t:$s" --cpus-per-task=1 --mem=16G --time=1:00:00 "$HERE/run.sh" report)
     echo "prepare $j, align $a, pack $p, truth $t, scan $s, report $r" ;;
 prepare)
     : "${PARQUETS:?set PARQUETS}" "${PFAM:?set PFAM}"
