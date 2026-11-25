@@ -477,8 +477,8 @@ def profile(a: argparse.Namespace) -> None:
         calls,
         separator="\t",
         has_header=False,
-        new_columns=names,
-        schema_overrides=[pl.Int64] * len(names),
+        schema=dict.fromkeys(names, pl.Int64),
+        raise_if_empty=False,  # a sample with no alignment
     )
     tmp.unlink()
     calls.unlink()

@@ -328,6 +328,13 @@ with tempfile.TemporaryDirectory() as tmp:
         assert (r["protein"], r["ko"], r["ties"]) == (want, ko, 1), (b, r)
         assert r["ec"] == (ko and "1.1.1.1"), (b, r)
 
+    # a sample with no alignment
+    pl.read_parquet(d / "mx.parquet").head(0).write_parquet(d / "m0.parquet")
+    run("profile", "--bundle", d / "bm", "--parquet", d / "m0.parquet", "--out", d / "m0")
+    assert pl.read_parquet(d / "m0.reads.parquet").height == 0
+    assert json.loads((d / "m0.summary.json").read_text())["reads"] == 0
+    assert (d / "m0.ko.tsv").read_text() == "label\treads\tsimilarity\n"
+
     # in parts: the members fixture as two families, each built on its own and then assembled,
     # gives each family's block byte for byte, and the same calls, as one build of both
     sys.path.insert(0, str(BUNDLE.parent))
