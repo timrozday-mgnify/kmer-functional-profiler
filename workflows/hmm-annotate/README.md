@@ -113,7 +113,15 @@ Every fourth model of Pfam 38.2 (7,534), M4 Pro, 4 threads, CPU-s, native ARM, 2
 | HMMER on the passing pairs alone: the floor | | 7.5 | 54× | 0 |
 
 `fast` on 108,471 other proteins (18.0 M residues): 26 + 30 CPU-s against 530, **9.4×**, 38 of 17,667
-domains missed (0.2%). Its bars were chosen on the first 80,000.
+domains missed (0.2%). Its bars were chosen on the first 80,000, and were 0.7 bits higher then, with
+a query length in them.
+
+`fast` assumes no query length. The same settings, (protein, model) pairs passing:
+
+| | filter | HMMER | against `hmmsearch` | pairs missed |
+| --- | ---: | ---: | ---: | ---: |
+| 80,000 whole proteins | 21 | 26 | 8.6× of 403 | 41 of 12,867 (0.32%) |
+| the same in 290,248 pieces of 50 residues | 9 | 4.5 | 32× of 438 | 13 of 16,070 (0.08%) |
 
 Why this is not the 30× of reads:
 - the same residues cut into 50-residue pieces take top's filter 47 to 54 CPU-s, against 344 (band 16)

@@ -1,6 +1,7 @@
 """hmm-annotate's steps on six mini HMMs. The search needs pyhmmer (it runs in kfpfam's image)."""
 
 import importlib.util
+import math
 import shutil
 import struct
 import subprocess
@@ -77,10 +78,12 @@ def test_seed_settings_for_each_kind_of_threshold(tmp_path: Path) -> None:
     ga = [x.split("\t") for x in (tmp_path / "ga.tsv").read_text().splitlines()]
     assert ga == [[f"M{i}", x, x] for i, x in enumerate(["8.0", "30.0", "21.0", "30.0"])]
     g = list(map(float, (tmp_path / "g.txt").read_text().split()))
-    assert g[0] == pytest.approx(15.50, abs=0.01)  # under the one bar, as a short repeat's is
+    assert g[0] == pytest.approx(
+        8 + math.log2(210), abs=0.01
+    )  # under the one bar, as a short repeat's is
     assert all(x > 21.25 for x in g[1:])
     run(tmp_path, "seeds.py", "bars", "--models", "models.tsv", "--thresholds", "t.tsv",
-        "--ga", "ga.tsv", "--gapped", "g.txt", "--slack", 14)  # fmt: skip
+        "--ga", "ga.tsv", "--gapped", "g.txt", "--slack", 10)  # fmt: skip
     slack = list(map(float, (tmp_path / "g.txt").read_text().split()))
     assert slack[0] == g[0] and slack[1] > 400 and 21.25 <= slack[2] < g[2]
     # quality falls from 24 to 0 over the grid of T: 9 / .936 is reached at 14.4 steps
