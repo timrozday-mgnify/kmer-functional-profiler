@@ -124,7 +124,7 @@ scan)
     export FLANK=10   # only the domain and 10 residues either side, as a self-contained index holds
     lookup scan "$D/bin" "$D/scan.tsv" "${CONFIGS:-100:200,500:200,2000:200,2000:1000}" 0,2,4,6
     export THREADS=1 LIMIT=${LIMIT:-200}
-    lookup scan "$D/bin" "$D/scan1.tsv" 500:200 0 ;;
+    lookup scan "$D/bin" "$D/scan1.tsv" 2000:1000 0 ;;   # the default since 2026-11-25
 report) large report ;;
 *) sed -n '5,/^set /{/^#/p;}' "$0"; exit 1 ;;
 esac

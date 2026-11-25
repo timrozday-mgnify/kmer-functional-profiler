@@ -385,8 +385,8 @@ def main() -> None:
         help="leave out the alignments under the gathering thresholds (pfam_weak_evalue)",
     )
     q.add_argument("--hmm", type=Path, help="the models the Parquets were aligned to, to check")
-    q.add_argument("--k", type=int, default=500)
-    q.add_argument("--second", type=int, default=200)
+    q.add_argument("--k", type=int, default=2000, help="rows the scan keeps (REPORT.md)")
+    q.add_argument("--second", type=int, default=1000, help="of those, rows to the banded score")
     q.add_argument("--threads", type=int, default=4)
     a = p.parse_args()
     a.run(a)

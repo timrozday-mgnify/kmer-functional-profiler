@@ -4,7 +4,7 @@
 `data/pfam-anchor/lookup/` (git-ignored, 2.3 GB). Nothing is committed. *Measured* is on this laptop; *estimated* is
 extrapolation, and is labelled so.
 
-**Status: the residue scan was chosen on 2026-11-24.** Annotated and collapsed indexes: `ANNOTATION.md`.
+**Status: the residue scan was chosen on 2026-11-24.** Annotated and collapsed indexes: `ANNOTATION.md`. **One very large family (PF00005, 14 M rows) was measured on the HPC on 2026-11-25:** recall .989 end to end, flat with family size; see that section.
 
 **Corrections (2026-11-24, after the first version).**
 - *Members were overstated.* The simulated reads were cut from member proteins that stayed in the members index. With the source protein left out, the source cluster is among the top ties for **.83 (BLOSUM62) to .90
@@ -182,17 +182,57 @@ scanned against its family; the family's share of the reads is B11's (6.4 M doma
   Aligning only the pairs MGnify's own Pfam table holds (110 GB, scores and coordinates, no alignments) is far cheaper but untried; its Pfam version must match the pipeline's.
   A new release or Pfam version means rebuilding: 37.4, 38.2 and 39.0 differ for nearly all families.
 
+## One very large family at full size (measured on Codon, 2026-11-25)
+
+`hpc/kfp-ablations/pfam-anchor-large/run.sh` with `FAMILY=5`; outputs copied back to `data/pfam-anchor/lookup/large/PF00005/`.
+
+- **Data.**
+  - *Family and release:* PF00005 (Pfam 39.0, PF00005.34), against MGnify release 2026_07. 59.3 M proteins carry the family; 11.5 M of the release's 1.66 B cluster representatives do. Those give 14.3 M domain rows, 12.2 M at GA.
+  - *Queries:* 2,176 real read domains at GA from the 11 B11 libraries, 200 a library (kfpfam top arm, Pfam 39.0, re-aligned to the same model), mean 41 residues. Each read is also reversed, as a null.
+  - *Truth:* exhaustive Smith-Waterman against every representative, and against 1 in 4, 16 and 64 of them (the subsamples).
+  - *Scan:* GA rows only, domain ±10 residues (`FLANK=10`), as a self-contained index holds.
+- **Size.** 1.56 B stored residues: **1.1 GB at 5 bits, 1.7 GB at 1 byte**. This matches the estimate for the largest family (about 14 M rows, under 2 GB; Full scale).
+- **Recall is about 1 point below the slice's, and does not fall with family size.** Best cluster called (*right*), and within 95% of the best score (*near*):
+
+  | K:SECOND | Full: right | Full: near | Full: missed | 1 in 4: right | 1 in 16: right | 1 in 64: right |
+  |---|---|---|---|---|---|---|
+  | 100:200 | .986 | .998 | 30 | .973 | .975 | .972 |
+  | **500:200** | **.989** | .997 | 25 | .985 | .988 | .988 |
+  | 2000:200 | .990 | .997 | 22 | .987 | .989 | .989 |
+  | 2000:1000 | .994 | .999 | 13 | .993 | .992 | .994 |
+
+  At 1 in 64 (about 180,000 clusters and 220,000 rows, 4× the slice's largest family in rows) recall is already .988 at 500:200. So the gap from the slice's .9991 comes with this family or its reads, not with N, over a 64× range up to 14 M rows. Per library, 500:200 ranges .970–1.000.
+- **Misses are near ties.**
+  - *At 500:200:* 17 of the 25 misses are 1–4 score units under the best; 2 are far off (30 and 40 short).
+  - *What they share:* shorter reads with lower best scores (medians 38 residues and 169, against 39 and 188), and a single best cluster (median ties 1, against 4).
+  - *Cheapest fix:* more rows to the banded score. 2000:1000 halves the misses to 13.
+  - *Untested cause:* the scan sees domain ±10 residues, while the truth aligns to whole proteins.
+- **Null: reversed reads stay apart from real ones.** At full size the reversed reads' best score has median 63, 99th percentile 82 and maximum 93; every real read scores at least 104. The null maximum grows with N: 80, 83, 87 and 93 from 1 in 64 to full. At 1 in 64 the lowest real read (82) is only 2 above the null maximum, so the floor has to grow with family size.
+- **Cost on x86** (Codon; 12.2 M rows a read domain):
+
+  | Run | Scan | Choosing top rows | Columns + banded | A read domain | Wall |
+  |---|---|---|---|---|---|
+  | 1 thread, 500:200, 200 reads | 1.48 ns a row | 0.66 ns a row | 0.9 ms | **27 ms** | |
+  | 16 threads, 500:200, 4,352 reads | 3.14 ns a row | 0.83 ns a row | 1.6 ms | **50 ms of CPU** | 3.1 ms |
+
+  - *One core* is as fast as the laptop's M4 (2.1 against 2.5 ns a row).
+  - *16 threads* are 1.9× slower per core. Memory bandwidth, or other jobs on the node, could explain it: the job could not be `--exclusive` there.
+  - *2000:1000:* the banded score takes 4.9 ms of CPU a read domain, against 1.2 at 500:200.
+  - *Worst case:* this is the largest family, about 11× the 2.4 ms estimated at the mean family size (0.77 M rows).
+- **Not measured.** The truth step's runtime (the jobs shared one log name, so only the report's survived), PF00072, and Pfam 37.4.
+
 ## Uncertainties, and what I could not test
 
 1. **Family size.** The tests stop at 58,000 rows per family; the median read domain lands at 0.27 M and the mean at 0.77 M, against a mean of 16,000 here: 17× and 47×, and 860× at the largest (14 M). Over a 16× range of N (1/16 subsamples), top-100 recall did not fall (.9991, .9982, .9985), and within-20-bits
    candidates grew as N^0.46 (61, 121, 220), so about 1,300 at 0.77 M if that continues, which is far past the tested range. The share of a family a
    seed passes is constant by construction in subsampling (it removes units at random). *Larger families are more diverse, so real shares may fall or rise.* This is why I recommend an HPC
-   test of one very large family.
+   test of one very large family. *Tested since (2026-11-25):* in PF00005 at 14 M rows, recall is .989 at 500:200 and the same from 1 in 64 to full size; it is lower than here for that family
+   or its reads, not for its size ("One very large family").
 2. **Reach.** Only reads with a Pfam GA hit and only clusters with a Pfam hit. Reads outside domains, or clusters with no domain, get nothing.
-3. **No null.** I have no false-assignment rate: a read whose source is absent from MGnify still gets its nearest cluster. A reversed-read null is the way to set a floor.
+3. **No null.** I have no false-assignment rate: a read whose source is absent from MGnify still gets its nearest cluster. A reversed-read null is the way to set a floor. *Measured since in PF00005:* reversed reads reach at most 93, real ones at least 104, and the null maximum grows with family size.
 4. **Read truth.** Real reads are the aligned part only, so nothing here tests extension past the domain. Truth is the best Smith-Waterman score; several clusters often tie.
    The families are mid-sized, the reads are 47 residues on average, and 37 families carry the whole real set, so a family-level CI is wide.
-5. **Emulation.** No x86 timing. The scan is on an M4 Pro, the stage times are scalar Rust in four threads with swap in use. Treat them as ±2×.
+5. **Emulation.** No x86 timing here (since measured on Codon for PF00005: 2.1 ns a row on one core, the same as the M4). The scan is on an M4 Pro, the stage times are scalar Rust in four threads with swap in use. Treat them as ±2×.
 6. **Pfam.** Everything here uses the local HMMs, labelled 38.2 (the B11 Parquets are labelled 38.2 too, and differ for at least two families); production is 37.4. Sizes scale with model columns and domain counts; the choice between methods should not change.
 
 ## Reproducing
@@ -210,5 +250,6 @@ the laptop was swapping (8.0 GB of 8.7 used at the end), so timings may be infla
 1. **Decided: the residue scan** (representatives' GA rows, per-read margin or top 500, then columns, then a banded alignment) as the method, with no seed index. Not taken: the 16-column scan as a first
    pass (3× less CPU, the same recall within error, but the number it must keep at release family sizes is untested), or 8-bit seeds every 4th column if RAM-resident lookup must be fast and 1–2% of best targets may be lost.
 2. **Representatives only, or representatives plus members as differences** (+20–50 GB estimated; the source cluster is among the top ties for .83–.90 of reads from members, against .63–.68)? *Recommend adding members as a second pass on the top 500 clusters.*
-3. **Run on HPC** (prepared in `hpc/kfp-ablations/pfam-anchor-large`, tested on a stand-in here, nothing submitted): one very large family (PF00005, PF00072) at full size, to check recall and CPU past 58,000 rows; Pfam 37.4's alignments for it; and the Zymo genes against all
-   of MGnify90 if a full Zymo truth is wanted.
+3. **Run on HPC** (`hpc/kfp-ablations/pfam-anchor-large`): one very large family at full size, to check recall and CPU past 58,000 rows. *PF00005 done 2026-11-25* (Pfam 39.0): recall holds with
+   family size, at about 1 point below the slice. **Decided (2026-11-25): 2000:1000 is the default** (.994 on PF00005, 13 misses against 25; the banded score 4.9 ms of CPU a read domain there, against 1.2); `bundle.py profile` uses it. Still open: PF00072; Pfam 37.4's alignments; a wider flank; and the Zymo
+   genes against all of MGnify90 if a full Zymo truth is wanted.

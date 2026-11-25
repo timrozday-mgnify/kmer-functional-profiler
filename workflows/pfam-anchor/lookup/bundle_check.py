@@ -88,7 +88,7 @@ subprocess.run(
     check=True,
 )
 subprocess.run(
-    [LOOKUP, "scan", OUT / "bin", B / "scan.tsv", "500:200"],
+    [LOOKUP, "scan", OUT / "bin", B / "scan.tsv", "2000:1000"],
     check=True,
     env={**os.environ, "FLANK": "10", "THREADS": "4"},
     stderr=subprocess.DEVNULL,
