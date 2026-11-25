@@ -267,6 +267,7 @@ with tempfile.TemporaryDirectory() as tmp:
         list(cluster.items()) + [(301, 301)], orient="row", schema=["protein_id", "cluster_rep"]
     ).write_parquet(d / "mc.parquet")
     (d / "mko.tsv").write_text("102\tK00102\n103\tK00102\n")
+    (d / "mec.tsv").write_text("102\t1.1.1.1\n103\t1.1.1.1\n")
     (d / "mm.hmm").write_text("ACC   PF00011.1\nLENG  80\n//\n")
     margs = [
         "--hits",
@@ -277,6 +278,8 @@ with tempfile.TemporaryDirectory() as tmp:
         d / "mm.hmm",
         "--label",
         f"ko={d / 'mko.tsv'}",
+        "--label",
+        f"ec={d / 'mec.tsv'}",  # not in alphabetical order: calls must not swap the schemes
     ]
     run(
         "build",
@@ -323,6 +326,7 @@ with tempfile.TemporaryDirectory() as tmp:
         )
         r = pl.read_parquet(d / "mp.reads.parquet").row(0, named=True)
         assert (r["protein"], r["ko"], r["ties"]) == (want, ko, 1), (b, r)
+        assert r["ec"] == (ko and "1.1.1.1"), (b, r)
 
     # in parts: the members fixture as two families, each built on its own and then assembled,
     # gives each family's block byte for byte, and the same calls, as one build of both
@@ -348,7 +352,6 @@ with tempfile.TemporaryDirectory() as tmp:
     build2 = ["--hits", d / "mh2.parquet", "--seqs", d / "ms.parquet", "--hmm", d / "mm2.hmm"]
     build2 += ["--label", f"ko={d / 'mko.tsv'}", "--clusters", d / "mc.parquet", "--collapse", "0"]
     run("build", *build2, "--out", d / "whole")
-    run("names", "--rows", d / "part11.parquet", d / "part12.parquet", "--out", d / "names")
     for f in (11, 12):
         run(
             "build-part",
@@ -356,8 +359,6 @@ with tempfile.TemporaryDirectory() as tmp:
             d / f"part{f}.parquet",
             "--hmm",
             d / "mm2.hmm",
-            "--names",
-            d / "names",
             "--out",
             d / f"p{f}",
         )
@@ -368,8 +369,6 @@ with tempfile.TemporaryDirectory() as tmp:
         d / "p12",
         "--hmm",
         d / "mm2.hmm",
-        "--names",
-        d / "names",
         "--out",
         d / "joined",
     )
@@ -384,7 +383,16 @@ with tempfile.TemporaryDirectory() as tmp:
         return out
 
     assert blocks(d / "whole") == blocks(d / "joined") and len(blocks(d / "joined")) == 2
-    assert (d / "whole/labels.ko.txt").read_text() == (d / "joined/labels.ko.txt").read_text()
+    labels = (d / "whole/labels.ko.tsv").read_text()
+    assert labels == (d / "joined/labels.ko.tsv").read_text() and labels.count("K00102") == 2
+    # past the limit a family keeps its commonest labels
+    few = pl.DataFrame(
+        [(1, "b"), (1, "a"), (1, "b"), (1, "c"), (1, "c"), (1, "c"), (2, "a"), (2, None)],
+        orient="row",
+        schema=["pfam_accession", "label_ko"],
+    )
+    bundle.LABELS = 2
+    assert bundle.label_names(few, "ko").rows() == [(1, "b", 1), (1, "c", 2), (2, "a", 1)]
     pl.DataFrame(
         [("m", "PF00011", 6, "50M", x[5:55]), ("n", "PF00012", 6, "50M", x[5:55])],
         orient="row",

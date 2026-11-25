@@ -2,7 +2,8 @@
 
 Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``main.nf``:
 
-- ``press``: an HMM file -> ``OUT.h3{m,i,f,p}``, checked against kfpfam's ``models.tsv``.
+- ``press``: an HMM file -> ``OUT.h3{m,i,f,p}``, checked against kfpfam's ``models.tsv``, and the
+  file's SHA-256 (``hmm.sha256``), for lookup-index to check its models against.
 - ``search``: pairs on stdin, from kfpfam's ``filter join`` run with ``FILTER_BINARY=1`` beside this
   script on the same FASTA (``protein_id`` as the name) -> ``--domains`` Parquet, ``--labels``
   Parquet (protein_id, model; proteins passing the model's thresholds), one-row ``--stats`` TSV.
@@ -22,6 +23,7 @@ The pair stream's reader and the thread jobs are from the raw-reads pipeline's `
 """
 
 import argparse
+import hashlib
 import re
 import resource
 import struct
@@ -109,6 +111,8 @@ def press(a: argparse.Namespace) -> None:
         expected = [line.rstrip("\n").split("\t")[1] for line in f][1:]
     with HMMPressedFile(a.out) as f:
         check_names([text(p.name) for p in f], expected, a.hmm)
+    with open(a.hmm, "rb") as f:
+        Path("hmm.sha256").write_text(hashlib.file_digest(f, "sha256").hexdigest() + "\n")
     print(f"{n} models pressed")
 
 

@@ -77,6 +77,7 @@ passes, and shows only with `--weak_evalue`.
 - **`labels/chunkN.labels.parquet`**: `protein_id`, `model`, for proteins passing the model's
   thresholds.
 - **`thresholds.tsv`**: the thresholds used (`inf`: never passes; `-inf`: not used).
+- **`hmm.sha256`**: of the HMM file, unzipped. `lookup-index` checks its models against it.
 - **`summary.tsv`**: proteins, residues, proteins over 100,000 residues (HMMER's limit, not
   searched), candidate pairs, domains and proteins passing, and pyhmmer's core-seconds.
 - **`check.tsv`**: per model, passing (protein, model) pairs and domains by full `hmmsearch`, how many

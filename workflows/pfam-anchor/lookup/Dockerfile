@@ -16,7 +16,10 @@ ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --offline --manifest-path rs/Cargo.toml
 
 FROM python:3.12-slim-bookworm
-RUN pip install --no-cache-dir polars==1.44.2 pyarrow==25.0.1 numpy==2.5.3
+# procps gives Nextflow its ps
+RUN apt-get update && apt-get install -y --no-install-recommends procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir polars==1.44.2 pyarrow==25.0.1 numpy==2.5.3
 COPY --from=build /src/rs/target/release/lookup /usr/local/bin/lookup
 COPY bundle.py /opt/lookup/bundle.py
 ENV LOOKUP_BIN=/usr/local/bin/lookup PYTHONDONTWRITEBYTECODE=1

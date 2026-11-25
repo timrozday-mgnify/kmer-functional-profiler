@@ -6,7 +6,7 @@ include { PLAN; FASTA; flag } from '../pfam-reannotate/main'
 process PREP {
     label 'process_prep'
     label 'kfpfam'
-    publishDir params.outdir, mode: 'copy', pattern: 'thresholds.tsv'
+    publishDir params.outdir, mode: 'copy', pattern: '{thresholds.tsv,hmm.sha256}'
 
     input:
     path hmm
@@ -18,6 +18,7 @@ process PREP {
     path 'prep', emit: prep
     path 'index.tidx', emit: index
     path 'thresholds.tsv', emit: thresholds
+    path 'hmm.sha256', emit: sha256
 
     script:
     def source = table ? "--table ${table}" : "--cutoff ${params.cutoff}"
@@ -33,7 +34,7 @@ process PREP {
     """
 
     stub:
-    "mkdir prep; touch models.hmm models.h3m models.h3i models.h3f models.h3p index.tidx thresholds.tsv"
+    "mkdir prep; touch models.hmm models.h3m models.h3i models.h3f models.h3p index.tidx thresholds.tsv hmm.sha256"
 }
 
 process SEARCH {

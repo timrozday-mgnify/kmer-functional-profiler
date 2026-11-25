@@ -11,8 +11,10 @@ A bundle:
   manifest.json   format, releases, flank, collapse, schemes, and each file's bytes and SHA-256
   rows.bin        residues, alignments and labels, a block per family (rs/src/bundle.rs)
   families.tsv    where each family's block is
-  labels.<scheme>.txt   label names, by number (1 on; 0 is unlabelled). A protein's several
-                  labels are one name, joined by +
+  labels.<scheme>.tsv   family, label name: a family's names in number order (1 on; 0 is
+                  unlabelled). A protein's several labels are one name, joined by +. A family
+                  keeps its 65,535 commonest names; rows of others are unlabelled, and the
+                  manifest counts them
   hmm/Pfam-A.hmm, kfpfam/index.tidx, kfpfam/prep/   what kfpfam and HMMER need to align reads
                   to the same models
 
@@ -48,7 +50,10 @@ import pyarrow.parquet as pq
 
 HERE = Path(__file__).resolve().parent
 LOOKUP = Path(os.environ.get("LOOKUP_BIN", HERE / "rs/target/release/lookup"))
-FORMAT = 4  # 2: members; 3: as differences; 4: no member accessions, CIGAR diffs (rs/src/bundle.rs)
+# 2: members; 3: as differences; 4: no member accessions, CIGAR diffs (rs/src/bundle.rs);
+# 5: labels numbered within a family
+FORMAT = 5
+LABELS = 65535  # a row's label is a u16
 FLANK = 10
 AA = "ACDEFGHIKLMNPQRSTVWY"
 CODE = np.full(256, 20, np.uint8)
@@ -191,26 +196,33 @@ def rows_of(a: argparse.Namespace, lengths: dict[int, int]) -> tuple[pl.DataFram
     return d.select(*PART, *(f"label_{s}" for s in schemes)), schemes
 
 
-def names_of(d: pl.DataFrame, schemes: list[str]) -> dict[str, list[str]]:
-    """Each scheme's label names, sorted: a label's number is its place here, from 1."""
-    out = {}
-    for s in schemes:
-        names = d[f"label_{s}"].drop_nulls().unique().sort().to_list()
-        if len(names) > 65535:
-            sys.exit(f"{s}: {len(names)} distinct labels, and 65,535 is the most")
-        out[s] = names
-    return out
+def label_names(d: pl.DataFrame, scheme: str) -> pl.DataFrame:
+    """pfam_accession, label_<scheme>, number: each family's label names, numbered from 1."""
+    c = f"label_{scheme}"
+    fam = "pfam_accession"
+    return (
+        d.lazy()
+        .filter(pl.col(c).is_not_null())
+        .group_by(fam, c)
+        .len()
+        .sort(fam, "len", c, descending=[False, True, False])
+        .filter(pl.int_range(pl.len()).over(fam) < LABELS)
+        .sort(fam, c)
+        .with_columns(number=pl.int_range(1, pl.len() + 1).over(fam))
+        .drop("len")
+        .collect()
+    )
 
 
 def write_part(
     d: pl.DataFrame,
-    names: dict[str, list[str]],
+    schemes: list[str],
     lengths: dict[int, int],
     collapse: float,
     out: Path,
 ) -> None:
-    """Part rows -> out/rows.bin and out/families.tsv, through bundle-build, family by family."""
-    schemes = list(names)
+    """Part rows -> out/rows.bin, families.tsv and labels.<scheme>.tsv, through bundle-build,
+    family by family."""
     unknown = set(d["pfam_accession"].unique()) - set(lengths)
     if unknown:
         sys.exit(f"{len(unknown)} families are not in the models, PF{min(unknown):05d} for one")
@@ -218,18 +230,23 @@ def write_part(
     if collapse > 0 and members.any():
         sys.exit("members are only kept uncollapsed: collapse 0")
     cols = [f"l{i}" for i in range(len(schemes))]
-    d = d.with_columns(
-        *(
-            pl.col(f"label_{s}")
-            .replace_strict(
-                {n: i + 1 for i, n in enumerate(names[s])}, default=0, return_dtype=pl.Int64
-            )
-            .fill_null(0)  # unlabelled
-            .alias(c)
-            for s, c in zip(schemes, cols, strict=True)
-        ),
-        cluster=pl.when(members).then(pl.col("cluster_rep")).otherwise(0),
-    )
+    out.mkdir(parents=True, exist_ok=True)
+    dropped = {}
+    for s, c in zip(schemes, cols, strict=True):
+        names = label_names(d, s)
+        label = f"label_{s}"
+        names.select("pfam_accession", label).write_csv(
+            out / f"labels.{s}.tsv", separator="\t", include_header=False, quote_style="never"
+        )
+        d = d.join(names, on=["pfam_accession", label], how="left").with_columns(
+            pl.col("number").cast(pl.Int64).alias(c)
+        )
+        dropped[s] = d.filter(pl.col(label).is_not_null() & pl.col(c).is_null()).height
+        if dropped[s]:
+            print(f"warning: {s}: {dropped[s]} rows have labels past their family's {LABELS}")
+        d = d.with_columns(pl.col(c).fill_null(0)).drop("number", label)  # 0: unlabelled
+    (out / "dropped.json").write_text(json.dumps(dropped))
+    d = d.with_columns(cluster=pl.when(members).then(pl.col("cluster_rep")).otherwise(0))
     # a member row only where it differs from the cluster's others: residues, start or labels
     domain = pl.col("residues").str.slice(
         pl.col("left"), pl.col("residues").str.len_bytes() - pl.col("left") - pl.col("right")
@@ -248,7 +265,6 @@ def write_part(
     d = pl.concat([d.filter(pl.col("cluster") == 0), m]).sort(
         "pfam_accession", pl.col("cluster") > 0, "cluster", "protein_id", "hmm_from"
     )
-    out.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen([LOOKUP, "bundle-build", out, str(collapse)], stdin=subprocess.PIPE)
     assert p.stdin
     try:
@@ -265,12 +281,19 @@ def write_part(
         sys.exit("bundle-build failed")
 
 
-def finish(
-    a: argparse.Namespace, out: Path, parts: list[Path], names: dict[str, list[str]]
-) -> None:
-    """Parts -> one bundle in out: rows.bin and families.tsv joined (offsets shifted), label names,
-    the models, kfpfam's files and the manifest."""
-    if parts != [out]:
+def finish(a: argparse.Namespace, out: Path, parts: list[Path]) -> None:
+    """Parts -> one bundle in out: rows.bin and families.tsv joined (offsets shifted), labels, the
+    models, kfpfam's files and the manifest."""
+    # a part's schemes are in the order its rows have them
+    drops = [json.loads((part / "dropped.json").read_text()) for part in parts]
+    schemes = list(drops[0])
+    for part, x in zip(parts, drops, strict=True):
+        if list(x) != schemes:
+            sys.exit(f"{part} has labels {list(x)}, and {parts[0]} {schemes}")
+    dropped = {s: sum(x[s] for x in drops) for s in schemes}
+    if parts == [out]:
+        (out / "dropped.json").unlink()
+    else:
         seen: set[int] = set()
         with open(out / "rows.bin", "wb") as rows, open(out / "families.tsv", "w") as tsv:
             at = 0
@@ -285,8 +308,10 @@ def finish(
                 with open(part / "rows.bin", "rb") as f:
                     shutil.copyfileobj(f, rows, 1 << 24)
                 at = rows.tell()
-    for s, ns in names.items():
-        (out / f"labels.{s}.txt").write_text("".join(f"{n}\n" for n in ns))
+        for s in schemes:
+            with open(out / f"labels.{s}.tsv", "wb") as f:
+                for part in parts:
+                    f.write((part / f"labels.{s}.tsv").read_bytes())
     place(a.hmm, out / "hmm/Pfam-A.hmm")
     if a.kfpfam_index:
         place(a.kfpfam_index, out / "kfpfam/index.tidx")
@@ -309,7 +334,8 @@ def finish(
         "mgnify": a.mgnify,
         "flank": FLANK,
         "collapse": a.collapse,
-        "schemes": list(names),
+        "schemes": schemes,
+        "rows_label_dropped": dropped,
         "families": fams.height,
         "rows": int(fams["column_3"].sum()),
         "rows_before_collapse": int(fams["column_4"].sum()),
@@ -341,17 +367,8 @@ def build(a: argparse.Namespace) -> None:
     empty(a.out)
     lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
     d, schemes = rows_of(a, lengths)
-    names = names_of(d, schemes)
-    write_part(d, names, lengths, a.collapse, a.out)
-    finish(a, a.out, [a.out], names)
-
-
-def read_names(d: Path | None, schemes: list[str]) -> dict[str, list[str]]:
-    if not schemes:
-        return {}
-    if d is None:
-        sys.exit(f"label columns {schemes} need --names, the label names of the whole bundle")
-    return {s: (d / f"labels.{s}.txt").read_text().splitlines() for s in schemes}
+    write_part(d, schemes, lengths, a.collapse, a.out)
+    finish(a, a.out, [a.out])
 
 
 def part_schemes(rows: list[Path]) -> list[str]:
@@ -360,41 +377,18 @@ def part_schemes(rows: list[Path]) -> list[str]:
     ]
 
 
-def names_cmd(a: argparse.Namespace) -> None:
-    """Every scheme's label names over all the rows: one numbering for every part."""
-    schemes = part_schemes(a.rows)
-    a.out.mkdir(parents=True, exist_ok=True)
-    for s in schemes:
-        names = (
-            pl.scan_parquet(a.rows).select(pl.col(f"label_{s}")).drop_nulls().unique()
-            .sort(f"label_{s}").collect()[f"label_{s}"].to_list()
-        )  # fmt: skip
-        if len(names) > 65535:
-            sys.exit(f"{s}: {len(names)} distinct labels, and 65,535 is the most")
-        (a.out / f"labels.{s}.txt").write_text("".join(f"{n}\n" for n in names))
-    print(f"{len(schemes)} schemes: {', '.join(schemes) or 'none'}")
-
-
 def build_part(a: argparse.Namespace) -> None:
     """Part rows (lookup-index's SPLIT) -> one part, its families whole."""
     empty(a.out)
     lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
     schemes = part_schemes(a.rows)
     d = pl.read_parquet(a.rows, columns=[*PART, *(f"label_{s}" for s in schemes)])
-    write_part(d, read_names(a.names, schemes), lengths, a.collapse, a.out)
+    write_part(d, schemes, lengths, a.collapse, a.out)
 
 
 def assemble(a: argparse.Namespace) -> None:
     empty(a.out)
-    schemes = (
-        sorted(
-            p.name.removeprefix("labels.").removesuffix(".txt")
-            for p in a.names.glob("labels.*.txt")
-        )
-        if a.names
-        else []
-    )
-    finish(a, a.out, a.parts, read_names(a.names, schemes))
+    finish(a, a.out, a.parts)
 
 
 def manifest_of(d: Path) -> dict:
@@ -492,11 +486,22 @@ def profile(a: argparse.Namespace) -> None:
         qid=pl.col("qid").cast(pl.UInt32), similarity=pl.col("score") / pl.col("self").clip(1)
     )
     x = d.select("qid", "read", "pfam").join(c, on="qid", how="left")
+    x = x.with_columns(fam=pl.col("pfam").str.slice(2, 5).cast(pl.Int64))
     for s in m["schemes"]:
-        label = [None, *(a.bundle / f"labels.{s}.txt").read_text().splitlines()]
-        x = x.with_columns(
-            pl.col(s).map_elements(lambda i, label=label: label[i], return_dtype=pl.String)
+        names = pl.read_csv(
+            a.bundle / f"labels.{s}.tsv",
+            separator="\t",
+            has_header=False,
+            quote_char=None,
+            raise_if_empty=False,
+            schema={"fam": pl.Int64, "name": pl.String},
+        ).with_columns(pl.int_range(1, pl.len() + 1).over("fam").alias(s))
+        x = (
+            x.join(names, on=["fam", s], how="left", maintain_order="left")
+            .with_columns(pl.col("name").alias(s))
+            .drop("name")
         )
+    x = x.drop("fam")
     x = x.with_columns(
         protein=pl.when(pl.col("acc") > 0).then(
             pl.format("MGYP{}", pl.col("acc").cast(pl.String).str.zfill(12))
@@ -549,23 +554,17 @@ def main() -> None:
     b.add_argument("--kfpfam-prep", type=Path)
     b.add_argument("--mgnify", default="")
     b.add_argument("--pfam", default="")
-    nm = sub.add_parser("names")
-    nm.set_defaults(run=names_cmd)
-    nm.add_argument("--rows", type=Path, nargs="+", required=True)
-    nm.add_argument("--out", type=Path, required=True)
     bp = sub.add_parser("build-part")
     bp.set_defaults(run=build_part)
     bp.add_argument("--rows", type=Path, nargs="+", required=True, help="part rows (bundle.PART)")
     bp.add_argument("--hmm", type=Path, required=True)
     bp.add_argument("--out", type=Path, required=True)
-    bp.add_argument("--names", type=Path, help="labels.<scheme>.txt of the whole bundle")
     bp.add_argument("--collapse", type=float, default=0.0)
     asm = sub.add_parser("assemble")
     asm.set_defaults(run=assemble)
     asm.add_argument("--parts", type=Path, nargs="+", required=True)
     asm.add_argument("--hmm", type=Path, required=True)
     asm.add_argument("--out", type=Path, required=True)
-    asm.add_argument("--names", type=Path)
     asm.add_argument("--collapse", type=float, default=0.0, help="what the parts were built with")
     asm.add_argument("--kfpfam-index", type=Path)
     asm.add_argument("--kfpfam-prep", type=Path)
