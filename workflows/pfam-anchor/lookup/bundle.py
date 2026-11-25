@@ -48,7 +48,7 @@ import pyarrow.parquet as pq
 
 HERE = Path(__file__).resolve().parent
 LOOKUP = Path(os.environ.get("LOOKUP_BIN", HERE / "rs/target/release/lookup"))
-FORMAT = 3  # 2: members; 3: members stored as differences (rs/src/bundle.rs)
+FORMAT = 4  # 2: members; 3: as differences; 4: no member accessions, CIGAR diffs (rs/src/bundle.rs)
 FLANK = 10
 AA = "ACDEFGHIKLMNPQRSTVWY"
 CODE = np.full(256, 20, np.uint8)

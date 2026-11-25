@@ -228,7 +228,7 @@ column and banded stages, scored like a representative, and the best cluster is 
 - **Prototype:** `lookup scan` with `MEMBERS=1`, after `prep.py member-seqs`. That step stores each distinct member row's domain ±10
   residues, with the protein it came from.
 - **Bundle:** `bundle.py build --clusters C.parquet --collapse 0`. Members follow the representatives in each family's block,
-  stored as differences from their representative (format 3). `profile` names the cluster by its representative, and ties
+  stored as differences from their representative (format 4). `profile` names the cluster by its representative, and ties
   count clusters.
 - **Evaluation:** `twostep.py` -> `report/twostep.tsv`, on 2,022,097 distinct member rows and 6,779 queries. A simulated read's own
   protein is left out: rows taken from it are skipped. A row shared with other members is skipped too, which makes this slightly
@@ -248,16 +248,19 @@ column and banded stages, scored like a representative, and the best cluster is 
   representative out of the top 1,000). There is no members truth for real reads, so this is not a recall.
 - **Cost (one M4 core a thread, 4 threads):** the members pass adds about 0.8 ms a read domain at 2000:1000, nearly all of it in
   the column stage (135 -> 906 µs), with the banded stage unchanged (about 2.2 ms). The scan itself is unchanged.
-- **Size: 31.4 bytes a member row, stored as differences** (measured on the slice's first 10 families: 313,732 member rows,
+- **Size: 21.1 bytes a member row, stored as differences** (measured on the slice's first 10 families: 313,732 member rows,
   153,312 representative rows at 100.9 bytes). Stored plainly a member row would cost what a representative's does.
   - *Encoding:* a member residue is copied from its representative's row where the two agree. The pairing follows the columns
     both cover, and the same offset from the nearest such column for flanks and inserts. The rest are literals.
-  - *Per member row:* row head 10 bytes, copy/literal runs 9.9, CIGAR 6.1 (one byte when it is the representative's; it
-    usually is not), literal residues 4.3 (about 7 residues), parent 1.0.
-  - *At release:* about 80 GB for 2.5 B member rows (estimated), against about 250 GB plain. The earlier guess of 12 bytes
+  - *Per member row:* copy/literal runs 6.7 bytes, row head 5.0, literal residues 4.3 (about 7 residues), CIGAR 4.2,
+    parent 1.0.
+  - *How each part shrank* (31.4 bytes at first):
+    - *No member accession:* the head is 5 bytes, not 10. A call names the cluster, so the member is no longer named.
+    - *CIGAR:* stored as 2 bytes when it is the representative's cut to the member's columns, which covers a member that
+      starts or ends elsewhere; 6.1 -> 4.2 bytes.
+    - *Runs:* a pair of under 63 copied and at most 3 literal residues is one byte; 9.9 -> 6.7 bytes.
+  - *At release:* about 53 GB for 2.5 B member rows (estimated), against about 250 GB plain. The earlier guess of 12 bytes
     each (Full scale) did not count the row head, the CIGAR or the runs.
-  - *Smaller still, not done:* a member's own accession (5 of the head's 10 bytes) is not needed to call its cluster; a CIGAR
-    could be stored as a difference too; runs could be packed tighter.
 - **Exact (measured):** the bundle with members gives the prototype's score for all 994 real reads of those 10 families, and
   names one of its best clusters (`FAMILIES=10 MEMBERS=1 bundle_check.py`; the same without members on 1,807 reads).
 - **Checked:** `cargo test` (block round trip with members; members must come last) and `test_bundle.py`. In the latter, a read of
@@ -294,7 +297,7 @@ the laptop was swapping (8.0 GB of 8.7 used at the end), so timings may be infla
 1. **Decided: the residue scan** (representatives' GA rows, per-read margin or top 500, then columns, then a banded alignment) as the method, with no seed index. Not taken: the 16-column scan as a first
    pass (3× less CPU, the same recall within error, but the number it must keep at release family sizes is untested), or 8-bit seeds every 4th column if RAM-resident lookup must be fast and 1–2% of best targets may be lost.
 2. **Representatives only, or representatives plus members as differences** (+20–50 GB estimated; the source cluster is among the top ties for .83–.90 of reads from members, against .63–.68)? *Recommend adding members as a second pass on the top 500 clusters.*
-   *Built 2026-11-25* ("Members second pass"): .831 against .638 end to end, for about 0.8 ms a read domain; 31.4 bytes a member row as differences, about 80 GB at release (estimated).
+   *Built 2026-11-25* ("Members second pass"): .831 against .638 end to end, for about 0.8 ms a read domain; 21.1 bytes a member row as differences, about 53 GB at release (estimated).
 3. **Run on HPC** (`hpc/kfp-ablations/pfam-anchor-large`): one very large family at full size, to check recall and CPU past 58,000 rows. *PF00005 done 2026-11-25* (Pfam 39.0): recall holds with
    family size, at about 1 point below the slice. **Decided (2026-11-25): 2000:1000 is the default** (.994 on PF00005, 13 misses against 25; the banded score 4.9 ms of CPU a read domain there, against 1.2); `bundle.py profile` uses it. Still open: PF00072; Pfam 37.4's alignments; a wider flank; and the Zymo
    genes against all of MGnify90 if a full Zymo truth is wanted.

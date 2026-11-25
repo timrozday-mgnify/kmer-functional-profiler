@@ -1,19 +1,21 @@
 //! The self-contained index: `rows.bin`, a block per family, read one family at a time.
 //!
-//! Block (format 3): "KFAB", acc u32, columns u32, rows u32, schemes u32, members u32, then seven lengths u64, then
+//! Block (format 4): "KFAB", acc u32, columns u32, rows u32, schemes u32, members u32, then seven lengths u64, then
 //!   bits      columns x 20 bytes: quarter bits of a residue at a column, from the representatives' rows before collapsing
-//!   heads     rows x 10: accession 5 bytes, hmm_from u16, sequence length u16, flanks (left << 4 | right)
+//!   heads     representatives x 10: accession 5 bytes, hmm_from u16, sequence length u16, flanks (left << 4 | right);
+//!             then members x 5, the same without the accession (a member is known by its cluster)
 //!   labels    schemes x rows u16: 0 is unlabelled
 //!   ops       the rows' CIGARs, one after another: op << 6 | length - 1, with lengths over 62 as 63 and a u16; 0xFF ends a row.
-//!             A member whose CIGAR is its parent's has 0xFE alone
+//!             A member whose CIGAR is its parent's cut to the member's columns has 0xFD and a LEB128 column count
 //!   seq       representatives' residues, flanks included, 5 bits each, each row from a whole byte; then each member's
 //!             literal residues (see runs), the same way
 //!   parents   per member, zigzag LEB128 of its parent's row less the previous member's: the last `members` rows are
 //!             members of other proteins' clusters, sorted by cluster, and the parent is the row of the cluster's
 //!             representative each is stored against, which names the cluster. The first stage
 //!             scans representatives only; the members of the clusters it keeps join the column and banded stages.
-//!   runs      per member, LEB128 pairs (copied, literal) covering its residues in order: a copied residue is the
-//!             parent's at the same place (`mapping`), a literal one is read from seq. Members differ from their
+//!   runs      per member, pairs (copied, literal) covering its residues in order: a copied residue is the parent's at
+//!             the same place (`mapping`), a literal one is read from seq. A pair of under 63 copied and at most 3
+//!             literal is one byte, literal << 6 | copied; otherwise 63, then both as LEB128. Members differ from their
 //!             representative at a few residues, so most are copied.
 //! All little-endian. Accessions fit 5 bytes: 1.1e12.
 use crate::cand::hash;
@@ -29,7 +31,8 @@ use std::sync::Mutex;
 const MAGIC: &[u8; 4] = b"KFAB";
 const HEAD: usize = 10;
 const TOP: usize = 24 + 7 * 8; // the block's fixed header
-const SAME_OPS: u8 = 0xFE; // a member's CIGAR is its parent's
+const CLIPPED: u8 = 0xFD; // a member's CIGAR is its parent's, cut to the member's columns
+const ESCAPE: u8 = 63; // a pair of runs that does not fit a byte
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Row {
@@ -139,6 +142,50 @@ fn unleb(b: &[u8], at: &mut usize) -> Option<usize> {
     }
 }
 
+/// A CIGAR's ops over columns c0..c1 only (0-based, `from` its first column): inserts kept only between two kept columns.
+pub fn clip(ops: &[(u8, u16)], from: usize, c0: usize, c1: usize) -> Vec<(u8, u16)> {
+    let (mut c, mut out): (usize, Vec<(u8, u16)>) = (from, vec![]);
+    for &(op, n) in ops {
+        let n = n as usize;
+        let (a, b) = if op == 1 { (c, c) } else { (c.max(c0), (c + n).min(c1)) };
+        let keep = if op == 1 { c > c0 && c < c1 } else { a < b };
+        if keep {
+            let k = if op == 1 { n } else { b - a };
+            match out.last_mut() {
+                Some(x) if x.0 == op => x.1 += k as u16,
+                _ => out.push((op, k as u16)),
+            }
+        }
+        if op != 1 {
+            c += n;
+        }
+    }
+    out
+}
+/// Columns a CIGAR covers (M and D).
+fn span(ops: &[(u8, u16)]) -> usize {
+    ops.iter().filter(|x| x.0 != 1).map(|x| x.1 as usize).sum()
+}
+
+fn put_pair(a: usize, b: usize, out: &mut Vec<u8>) {
+    if a < ESCAPE as usize && b <= 3 {
+        out.push((b as u8) << 6 | a as u8);
+    } else {
+        out.push(ESCAPE);
+        leb(a, out);
+        leb(b, out);
+    }
+}
+fn get_pair(s: &[u8], at: &mut usize) -> Option<(usize, usize)> {
+    let x = *s.get(*at)?;
+    *at += 1;
+    if x == ESCAPE {
+        Some((unleb(s, at)?, unleb(s, at)?))
+    } else {
+        Some(((x & 63) as usize, (x >> 6) as usize))
+    }
+}
+
 /// A member against its parent: the runs, and the literal residues.
 fn diff(r: &Row, parent: &Row, parent_pos: &[u16]) -> (Vec<u8>, Vec<u8>) {
     let m = mapping(r, parent_pos);
@@ -147,8 +194,7 @@ fn diff(r: &Row, parent: &Row, parent_pos: &[u16]) -> (Vec<u8>, Vec<u8>) {
     while p < same.len() {
         let a = same[p..].iter().take_while(|&&x| x).count();
         let b = same[p + a..].iter().take_while(|&&x| !x).count();
-        leb(a, &mut runs);
-        leb(b, &mut runs);
+        put_pair(a, b, &mut runs);
         lit.extend_from_slice(&r.seq[p + a..p + a + b]);
         p += a + b;
     }
@@ -277,7 +323,9 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
     let mut last = 0i64;
     for r in rows {
         assert!(r.left < 16 && r.right < 16 && r.acc < 1 << 40 && r.seq.len() < 65536);
-        heads.extend_from_slice(&r.acc.to_le_bytes()[..5]);
+        if r.cluster == 0 {
+            heads.extend_from_slice(&r.acc.to_le_bytes()[..5]);
+        }
         heads.extend_from_slice(&r.hmm_from.to_le_bytes());
         heads.extend_from_slice(&(r.seq.len() as u16).to_le_bytes());
         heads.push(r.left << 4 | r.right);
@@ -291,8 +339,10 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
             let pp = ppos[i].get_or_insert_with(|| rows[i].columns(len).expect("a representative's row").1);
             (i, diff(r, &rows[i], pp))
         }).min_by_key(|(i, (_, lit))| (lit.len(), *i)).unwrap();
-        if r.ops == rows[i].ops {
-            ops.push(SAME_OPS);
+        let (c0, w) = (r.hmm_from as usize - 1, span(&r.ops));
+        if clip(&rows[i].ops, rows[i].hmm_from as usize - 1, c0, c0 + w) == r.ops {
+            ops.push(CLIPPED);
+            leb(w, &mut ops);
         } else {
             pack_ops(&r.ops, &mut ops);
         }
@@ -328,7 +378,7 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
     }
     let (acc, len, n, schemes, members) = (u(4), u(8) as usize, u(12) as usize, u(16) as usize, u(20) as usize);
     let sizes: Vec<usize> = (0..7).map(|i| u64::from_le_bytes(b[24 + 8 * i..32 + 8 * i].try_into().unwrap()) as usize).collect();
-    if TOP + sizes.iter().sum::<usize>() != b.len() || sizes[0] != 20 * len || sizes[1] != HEAD * n || sizes[2] != 2 * n * schemes
+    if TOP + sizes.iter().sum::<usize>() != b.len() || sizes[0] != 20 * len || sizes[1] != HEAD * n - 5 * members || sizes[2] != 2 * n * schemes
         || members > n {
         return Err(format!("PF{acc:05}: the block's sizes do not add up"));
     }
@@ -338,20 +388,26 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
     let (mut rows, mut o, mut q, mut ra, mut pa, mut last): (Vec<Row>, _, _, _, _, i64) = (Vec::with_capacity(n), 0, 0, 0, 0, 0);
     let mut ppos: Vec<Option<Vec<u16>>> = vec![None; nr];
     for i in 0..n {
-        let h = &part[1][HEAD * i..HEAD * (i + 1)];
-        let sl = u16::from_le_bytes([h[7], h[8]]) as usize;
+        // a member's head has no accession: its last 5 bytes only
+        let (acc_r, h) = match i.checked_sub(nr) {
+            None => (part[1][HEAD * i..HEAD * i + 5].iter().rev().fold(0, |a, &x| a << 8 | x as u64), &part[1][HEAD * i + 5..HEAD * (i + 1)]),
+            Some(j) => (0, &part[1][HEAD * nr + 5 * j..HEAD * nr + 5 * (j + 1)]),
+        };
+        let sl = u16::from_le_bytes([h[2], h[3]]) as usize;
         let mut r = Row {
-            acc: h[..5].iter().rev().fold(0, |a, &x| a << 8 | x as u64),
-            hmm_from: u16::from_le_bytes([h[5], h[6]]),
-            left: h[9] >> 4,
-            right: h[9] & 15,
+            acc: acc_r,
+            hmm_from: u16::from_le_bytes([h[0], h[1]]),
+            left: h[4] >> 4,
+            right: h[4] & 15,
             ops: vec![],
             seq: vec![0; sl],
             labels: (0..schemes).map(|s| { let x = 2 * (s * n + i); u16::from_le_bytes([part[2][x], part[2][x + 1]]) }).collect(),
             cluster: 0,
         };
-        if i >= nr && part[3].get(o) == Some(&SAME_OPS) {
-            o += 1; // the parent's, set below
+        let mut clipped = None;
+        if i >= nr && part[3].get(o) == Some(&CLIPPED) {
+            o += 1; // the parent's, cut below
+            clipped = Some(unleb(part[3], &mut o).ok_or("short CIGARs")?);
         } else {
             r.ops = unpack_ops(part[3], &mut o).ok_or("short CIGARs")?;
         }
@@ -367,8 +423,12 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
         let pi = usize::try_from(pi).ok().filter(|&x| x < nr).ok_or_else(|| format!("PF{acc:05}: a member's parent is not a representative"))?;
         let parent = &rows[pi];
         r.cluster = parent.acc;
-        if r.ops.is_empty() {
-            r.ops = parent.ops.clone();
+        if let Some(w) = clipped {
+            let c0 = r.hmm_from as usize - 1;
+            r.ops = clip(&parent.ops, parent.hmm_from as usize - 1, c0, c0 + w);
+            if span(&r.ops) != w {
+                return Err(format!("PF{acc:05}: a member's columns are not all its parent's"));
+            }
         }
         let pp = match &ppos[pi] {
             Some(x) => x,
@@ -377,8 +437,7 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
         let m = mapping(&r, pp);
         let (mut p, mut literal_at) = (0, vec![]);
         while p < sl {
-            let a = unleb(part[6], &mut ra).ok_or("short runs")?;
-            let e = unleb(part[6], &mut ra).ok_or("short runs")?;
+            let (a, e) = get_pair(part[6], &mut ra).ok_or("short runs")?;
             if p + a + e > sl {
                 return Err(format!("PF{acc:05}: a member's runs pass its end"));
             }
@@ -549,6 +608,10 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// What reading gives back: members without their accessions.
+    fn known(rows: &[Row]) -> Vec<Row> {
+        rows.iter().map(|r| Row { acc: if r.cluster > 0 { 0 } else { r.acc }, ..r.clone() }).collect()
+    }
     fn rows() -> Vec<Row> {
         (0..50u64).map(|i| {
             let long = 60 + (i * 7 % 90) as u16;
@@ -566,7 +629,7 @@ mod tests {
         let (r, bits) = (rows(), vec![7u8; 20 * 400]);
         let mut b = block(44, 400, 2, &r, &bits);
         let x = read_block(&b).unwrap();
-        assert_eq!((x.acc, x.len, &x.bits, &x.rows), (44, 400, &bits, &r));
+        assert_eq!((x.acc, x.len, &x.bits, &x.rows), (44, 400, &bits, &known(&r)));
         assert!(read_block(&b[..b.len() - 1]).is_err(), "a cut block must not pass");
         b[16] = 1;
         assert!(read_block(&b).is_err(), "nor a wrong number of schemes");
@@ -593,7 +656,7 @@ mod tests {
         let v = vec![rep.clone(), mem.clone()];
         let b = block(1, 120, 0, &v, &[0u8; 2400]);
         let x = read_block(&b).unwrap();
-        assert_eq!(x.rows, v);
+        assert_eq!(x.rows, known(&v));
         // literals: 7 left flank + 4 substituted + 2 inserted; the right flank is the representative's, so copied
         let (_, lit) = diff(&mem, &rep, &rep.columns(120).unwrap().1);
         assert_eq!(lit.len(), 13);
@@ -603,6 +666,32 @@ mod tests {
         let at = bad.len() - 1;
         bad[at] = 0x7f; // the last run: past the member's end
         assert!(read_block(&bad).is_err());
+    }
+    #[test]
+    fn cigars_and_runs_as_differences() {
+        // columns 0..10 M, insert 3, 10..14 deleted, 14..30 M; cut to columns 5..20
+        let ops = vec![(0, 10), (1, 3), (2, 4), (0, 16)];
+        assert_eq!(clip(&ops, 0, 5, 20), vec![(0, 5), (1, 3), (2, 4), (0, 6)]);
+        assert_eq!(clip(&ops, 0, 10, 20), vec![(2, 4), (0, 6)], "an insert at the cut is dropped");
+        assert_eq!(clip(&ops, 0, 0, 30), ops);
+        let mut b = vec![];
+        for (a, e) in [(0, 0), (62, 3), (63, 0), (5, 4), (1000, 2)] {
+            put_pair(a, e, &mut b);
+        }
+        assert_eq!(b.len(), 2 + 3 + 3 + 4, "two pairs in a byte each");
+        let mut at = 0;
+        let got: Vec<_> = (0..5).map(|_| get_pair(&b, &mut at).unwrap()).collect();
+        assert_eq!(got, vec![(0, 0), (62, 3), (63, 0), (5, 4), (1000, 2)]);
+        // a member whose CIGAR is its representative's cut to its columns: 2 bytes of CIGAR, and back exactly
+        let s: Vec<u8> = (0..60u64).map(|k| (hash(k) % 20) as u8).collect();
+        let rep = Row { acc: 3, hmm_from: 1, left: 0, right: 0, ops: vec![(0, 20), (1, 2), (0, 38)], seq: s.clone(), labels: vec![], cluster: 0 };
+        let mem = Row { acc: 4, hmm_from: 6, left: 0, right: 0, ops: vec![(0, 15), (1, 2), (0, 30)], seq: s[5..52].to_vec(), labels: vec![], cluster: 3 };
+        let v = vec![rep.clone(), mem];
+        let blk = block(1, 58, 0, &v, &[0u8; 20 * 58]);
+        assert_eq!(read_block(&blk).unwrap().rows, known(&v));
+        let ops_part = u64::from_le_bytes(blk[24 + 3 * 8..32 + 3 * 8].try_into().unwrap());
+        let rep_ops = { let mut x = vec![]; pack_ops(&rep.ops, &mut x); x.len() as u64 };
+        assert_eq!(ops_part, rep_ops + 2);
     }
     #[test]
     #[should_panic(expected = "members must come last")]
