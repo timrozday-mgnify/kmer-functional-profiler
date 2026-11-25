@@ -6,7 +6,7 @@ at GA, so this is where the weak ones come from.
 - ``ga``: an HMM file's accessions and GA thresholds -> ``ga.tsv``.
 - ``plan``: the targets (``reps``: 90% cluster representatives; ``all``: every protein; 1 in
   ``--sample`` of them by id) -> ``ranges.tsv``, ``protein_id`` ranges of about
-  ``--chunk-proteins`` each.
+  ``--chunk-proteins`` each. ``--min-cluster``: only the ``reps`` of clusters of that size or more.
 - ``fasta``: one range's sequences -> ``--out`` FASTA with ``protein_id`` as the name, and
   ``--out``.tsv with its proteins and residues. Fails if the count differs from the plan's.
   ``--reverse`` reverses each sequence: the null arm (same lengths and composition).
@@ -73,11 +73,14 @@ def accession(acc: str) -> int:
     return int(acc.removeprefix("PF").split(".")[0])
 
 
-def targets(release: str, kind: str) -> tuple[str, str]:
-    """The id column's table and name for one kind of target."""
-    if kind == "reps":
-        return f"read_parquet('{release}/mgy_clusters.parquet')", "cluster_rep"
-    return f"read_parquet('{release}/mgy_cluster_seqs.parquet')", "cluster_member"
+def targets(args: argparse.Namespace) -> tuple[str, str]:
+    """The id column's table and name for the kind of target."""
+    if args.targets == "reps":
+        table = f"read_parquet('{args.release}/mgy_clusters.parquet')"
+        if args.min_cluster > 1:
+            table = f"(SELECT * FROM {table} WHERE cluster_size >= {args.min_cluster})"
+        return table, "cluster_rep"
+    return f"read_parquet('{args.release}/mgy_cluster_seqs.parquet')", "cluster_member"
 
 
 def ga(args: argparse.Namespace) -> None:
@@ -93,7 +96,7 @@ def ga(args: argparse.Namespace) -> None:
 
 
 def plan(args: argparse.Namespace) -> None:
-    table, column = targets(args.release, args.targets)
+    table, column = targets(args)
     bins = (
         connect(args)
         .sql(
@@ -118,7 +121,7 @@ def fasta(args: argparse.Namespace) -> None:
     in_range = f"BETWEEN {args.lo} AND {args.hi - 1}"
     where = f"protein_id {in_range} AND protein_id % {args.sample} = 0"
     if args.targets == "reps":
-        table, column = targets(args.release, "reps")
+        table, column = targets(args)
         where += f" AND protein_id IN (SELECT {column} FROM {table} WHERE {column} {in_range})"
     rows = connect(args).execute(
         "SELECT protein_id, sequence "
@@ -286,6 +289,7 @@ def main() -> None:
         p.add_argument("--release", required=True)
         p.add_argument("--targets", choices=["reps", "all"], default="reps")
         p.add_argument("--sample", type=int, default=1)
+        p.add_argument("--min-cluster", type=int, default=1)
     p = sub.choices["plan"]
     p.add_argument("--chunk-proteins", type=int, default=500_000)
     p.add_argument("--bin-width", type=int, default=BIN_WIDTH)

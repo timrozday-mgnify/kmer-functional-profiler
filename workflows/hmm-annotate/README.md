@@ -14,6 +14,7 @@ SEARCH         per range: filter join | annotate.py search -> domains/ and label
 MEMBER_PAIRS   with --members: the models each representative nearly passes -> its members' pairs, by member id
 MEMBER_FASTA   per --member_width ids: those members' sequences and pairs
 MEMBER_SEARCH  per --member_width ids: HMMER on the pairs -> domains/ and labels/
+               (--member_filter: on those and on the prefilter's, of every member)
 CHECK          per range: 1 in --check_sample proteins against every model, no prefilter  (--check_sample N)
 COMPARE        per range: the passing domains against the release's own Pfam table     (--compare_release true)
 SUMMARY        -> summary.tsv, one total row
@@ -63,6 +64,8 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | `--thresholds` | | Or a TSV with a header: model, threshold, `full` or `domain`. KOfam's `ko_list` as it is |
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |
 | `--members` | `false` | With `--targets reps`: their members too, so every protein. A member (90% identity) is searched with HMMER against only the models its representative passes to within `--member_slack` (8) bits |
+| `--member_filter` | `false` | With `--members`: kfpfam's prefilter on every member as well, and HMMER on the models of either |
+| `--min_cluster` | `1` | With `--member_filter`: `--engine` has the representatives of clusters this size or more only. The prefilter has the whole of the others, whose members get no candidates from their representative |
 | `--sample` | `1000` | 1 in N targets by `protein_id`; with `--members`, 1 in N clusters |
 | `--check_sample` | `0` | 1 in N of those also against every model, without the prefilter; `0`: none |
 | `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.2 |
@@ -90,6 +93,9 @@ passes, and shows only with `--weak_evalue`.
   `lookup-index` reads both.
 - **`thresholds.tsv`**: the thresholds used (`inf`: never passes; `-inf`: not used).
 - **`hmm.sha256`**: of the HMM file, unzipped. `lookup-index` checks its models against it.
+- **`logs/chunkN.log`**: the CPU, and kfpfam's log with its SIMD kernel and CPU time. `bench.py` compares
+  runs of the same proteins from it, `summary.tsv` and `trace.tsv`; `hpc/kfp-ablations/hmm-annotate/benchmark.sh`
+  makes the runs.
 - **`summary.tsv`**: proteins, residues, proteins over 100,000 residues (HMMER's limit, not
   searched), candidate pairs, domains and proteins passing, and pyhmmer's core-seconds.
 - **`check.tsv`**: per model, passing (protein, model) pairs and domains by full `hmmsearch`, how many
@@ -152,3 +158,22 @@ comes in clusters; looser bars (`slack` 14 or 18) did not change it. The slice i
 large clusters: 1 in 1,000 clusters and `check.members.tsv` give it for the release. Estimated for the
 release at 38.2 and laptop speed: 63,600 core-h by `hmmsearch`; with `--members` about 16,000 with
 `hmmsearch` on the representatives (23% of the residues) and 2,500 with `fast`. 39.0 has 1.8× the models.
+
+With `--member_filter` and `fast`, the same 49,998 proteins; CPU-s of kfpfam and HMMER together:
+
+| | representatives missed, of 5,115 | members missed, of 16,143 | CPU-s | against `hmmsearch` |
+| --- | ---: | ---: | ---: | ---: |
+| `hmmsearch` on everything | 0 | 0 | 357 | 1 |
+| `fast` on everything | 6 | 249 | 41 | 8.7× |
+| `fast` on everything, and representatives' hits to members | 6 | 215 | 42 | 8.5× |
+| `hmmsearch` on representatives, no `--member_filter` | 0 | 12 | 85 | 4.2× |
+| **`hmmsearch` on representatives**, `--member_filter` | 0 | 0 | 108 | 3.3× |
+| the same, `--min_cluster 2` | 1 | 0 | 75 | 4.8× |
+| the same, `--min_cluster 10` | 3 | 1 | 51 | 7.0× |
+
+211 of the domains `fast` misses are of PF14306, 196 of them in one cluster: it misses that family in members as it does in
+their representative, so its own hits do not bring them back, and `hmmsearch` on the representative does. Here
+representatives are 21%, 11% and 2.6% of the residues at `--min_cluster` 1, 2 and 10. In the release (three row
+groups of `mgy_cluster_seqs`, 2026-11-25) 62-74% of clusters are single proteins, and those of 10 or more
+are 4-9% of clusters with 53-71% of the proteins. Estimated for the release at 38.2 and laptop speed, against 63,600 core-h: about 21,000 at
+`--min_cluster` 1, 12,000 at 2 and 9,500 at 10.

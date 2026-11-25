@@ -30,7 +30,7 @@ process PREP {
     ${params.kfpfam_python} tables.py thresholds --hmm models.hmm --models prep/models.tsv ${source}
     ${params.kfpfam_python} annotate.py press --hmm models.hmm --models prep/models.tsv --out models
     mkdir index
-    if [[ ${params.engine} == kfpfam ]]; then
+    if [[ ${params.engine == 'kfpfam' || flag(params.member_filter)} == true ]]; then
         export RAYON_NUM_THREADS=${task.cpus}
         ${params.kfpfam_python} seeds.py bars --models prep/models.tsv --thresholds thresholds.tsv \\
             --ga ga.tsv --gapped index/gapped.txt --slack ${kfpfam.slack}
@@ -53,6 +53,7 @@ process SEARCH {
     label 'kfpfam'
     publishDir "${params.outdir}/domains", mode: params.publish_mode, pattern: '*.domains.parquet'
     publishDir "${params.outdir}/labels", mode: params.publish_mode, pattern: '*.labels.parquet'
+    publishDir "${params.outdir}/logs", mode: params.publish_mode, pattern: '*.log'
 
     input:
     tuple val(_arm), val(chunk), path(faa), path(counts)
@@ -66,21 +67,14 @@ process SEARCH {
     tuple val(chunk), path(faa), path("chunk${chunk}.domains.parquet"), emit: domains, optional: true
     path "chunk${chunk}.labels.parquet", emit: labels
     path "chunk${chunk}.stats.tsv", emit: stats
+    path "chunk${chunk}.log", emit: log
     tuple val(chunk), path("chunk${chunk}.near.parquet"), emit: near, optional: true
 
-    // The filter writes each block's pairs to the pipe as numbers, and HMMER searches them while the
-    // next block is filtered, as in the raw-reads pipeline's KFPFAM_HMMER. Both use every core.
     script:
-    def kfpfam = params.kfpfam_modes[params.kfpfam_mode]
-    def prefilter = """\
-        RAYON_NUM_THREADS=${task.cpus} FILTER_MIN_GAPPED=${kfpfam.min_gapped} \\
-        FILTER_GAPPED_FILE=${index}/gapped.txt FILTER_BAND=${params.kfpfam_band} \\
-        FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
-        ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
-        ${params.kfpfam_block} ${faa} /dev/stdout |""".stripIndent()
     """
     set -o pipefail
-    ${params.engine == 'kfpfam' ? prefilter : ''} \\
+    ${logged(chunk)}
+    ${params.engine == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
         ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
             --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
             ${params.engine == 'kfpfam' ? '' : '--all-pairs'} \\
@@ -91,7 +85,26 @@ process SEARCH {
     """
 
     stub:
-    "touch chunk${chunk}.domains.parquet chunk${chunk}.labels.parquet chunk${chunk}.stats.tsv chunk${chunk}.near.parquet"
+    "touch chunk${chunk}.domains.parquet chunk${chunk}.labels.parquet chunk${chunk}.log chunk${chunk}.stats.tsv chunk${chunk}.near.parquet"
+}
+
+// The filter writes each block's pairs to the pipe as numbers, and HMMER searches them while the
+// next block is filtered, as in the raw-reads pipeline's KFPFAM_HMMER. Both use every core.
+def prefilter(prep, index, faa, chunk, cpus) {
+    def kfpfam = params.kfpfam_modes[params.kfpfam_mode]
+    """\
+        { time RAYON_NUM_THREADS=${cpus} FILTER_MIN_GAPPED=${kfpfam.min_gapped} \\
+        FILTER_GAPPED_FILE=${index}/gapped.txt FILTER_BAND=${params.kfpfam_band} \\
+        FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
+        ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
+        ${params.kfpfam_block} ${faa} /dev/stdout; } 2>> chunk${chunk}.log |""".stripIndent()
+}
+
+// The CPU, and the filter's log: its kernel and CPU time, for bench.py. Nextflow's own log has it too.
+def logged(chunk) {
+    """trap 'cat chunk${chunk}.log >&2' EXIT
+    TIMEFORMAT='cpu_s %U %S'
+    { grep -m1 'model name' /proc/cpuinfo || uname -m; } > chunk${chunk}.log 2> /dev/null"""
 }
 
 // Every protein of the FASTA was read: its counts are the search's
@@ -118,6 +131,7 @@ process MEMBER_PAIRS {
     """
     ${params.python} ${code} --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' pairs --release '${params.release}' \\
         --near ${near} --lo ${lo} --hi ${hi} --sample ${params.sample} --check-sample ${params.check_sample} \\
+        ${flag(params.member_filter) ? "--all --min-cluster ${params.min_cluster}" : ''} \\
         --width ${params.member_width} --out pairs${batch}
     rm -rf duckdb_tmp
     """
@@ -143,7 +157,7 @@ process MEMBER_FASTA {
     """
     ${params.python} ${code} --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' fasta --release '${params.release}' \\
         --pairs ${pairs} --shard ${shard} --width ${params.member_width} --thresholds ${thresholds} \\
-        --out member${shard}.faa --pairs-out member${shard}.pairs
+        --block ${params.kfpfam_block} --out member${shard}.faa --pairs-out member${shard}.pairs
     rm -rf duckdb_tmp
     """
 
@@ -157,10 +171,13 @@ process MEMBER_SEARCH {
     label 'kfpfam'
     publishDir "${params.outdir}/domains", mode: params.publish_mode, pattern: '*.domains.parquet'
     publishDir "${params.outdir}/labels", mode: params.publish_mode, pattern: '*.labels.parquet'
+    publishDir "${params.outdir}/logs", mode: params.publish_mode, pattern: '*.log'
 
     input:
     tuple val(chunk), path(faa), path(counts), path(pairs)
     path hmm
+    path prep
+    path index
     path thresholds
     path code
 
@@ -168,18 +185,23 @@ process MEMBER_SEARCH {
     tuple val(chunk), path(faa), path("chunk${chunk}.domains.parquet"), emit: domains, optional: true
     path "chunk${chunk}.labels.parquet", emit: labels
     path "chunk${chunk}.stats.tsv", emit: stats
+    path "chunk${chunk}.log", emit: log
 
     script:
+    def filtered = flag(params.member_filter)
     """
+    set -o pipefail
+    ${logged(chunk)}
+    ${filtered ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
     ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
         --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-        ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
-        --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv < ${pairs}
+        ${filtered ? "--more-pairs ${pairs}" : ''} ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
+        --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv ${filtered ? '' : "< ${pairs}"}
     ${searched(chunk, counts)}
     """
 
     stub:
-    "touch chunk${chunk}.domains.parquet chunk${chunk}.labels.parquet chunk${chunk}.stats.tsv"
+    "touch chunk${chunk}.domains.parquet chunk${chunk}.labels.parquet chunk${chunk}.log chunk${chunk}.stats.tsv"
 }
 
 process CHECK {
@@ -279,6 +301,12 @@ workflow {
     if (flag(params.members) && params.targets != 'reps') {
         error "--members searches representatives first: it needs --targets reps"
     }
+    if (flag(params.member_filter) && !flag(params.members)) {
+        error "--member_filter is for --members true"
+    }
+    if (params.min_cluster as int > 1 && !flag(params.member_filter)) {
+        error "--min_cluster leaves the smaller clusters to the prefilter: it needs --member_filter true"
+    }
     if (!params.hmm) {
         error "--hmm: the collection's HMM file, plain or gzipped"
     }
@@ -299,23 +327,30 @@ workflow {
     PREP(file(params.hmm, checkIfExists: true), table, [annotate, tables, seeds])
     ch_chunks = PLAN().splitCsv(sep: '\t', header: true)
         .map { r -> ['real', r.chunk as int, r.lo as long, r.hi as long, r.proteins as long] }
+        .ifEmpty { error "nothing to search: no protein is in the sample, or no cluster of --min_cluster" }
     FASTA(ch_chunks)
     SEARCH(FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
     def ch_stats = SEARCH.out.stats
     def ch_check = SEARCH.out.domains.map { chunk, faa, domains -> ['check', chunk, faa, domains, params.sample] }
     if (flag(params.members)) {
         def members = file("${projectDir}/members.py", checkIfExists: true)
-        // in the order of the representatives, so that a batch is a range of them
+        // in the order of the representatives, so that a batch is a range of them, and the batches are every
+        // range: the clusters under min_cluster are in no chunk
         ch_near = ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }.join(SEARCH.out.near)
             .toSortedList { a, b -> a[0] <=> b[0] }
-            .flatMap { rows -> rows.collate(params.member_batch as int).withIndex().collect { part, i ->
-                [i, part[0][1], part[-1][2], part.collect { r -> r[3] }] } }
+            .flatMap { rows ->
+                def parts = rows.groupBy { r -> r[1].intdiv(params.member_batch as long) }.values() as List
+                parts.withIndex().collect { part, i ->
+                    [i, i == 0 ? 0L : part[0][1], i + 1 < parts.size() ? parts[i + 1][0][1] : Long.MAX_VALUE,
+                     part.collect { r -> r[3] }]
+                }
+            }
         MEMBER_PAIRS(ch_near, members)
         ch_shards = MEMBER_PAIRS.out.shards.splitText().map { s -> s.trim() as long }.unique()
         ch_shards.map { s -> "m${s}\t${s * (params.member_width as long)}\t${(s + 1) * (params.member_width as long)}\n" }
             .collectFile(name: 'ranges.members.tsv', seed: "chunk\tlo\thi\n", sort: true, storeDir: params.outdir)
         MEMBER_FASTA(ch_shards, MEMBER_PAIRS.out.pairs.collect(), PREP.out.thresholds, members)
-        MEMBER_SEARCH(MEMBER_FASTA.out, PREP.out.hmm, PREP.out.thresholds, annotate)
+        MEMBER_SEARCH(MEMBER_FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
         ch_stats = ch_stats.mix(MEMBER_SEARCH.out.stats)
         ch_check = ch_check.mix(MEMBER_SEARCH.out.domains.map { chunk, faa, domains -> ['check.members', chunk, faa, domains, 1] })
     }

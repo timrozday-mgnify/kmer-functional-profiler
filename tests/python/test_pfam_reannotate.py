@@ -35,15 +35,18 @@ def chunks(cwd: Path, *args: object) -> pl.DataFrame:
 
 def test_plan_and_fasta_cover_each_target_once(tmp_path: Path) -> None:
     release = pl.read_parquet(RELEASE / "mgy_cluster_seqs.parquet")
-    for kind, expected in (
-        ("reps", set(release["cluster_rep"])),
-        ("all", set(release["cluster_member"])),
+    sizes = release["cluster_rep"].value_counts()
+    for kind, size, expected in (
+        ("reps", 1, set(release["cluster_rep"])),
+        ("reps", 3, set(sizes.filter(pl.col("count") >= 3)["cluster_rep"])),
+        ("all", 1, set(release["cluster_member"])),
     ):
-        ranges = chunks(tmp_path, "--targets", kind, "--chunk-proteins", 7)
+        kinds = ("--targets", kind, "--min-cluster", size)
+        ranges = chunks(tmp_path, *kinds, "--chunk-proteins", 7)
         assert ranges.height > 1
         got: list[int] = []
         for chunk, lo, hi, n in ranges.iter_rows():
-            run(tmp_path, "fasta", "--release", RELEASE, "--targets", kind, "--lo", lo,
+            run(tmp_path, "fasta", "--release", RELEASE, *kinds, "--lo", lo,
                 "--hi", hi, "--proteins", n, "--out", f"{chunk}.faa")  # fmt: skip
             got += [
                 int(x[1:]) for x in (tmp_path / f"{chunk}.faa").read_text().split() if x[0] == ">"

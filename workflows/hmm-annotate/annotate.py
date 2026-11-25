@@ -7,6 +7,7 @@ Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``mai
 - ``search``: pairs on stdin, from kfpfam's ``filter join`` run with ``FILTER_BINARY=1`` beside this
   script on the same FASTA (``protein_id`` as the name) -> ``--domains`` Parquet, ``--labels``
   Parquet (protein_id, model; proteins passing the model's thresholds), one-row ``--stats`` TSV.
+  ``--more-pairs``: a file of further pairs in the same blocks, searched as well.
   With ``--all-pairs``, every protein against every model as ``hmmsearch`` does, and no stdin.
   ``--near``: also (protein_id, model) within ``--near-slack`` bits of passing, for ``members.py``.
 - ``check``: 1 in N of the same proteins against every model, without kfpfam -> per model, what
@@ -36,6 +37,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyhmmer
@@ -213,20 +215,36 @@ def table(rows: list[tuple], schema: pa.Schema) -> pa.Table:
     )
 
 
-def read_blocks(stream, proteins: SequenceFile) -> Iterator[tuple]:
-    """`filter join`'s blocks: their proteins, read forward from the FASTA it read, and their pairs,
-    as one flat array of protein in the block, model, protein, model... in model order."""
-
-    def take(size: int) -> bytes:
+def read_block(stream) -> tuple[tuple[int, int], bytes] | None:
+    """((proteins, residues), pairs) of the next block; None after the last."""
+    data = stream.read(24)
+    if not data:
+        return None
+    if len(data) == 24:
+        n, residues, size = struct.unpack("<3Q", data)
         data = stream.read(size)
-        if len(data) < size:
-            sys.exit("the filter's output stops inside a block")
-        return data
+        if len(data) == size:
+            return (n, residues), data
+    sys.exit("the filter's output stops inside a block")
 
-    while head := stream.read(24):
-        n, residues, size = struct.unpack("<3Q", head + take(24 - len(head)))
+
+def union(streams: list[bytes]) -> bytes:
+    """The pairs of any of them, once each, in model order."""
+    pairs = np.concatenate([np.frombuffer(s, "<u4").reshape(-1, 2) for s in streams])
+    keys = np.unique(pairs[:, 1].astype("u8") << 32 | pairs[:, 0])
+    return np.stack([keys & 0xFFFFFFFF, keys >> 32], axis=1).astype("<u4").tobytes()
+
+
+def read_blocks(streams: list, proteins: SequenceFile) -> Iterator[tuple]:
+    """`filter join`'s blocks: their proteins, read forward from the FASTA it read, and their pairs,
+    as one flat array of protein in the block, model, protein, model... in model order. Of several
+    streams, the pairs in any of them."""
+    while any(found := [read_block(s) for s in streams]):
+        if not all(found) or len({head for head, _ in found}) > 1:
+            sys.exit("the two sets of pairs are not in the same blocks")
+        n, residues = found[0][0]
         pairs = array("I")
-        pairs.frombytes(take(size))
+        pairs.frombytes(found[0][1] if len(found) == 1 else union([p for _, p in found]))
         block = proteins.read_block(sequences=n)
         if (len(block), sum(map(len, block))) != (n, residues):
             sys.exit("the filter's blocks are not of these proteins")
@@ -311,7 +329,10 @@ def search(a: argparse.Namespace) -> None:
         if a.all_pairs:
             run(every_pair(proteins, optimized, counts), thresholds, pool, output, a)
         else:
-            blocks = read_blocks(sys.stdin.buffer, proteins)
+            streams = [sys.stdin.buffer]
+            if a.more_pairs:
+                streams.append(open(a.more_pairs, "rb"))  # noqa: SIM115, read to the end
+            blocks = read_blocks(streams, proteins)
             for targets in batches(blocks, BATCH, counts):
                 # built here, not in the workers: across 6 threads blocks ran about 40x slower
                 jobs = (
@@ -392,6 +413,7 @@ def main() -> None:
     x.add_argument("--stats", type=Path, required=True)
     x.add_argument("--near", type=Path)
     x.add_argument("--near-slack", type=float, default=8)
+    x.add_argument("--more-pairs", type=Path, help="as members.py fasta writes them")
     x.add_argument("--all-pairs", action="store_true", help="no prefilter: hmmsearch")
     x.add_argument("--weak-evalue", type=float, default=0, help="0: passing domains only")
     c = sub.add_parser("check")

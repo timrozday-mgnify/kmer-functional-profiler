@@ -5,9 +5,12 @@ those its representative nearly passes (``annotate.py search --near``).
 
 - ``pairs``: a range of representatives' near hits -> their members' (protein_id, model), in
   ``--out``/shard=S/ by the member's id (S = protein_id // ``--width``), and ``--shards``, the S.
-  With ``--check-sample`` 1 in that many members is there without a candidate too (model null).
+  With ``--check-sample`` 1 in that many members is there without a candidate too (model null);
+  with ``--all`` every one is, and every protein of the clusters under ``--min-cluster``, whose
+  representatives had no search of their own.
 - ``fasta``: one shard of every batch's pairs -> ``--out`` FASTA, ``--out``.tsv (its proteins and
-  residues) and ``--pairs-out``, the pairs as ``filter join`` streams them.
+  residues) and ``--pairs-out``, the pairs as ``filter join`` streams them, ``--block`` proteins
+  at a time.
 
 ``--release`` is a local directory or an https prefix (DuckDB reads it remotely).
 """
@@ -19,8 +22,6 @@ from pathlib import Path
 
 import duckdb
 import numpy as np
-
-BLOCK = 200_000  # proteins to a block of pairs
 
 
 def connect(a: argparse.Namespace) -> duckdb.DuckDBPyConnection:
@@ -39,7 +40,16 @@ def sql_list(files: list[Path]) -> str:
 def pairs(a: argparse.Namespace) -> None:
     con = connect(a)
     con.execute("SET preserve_insertion_order = false")
-    checked = f"OR c.cluster_member % {a.check_sample} = 0" if a.check_sample else ""
+    wanted = "n.model IS NOT NULL"
+    if a.all:
+        wanted = "true"
+    elif a.check_sample:
+        wanted += f" OR c.cluster_member % {a.check_sample} = 0"
+    reps = "true"
+    if a.min_cluster > 1:
+        reps = f"""c.cluster_rep IN (
+            SELECT cluster_rep FROM read_parquet('{a.release}/mgy_clusters.parquet')
+            WHERE cluster_size >= {a.min_cluster} AND cluster_rep BETWEEN {a.lo} AND {a.hi - 1})"""
     a.out.mkdir()
     con.execute(
         f"""
@@ -48,7 +58,7 @@ def pairs(a: argparse.Namespace) -> None:
             FROM read_parquet('{a.release}/mgy_cluster_seqs.parquet') c
             LEFT JOIN read_parquet({sql_list(a.near)}) n ON n.protein_id = c.cluster_rep
             WHERE c.cluster_rep BETWEEN {a.lo} AND {a.hi - 1} AND c.cluster_rep % {a.sample} = 0
-                AND c.cluster_member <> c.cluster_rep AND (n.model IS NOT NULL {checked})
+                AND NOT (c.cluster_member = c.cluster_rep AND {reps}) AND ({wanted})
         ) TO '{a.out}' (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (shard), OVERWRITE_OR_IGNORE)
         """
     )
@@ -83,7 +93,7 @@ def fasta(a: argparse.Namespace) -> None:
     )
     n = residues = 0
     with open(a.out, "w") as out, open(a.pairs_out, "wb") as stream:
-        while block := rows.fetchmany(BLOCK):
+        while block := rows.fetchmany(a.block):
             out.writelines(f">{i}\n{s}\n" for i, s in block)
             ids = np.array([i for i, _ in block])
             size = sum(len(s) for _, s in block)
@@ -114,6 +124,8 @@ def main() -> None:
     x.add_argument("--hi", type=int, required=True)
     x.add_argument("--sample", type=int, default=1, help="1 in this many clusters")
     x.add_argument("--check-sample", type=int, default=0)
+    x.add_argument("--all", action="store_true")
+    x.add_argument("--min-cluster", type=int, default=1)
     x.add_argument("--shards", type=Path, default=Path("shards.txt"))
     f = sub.add_parser("fasta")
     f.set_defaults(run=fasta)
@@ -121,6 +133,7 @@ def main() -> None:
     f.add_argument("--shard", type=int, required=True)
     f.add_argument("--thresholds", type=Path, required=True)
     f.add_argument("--pairs-out", type=Path, required=True)
+    f.add_argument("--block", type=int, default=80_000)
     for s in (x, f):
         s.add_argument("--release", required=True)
         s.add_argument("--width", type=int, required=True, help="protein_ids to a shard")

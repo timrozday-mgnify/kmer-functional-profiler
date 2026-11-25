@@ -133,7 +133,10 @@ def test_compare_counts_shared_missing_and_extra_domains(tmp_path: Path) -> None
     ]  # fmt: skip
 
 
-def test_members_pairs_are_their_representatives(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "options", [("--check-sample", 5), ("--all",), ("--all", "--min-cluster", 3)]
+)
+def test_members_pairs_are_their_representatives(tmp_path: Path, options: tuple) -> None:
     models_tsv(tmp_path)
     thresholds(tmp_path)
     release = PROTEINS.parent
@@ -143,12 +146,20 @@ def test_members_pairs_are_their_representatives(tmp_path: Path) -> None:
     near = pl.DataFrame(
         {"protein_id": reps, "model": [MODELS[i % 6][0] for i in range(len(reps))]}
     ).filter(pl.col("protein_id") != reps[0])  # one with no hit
+    if "--min-cluster" in options:  # the others were not searched, and are members
+        small = clusters.filter(pl.len().over("cluster_rep") < 3)["cluster_rep"].unique()
+        near = near.filter(~pl.col("protein_id").is_in(small.implode()))
+        members = clusters.filter(
+            (pl.col("cluster_member") != pl.col("cluster_rep"))
+            | pl.col("cluster_rep").is_in(small.implode())
+        )
+        assert len(small) and near.height
     near.write_parquet(tmp_path / "near.parquet")
     width, check = 40, 5
     cut, end = reps[len(reps) // 2], reps[-1] + 1
     for b, (lo, hi) in enumerate([(0, cut), (cut, end)]):
         run(tmp_path, "members.py", "pairs", "--release", release, "--near", "near.parquet",
-            "--lo", lo, "--hi", hi, "--check-sample", check, "--width", width,
+            "--lo", lo, "--hi", hi, *options, "--width", width,
             "--out", f"pairs{b}", "--shards", f"shards{b}.txt")  # fmt: skip
     shards = sorted(
         {int(x) for b in "01" for x in (tmp_path / f"shards{b}.txt").read_text().split()}
@@ -158,21 +169,26 @@ def test_members_pairs_are_their_representatives(tmp_path: Path) -> None:
     for shard in shards:
         run(tmp_path, "members.py", "fasta", "--release", release, "--pairs", "pairs0", "pairs1",
             "--shard", shard, "--width", width, "--thresholds", "thresholds.tsv",
-            "--out", "m.faa", "--pairs-out", "m.pairs")  # fmt: skip
+            "--block", 7, "--out", "m.faa", "--pairs-out", "m.pairs")  # fmt: skip
         lines = (tmp_path / "m.faa").read_text().splitlines()
         ids = [int(x[1:]) for x in lines[::2]]
         assert ids == sorted(ids) and {i // width for i in ids} == {shard}
         assert lines[1::2] == [seqs[i] for i in ids]
         raw = (tmp_path / "m.pairs").read_bytes()
-        n, residues, size = struct.unpack("<3Q", raw[:24])
-        assert (n, residues, len(raw) - 24) == (len(ids), sum(map(len, lines[1::2])), size)
-        pairs = np.frombuffer(raw, "<u4", offset=24).reshape(-1, 2)
-        assert (np.diff(pairs[:, 1].astype(int)) >= 0).all()
-        got += [(ids[i], MODELS[m][0]) for i, m in pairs]
+        for at in range(0, len(ids), 7):
+            n, residues, size = struct.unpack("<3Q", raw[:24])
+            block = lines[1::2][at : at + 7]
+            assert (n, residues) == (len(block), sum(map(len, block)))
+            pairs = np.frombuffer(raw[24 : 24 + size], "<u4").reshape(-1, 2)
+            assert (np.diff(pairs[:, 1].astype(int)) >= 0).all()
+            got += [(ids[at + i], MODELS[m][0]) for i, m in pairs]
+            raw = raw[24 + size :]
+        assert not raw
         names += ids
     candidates = members.join(near, left_on="cluster_rep", right_on="protein_id")
     assert sorted(got) == sorted(candidates.select("cluster_member", "model").rows())
-    checked = members.filter(pl.col("cluster_member") % check == 0)["cluster_member"]
+    checked = members.filter((pl.col("cluster_member") % check == 0) | ("--all" in options))
+    checked = checked["cluster_member"]
     assert sorted(names) == sorted({*candidates["cluster_member"], *checked})
 
 
@@ -244,6 +260,13 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
     stats = pl.read_csv(tmp_path / "s.tsv", separator="\t")
     assert stats.select("proteins", "too_long", "pairs").row(0) == (len(seqs), 0, 6 * len(seqs))
 
+    # so are some models' pairs on stdin and some from a file, with pairs in both
+    (tmp_path / "more").write_bytes(stream([len(s) for s in seqs.values()], 30, range(2, 6)))
+    both = searched(tmp_path, seqs, range(4), "--more-pairs", "more")
+    assert both.equals(d)
+    stats = pl.read_csv(tmp_path / "s.tsv", separator="\t")
+    assert stats["pairs"].item() == 6 * len(seqs)
+
     # the check finds it whole, and finds what is missing when a model is left out
     check = (
         "annotate.py", "check", "--faa", "p.faa", "--hmm", HMM, "--thresholds", "thresholds.tsv",
@@ -265,6 +288,11 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
     assert searched(tmp_path, seqs, range(6)).filter(one).is_empty()
     weak = searched(tmp_path, seqs, range(6), "--weak-evalue", 1e-3).filter(one)
     assert weak.height >= 3 and not weak["passes"].any()
+
+    # two sets of pairs in different blocks are an error
+    (tmp_path / "more").write_bytes(stream([len(s) for s in seqs.values()], 20, range(6)))
+    with pytest.raises(subprocess.CalledProcessError):
+        searched(tmp_path, seqs, range(4), "--more-pairs", "more")
 
 
 @needs_pyhmmer

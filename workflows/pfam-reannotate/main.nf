@@ -33,7 +33,7 @@ process PLAN {
     """
     ${params.python} ${moduleDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' plan --release '${params.release}' \\
         --targets ${params.targets} --sample ${params.sample} \\
-        --chunk-proteins ${params.chunk_proteins} ${params.plan_args}
+        --chunk-proteins ${params.chunk_proteins} ${params.plan_args} ${task.ext.args ?: ''}
     """
 
     stub:
@@ -54,7 +54,7 @@ process FASTA {
     """
     ${params.python} ${moduleDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' fasta --release '${params.release}' \\
         --targets ${params.targets} --sample ${params.sample} ${arm == 'reversed' ? '--reverse' : ''} \\
-        --lo ${lo} --hi ${hi} --proteins ${proteins} --out ${arm}.chunk${chunk}.faa
+        --lo ${lo} --hi ${hi} --proteins ${proteins} --out ${arm}.chunk${chunk}.faa ${task.ext.args ?: ''}
     """
 
     stub:

@@ -11,6 +11,10 @@
 #   ENGINE=kfpfam-top              kfpfam's top mode, kfpfam-fast, or hmmsearch: every model, no prefilter
 #   MEMBERS=true                   representatives by ENGINE, then their members by HMMER alone, on the models the
 #                                  representative nearly passes. Every protein still, at a fraction of the cost
+#   MEMBERS=fast                   representatives by ENGINE (hmmsearch, or kfpfam-fast), and then kfpfam's fast mode on
+#                                  every member too: HMMER has the models of either. MEMBERS=top: its top mode
+#   MIN_CLUSTER=1                  with MEMBERS=fast or top, ENGINE has the representatives of clusters this size or more only;
+#                                  kfpfam has the whole of the others
 #   SIF=<kfpfam-filter.sif>        kfpfam's image, e54c21a or later (both engines); ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
@@ -29,10 +33,11 @@
 #   PFAM=39.0 sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=kfpfam-fast sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
-#   PFAM=39.0 ENGINE=kfpfam-fast MEMBERS=true sbatch --dependency=afterany:<that job> run.sh   # check.members.tsv
+#   PFAM=39.0 ENGINE=hmmsearch MEMBERS=fast sbatch --dependency=afterany:<that job> run.sh     # check.members.tsv
 #   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
+# kfpfam's speed against hmmsearch's on the HPC's CPUs, and what it misses: benchmark.sh
 # One at a time in this directory: they share its work/ and -resume cache.
-# Read results-<collection><release>-<engine>[-members]-<sample>/ (results-pfam39.0-hmmsearch-1000):
+# Read results-<collection><release>-<engine>[-members[-fast|-top][-min<n>]]-<sample>/ (results-pfam39.0-hmmsearch-1000):
 #   check.members.tsv  with MEMBERS, the members' recall; check.tsv is the representatives'
 #   check.tsv       kfpfam's recall of the passing domains of full hmmsearch, all and by model
 #   compare.tsv     the same against the release's own table (38.2)
@@ -55,7 +60,23 @@ collection=${COLLECTION:-pfam}
 sample=${SAMPLE:-1000}
 engine=${ENGINE:-kfpfam-top}
 check=${CHECK:-10}
-if [[ $sample == 1 || ( $engine == hmmsearch && ${MEMBERS:-false} != true ) ]]; then check=0; fi
+members=${MEMBERS:-false}
+min_cluster=${MIN_CLUSTER:-1}
+case $members in
+    false | true | fast | top) ;;
+    *) echo "MEMBERS=$members: false, true, fast or top" >&2; exit 1 ;;
+esac
+filter=false
+if [[ $members == fast || $members == top ]]; then filter=true; fi
+if [[ $filter == true && $engine != hmmsearch && $engine != "kfpfam-$members" ]]; then
+    echo "MEMBERS=$members: ENGINE=hmmsearch or kfpfam-$members, as kfpfam has one mode to a run" >&2
+    exit 1
+fi
+if [[ $min_cluster != 1 && $filter == false ]]; then
+    echo "MIN_CLUSTER needs MEMBERS=fast or top" >&2
+    exit 1
+fi
+if [[ $sample == 1 || ( $engine == hmmsearch && $members == false ) ]]; then check=0; fi
 args=(--engine "${engine%%-*}")
 if [[ $engine == kfpfam-* ]]; then args+=(--kfpfam_mode "${engine#*-}"); fi
 name=$collection
@@ -63,7 +84,7 @@ case $collection in
     pfam)
         release=${PFAM:-39.0}
         name=pfam$release
-        if [[ ${MEMBERS:-false} != true ]]; then
+        if [[ $members == false ]]; then
             args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
         fi
         args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam$release/Pfam-A.hmm.gz}")
@@ -79,9 +100,14 @@ case $collection in
         ;;
 esac
 targets=all
-if [[ ${MEMBERS:-false} == true ]]; then
+if [[ $members != false ]]; then
     targets=reps engine=$engine-members
     args+=(--members true)
+fi
+if [[ $filter == true ]]; then
+    engine+=-$members
+    args+=(--member_filter true --kfpfam_mode "$members" --min_cluster "$min_cluster")
+    if [[ $min_cluster != 1 ]]; then engine+=-min$min_cluster; fi
 fi
 nextflow run "$WF/hmm-annotate" -c ../site.config \
     ${RELEASE:+--release "$RELEASE"} --kfpfam_sif "$(realpath "$SIF")" "${args[@]}" \
