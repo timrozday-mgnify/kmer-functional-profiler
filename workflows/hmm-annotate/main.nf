@@ -78,7 +78,7 @@ process SEARCH {
     ${params.engine == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
         ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
             --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-            ${searchable(params.engine, seeds)} \\
+            ${searchable(params.engine, seeds)} ${params.engine == 'hmmsearch' ? '' : forward()} \\
             ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
             ${flag(params.members) ? "--near chunk${chunk}.near.parquet --near-slack ${params.member_slack}" : ''} \\
             --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv
@@ -104,6 +104,10 @@ def prefilter(prep, index, faa, chunk, cpus) {
 // Where the pairs to search come from, if not stdin
 def searchable(engine, seeds) {
     engine == 'nail' ? "--seeds ${[seeds].flatten().join(' ')} --block ${params.kfpfam_block}" : engine == 'hmmsearch' ? '--all-pairs' : ''
+}
+
+def forward() {
+    params.forward_slack == '' ? '' : "--forward-slack ${params.forward_slack}"
 }
 
 // The CPU, and the filter's log: its kernel and CPU time, for bench.py. Nextflow's own log has it too.
@@ -201,7 +205,7 @@ process MEMBER_SEARCH {
     ${params.member_filter == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
     ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
         --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-        ${filtered ? "--more-pairs ${pairs}" : ''} ${searchable(params.member_filter, seeds)} \\
+        ${filtered ? "--more-pairs ${pairs}" : ''} ${searchable(params.member_filter, seeds)} ${forward()} \\
         ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
         --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv ${filtered ? '' : "< ${pairs}"}
     ${searched(chunk, counts)}

@@ -311,6 +311,12 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
     weak = searched(tmp_path, seqs, range(6), "--weak-evalue", 1e-3).filter(one)
     assert weak.height >= 3 and not weak["passes"].any()
 
+    # HMMER's Forward filter at the thresholds less a slack: the same domains here, and none if
+    # the slack is very negative
+    base = searched(tmp_path, seqs, range(6))
+    assert searched(tmp_path, seqs, range(6), "--forward-slack", 8).equals(base)
+    assert searched(tmp_path, seqs, range(6), "--forward-slack", -500).is_empty()
+
     # two sets of pairs in different blocks are an error
     (tmp_path / "more").write_bytes(stream([len(s) for s in seqs.values()], 20, range(6)))
     with pytest.raises(subprocess.CalledProcessError):

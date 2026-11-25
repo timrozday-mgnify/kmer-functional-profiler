@@ -19,6 +19,11 @@ at least the ``dom`` one (``tables.py thresholds``). Only passing domains are wr
 ``--weak-evalue`` also asks for those with an independent E-value at most that. E-values are at a
 fixed Z, so they compare across chunks.
 
+``--forward-slack S`` stops a candidate whose Forward score is S bits under the model's sequence
+threshold before HMMER's domain definition, most of what a candidate costs. At 8 it lost no domain
+on 24,000 proteins against 7,534 Pfam models (4 lost 2) and saved a fifth of HMMER's time. It is
+off with ``--near``, which it cut by 1 in 10,000, and for the truth, ``--all-pairs``.
+
 HMMER takes at most 100,000 residues: longer proteins are not searched, and counted (``too_long``).
 
 The pair stream's reader and the thread jobs are from the raw-reads pipeline's ``hmmer_pairs.py``.
@@ -26,6 +31,7 @@ The pair stream's reader and the thread jobs are from the raw-reads pipeline's `
 
 import argparse
 import hashlib
+import math
 import re
 import resource
 import struct
@@ -131,8 +137,17 @@ def pipeline(z: float) -> Pipeline:
     own filters, and passing is decided from the scores."""
     if not hasattr(LOCAL, "pipeline"):
         LOCAL.pipeline = Pipeline(ALPHABET, Z=z, domZ=z, E=float("inf"), domE=float("inf"))
+        LOCAL.f3 = LOCAL.pipeline.F3
     LOCAL.pipeline.clear()
+    LOCAL.pipeline.F3 = LOCAL.f3
     return LOCAL.pipeline
+
+
+def forward_cut(profile, bits: float) -> float:
+    """HMMER's Forward filter (F3) as a P-value that stops a protein whose Forward score, after the
+    bias filter, is under `bits`: it gets no domain definition, most of the cost of a candidate."""
+    e = profile.evalue_parameters
+    return 1.0 if bits <= e.f_tau else math.exp(-e.f_lambda * (bits - e.f_tau))
 
 
 def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> tuple[list, set]:
@@ -141,7 +156,10 @@ def search_model(profile, block, seqs, threshold, a: argparse.Namespace) -> tupl
     model, _, seq_t, dom_t = threshold
     rows: list[tuple] = []
     near: set[tuple[int, str]] = set()
-    hits = pipeline(a.z).search_hmm(profile, block)
+    p = pipeline(a.z)
+    if a.forward_slack is not None and math.isfinite(seq_t) and not (a.weak_evalue or a.near):
+        p.F3 = min(p.F3, forward_cut(profile, seq_t - a.forward_slack))
+    hits = p.search_hmm(profile, block)
     if not len(hits):
         return rows, near
     seqs = seqs or {text(s.name): s for s in block}
@@ -471,6 +489,12 @@ def main() -> None:
     x.add_argument("--block", type=int, default=80_000, help="proteins of --seeds at a time")
     x.add_argument("--more-pairs", type=Path, help="as members.py fasta writes them")
     x.add_argument("--all-pairs", action="store_true", help="no prefilter: hmmsearch")
+    x.add_argument(
+        "--forward-slack",
+        type=float,
+        help="no domain definition for a protein this many bits under the sequence threshold by "
+        "HMMER's Forward filter; none with --weak-evalue or --near",
+    )
     x.add_argument("--weak-evalue", type=float, default=0, help="0: passing domains only")
     c = sub.add_parser("check")
     c.set_defaults(run=check)

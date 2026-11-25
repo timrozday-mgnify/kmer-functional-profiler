@@ -207,3 +207,41 @@ Why 1 M proteins a task (measured at 1,000, 20,000 and 80,000 proteins and half 
   removed as it ends; its memory is 0.7 GB and 3 MB per 1,000 proteins, so some 10 GB with the seeds
   (estimate; it asks for 32). At 2.7 KB of seeds a protein, 1 M is 3 GB, less gzipped; all of the release's would
   be about 2 TB in `work/`.
+
+### Why whole proteins are slower than reads, and what helps (2026-11-25)
+
+24,000 proteins (6.2 M residues, median 191) of the slice, and the same residues cut into pieces; 7,534 models,
+M4 Pro, 4 threads, CPU-s. `hmmsearch` takes 179-196 at every length.
+
+| `fast` | join | gapped | survivors | HMMER | all | against `hmmsearch` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50-residue pieces | 3.3 | 0.7 | 0.3 | 3.9 | 8.0 | 25× |
+| 200 | 4.2 | 3.2 | 0.7 | 9.3 | 17.0 | 11× |
+| whole | 4.8 | 5.0 | 1.0 | 12.2 | 22.0 | 8.1× |
+
+- **Seeds are not it.** Hits per residue hardly change with length (2.40 to 2.75 G), as the index is
+  per residue. A 4-, 5- or 6-residue seed costs the same at any length, so indexes by query length
+  would not help.
+- **The gapped stage scores the whole stretch of the diagonal that meets the model**, up to the model's
+  length: about 50 rows on a piece and 140 on a protein, and more pairs reach the bars by chance.
+- **HMMER is most of it.** Of its 11.8 CPU-s on the whole proteins, its filters and Forward are 2.8 and
+  domain definition 9.0. Domain definition on the 8,654 true pairs takes 3.0, the floor (60× `hmmsearch`).
+  False candidates that pass HMMER's own filters cost 6.9: 7,000 under the threshold
+  by Forward (3.0 CPU-s), and 4,100 above it that only the composition correction rejects, mostly short
+  repeat models on long proteins (4.0).
+
+Tried:
+
+| | Change | Cost | Recall |
+| --- | --- | --- | --- |
+| **`--forward-slack 8`** (built, the default) | no domain definition for a candidate 8 bits under the sequence threshold by HMMER's Forward filter | HMMER −22% (`fast`), −20% (`top`) | no domain lost; 4 bits lost 2 |
+| θ 4 for `fast`, not 5 | fewer seeds | filter 9.8 → 7.6 | pairs missed 69 → 89 of 8,723 |
+| a spaced 5-mer, 1101011, θ 4 | 0.54× the hits of the 4-mer at θ 4 | join the same: its lists fill 32% of the SIMD lanes (74% in 4× larger blocks, then 0.85× the 4-mer's) | the same; index 12× the size |
+| 6-mers | 0.34× the hits at θ 5 | | index 137× the size |
+| HMMER's MSV on every pair first | | 92 CPU-s alone, more than all of `fast` | |
+| a composition correction on the filter's best segment | | removes 0.8 of HMMER's 12 at no loss | |
+
+Not tried: an X-drop gapped stage that stops when a chance extension dies (estimated up to 2 CPU-s of the 22).
+So at most about 11× on whole proteins at `fast`'s recall on this CPU, against 25× on 50-residue pieces: what is
+left is HMMER on true hits and on repeat-rich near misses, which `hmmsearch` pays as well. Members
+(`MEMBERS=fast`) are where the large factor is.
