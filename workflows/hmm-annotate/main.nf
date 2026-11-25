@@ -104,40 +104,63 @@ process CHECK {
     "touch chunk${chunk}.check.tsv"
 }
 
+process COMPARE {
+    tag "${chunk}"
+    label 'process_small'
+
+    input:
+    tuple val(chunk), val(lo), val(hi), path(domains)
+    path code
+
+    output:
+    path "chunk${chunk}.compare.tsv"
+
+    script:
+    """
+    ${params.python} ${code} --domains ${domains} --table '${params.release}/mgy_proteins_pfam.parquet' \\
+        --lo ${lo} --hi ${hi} --sample ${params.sample} --threads ${task.cpus} --out chunk${chunk}.compare.tsv
+    """
+
+    stub:
+    "touch chunk${chunk}.compare.tsv"
+}
+
 process SUMMARY {
     label 'process_small'
     publishDir params.outdir, mode: 'copy'
 
     input:
-    path stats
+    path stats, stageAs: 'chunks/*'
     path code
 
     output:
     path 'summary.tsv'
 
     script:
-    "${params.python} tables.py summary ${stats}"
+    "${params.python} tables.py summary chunks"
 
     stub:
     "touch summary.tsv"
 }
 
 process CHECK_SUMMARY {
+    tag "${name}"
     label 'process_small'
     publishDir params.outdir, mode: 'copy'
 
     input:
-    path checks
+    tuple val(name), path(checks, stageAs: 'chunks/*')
     path code
 
     output:
-    path 'check.tsv'
+    path "${name}.tsv"
 
+    // by directory: thousands of names would not fit on a command line
     script:
-    "${params.python} tables.py check-summary ${checks}"
+    "${params.python} tables.py check-summary chunks --out ${name}.tsv"
 
     stub:
-    "touch check.tsv"
+    "touch ${name}.tsv"
 }
 
 workflow {
@@ -149,6 +172,9 @@ workflow {
     }
     if (params.check_sample as int > 0 && !flag(params.domains)) {
         error "--check_sample compares domains: it needs --domains true"
+    }
+    if (flag(params.compare_release) && !(flag(params.domains) && params.targets == 'all')) {
+        error "--compare_release compares domains of every protein: it needs --domains true --targets all"
     }
     if (workflow.containerEngine && !params.kfpfam_sif) {
         error "--kfpfam_sif: kfpfam's image (kfpfam's docker/filter.Dockerfile)"
@@ -163,8 +189,19 @@ workflow {
     FASTA(ch_chunks)
     SEARCH(FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
     SUMMARY(SEARCH.out.stats.collect(), tables)
+    def ch_checks = channel.empty()
     if (params.check_sample as int > 0) {
         CHECK(SEARCH.out.domains, PREP.out.hmm, PREP.out.thresholds, annotate)
-        CHECK_SUMMARY(CHECK.out.collect(), tables)
+        ch_checks = CHECK.out.collect().map { c -> ['check', c] }
     }
+    if (flag(params.compare_release)) {
+        def compare = file("${projectDir}/compare.py", checkIfExists: true)
+        COMPARE(
+            ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }
+                .join(SEARCH.out.domains.map { chunk, _faa, domains -> [chunk, domains] }),
+            compare,
+        )
+        ch_checks = ch_checks.mix(COMPARE.out.collect().map { c -> ['compare', c] })
+    }
+    CHECK_SUMMARY(ch_checks, tables)
 }

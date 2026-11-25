@@ -45,7 +45,7 @@ singularity build kfp-lookup.sif docker-archive://kfp-lookup.tar
 | `--labels` | | `ko=DIR,ec=DIR`: hmm-annotate outputs whose models are the labels |
 | `--groups` | `400` | `BUILD` tasks, about |
 | `--batch_chunks` | `50` | Annotation chunks per `SPLIT` task |
-| `--pfam_version`, `--mgnify_version` | `38.2`, `2026_07` | Recorded in the bundle's manifest |
+| `--pfam_version`, `--mgnify_version` | `39.0`, `2026_07` | Recorded in the bundle's manifest |
 | `--check_parquet` | | A sample's `*_pfam_alignments.parquet` to profile with the bundle |
 | `--lookup_sif` | | The lookup image |
 

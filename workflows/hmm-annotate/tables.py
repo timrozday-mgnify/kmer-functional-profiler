@@ -5,7 +5,8 @@
   TSV with a header line and model, threshold, score_type first, as KOfam's ko_list is. ``full``
   sets the sequence score's threshold and ``domain`` the domain's; ``-`` (none) never passes.
 - ``summary``: the chunks' stats -> one total row.
-- ``check-summary``: the chunks' checks -> a row ``all``, then one per model, worst recall first.
+- ``check-summary``: the chunks' checks (``annotate.py check`` or ``compare.py``) -> a row ``all``,
+  then one per model, worst recall first.
 """
 
 import argparse
@@ -85,7 +86,7 @@ def rows(path: Path) -> list[dict[str, str]]:
 
 def summary(a: argparse.Namespace) -> None:
     total: Counter = Counter()
-    for p in a.stats:
+    for p in sorted(a.stats.iterdir()):
         for k, v in rows(p)[0].items():
             total[k] += int(v)
     text = "\t".join(total) + "\n" + "\t".join(map(str, total.values())) + "\n"
@@ -95,7 +96,7 @@ def summary(a: argparse.Namespace) -> None:
 
 def check_summary(a: argparse.Namespace) -> None:
     models: dict[str, Counter] = defaultdict(Counter)
-    for p in a.checks:
+    for p in sorted(a.checks.iterdir()):
         for r in rows(p):
             models[r.pop("model")].update({k: int(v) for k, v in r.items()})
     every: Counter = Counter()
@@ -128,11 +129,11 @@ def main() -> None:
     t.add_argument("--out", type=Path, default=Path("thresholds.tsv"))
     s = sub.add_parser("summary")
     s.set_defaults(run=summary)
-    s.add_argument("stats", type=Path, nargs="+")
+    s.add_argument("stats", type=Path, help="directory of the chunks' stats")
     s.add_argument("--out", type=Path, default=Path("summary.tsv"))
     c = sub.add_parser("check-summary")
     c.set_defaults(run=check_summary)
-    c.add_argument("checks", type=Path, nargs="+")
+    c.add_argument("checks", type=Path, help="directory of the chunks' checks")
     c.add_argument("--out", type=Path, default=Path("check.tsv"))
     a = p.parse_args()
     a.run(a)

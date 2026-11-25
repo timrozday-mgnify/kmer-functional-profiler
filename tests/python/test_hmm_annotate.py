@@ -65,13 +65,37 @@ def test_check_summary_totals_and_puts_the_worst_model_first(tmp_path: Path) -> 
     head = (
         "model\tpairs_truth\tpairs_found\tpairs_extra\tdomains_truth\tdomains_found\tdomains_extra"
     )
-    (tmp_path / "a.tsv").write_text(f"{head}\nA\t4\t4\t0\t4\t4\t0\nB\t1\t1\t0\t2\t1\t0\n")
-    (tmp_path / "b.tsv").write_text(f"{head}\nB\t2\t1\t0\t2\t1\t0\n")
-    run(tmp_path, "tables.py", "check-summary", "a.tsv", "b.tsv")
+    (tmp_path / "c").mkdir()
+    (tmp_path / "c/a.tsv").write_text(f"{head}\nA\t4\t4\t0\t4\t4\t0\nB\t1\t1\t0\t2\t1\t0\n")
+    (tmp_path / "c/b.tsv").write_text(f"{head}\nB\t2\t1\t0\t2\t1\t0\n")
+    run(tmp_path, "tables.py", "check-summary", "c")
     t = pl.read_csv(tmp_path / "check.tsv", separator="\t")
     assert t["model"].to_list() == ["all", "B", "A"]
     assert t["domains_found"].to_list() == [6, 2, 4]
     assert t["domain_recall"].to_list() == [0.75, 0.5, 1.0]
+
+
+def test_compare_counts_shared_missing_and_extra_domains(tmp_path: Path) -> None:
+    here = [
+        (10, "PF00001", 1, 50),
+        (10, "PF00001", 60, 90),
+        (20, "PF00002", 1, 9),
+        (30, "PF00001", 1, 9),
+    ]
+    pl.DataFrame(
+        [(*r, True) for r in here] + [(20, "PF00001", 1, 9, False)],
+        orient="row", schema=["protein_id", "model", "env_from", "env_to", "passes"],
+    ).write_parquet(tmp_path / "d.parquet")  # fmt: skip
+    there = [(10, 1, 1, 50), (10, 1, 61, 90), (20, 3, 5, 9), (21, 1, 1, 9), (90, 1, 1, 9)]
+    pl.DataFrame(
+        there, orient="row", schema=["protein_id", "pfam_accession", "env_from", "env_to"]
+    ).write_parquet(tmp_path / "t.parquet")
+    run(tmp_path, "compare.py", "--domains", "d.parquet", "--table", "t.parquet", "--lo", 0,
+        "--hi", 40, "--sample", 10, "--out", "c.tsv")  # fmt: skip
+    # protein 21 is not in the sample and 90 not in the range; PF00001 of 20 does not pass
+    assert pl.read_csv(tmp_path / "c.tsv", separator="\t").rows() == [
+        ("PF00001", 1, 1, 1, 2, 1, 2), ("PF00002", 0, 0, 1, 0, 0, 1), ("PF00003", 1, 0, 0, 1, 0, 0),
+    ]  # fmt: skip
 
 
 def stream(lengths: list[int], block: int, models: range) -> bytes:

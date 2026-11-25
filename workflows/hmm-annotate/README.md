@@ -10,8 +10,9 @@ PLAN           ids of the targets -> ranges.tsv, protein_id ranges of ~--chunk_p
 FASTA          per range: the sequences                                                   (pfam-reannotate's)
 SEARCH         per range: filter join | annotate.py search -> domains/ and labels/
 CHECK          per range: 1 in --check_sample proteins against every model, no prefilter  (--check_sample N)
+COMPARE        per range: the passing domains against the release's own Pfam table     (--compare_release true)
 SUMMARY        -> summary.tsv, one total row
-CHECK_SUMMARY  -> check.tsv, recall against CHECK, worst model first                      (--check_sample N)
+CHECK_SUMMARY  -> check.tsv and compare.tsv, recall against each, worst model first
 ```
 
 ## Setup
@@ -57,6 +58,7 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |
 | `--sample` | `1000` | 1 in N targets by `protein_id` |
 | `--check_sample` | `0` | 1 in N of those also against every model, without the prefilter; `0`: none |
+| `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.2 |
 | `--domains` | `true` | Write the domain rows; labels are always written |
 | `--weak_evalue` | `0` | Also domains under the thresholds, at this E-value (Z = 10⁶); `0`: none |
 | `--chunk_proteins` | `500000` | Proteins per `SEARCH` task |
@@ -82,6 +84,9 @@ passes, and shows only with `--weak_evalue`.
   searched), candidate pairs, domains and proteins passing, and pyhmmer's core-seconds.
 - **`check.tsv`**: per model, passing (protein, model) pairs and domains by full `hmmsearch`, how many
   `SEARCH` found, and how many it has that `hmmsearch` doesn't (`extra`, none expected).
+
+- **`compare.tsv`**: the same columns with the release's own Pfam table as the truth; a domain is the same if
+  its envelope is. Use it with Pfam 38.2 only, and `--cutoff gathering`, as the table was made.
 
 `work/` holds the FASTA of every chunk until deleted: about 1.1 TB for every protein of the release.
 

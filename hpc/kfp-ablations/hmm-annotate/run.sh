@@ -9,8 +9,11 @@
 # Every MGnify protein against an HMM collection, kfpfam's prefilter then HMMER on its candidates
 # (workflows/hmm-annotate/README.md). Inputs, as environment variables:
 #   SIF=<kfpfam-filter.sif>        kfpfam's image, 86f2a63 or later; ../images/kfpfam-filter.{tar,sif} by default
-#   COLLECTION=pfam                HMM=<Pfam-A.hmm[.gz]>: 38.2 from the FTP site if not set. The
-#                                  index must be of the models the reads are aligned to
+#   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
+#                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
+#                                  the index must be of the models the reads are aligned to
+#   COLLECTION=pfam PFAM=38.2      also compares with the release's own Pfam table, made with 38.2
+#                                  (COMPARE=true or false says otherwise)
 #   COLLECTION=kofam               HMM=<all profiles in one file>  THRESHOLDS=<ko_list[.gz]>; labels only
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
 #                                  cat profiles/K*.hmm > kofam.hmm
@@ -18,20 +21,23 @@
 #   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
 #                                  reads most of the release's 1 TB of sequences, as samples are spread out
 # First, and look at check.tsv and trace.tsv before the whole:
-#   COLLECTION=pfam sbatch run.sh
-#   COLLECTION=pfam SAMPLE=1 sbatch run.sh
-# Read results-<collection>-<sample>/:
-#   check.tsv       kfpfam's recall of the passing domains, all and by model
+#   PFAM=38.2 sbatch run.sh
+#   PFAM=39.0 sbatch --dependency=afterany:<that job> run.sh
+#   PFAM=39.0 SAMPLE=1 sbatch run.sh
+# One at a time in this directory: they share its work/ and -resume cache.
+# Read results-<collection><release>-<sample>/ (results-pfam39.0-1000, results-kofam-1000):
+#   check.tsv       kfpfam's recall of the passing domains of full hmmsearch, all and by model
+#   compare.tsv     the same against the release's own table (38.2)
 #   summary.tsv     proteins, residues, pairs, domains passing
 #   trace.tsv       time and memory per task: realtime x cpus of SEARCH x SAMPLE is the whole run's cost
 #   domains/        lookup-index's input (Pfam)
 #   labels/         protein_id, model (KOfam: lookup-index's LABELS)
 # Cost, estimates to be replaced by the 1-in-1,000 run's trace:
-#   SAMPLE=1 pfam   not measured on proteins. hmmsearch alone would be about 63,600 core-hours at
-#                   laptop speed (pfam-reannotate's README); kfpfam on reads' ORFs was well under nail
-#                   there but about 13x slower per read on Codon
-#   check           about 6 core-hours at SAMPLE=1000 CHECK=10 (hmmsearch, laptop speed)
-#   disk            domains about 64 bytes a row (laptop), so some 250 GB for Pfam over every protein;
+#   SAMPLE=1 pfam   not measured on proteins. hmmsearch alone would be about 113,000 core-hours at
+#                   laptop speed (pfam-reannotate's 63,600 for 38.2's 30,134 models, 39.0 has 53,275)
+#   check           about 10 core-hours at SAMPLE=1000 CHECK=10 (hmmsearch, laptop speed)
+#   disk            domains about 64 bytes a row (laptop), so some 250 GB for Pfam over every protein
+#                   at 38.2's hits, more at 39.0;
 #                   work/ about 1.1 TB of FASTA, deletable when the run has finished
 # Re-submitting resumes.
 source ../common.sh
@@ -40,9 +46,13 @@ collection=${COLLECTION:-pfam}
 sample=${SAMPLE:-1000}
 check=$([[ $sample == 1 ]] && echo 0 || echo "${CHECK:-10}")
 args=()
+name=$collection
 case $collection in
     pfam)
-        args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam38.2/Pfam-A.hmm.gz}")
+        release=${PFAM:-39.0}
+        name=pfam$release
+        args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
+        args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam$release/Pfam-A.hmm.gz}")
         ;;
     kofam)
         : "${HMM:?KOfam profiles in one file}" "${THRESHOLDS:?KOfam ko_list}"
@@ -57,4 +67,4 @@ esac
 nextflow run "$WF/hmm-annotate" -c ../site.config \
     ${RELEASE:+--release "$RELEASE"} --kfpfam_sif "$(realpath "$SIF")" "${args[@]}" \
     --targets all --sample "$sample" --check_sample "$check" \
-    --outdir "results-$collection-$sample" -resume
+    --outdir "results-$name-$sample" -resume

@@ -30,9 +30,11 @@ cd kfp-ablations/floor-query-cost && sbatch run.sh
 cd kfp-ablations/pfam-reannotate && sbatch run.sh
 # every MGnify protein against Pfam or KOfam (workflows/hmm-annotate), 1 in 1,000 with the check
 # first; its header says what it reads:
-cd kfp-ablations/hmm-annotate && COLLECTION=pfam sbatch run.sh
+cd kfp-ablations/hmm-annotate && PFAM=38.2 sbatch run.sh   # then PFAM=39.0
 # when the whole release is annotated (SAMPLE=1, Pfam and KOfam), the lookup bundle from it:
 cd kfp-ablations/lookup-index && HMM=... sbatch run.sh
+# then profile Pfam alignments that exist already (the B11 arms'), without re-running the pipeline:
+cd kfp-ablations/lookup-profile && HMM=... PARQUETS='...' ./run.sh
 # MGnify90 residue scan on one very large family (workflows/pfam-anchor/lookup/REPORT.md), any time; its header says what it reads:
 cd kfp-ablations/pfam-anchor-large && FAMILY=5 PARQUETS='...' PFAM=... ./run.sh submit
 # clusters with a Pfam hit (plan, phase 6), any time:
