@@ -419,7 +419,7 @@ pub fn run(dir: &Path, arm: &str, sub: u32, out: &Path, threads: usize, truth_ar
                 by_bits.clear();
                 by_bits.extend_from_slice(u);
                 by_bits.sort_by(|a, b| b.total_cmp(a));
-                let mut rank = |label: String, k: usize, sc: &mut Score| {
+                let rank = |label: String, k: usize, sc: &mut Score| {
                     let bar = by_bits[k.clamp(1, n) - 1].max(0.0);
                     sc.emit(&label, hits, (0..n as u32).filter(|&x| u[x as usize] >= bar && u[x as usize] > 0.0));
                 };

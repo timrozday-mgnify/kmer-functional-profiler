@@ -42,14 +42,16 @@ mkdir -p "$D"
 large () { "$PY" "$LOOKUP/large.py" "$@" --out "$D"; }
 
 # Built on the node it runs on, for that node's CPU: an AVX-512 binary would crash on an older one. With cargo, or in the
-# Rust image, which the scan then runs in too, as a binary of its glibc may not run on the node.
+# Rust image, which the scan then runs in too, as a binary of its glibc may not run on the node. Each job builds in its
+# own local temp directory (about a minute): jobs sharing a target directory on a network filesystem clobber each
+# other's objects, as cargo's lock does not hold across nodes.
 command -v cargo > /dev/null || [[ ! -x $HOME/.cargo/bin/cargo ]] || PATH=$HOME/.cargo/bin:$PATH
 RUST_SIF=${RUST_SIF:-$HERE/rust.sif}
 build () {
-    CPU=$(uname -m)-$(grep -m1 -E 'model name|^CPU part' /proc/cpuinfo 2>/dev/null | cksum | cut -d' ' -f1 || true)
-    export RUSTFLAGS='-C target-cpu=native'
+    T=$(mktemp -d "${TMPDIR:-/tmp}/kfp-lookup.XXXXXX")
+    trap 'rm -rf "$T"' EXIT
+    export RUSTFLAGS='-C target-cpu=native' CARGO_TARGET_DIR=$T/target CARGO_HOME=$T/cargo
     if command -v cargo > /dev/null; then
-        export CARGO_TARGET_DIR=$D/target-$CPU
         cargo build --quiet --release --offline --manifest-path "$LOOKUP/rs/Cargo.toml"
         lookup () { "$CARGO_TARGET_DIR/release/lookup" "$@"; }
     else
@@ -57,8 +59,7 @@ build () {
             singularity pull "$RUST_SIF.$$" "${RUST_IMAGE:-docker://rust:1.92-slim-bookworm}"
             mv "$RUST_SIF.$$" "$RUST_SIF"
         fi
-        export CARGO_TARGET_DIR=$D/target-sif-$CPU CARGO_HOME=$D/cargo
-        in_sif () { singularity exec -B "$REPO,$D" "$RUST_SIF" "$@"; }
+        in_sif () { singularity exec -B "$REPO,$D,$T" "$RUST_SIF" "$@"; }
         # its own toolchain by path: rustup would fetch the one rust-toolchain.toml names
         # cargo's settings passed explicitly: the image's ENV CARGO_HOME (read-only in a sif) can win over the host's
         in_sif env CARGO_HOME="$CARGO_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" RUSTFLAGS="$RUSTFLAGS" \
@@ -83,14 +84,20 @@ submit)
     [[ -s $LOOKUP/large.py ]] || { echo "no $LOOKUP/large.py: is the branch checked out in $REPO?" >&2; exit 1; }
     command -v cargo > /dev/null || command -v singularity > /dev/null || { echo "no cargo and no singularity on PATH (the jobs build the scan)" >&2; exit 1; }
     export KFP_RUN_DIR=$HERE
-    sb () { sbatch --parsable --chdir="$HERE" ${SBATCH_ARGS:-} "$@"; }
-    j=$(sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$HERE/run.sh" prepare)
-    a=$(sb --dependency="afterok:$j" --array="0-$((CHUNKS - 1))" --cpus-per-task=4 --mem=24G --time=12:00:00 "$HERE/run.sh" align)
-    p=$(sb --dependency="afterok:$a" --cpus-per-task=2 --mem=48G --time=12:00:00 "$HERE/run.sh" pack)
-    t=$(sb --dependency="afterok:$p" --cpus-per-task=48 --mem=48G --time=12:00:00 "$HERE/run.sh" truth)
+    # one sbatch refused (an option the site lacks, say) cancels those already queued, or a re-submit runs them twice
+    queued=()
+    sb () {   # sets $id
+        id=$(sbatch --parsable --chdir="$HERE" ${SBATCH_ARGS:-} "$@") || {
+            (( ${#queued[@]} )) && scancel "${queued[@]}"
+            echo "sbatch $* failed; cancelled ${queued[*]:-nothing}" >&2; exit 1; }
+        id=${id%%;*}; queued+=("$id"); }
+    sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$HERE/run.sh" prepare; j=$id
+    sb --dependency="afterok:$j" --array="0-$((CHUNKS - 1))" --cpus-per-task=4 --mem=24G --time=12:00:00 "$HERE/run.sh" align; a=$id
+    sb --dependency="afterok:$a" --cpus-per-task=2 --mem=48G --time=12:00:00 "$HERE/run.sh" pack; p=$id
+    sb --dependency="afterok:$p" --cpus-per-task=48 --mem=48G --time=12:00:00 "$HERE/run.sh" truth; t=$id
     # timed, but not --exclusive (some sites refuse it): node neighbours make scan*.times.tsv noisier, not the recall
-    s=$(sb --dependency="afterok:$p" --cpus-per-task=16 --mem=64G --time=12:00:00 "$HERE/run.sh" scan)
-    r=$(sb --dependency="afterok:$t:$s" --cpus-per-task=1 --mem=16G --time=1:00:00 "$HERE/run.sh" report)
+    sb --dependency="afterok:$p" --cpus-per-task=16 --mem=64G --time=12:00:00 "$HERE/run.sh" scan; s=$id
+    sb --dependency="afterok:$t:$s" --cpus-per-task=1 --mem=16G --time=1:00:00 "$HERE/run.sh" report; r=$id
     echo "prepare $j, align $a, pack $p, truth $t, scan $s, report $r" ;;
 prepare)
     : "${PARQUETS:?set PARQUETS}" "${PFAM:?set PFAM}"
