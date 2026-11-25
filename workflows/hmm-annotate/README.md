@@ -1,8 +1,8 @@
 # hmm-annotate
 
 Annotates MGnify proteins with any HMM collection (Pfam, KOfam, ...): kfpfam's k-mer prefilter picks
-candidate models, and HMMER (pyhmmer) scores only those. Or HMMER scores every model, with
-`--engine hmmsearch`. It gives the domain rows with alignments
+candidate models, and HMMER (pyhmmer) scores only those. Or nail's seeds are the candidates, with
+`--engine nail`, or HMMER scores every model, with `--engine hmmsearch`. It gives the domain rows with alignments
 that `lookup-index` builds from, and a label table (protein, model) for any collection.
 
 ```text
@@ -11,6 +11,7 @@ PLAN           ids of the targets -> ranges.tsv, protein_id ranges of ~--chunk_p
 FASTA          per range: the sequences                                                   (pfam-reannotate's)
 SEARCH         per range: filter join | annotate.py search -> domains/ and labels/
                (--engine hmmsearch: annotate.py search --all-pairs, no index)
+NAIL_SEED      per range, with --engine nail: its seeds, for SEARCH; NAIL_MEMBERS, the same of the members
 MEMBER_PAIRS   with --members: the models each representative nearly passes -> its members' pairs, by member id
 MEMBER_FASTA   per --member_width ids: those members' sequences and pairs
 MEMBER_SEARCH  per --member_width ids: HMMER on the pairs -> domains/ and labels/
@@ -59,19 +60,22 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--hmm` | | The collection: one HMM file, plain or gzipped |
-| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `hmmsearch`: HMMER on every model |
+| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `nail`: its seeds (an MMseqs2 profile search), then HMMER on those; `hmmsearch`: HMMER on every model |
 | `--cutoff` | `gathering` | The HMM file's own thresholds: `gathering`, `trusted` or `noise` |
 | `--thresholds` | | Or a TSV with a header: model, threshold, `full` or `domain`. KOfam's `ko_list` as it is |
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |
 | `--members` | `false` | With `--targets reps`: their members too, so every protein. A member (90% identity) is searched with HMMER against only the models its representative passes to within `--member_slack` (8) bits |
-| `--member_filter` | `false` | With `--members`: kfpfam's prefilter on every member as well, and HMMER on the models of either |
+| `--member_filter` | | With `--members`: `kfpfam` or `nail` on every member as well, and HMMER on the models of either |
 | `--min_cluster` | `1` | With `--member_filter`: `--engine` has the representatives of clusters this size or more only. The prefilter has the whole of the others, whose members get no candidates from their representative |
 | `--sample` | `1000` | 1 in N targets by `protein_id`; with `--members`, 1 in N clusters |
 | `--check_sample` | `0` | 1 in N of those also against every model, without the prefilter; `0`: none |
 | `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.2 |
 | `--domains` | `true` | Write the domain rows; labels are always written |
 | `--weak_evalue` | `0` | Also domains under the thresholds, at this E-value (Z = 10⁶); `0`: none |
-| `--chunk_proteins` | `500000` | Proteins per `SEARCH` task |
+| `--chunk_proteins` | `1000000` | Proteins per `SEARCH` task, the same for every engine so that they share FASTAs |
+| `--nail_seed_pvalue` | `0.01` | nail's `-S`, as the B11 arm's; nail's own default is 1e-4 |
+| `--nail_proteins` | `1250000` | Proteins nail has at a time, over a chunk's most; a member task's (10 M) are split |
+| `--nail_sif` | nail 0.7.1's biocontainer | nail's image, with MMseqs2 18. 0.8.0 writes its seeds differently |
 | `--kfpfam_sif` | | kfpfam's image |
 | `--kfpfam_mode` | `top` | `top`: as near every domain as it goes; `fast`: gapped bars per model from its threshold, 99.8% of domains. Settings: `kfpfam_modes` in `nextflow.config` |
 | `--kfpfam_band`, `_diagonals` | 15, `any` | A band around every diagonal at the bar, until one reaches the gapped bar |
@@ -177,3 +181,29 @@ representatives are 21%, 11% and 2.6% of the residues at `--min_cluster` 1, 2 an
 groups of `mgy_cluster_seqs`, 2026-11-25) 62-74% of clusters are single proteins, and those of 10 or more
 are 4-9% of clusters with 53-71% of the proteins. Estimated for the release at 38.2 and laptop speed, against 63,600 core-h: about 21,000 at
 `--min_cluster` 1, 12,000 at 2 and 9,500 at 10.
+
+nail 0.7.1 and MMseqs2 18, the same 49,998 proteins and 7,534 models, 4 threads, in one task (`bench.py`):
+
+| | domains missed, of 21,258 | CPU-s, seeds or filter + HMMER | against `hmmsearch` |
+| --- | ---: | ---: | ---: |
+| `hmmsearch` | 0 | 357 | 1 |
+| `kfpfam`, `top` | 1 (0.005%) | 139 + 103 | 1.5× |
+| `kfpfam`, `fast` | 255 (1.2%) | 18 + 22 | 8.9× |
+| `nail`, `-S 0.01` | 928 (4.4%) | 164 + 29 | 1.8× |
+| `nail`, `-S 1e-4` | 963 (4.5%) | 107 + 14 | 3.0× |
+| `nail` on representatives, HMMER on members | 915 (4.3%) | 117 + 15 | 2.7× |
+| `hmmsearch` on representatives, `--member_filter nail` | 1 | 135 + 100 | 1.5× |
+| the same, `--min_cluster 10` | 285 (1.3%) | 161 + 39 | 1.8× |
+
+Every domain nail misses is of a pair it did not seed; the families missed most are hEGF (PF12661, 251 of 1,907), PF14306
+(216 of 3,331), PF09393 and EGF. Every pair it does seed gives `hmmsearch`'s domains.
+
+Why 1 M proteins a task (measured at 1,000, 20,000 and 80,000 proteins and half the models):
+- nail spends about 65-100 CPU-s on 7,534 models whatever the proteins, so some 460-700 on 39.0's 53,275,
+  and then about 2 ms a protein (14 at 39.0). So start-up is 3-5% of a task's CPU at 1 M proteins, 25-40%
+  at 100,000. The table above is of one task of 50,000, where start-up is nearly half: nail should
+  be faster against `hmmsearch` at 1 M (estimate: 2.5-3×).
+- its temporary files are 8 KB a protein, so about 55 GB a task at 39.0 (estimate), in the task's directory and
+  removed as it ends; its memory is 0.7 GB and 3 MB per 1,000 proteins, so some 10 GB with the seeds
+  (estimate; it asks for 32). At 2.7 KB of seeds a protein, 1 M is 3 GB, less gzipped; all of the release's would
+  be about 2 TB in `work/`.
