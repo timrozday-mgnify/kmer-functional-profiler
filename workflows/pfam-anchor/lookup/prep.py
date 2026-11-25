@@ -3,6 +3,8 @@
   prep.py targets   MGnify90 slice -> hmmsearch of every member -> domains.parquet (GA and weak)
   prep.py queries   real (B11 Parquets), simulated (windows of members) and Zymo (genome genes)
   prep.py pack      -> bin/ for the Rust prototype
+  prep.py member-seqs   after pack --members: each member row's domain and FLANK residues either
+                        side, its protein, and each query's source protein, for scan's MEMBERS pass
 
 Targets are the 630,402 MGnify90 clusters of results-hpc/tree-index-slice: every cluster holding a
 protein that the release annotates with one of 40 Pfam families, so those families are complete.
@@ -285,6 +287,75 @@ def rows_of(d: pl.DataFrame, lengths: dict[int, int], f_rows, f_pos) -> None:
         f_pos.write(pos.tobytes())
 
 
+FLANK = 10  # residues either side of a domain, as a self-contained index holds (ANNOTATION.md)
+
+
+def member_rows(d: pl.DataFrame) -> pl.DataFrame:
+    """The members arm: distinct GA rows per cluster (same residues, same start column), pack's
+    order. A row shared by several members keeps the first protein's coordinates."""
+    return (
+        d.filter("above_ga")
+        .with_columns(
+            key=pl.col("sequence").str.slice(
+                pl.col("ali_from") - 1, pl.col("ali_to") - pl.col("ali_from") + 1
+            )
+        )
+        .unique(
+            ["pfam_accession", "cluster_rep", "key", "hmm_from"], keep="first", maintain_order=True
+        )
+        .drop("key")
+    )
+
+
+def pack_inputs() -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Every member with its cluster and sequence; and every domain joined to it, pack's order."""
+    members = pl.read_parquet(
+        SLICE / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
+    )
+    d = (
+        pl.read_parquet(OUT / "domains.parquet")
+        .join(members, on="protein_id")
+        .sort("pfam_accession", "cluster_rep", "protein_id", "domain")
+    )
+    return members, d
+
+
+def member_seqs(a: argparse.Namespace) -> None:
+    """bin/members.{seq,off,base,prot,rep} and bin/q.prot. A row's residues run from FLANK before
+    its first match column to FLANK after its last; base is the protein position of the first, so a
+    row's positions (members.pos) less base index its residues. prot is the protein a row was
+    taken from, for leaving a simulated read's own protein out; q.prot is -1 for real reads."""
+    b = OUT / "bin"
+    members, d = pack_inputs()
+    x = member_rows(d)
+    reps = members.filter(pl.col("protein_id") == pl.col("cluster_rep")).sort("cluster_rep")
+    unit_of = {u: i for i, u in enumerate(reps["cluster_rep"].to_list())}
+    unit = np.array([unit_of[u] for u in x["cluster_rep"]], np.uint32)
+    assert np.array_equal(unit, np.fromfile(b / "members.unit", "<u4")), "not pack's members order"
+    # span of the match columns on the protein, from the CIGAR: ali_from .. ali_to, inserts included
+    x = x.with_columns(
+        lo=(pl.col("ali_from") - 1 - FLANK).clip(lower_bound=0),
+        hi=pl.min_horizontal(pl.col("ali_to") + FLANK, pl.col("sequence").str.len_bytes()),
+    )
+    seqs = [
+        CODE[np.frombuffer(s[lo:hi].encode(), np.uint8)]
+        for s, lo, hi in x.select("sequence", "lo", "hi").iter_rows()
+    ]
+    (b / "members.off").write_bytes(
+        np.concatenate([[0], np.cumsum([len(s) for s in seqs])]).astype("<u8").tobytes()
+    )
+    (b / "members.seq").write_bytes(np.concatenate(seqs).tobytes())
+    (b / "members.base").write_bytes(x["lo"].to_numpy().astype("<u4").tobytes())
+    (b / "members.prot").write_bytes(x["protein_id"].to_numpy().astype("<i8").tobytes())
+    # the representative's own rows are in the members arm too: the scan has them already
+    rep = (x["protein_id"] == x["cluster_rep"]).cast(pl.UInt8)
+    (b / "members.rep").write_bytes(rep.to_numpy().tobytes())
+    q = pl.read_parquet(OUT / "queries.parquet").sort("qid")
+    src = q.select(pl.when(pl.col("set") == "sim").then(pl.col("source")).otherwise(-1))
+    (b / "q.prot").write_bytes(src.to_series().to_numpy().astype("<i8").tobytes())
+    print(f"{x.height} member rows, {sum(len(s) for s in seqs) / 1e6:.0f} M residues")
+
+
 def pack_queries(q: pl.DataFrame, b: Path, fams: list[int], lengths: dict[int, int]) -> None:
     fam_index = {f: i for i, f in enumerate(fams)}
     (b / "q.fam").write_bytes(
@@ -306,9 +377,7 @@ def pack(a: argparse.Namespace) -> None:
     b.mkdir(exist_ok=True)
     lengths = hmm_lengths()
     fams = sorted(lengths)
-    members = pl.read_parquet(
-        SLICE / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
-    )
+    members, d = pack_inputs()
     reps = members.filter(pl.col("protein_id") == pl.col("cluster_rep")).sort("cluster_rep")
     unit_of = {u: i for i, u in enumerate(reps["cluster_rep"].to_list())}
     offsets = np.concatenate([[0], np.cumsum(reps["sequence"].str.len_bytes().to_numpy())]).astype(
@@ -320,29 +389,12 @@ def pack(a: argparse.Namespace) -> None:
             f.write(CODE[np.frombuffer(s.encode(), np.uint8)].tobytes())
     pl.DataFrame({"unit": reps["cluster_rep"]}).write_parquet(b / "units.parquet")
 
-    domains = pl.read_parquet(OUT / "domains.parquet")
     meta = {"families": fams, "lengths": [lengths[f] for f in fams], "units": reps.height}
     # reps: each representative's domains, GA and weak. members: distinct rows of every member, per
     # unit
-    d = domains.join(members, on="protein_id").sort(
-        "pfam_accession", "cluster_rep", "protein_id", "domain"
-    )
     arms = {"reps": d.filter(pl.col("protein_id") == pl.col("cluster_rep"))}
     if a.members:
-        arms["members"] = (
-            d.filter("above_ga")
-            .with_columns(
-                key=pl.col("sequence").str.slice(
-                    pl.col("ali_from") - 1, pl.col("ali_to") - pl.col("ali_from") + 1
-                )
-            )
-            .unique(
-                ["pfam_accession", "cluster_rep", "key", "hmm_from"],
-                keep="first",
-                maintain_order=True,
-            )
-            .drop("key")
-        )
+        arms["members"] = member_rows(d)
     for arm, x in arms.items():
         n_rows = []
         with open(b / f"{arm}.rows", "wb") as f1, open(b / f"{arm}.pos", "wb") as f2:
@@ -397,12 +449,13 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("step", choices=["targets", "queries", "pack"])
+    p.add_argument("step", choices=["targets", "queries", "pack", "member-seqs"])
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--members", action="store_true", help="pack every member's rows too")
     a = p.parse_args()
     prepare.watchdog(8)
-    {"targets": targets, "queries": queries, "pack": pack}[a.step](a)
+    steps = {"targets": targets, "queries": queries, "pack": pack, "member-seqs": member_seqs}
+    steps[a.step](a)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 //! The self-contained index: `rows.bin`, a block per family, read one family at a time.
 //!
-//! Block: "KFAB", acc u32, columns u32, rows u32, schemes u32, then five lengths u64, then
-//!   bits      columns x 20 bytes: quarter bits of a residue at a column, from the family's rows before collapsing
+//! Block (format 2): "KFAB", acc u32, columns u32, rows u32, schemes u32, members u32, then six lengths u64, then
+//!   bits      columns x 20 bytes: quarter bits of a residue at a column, from the representatives' rows before collapsing
 //!   heads     rows x 10: accession 5 bytes, hmm_from u16, sequence length u16, flanks (left << 4 | right)
 //!   labels    schemes x rows u16: 0 is unlabelled
 //!   ops       the rows' CIGARs, one after another: op << 6 | length - 1, with lengths over 62 as 63 and a u16; 0xFF ends a row
 //!   seq       the rows' residues, flanks included, 5 bits each, each row from a whole byte
+//!   clusters  members x 5 bytes: the last `members` rows are members of other proteins' clusters, sorted by cluster;
+//!             this is each one's representative. The first stage scans representatives only; the members of the
+//!             clusters it keeps join the column and banded stages (scan.rs, MEMBERS).
 //! All little-endian. Accessions fit 5 bytes: 1.1e12.
 use crate::cand::hash;
 use crate::data::*;
@@ -19,6 +22,7 @@ use std::sync::Mutex;
 
 const MAGIC: &[u8; 4] = b"KFAB";
 const HEAD: usize = 10;
+const TOP: usize = 24 + 6 * 8; // the block's fixed header
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Row {
@@ -29,8 +33,13 @@ pub struct Row {
     pub ops: Vec<(u8, u16)>, // 0 M, 1 I, 2 D
     pub seq: Vec<u8>,
     pub labels: Vec<u16>,
+    pub cluster: u64, // a member's representative; 0 for a representative
 }
 impl Row {
+    /// The cluster the row stands for.
+    pub fn unit(&self) -> u64 {
+        if self.cluster == 0 { self.acc } else { self.cluster }
+    }
     /// Residues on the model's columns, and each one's position in `seq` (u16::MAX: none).
     pub fn columns(&self, len: usize) -> Result<(Vec<u8>, Vec<u16>), String> {
         let (mut codes, mut pos) = (vec![NONE; len], vec![u16::MAX; len]);
@@ -142,6 +151,7 @@ impl<R: Read> In<R> {
         for _ in 0..schemes {
             r.labels.push(self.u16()?);
         }
+        r.cluster = u64::from_le_bytes(self.n()?);
         Some(r)
     }
 }
@@ -168,8 +178,12 @@ fn collapse(cols: &[Vec<u8>], rows: &[Row], t: f32) -> Vec<usize> {
     v
 }
 
+/// `rows`: representatives, then members sorted by cluster.
 fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec<u8> {
-    let (mut heads, mut labels, mut ops, mut seq) = (vec![], vec![], vec![], vec![]);
+    let (mut heads, mut labels, mut ops, mut seq, mut clusters) = (vec![], vec![], vec![], vec![], vec![]);
+    let members = rows.iter().filter(|r| r.cluster > 0).count();
+    assert!(rows[..rows.len() - members].iter().all(|r| r.cluster == 0), "members must come last");
+    assert!(rows[rows.len() - members..].is_sorted_by_key(|r| r.cluster), "members must be sorted by cluster");
     for r in rows {
         assert!(r.left < 16 && r.right < 16 && r.acc < 1 << 40 && r.seq.len() < 65536);
         heads.extend_from_slice(&r.acc.to_le_bytes()[..5]);
@@ -178,15 +192,19 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
         heads.push(r.left << 4 | r.right);
         pack_ops(&r.ops, &mut ops);
         pack5(&r.seq, &mut seq);
+        if r.cluster > 0 {
+            assert!(r.cluster < 1 << 40);
+            clusters.extend_from_slice(&r.cluster.to_le_bytes()[..5]);
+        }
     }
     for s in 0..schemes {
         rows.iter().for_each(|r| labels.extend_from_slice(&r.labels[s].to_le_bytes()));
     }
     let mut o = MAGIC.to_vec();
-    for x in [acc, len as u32, rows.len() as u32, schemes as u32] {
+    for x in [acc, len as u32, rows.len() as u32, schemes as u32, members as u32] {
         o.extend_from_slice(&x.to_le_bytes());
     }
-    let parts: [&[u8]; 5] = [bits, &heads, &labels, &ops, &seq];
+    let parts: [&[u8]; 6] = [bits, &heads, &labels, &ops, &seq, &clusters];
     parts.iter().for_each(|p| o.extend_from_slice(&(p.len() as u64).to_le_bytes()));
     parts.iter().for_each(|p| o.extend_from_slice(p));
     o
@@ -195,20 +213,22 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
 pub struct Block {
     pub acc: u32,
     pub len: usize,
+    pub reps: usize, // rows[..reps] are representatives, rows[reps..] members
     pub bits: Vec<u8>,
     pub rows: Vec<Row>,
 }
 pub fn read_block(b: &[u8]) -> Result<Block, String> {
     let u = |at: usize| -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) };
-    if b.len() < 60 || &b[..4] != MAGIC {
+    if b.len() < TOP || &b[..4] != MAGIC {
         return Err("not a block".into());
     }
-    let (acc, len, n, schemes) = (u(4), u(8) as usize, u(12) as usize, u(16) as usize);
-    let sizes: Vec<usize> = (0..5).map(|i| u64::from_le_bytes(b[20 + 8 * i..28 + 8 * i].try_into().unwrap()) as usize).collect();
-    if 60 + sizes.iter().sum::<usize>() != b.len() || sizes[0] != 20 * len || sizes[1] != HEAD * n || sizes[2] != 2 * n * schemes {
+    let (acc, len, n, schemes, members) = (u(4), u(8) as usize, u(12) as usize, u(16) as usize, u(20) as usize);
+    let sizes: Vec<usize> = (0..6).map(|i| u64::from_le_bytes(b[24 + 8 * i..32 + 8 * i].try_into().unwrap()) as usize).collect();
+    if TOP + sizes.iter().sum::<usize>() != b.len() || sizes[0] != 20 * len || sizes[1] != HEAD * n || sizes[2] != 2 * n * schemes
+        || members > n || sizes[5] != 5 * members {
         return Err(format!("PF{acc:05}: the block's sizes do not add up"));
     }
-    let mut at = 60;
+    let mut at = TOP;
     let part: Vec<&[u8]> = sizes.iter().map(|&s| { at += s; &b[at - s..at] }).collect();
     let (mut rows, mut o, mut q) = (Vec::with_capacity(n), 0, 0);
     for i in 0..n {
@@ -224,16 +244,20 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
             ops: unpack_ops(part[3], &mut o).ok_or("short CIGARs")?,
             seq: unpack5(bytes, sl),
             labels: (0..schemes).map(|s| { let x = 2 * (s * n + i); u16::from_le_bytes([part[2][x], part[2][x + 1]]) }).collect(),
+            cluster: match i.checked_sub(n - members) {
+                Some(j) => part[5][5 * j..5 * j + 5].iter().rev().fold(0, |a, &x| a << 8 | x as u64),
+                None => 0,
+            },
         });
     }
     if o != part[3].len() || q != part[4].len() {
         return Err(format!("PF{acc:05}: bytes left over"));
     }
-    Ok(Block { acc, len, bits: part[0].to_vec(), rows })
+    Ok(Block { acc, len, reps: n - members, bits: part[0].to_vec(), rows })
 }
 
 /// bundle-build OUT_DIR T < stream: (acc u32, columns u32, rows u32, schemes u32, rows...)*. Writes rows.bin and families.tsv
-/// (accession, columns, rows, rows before collapsing, offset, bytes).
+/// (accession, columns, representative rows, before collapsing, offset, bytes, member rows, members left out).
 pub fn build(out: &Path, t: f32) {
     let mut f = std::io::BufWriter::with_capacity(1 << 20, File::create(out.join("rows.bin")).unwrap());
     let mut i = In(std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock()));
@@ -242,7 +266,9 @@ pub fn build(out: &Path, t: f32) {
         let (len, n, schemes) = (i.u32().unwrap() as usize, i.u32().unwrap() as usize, i.u32().unwrap() as usize);
         assert!(acc > last, "families out of order");
         last = acc;
-        let rows: Vec<Row> = (0..n).map(|_| i.row(schemes).expect("the stream ends inside a family")).collect();
+        let all: Vec<Row> = (0..n).map(|_| i.row(schemes).expect("the stream ends inside a family")).collect();
+        let (rows, mut members): (Vec<Row>, Vec<Row>) = all.into_iter().partition(|r| r.cluster == 0);
+        assert!(members.is_empty() || t <= 0.0, "members are only kept uncollapsed (collapse 0)");
         let cols: Vec<Vec<u8>> = rows.iter().map(|r| r.columns(len).unwrap_or_else(|e| panic!("PF{acc:05} {e}")).0).collect();
         let mut count = vec![[0u32; AA]; len];
         cols.iter().for_each(|x| x.iter().enumerate().for_each(|(c, &a)| count[c][a as usize] += 1));
@@ -254,10 +280,19 @@ pub fn build(out: &Path, t: f32) {
                 bits[20 * c + a] = (-4.0 * p.log2()).round().clamp(0.0, 255.0) as u8;
             }
         }
-        let kept: Vec<Row> = collapse(&cols, &rows, t).into_iter().map(|k| rows[k].clone()).collect();
+        let mut kept: Vec<Row> = collapse(&cols, &rows, t).into_iter().map(|k| rows[k].clone()).collect();
+        // a member whose representative has no row in the family is never reached: left out
+        let mut reps: Vec<u64> = kept.iter().map(|r| r.acc).collect();
+        reps.sort_unstable();
+        let before = members.len();
+        members.retain(|r| reps.binary_search(&r.cluster).is_ok());
+        members.iter().for_each(|r| { r.columns(len).unwrap_or_else(|e| panic!("PF{acc:05} {e}")); });
+        members.sort_by_key(|r| r.cluster);
+        let (nr, nm) = (kept.len(), members.len());
+        kept.append(&mut members);
         let b = block(acc, len, schemes, &kept, &bits);
         f.write_all(&b).unwrap();
-        writeln!(tsv, "{acc}\t{len}\t{}\t{n}\t{at}\t{}", kept.len(), b.len()).unwrap();
+        writeln!(tsv, "{acc}\t{len}\t{nr}\t{}\t{at}\t{}\t{nm}\t{}", rows.len(), b.len(), before - nm).unwrap();
         at += b.len() as u64;
     }
     f.flush().unwrap();
@@ -265,7 +300,8 @@ pub fn build(out: &Path, t: f32) {
 }
 
 /// bundle-query DIR QUERIES OUT K SECOND: QUERIES is the same stream with no schemes, a row's accession being the query's id.
-/// OUT: qid, score, self score, tied rows, accession of the first, then each scheme's commonest label among the tied.
+/// OUT: qid, score, self score, tied clusters, accession of the first, then each scheme's commonest label among the tied rows.
+/// A cluster is named by its representative's accession, also when a member's row scored best.
 pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, threads: usize) {
     let index: Vec<Vec<u64>> = std::fs::read_to_string(dir.join("families.tsv")).unwrap().lines()
         .map(|l| l.split('\t').map(|x| x.parse().unwrap()).collect()).collect();
@@ -287,10 +323,11 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
         let bk = read_block(&b).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((bk.acc, bk.len), (acc, len));
         drop(b);
-        let nr = bk.rows.len();
+        let nr = bk.reps; // the first stage sees representatives only
         let rc: Vec<(Vec<u8>, Vec<u16>)> = bk.rows.iter().map(|r| r.columns(len).unwrap()).collect();
+        let mclusters: Vec<u64> = bk.rows[nr..].iter().map(|r| r.cluster).collect();
         let mut m = vec![NONE; nr * len];
-        rc.iter().enumerate().for_each(|(r, x)| x.0.iter().enumerate().for_each(|(c, &a)| m[c * nr + r] = a));
+        rc[..nr].iter().enumerate().for_each(|(r, x)| x.0.iter().enumerate().for_each(|(c, &a)| m[c * nr + r] = a));
         let t2 = std::time::Instant::now();
         let lines = Mutex::new(vec![]);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -304,7 +341,17 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
                     .map(|&c| (&m[c * nr..(c + 1) * nr], row[c], bk.bits[20 * c + row[c] as usize] as u16)).collect();
                 score_rows(&cw, &mut s);
                 let lo = bar(&s, k.min(nr));
-                let mut v: Vec<(i16, usize)> = (0..nr).filter(|&r| s[r] >= lo).map(|r| {
+                let mut keep: Vec<usize> = (0..nr).filter(|&r| s[r] >= lo).collect();
+                if !mclusters.is_empty() {
+                    let mut us: Vec<u64> = keep.iter().map(|&r| bk.rows[r].acc).collect();
+                    us.sort_unstable();
+                    us.dedup();
+                    for u in us {
+                        let (a, e) = (mclusters.partition_point(|&x| x < u), mclusters.partition_point(|&x| x <= u));
+                        keep.extend(nr + a..nr + e);
+                    }
+                }
+                let mut v: Vec<(i16, usize)> = keep.into_iter().map(|r| {
                     let x = &rc[r].0;
                     (kadane(cols.iter().map(|&c| if x[c] < 21 { bl[row[c] as usize][x[c] as usize] } else { -4 })), r)
                 }).collect();
@@ -327,8 +374,10 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
                     }
                 }
                 let own: i32 = q.seq.iter().filter(|&&a| a < 20).map(|&a| bl[a as usize][a as usize] as i32).sum();
-                best.1.sort_unstable_by_key(|&r| hash(bk.rows[r].acc)); // the accession named is any of the tied, always the same
-                let mut l = format!("{}\t{}\t{own}\t{}\t{}", q.acc, best.0, best.1.len(), best.1.first().map_or(0, |&r| bk.rows[r].acc));
+                let mut tied: Vec<u64> = best.1.iter().map(|&r| bk.rows[r].unit()).collect();
+                tied.sort_unstable_by_key(|&u| (hash(u), u)); // the cluster named is any of the tied, always the same
+                tied.dedup();
+                let mut l = format!("{}\t{}\t{own}\t{}\t{}", q.acc, best.0, tied.len(), tied.first().map_or(0, |&u| u));
                 for sch in 0..bk.rows.first().map_or(0, |r| r.labels.len()) {
                     let mut c: std::collections::BTreeMap<u16, usize> = Default::default();
                     best.1.iter().for_each(|&r| *c.entry(bk.rows[r].labels[sch]).or_default() += 1);
@@ -360,7 +409,9 @@ mod tests {
             let ops = vec![(0, long), (1, 3), (0, 5), (2, 64), (0, 63), (0, 62)];
             let (left, right) = ((i % 11) as u8, (i % 4) as u8);
             let n = left as usize + long as usize + 3 + 5 + 63 + 62 + right as usize;
-            Row { acc: i * 21_000_000_003, hmm_from: 1 + (i % 5) as u16, left, right, ops, labels: vec![i as u16, 65535 - i as u16],
+            // the last 10 are members of rows 1-10's clusters
+            let cluster = if i >= 40 { (i - 39) * 21_000_000_003 } else { 0 };
+            Row { acc: i * 21_000_000_003, hmm_from: 1 + (i % 5) as u16, left, right, ops, labels: vec![i as u16, 65535 - i as u16], cluster,
                   seq: (0..n as u64).map(|k| (hash(i * 1000 + k) % 21) as u8).collect() }
         }).collect()
     }
@@ -369,10 +420,20 @@ mod tests {
         let (r, bits) = (rows(), vec![7u8; 20 * 400]);
         let mut b = block(44, 400, 2, &r, &bits);
         let x = read_block(&b).unwrap();
-        assert_eq!((x.acc, x.len, x.bits, x.rows), (44, 400, bits, r));
+        assert_eq!((x.acc, x.len, &x.bits, &x.rows), (44, 400, &bits, &r));
         assert!(read_block(&b[..b.len() - 1]).is_err(), "a cut block must not pass");
         b[16] = 1;
         assert!(read_block(&b).is_err(), "nor a wrong number of schemes");
+        assert_eq!(x.reps, 40);
+        assert_eq!(r[45].unit(), r[6].acc);
+        assert_eq!(r[5].unit(), r[5].acc);
+    }
+    #[test]
+    #[should_panic(expected = "members must come last")]
+    fn members_last() {
+        let mut r = rows();
+        r.swap(0, 45);
+        block(44, 400, 2, &r, &[7u8; 20 * 400]);
     }
     #[test]
     fn columns_are_checked() {
@@ -383,7 +444,7 @@ mod tests {
     }
     #[test]
     fn collapse_keeps_labels_apart() {
-        let r = rows().remove(0);
+        let r = rows().remove(1);
         let other = Row { labels: vec![9, 9], ..r.clone() };
         let v = vec![r.clone(), r, other];
         let c: Vec<Vec<u8>> = v.iter().map(|x| x.columns(400).unwrap().0).collect();

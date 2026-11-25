@@ -1,5 +1,6 @@
 """The bundle against the prototype scan: same rows, no collapsing, so the same calls. Fails if any
-differ."""
+differ. MEMBERS=1: a bundle with members (--clusters) against scan MEMBERS=1, on real reads only,
+as the scan leaves a simulated read's own protein out and the bundle cannot."""
 
 import os
 import subprocess
@@ -12,17 +13,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bundle import LOOKUP  # noqa: E402
 from prep import OUT, SLICE  # noqa: E402
 
-B = OUT / "bundle_check"
+MEMBERS = os.environ.get("MEMBERS") == "1"
+B = OUT / ("bundle_check_members" if MEMBERS else "bundle_check")
 subprocess.run(["rm", "-rf", B], check=True)
 B.mkdir()
-m = pl.read_parquet(
-    SLICE / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"]
-).filter(pl.col("protein_id") == pl.col("cluster_rep"))
+m = pl.read_parquet(SLICE / "members.parquet", columns=["protein_id", "cluster_rep", "sequence"])
+if MEMBERS:
+    m.select("protein_id", "cluster_rep").write_parquet(B / "clusters.parquet")
+else:
+    m = m.filter(pl.col("protein_id") == pl.col("cluster_rep"))
 m.select("protein_id", "sequence").write_parquet(B / "seqs.parquet")
 pl.read_parquet(OUT / "domains.parquet").join(
     m.select("protein_id"), on="protein_id", how="semi"
 ).write_parquet(B / "hits.parquet")
 q = pl.read_parquet(OUT / "queries.parquet").sort("qid")
+if MEMBERS:
+    q = q.filter(pl.col("set") == "real")
 
 
 # the prototype's queries in the pipeline's schema: a simulated read's CIGAR starts inside its
@@ -68,6 +74,7 @@ subprocess.run(
         B / "b",
         "--collapse",
         "0",
+        *(["--clusters", B / "clusters.parquet"] if MEMBERS else []),
     ],
     check=True,
 )
@@ -90,7 +97,7 @@ subprocess.run(
 subprocess.run(
     [LOOKUP, "scan", OUT / "bin", B / "scan.tsv", "2000:1000"],
     check=True,
-    env={**os.environ, "FLANK": "10", "THREADS": "4"},
+    env={**os.environ, "FLANK": "10", "THREADS": "4", "MEMBERS": "1" if MEMBERS else "0"},
     stderr=subprocess.DEVNULL,
 )
 s = pl.read_csv(B / "scan.tsv", separator="\t", schema_overrides={"units": pl.String}).select(

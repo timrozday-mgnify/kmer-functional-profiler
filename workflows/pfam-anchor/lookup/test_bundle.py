@@ -236,4 +236,91 @@ with tempfile.TemporaryDirectory() as tmp:
         ok=False,
         says="missing, or not",
     )
+
+    # members: a read of member 102 of cluster 101, whose representative is far from it while
+    # cluster 201's is near. Representatives alone call 201; with members, 101. Member 103 is
+    # the same row as 102 (kept once); 302's representative has no row here (left out).
+    x = rand(80)
+    mut = lambda s, p: "".join(c if rng.random() > p else rng.choice(list(AA)) for c in s)  # noqa: E731
+    doms = {101: mut(x, 0.5), 102: x, 103: x, 201: mut(x, 0.15), 302: mut(x, 0.3)}
+    cluster = {101: 101, 102: 101, 103: 101, 201: 201, 302: 301}
+    flank = rand(12)
+    pl.DataFrame(
+        [(i, 11, 1, 13, 92, "80M", True) for i in doms],
+        orient="row",
+        schema=[
+            "protein_id",
+            "pfam_accession",
+            "hmm_from",
+            "ali_from",
+            "ali_to",
+            "cigar",
+            "above_ga",
+        ],
+    ).write_parquet(d / "mh.parquet")
+    pl.DataFrame(
+        [(i, flank + s + flank) for i, s in doms.items()] + [(301, rand(100))],
+        orient="row",
+        schema=["protein_id", "sequence"],
+    ).write_parquet(d / "ms.parquet")
+    pl.DataFrame(
+        list(cluster.items()) + [(301, 301)], orient="row", schema=["protein_id", "cluster_rep"]
+    ).write_parquet(d / "mc.parquet")
+    (d / "mko.tsv").write_text("102\tK00102\n103\tK00102\n")
+    (d / "mm.hmm").write_text("ACC   PF00011.1\nLENG  80\n//\n")
+    margs = [
+        "--hits",
+        d / "mh.parquet",
+        "--seqs",
+        d / "ms.parquet",
+        "--hmm",
+        d / "mm.hmm",
+        "--label",
+        f"ko={d / 'mko.tsv'}",
+    ]
+    run(
+        "build",
+        *margs,
+        "--clusters",
+        d / "mc.parquet",
+        "--out",
+        d / "bm",
+        ok=False,
+        says="--collapse 0",
+    )
+    run("build", *margs, "--clusters", d / "mc.parquet", "--collapse", "0", "--out", d / "bm")
+    # representatives only, as an index without members holds them
+    reps = [k for k, v in cluster.items() if k == v]
+    pl.read_parquet(d / "mh.parquet").filter(pl.col("protein_id").is_in(reps)).write_parquet(
+        d / "mr.parquet"
+    )
+    run(
+        "build",
+        *[d / "mr.parquet" if x == d / "mh.parquet" else x for x in margs],
+        "--collapse",
+        "0",
+        "--out",
+        d / "br",
+    )
+    m = json.loads((d / "bm/manifest.json").read_text())
+    assert (m["rows"], m["member_rows"], m["member_rows_unreached"]) == (2, 1, 1), m
+    pl.DataFrame(
+        [("m", "PF00011", 6, "50M", x[5:55])],
+        orient="row",
+        schema=["read", "pfam", "hmm_from", "cigar", "residues"],
+    ).write_parquet(d / "mx.parquet")
+    for b, want, ko in (("bm", "MGYP000000000101", "K00102"), ("br", "MGYP000000000201", None)):
+        run(
+            "profile",
+            "--bundle",
+            d / b,
+            "--parquet",
+            d / "mx.parquet",
+            "--out",
+            d / "mp",
+            "--hmm",
+            d / "mm.hmm",
+        )
+        r = pl.read_parquet(d / "mp.reads.parquet").row(0, named=True)
+        assert (r["protein"], r["ko"], r["ties"]) == (want, ko, 1), (b, r)
 print("all bundle tests pass")

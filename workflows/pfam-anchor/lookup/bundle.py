@@ -1,31 +1,35 @@
 """The self-contained annotated index: build it, check it, and profile a sample with it.
 
-  bundle.py build   --hits H.parquet --seqs S.parquet --hmm Pfam-A.hmm --out DIR [--label ko=KO.tsv
-      ...] [--collapse 0.7]
+  bundle.py build   --hits H.parquet --seqs S.parquet --hmm Pfam-A.hmm --out DIR
+                    [--label ko=KO.tsv ...] [--collapse 0.7 | --clusters C.parquet --collapse 0]
                     [--kfpfam-index X.tidx --kfpfam-prep DIR] [--mgnify 2026_07] [--pfam 37.4]
   bundle.py verify  DIR            every file's SHA-256
-  bundle.py profile --bundle DIR --parquet SAMPLE_pfam_alignments.parquet... --out PREFIX [--floor
-      0.4] [--hmm Pfam-A.hmm]
+  bundle.py profile --bundle DIR --parquet SAMPLE_pfam_alignments.parquet... --out PREFIX
+                    [--floor 0.4] [--hmm Pfam-A.hmm]
 
 A bundle:
   manifest.json   format, releases, flank, collapse, schemes, and each file's bytes and SHA-256
   rows.bin        residues, alignments and labels, a block per family (rs/src/bundle.rs)
   families.tsv    where each family's block is
-  labels.<scheme>.txt   label names, by number (1 on; 0 is unlabelled). A protein's several labels
-  are one name, joined by +
-  hmm/Pfam-A.hmm, kfpfam/index.tidx, kfpfam/prep/   what kfpfam and HMMER need to align reads to the
-  same models
+  labels.<scheme>.txt   label names, by number (1 on; 0 is unlabelled). A protein's several
+                  labels are one name, joined by +
+  hmm/Pfam-A.hmm, kfpfam/index.tidx, kfpfam/prep/   what kfpfam and HMMER need to align reads
+                  to the same models
 
 H: protein_id, pfam_accession, hmm_from, ali_from, ali_to, cigar, above_ga (pfam-reannotate's
-columns); only GA domains are taken.
-S: protein_id, sequence. Labels: protein_id<TAB>label, several lines a protein if it has several.
-Unlabelled proteins stay in: without
-them, reads of unlabelled proteins go to labelled relatives (ANNOTATION.md).
+columns); only GA domains are taken. S: protein_id, sequence. Labels: protein_id<TAB>label,
+several lines a protein if it has several. Unlabelled proteins stay in: without them, reads of
+unlabelled proteins go to labelled relatives (ANNOTATION.md).
+
+C: protein_id, cluster_rep. With it, H's proteins that are not their cluster's representative
+are members: the first stage scans representatives only, and the members of the clusters it
+keeps join the later stages (REPORT.md, "Members second pass"). A call names a cluster by its
+representative. Members are only kept uncollapsed, as collapsing at 70% would merge each into
+its representative.
 
 profile writes PREFIX.<scheme>.tsv (label, reads, mean similarity), PREFIX.reads.parquet (every
-alignment's call, weak ones too) and
-PREFIX.summary.json. A read counts once a scheme, for its best-scoring alignment; calls under
---floor of the read's own score are dropped.
+alignment's call, weak ones too) and PREFIX.summary.json. A read counts once a scheme, for its
+best-scoring alignment; calls under --floor of the read's own score are dropped.
 """
 
 import argparse
@@ -44,7 +48,7 @@ import pyarrow.parquet as pq
 
 HERE = Path(__file__).resolve().parent
 LOOKUP = Path(os.environ.get("LOOKUP_BIN", HERE / "rs/target/release/lookup"))
-FORMAT = 1
+FORMAT = 2  # 2: members (rs/src/bundle.rs)
 FLANK = 10
 AA = "ACDEFGHIKLMNPQRSTVWY"
 CODE = np.full(256, 20, np.uint8)
@@ -77,6 +81,7 @@ def record(
     cigar: str,
     seq: str,
     labels: tuple[int, ...] = (),
+    cluster: int = 0,
 ) -> bytes:
     ops = cigar_ops(cigar)
     return b"".join(
@@ -86,6 +91,7 @@ def record(
             struct.pack("<H", len(seq)),
             CODE[np.frombuffer(seq.encode(), np.uint8)].tobytes(),
             struct.pack(f"<{len(labels)}H", *labels),
+            struct.pack("<Q", cluster),  # a member's representative; 0 for a representative
         )
     )
 
@@ -115,6 +121,8 @@ def build(a: argparse.Namespace) -> None:
     out = a.out
     if out.exists() and any(out.iterdir()):
         sys.exit(f"{out} is not empty")
+    if a.clusters and a.collapse > 0:
+        sys.exit("--clusters keeps members, which collapsing would merge away: add --collapse 0")
     out.mkdir(parents=True, exist_ok=True)
     lengths = {k: v[0] for k, v in models_of(a.hmm).items()}
     hits = pl.read_parquet(
@@ -163,19 +171,56 @@ def build(a: argparse.Namespace) -> None:
             pl.col(f"l{len(schemes)}").fill_null(0)
         )
         schemes.append(name)
-    d = d.sort("pfam_accession", "protein_id", "ali_from")
     cols = [f"l{i}" for i in range(len(schemes))]
+    if a.clusters:
+        c = pl.read_parquet(a.clusters, columns=["protein_id", "cluster_rep"])
+        d = d.join(c, on="protein_id", how="left")
+        if d["cluster_rep"].null_count():
+            sys.exit(f"{d['cluster_rep'].null_count()} domains have no cluster in {a.clusters}")
+        d = d.with_columns(
+            cluster=pl.when(pl.col("protein_id") == pl.col("cluster_rep"))
+            .then(0)
+            .otherwise(pl.col("cluster_rep"))
+        ).drop("cluster_rep")
+        # a member row only where it differs from the cluster's others: residues, start or labels
+        key = pl.col("sequence").str.slice(
+            pl.col("ali_from") - 1, pl.col("ali_to") - pl.col("ali_from") + 1
+        )
+        members = (
+            d.filter(pl.col("cluster") > 0)
+            .sort("pfam_accession", "cluster", "protein_id", "ali_from")
+            .with_columns(key=key)
+            .unique(
+                ["pfam_accession", "cluster", "key", "hmm_from", *cols],
+                keep="first",
+                maintain_order=True,
+            )
+            .drop("key")
+        )
+        d = pl.concat([d.filter(pl.col("cluster") == 0), members])
+    else:
+        d = d.with_columns(cluster=pl.lit(0, pl.Int64))
+    d = d.sort("pfam_accession", pl.col("cluster") > 0, "cluster", "protein_id", "ali_from")
     p = subprocess.Popen([LOOKUP, "bundle-build", out, str(a.collapse)], stdin=subprocess.PIPE)
     assert p.stdin
     try:
         for (acc,), g in d.group_by("pfam_accession", maintain_order=True):
             p.stdin.write(struct.pack("<IIII", acc, lengths[acc], g.height, len(schemes)))
-            for pid, hf, af, at, cg, seq, *lab in g.select(
-                "protein_id", "hmm_from", "ali_from", "ali_to", "cigar", "sequence", *cols
+            for pid, hf, af, at, cg, seq, cl, *lab in g.select(
+                "protein_id",
+                "hmm_from",
+                "ali_from",
+                "ali_to",
+                "cigar",
+                "sequence",
+                "cluster",
+                *cols,
             ).iter_rows():
                 left, right = min(FLANK, af - 1), min(FLANK, len(seq) - at)
                 p.stdin.write(
-                    record(pid, hf, left, right, cg, seq[af - 1 - left : at + right], tuple(lab))
+                    record(
+                        pid, hf, left, right, cg, seq[af - 1 - left : at + right], tuple(lab), cl
+                    )
                 )
         p.stdin.close()
     except BrokenPipeError:
@@ -208,13 +253,18 @@ def build(a: argparse.Namespace) -> None:
         "families": fams.height,
         "rows": int(fams["column_3"].sum()),
         "rows_before_collapse": int(fams["column_4"].sum()),
+        "member_rows": int(fams["column_7"].sum()),
+        "member_rows_unreached": int(fams["column_8"].sum()),  # their representative has no row
         "files": files,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     b = files["rows.bin"]["bytes"]
+    n = manifest["rows"] + manifest["member_rows"]
     print(
         f"{manifest['rows']} rows of {manifest['rows_before_collapse']} in {fams.height} families, "
-        f"{b / manifest['rows']:.1f} bytes a row, "
+        f"and {manifest['member_rows']} member rows "
+        f"({manifest['member_rows_unreached']} unreached), "
+        f"{b / n:.1f} bytes a row, "
         f"{sum(f['bytes'] for f in files.values()) / 1e9:.2f} GB in all"
     )
 
@@ -366,6 +416,7 @@ def main() -> None:
         b.add_argument(f"--{x}", type=Path, required=True)
     b.add_argument("--label", action="append", default=[], metavar="SCHEME=TSV")
     b.add_argument("--collapse", type=float, default=0.7, help="0 keeps every row")
+    b.add_argument("--clusters", type=Path, help="protein_id, cluster_rep: index members too")
     b.add_argument("--kfpfam-index", type=Path)
     b.add_argument("--kfpfam-prep", type=Path)
     b.add_argument("--mgnify", default="")
