@@ -15,7 +15,7 @@ process PFAM_HMM {
     """
     if [[ ${hmm} == *.gz ]]; then gunzip -c ${hmm} > tmp.hmm; else cp -L ${hmm} tmp.hmm; fi
     mv tmp.hmm Pfam-A.hmm
-    ${params.python} ${projectDir}/reannotate.py ga --hmm Pfam-A.hmm
+    ${params.python} ${moduleDir}/reannotate.py ga --hmm Pfam-A.hmm
     """
 
     stub:
@@ -31,7 +31,7 @@ process PLAN {
 
     script:
     """
-    ${params.python} ${projectDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' plan --release '${params.release}' \\
+    ${params.python} ${moduleDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' plan --release '${params.release}' \\
         --targets ${params.targets} --sample ${params.sample} \\
         --chunk-proteins ${params.chunk_proteins} ${params.plan_args}
     """
@@ -52,7 +52,7 @@ process FASTA {
 
     script:
     """
-    ${params.python} ${projectDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' fasta --release '${params.release}' \\
+    ${params.python} ${moduleDir}/reannotate.py --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' fasta --release '${params.release}' \\
         --targets ${params.targets} --sample ${params.sample} ${arm == 'reversed' ? '--reverse' : ''} \\
         --lo ${lo} --hi ${hi} --proteins ${proteins} --out ${arm}.chunk${chunk}.faa
     """
@@ -101,7 +101,7 @@ process PARSE {
 
     script:
     """
-    ${params.python} ${projectDir}/reannotate.py parse --arm ${arm} --domtbl ${domtbl} --alignments ${alignments} \\
+    ${params.python} ${moduleDir}/reannotate.py parse --arm ${arm} --domtbl ${domtbl} --alignments ${alignments} \\
         ${flag(params.pp) ? '--pp' : ''} --ga ${ga} --counts ${counts} \\
         --out ${arm}.chunk${chunk}.parquet --stats ${arm}.chunk${chunk}.stats.tsv
     """
@@ -121,7 +121,7 @@ process SUMMARY {
     path 'summary.tsv'
 
     script:
-    "${params.python} ${projectDir}/reannotate.py summary ${stats}"
+    "${params.python} ${moduleDir}/reannotate.py summary ${stats}"
 
     stub:
     "touch summary.tsv"
@@ -138,7 +138,7 @@ process COMPARE {
     path 'compare.tsv'
 
     script:
-    "${params.python} ${projectDir}/reannotate.py compare ${hits}"
+    "${params.python} ${moduleDir}/reannotate.py compare ${hits}"
 
     stub:
     "touch compare.tsv"

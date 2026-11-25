@@ -27,6 +27,9 @@ done
 cd kfp-ablations/floor-query-cost && sbatch run.sh
 # Pfam-A re-annotation with hits below GA, 1 in 100 representatives first (plan, phase 6):
 cd kfp-ablations/pfam-reannotate && sbatch run.sh
+# every MGnify protein against Pfam or KOfam (workflows/hmm-annotate), 1 in 1,000 with the check
+# first; its header says what it reads:
+cd kfp-ablations/hmm-annotate && SIF=... COLLECTION=pfam sbatch run.sh
 # MGnify90 residue scan on one very large family (workflows/pfam-anchor/lookup/REPORT.md), any time; its header says what it reads:
 cd kfp-ablations/pfam-anchor-large && FAMILY=5 PARQUETS='...' PFAM=... ./run.sh submit
 # clusters with a Pfam hit (plan, phase 6), any time:
