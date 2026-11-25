@@ -8,7 +8,7 @@
 #SBATCH --export=ALL
 # The MGnify90 lookup bundle of the whole release (workflows/lookup-index/README.md), from hmm-annotate's
 # SAMPLE=1 runs. Inputs, as environment variables:
-#   SIF=<kfp-lookup.sif>         workflows/pfam-anchor/lookup/Dockerfile's image
+#   SIF=<kfp-lookup.sif>         workflows/pfam-anchor/lookup/Dockerfile's image; ../images/kfp-lookup.{tar,sif} by default
 #   HMM=<Pfam-A.hmm[.gz]>        the file hmm-annotate searched, and the one the reads are aligned to
 #   PFAM=../hmm-annotate/results-pfam-1
 #   KOFAM=../hmm-annotate/results-kofam-1   its labels; KOFAM= (empty) for a bundle with none
@@ -26,7 +26,8 @@
 #   memory    BUILD of the group that holds PF00005 alone 30-40 GB; asks for 64, 128 on the retry
 # Re-submitting resumes.
 source ../common.sh
-: "${SIF:?the lookup image}" "${HMM:?the Pfam-A.hmm that was annotated with}"
+: "${HMM:?the Pfam-A.hmm that was annotated with}"
+SIF=${SIF:-$(sif kfp-lookup)}
 PFAM=${PFAM:-../hmm-annotate/results-pfam-1}
 KOFAM=${KOFAM-../hmm-annotate/results-kofam-1}
 nextflow run "$WF/lookup-index" -c ../site.config ${RELEASE:+--release "$RELEASE"} \

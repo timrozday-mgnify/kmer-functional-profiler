@@ -11,6 +11,7 @@ relative, for this layout:
     kfp-ablations/                               this directory
         site.config  common.sh                   shared by every run
         fmh-benchmark-data/                      shared storeDir, created by 00-dbs
+        images/                                  kfpfam-filter.tar and kfp-lookup.tar, copied from where Docker is (not in git)
         <run>/run.sh                             results/, work/ and the head job's log land here
 ```
 
@@ -29,9 +30,9 @@ cd kfp-ablations/floor-query-cost && sbatch run.sh
 cd kfp-ablations/pfam-reannotate && sbatch run.sh
 # every MGnify protein against Pfam or KOfam (workflows/hmm-annotate), 1 in 1,000 with the check
 # first; its header says what it reads:
-cd kfp-ablations/hmm-annotate && SIF=... COLLECTION=pfam sbatch run.sh
+cd kfp-ablations/hmm-annotate && COLLECTION=pfam sbatch run.sh
 # when the whole release is annotated (SAMPLE=1, Pfam and KOfam), the lookup bundle from it:
-cd kfp-ablations/lookup-index && SIF=... HMM=... sbatch run.sh
+cd kfp-ablations/lookup-index && HMM=... sbatch run.sh
 # MGnify90 residue scan on one very large family (workflows/pfam-anchor/lookup/REPORT.md), any time; its header says what it reads:
 cd kfp-ablations/pfam-anchor-large && FAMILY=5 PARQUETS='...' PFAM=... ./run.sh submit
 # clusters with a Pfam hit (plan, phase 6), any time:

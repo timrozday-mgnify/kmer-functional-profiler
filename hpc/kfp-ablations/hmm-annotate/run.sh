@@ -8,17 +8,18 @@
 #SBATCH --export=ALL
 # Every MGnify protein against an HMM collection, kfpfam's prefilter then HMMER on its candidates
 # (workflows/hmm-annotate/README.md). Inputs, as environment variables:
-#   SIF=<kfpfam-filter.sif>        kfpfam's image, from its prep-any-hmm branch or later
+#   SIF=<kfpfam-filter.sif>        kfpfam's image, 86f2a63 or later; ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam                HMM=<Pfam-A.hmm[.gz]>: 38.2 from the FTP site if not set. The
 #                                  index must be of the models the reads are aligned to
 #   COLLECTION=kofam               HMM=<all profiles in one file>  THRESHOLDS=<ko_list[.gz]>; labels only
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
 #                                  cat profiles/K*.hmm > kofam.hmm
 #   SAMPLE=1000                    1 in N proteins, and full hmmsearch on 1 in CHECK (10) of those
-#   RELEASE=<mirror>               a local mirror instead of the FTP site
+#   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
+#                                  reads most of the release's 1 TB of sequences, as samples are spread out
 # First, and look at check.tsv and trace.tsv before the whole:
-#   SIF=... COLLECTION=pfam sbatch run.sh
-#   SIF=... COLLECTION=pfam SAMPLE=1 sbatch run.sh
+#   COLLECTION=pfam sbatch run.sh
+#   COLLECTION=pfam SAMPLE=1 sbatch run.sh
 # Read results-<collection>-<sample>/:
 #   check.tsv       kfpfam's recall of the passing domains, all and by model
 #   summary.tsv     proteins, residues, pairs, domains passing
@@ -34,7 +35,7 @@
 #                   work/ about 1.1 TB of FASTA, deletable when the run has finished
 # Re-submitting resumes.
 source ../common.sh
-: "${SIF:?the kfpfam image}"
+SIF=${SIF:-$(sif kfpfam-filter)}
 collection=${COLLECTION:-pfam}
 sample=${SAMPLE:-1000}
 check=$([[ $sample == 1 ]] && echo 0 || echo "${CHECK:-10}")

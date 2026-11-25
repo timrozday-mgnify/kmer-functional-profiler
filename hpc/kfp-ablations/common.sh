@@ -43,3 +43,15 @@ fetch_pairs() {
         mv "${out}_$m.fastq.gz.tmp" "${out}_$m.fastq.gz"
     done
 }
+
+# sif NAME: prints the path of ../images/NAME.sif, converted first from NAME.tar (`docker save`, made where
+# Docker is) if it is missing or the tar is newer.
+sif() {
+    local at
+    at=$(realpath ../images)/$1
+    if [[ -s $at.tar && ( ! -s $at.sif || $at.tar -nt $at.sif ) ]]; then
+        singularity build --force "$at.sif" "docker-archive://$at.tar" >&2
+    fi
+    [[ -s $at.sif ]] || { echo "no $at.sif or $at.tar" >&2; return 1; }
+    echo "$at.sif"
+}
