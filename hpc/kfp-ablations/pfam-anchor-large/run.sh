@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=kfp-anchor-large
+#SBATCH --output=%x.%j.log
+#SBATCH --export=ALL
+# The MGnify90 residue scan (workflows/pfam-anchor/lookup) on one very large Pfam family at full release size: does recall
+# hold past the 58,000 rows tested on the laptop, and what do the scan and the selection of the top rows cost on x86?
+#   FAMILY=5 PARQUETS='/path/results_main_<arm>/*/function-summary/pfam/*_pfam_alignments.parquet' \
+#   PFAM=/path/Pfam-A.hmm ./run.sh submit
+# Settings (environment):
+#   FAMILY       accession number: 5 is PF00005 (62.6 M domains in the release), 72 is PF00072 (22.5 M)
+#   PARQUETS     the raw-reads pipeline's alignments (seeded engines), any Pfam release: the reads are re-aligned (quote it: it is a glob)
+#   PFAM         Pfam-A.hmm[.gz], the release to align both sides to
+#   RELEASE      release directory or URL with mgy_proteins_pfam.parquet (default: the FTP site; about 110 GB, scanned)
+#   REPS         mgy_clusters.fa.gz (default: $RELEASE's). A URL is streamed (157 GB), never stored
+#   PER_LIBRARY  reads per library (200)   CHUNKS  alignment tasks (30)   EXPECT  records REPS must hold (1661142385)
+#   SBATCH_ARGS  extra sbatch options for every job, a partition say
+# Steps: prepare -> align (array) -> pack -> truth -> scan -> report; ./run.sh STEP runs one here.
+# Read: PF<family>/report.tsv (recall by subsample, K and SECOND), report_by_library.tsv, null.tsv (best score of reversed
+#   reads, by family size), size.tsv (bytes the family needs), scan*.times.tsv (core-seconds by stage).
+# Estimates, not measured: prepare 2-8 h (streaming), align 5-10 CPU-h in all, truth about 40-80 CPU-h for PF00005,
+#   scan 2-6 CPU-h; 60 GB of disk in PF<family>/ and 64 GB of memory at most.
+# Re-running a step skips what it has finished. Needs the repo's venv (setup.sh), singularity, and cargo on the nodes (setup.sh needs it too).
+set -euo pipefail
+trap 'echo "failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+export LC_ALL=C
+HERE=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}
+cd "$HERE"
+REPO=$(cd "${REPO:-../../../kmer-functional-profiler}" && pwd)
+LOOKUP=$REPO/workflows/pfam-anchor/lookup
+PY=${PY:-$REPO/.venv/bin/python}
+: "${FAMILY:?set FAMILY, 5 for PF00005}"
+RELEASE=${RELEASE:-https://ftp.ebi.ac.uk/pub/databases/metagenomics/peptide_database/current_release}
+REPS=${REPS:-$RELEASE/mgy_clusters.fa.gz}
+EXPECT=${EXPECT:-1661142385}
+CHUNKS=${CHUNKS:-30}
+RUNTIME=${RUNTIME:-singularity}
+THREADS=${THREADS:-${SLURM_CPUS_PER_TASK:-4}}
+export THREADS
+D=$HERE/$(printf 'PF%05d' "$FAMILY")
+mkdir -p "$D"
+large () { "$PY" "$LOOKUP/large.py" "$@" --out "$D"; }
+
+# built on the node it runs on, for that node's CPU: an AVX-512 binary would crash on an older one
+build () {
+    export CARGO_TARGET_DIR="$D/target-$(uname -m)-$(grep -m1 -E 'model name|^CPU part' /proc/cpuinfo 2>/dev/null | cksum | cut -d' ' -f1)"
+    export RUSTFLAGS='-C target-cpu=native'
+    L=$CARGO_TARGET_DIR/release/lookup
+    command -v cargo > /dev/null || { echo "no cargo on PATH (workflows/setup.sh needs it too)" >&2; exit 1; }
+    cargo build --quiet --release --offline --manifest-path "$LOOKUP/rs/Cargo.toml"
+}
+
+case ${1:-} in
+submit)
+    : "${PARQUETS:?set PARQUETS}" "${PFAM:?set PFAM}"
+    [[ -x $PY ]] || { echo "no $PY: run $REPO/workflows/setup.sh first" >&2; exit 1; }
+    [[ -s $PFAM ]] || { echo "no $PFAM" >&2; exit 1; }
+    compgen -G "$PARQUETS" > /dev/null || { echo "nothing matches $PARQUETS" >&2; exit 1; }
+    sb () { sbatch --parsable ${SBATCH_ARGS:-} "$@"; }
+    j=$(sb --cpus-per-task=4 --mem=48G --time=1-00:00:00 "$0" prepare)
+    a=$(sb --dependency="afterok:$j" --array="0-$((CHUNKS - 1))" --cpus-per-task=4 --mem=24G --time=12:00:00 "$0" align)
+    p=$(sb --dependency="afterok:$a" --cpus-per-task=2 --mem=48G --time=12:00:00 "$0" pack)
+    t=$(sb --dependency="afterok:$p" --cpus-per-task=48 --mem=48G --time=12:00:00 "$0" truth)
+    # alone on a node, as it is timed
+    s=$(sb --dependency="afterok:$p" --cpus-per-task=16 --mem=64G --time=12:00:00 --exclusive "$0" scan)
+    r=$(sb --dependency="afterok:$t:$s" --cpus-per-task=1 --mem=16G --time=1:00:00 "$0" report)
+    echo "prepare $j, align $a, pack $p, truth $t, scan $s, report $r" ;;
+prepare)
+    : "${PARQUETS:?set PARQUETS}" "${PFAM:?set PFAM}"
+    large hmm --pfam "$PFAM" --family "$FAMILY"
+    large queries --parquets "$PARQUETS" --family "$FAMILY" --per-library "${PER_LIBRARY:-200}" --runtime "$RUNTIME"
+    [[ -s $D/ids.u64 ]] || large ids --release "$RELEASE" --family "$FAMILY" --threads "$THREADS" --memory 40
+    if [[ ! -s $D/picked.tsv ]]; then
+        build
+        cat=(cat "$REPS")
+        [[ $REPS == http* ]] && cat=(curl -fsSL "$REPS")
+        # no retry: a resumed stream would repeat or lose records, so the count is checked instead
+        "${cat[@]}" | gzip -dc | "$L" pick "$D/ids.u64" "$D/chunk" "$CHUNKS" > "$D/picked.tsv.part"
+        read -r seen got _ < "$D/picked.tsv.part"
+        [[ $seen == "$EXPECT" ]] || { echo "$REPS gave $seen records, expected $EXPECT" >&2; exit 1; }
+        (( got > 0 )) || { echo "no representative has the family" >&2; exit 1; }
+        mv "$D/picked.tsv.part" "$D/picked.tsv"
+    fi
+    cat "$D/picked.tsv" ;;
+align) large align --chunk "${CHUNK:-${SLURM_ARRAY_TASK_ID:?an array task, or set CHUNK}}" --threads "$THREADS" --memory 20 --runtime "$RUNTIME" ;;
+pack) large pack ;;
+truth) build; "$L" truthsub "$D/bin" ;;
+scan)
+    build
+    export FLANK=10   # only the domain and 10 residues either side, as a self-contained index holds
+    "$L" scan "$D/bin" "$D/scan.tsv" "${CONFIGS:-100:200,500:200,2000:200,2000:1000}" 0,2,4,6
+    THREADS=1 LIMIT=${LIMIT:-200} "$L" scan "$D/bin" "$D/scan1.tsv" 500:200 0 ;;
+report) large report ;;
+*) sed -n '6,33p' "$0"; exit 1 ;;
+esac
