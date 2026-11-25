@@ -2,7 +2,7 @@
 
 Usage: bench.py RESULTS... (the first is the truth, ``--engine hmmsearch``; all ``--domains true``)
 
-``cpu_h`` is CPU time: the filter's, by bash's ``time``, and HMMER's, by pyhmmer's process.
+``cpu_h`` is CPU time: kfpfam's or nail's, by bash's ``time``, and HMMER's, by pyhmmer's process.
 ``core_h`` is what the tasks held, cores by time. ``speedup`` is of ``cpu_h``.
 """
 
@@ -26,7 +26,7 @@ def row(run: Path, truth: Path) -> dict[str, object]:
     seconds = [sum(map(float, m)) for log in logs for m in CPU.findall(log)]
     kernels = {m[1] for log in logs if (m := re.search(r"^(\S+): \d+ ORFs", log, re.M))}
     trace = pl.read_csv(run / "trace.tsv", separator="\t", infer_schema=False).filter(
-        pl.col("name").str.contains(r"^(MEMBER_)?SEARCH"),
+        pl.col("name").str.contains(r"^((MEMBER_)?SEARCH|NAIL)"),
         pl.col("status").is_in(["COMPLETED", "CACHED"]),
     )
     cores = (pl.col("realtime").cast(pl.Float64) * pl.col("cpus").cast(pl.Float64)).sum() / 3.6e6

@@ -1,5 +1,6 @@
 """hmm-annotate's steps on six mini HMMs. The search needs pyhmmer (it runs in kfpfam's image)."""
 
+import gzip
 import importlib.util
 import math
 import shutil
@@ -266,6 +267,27 @@ def test_search_gives_hmmsearch_cut_ga(tmp_path: Path) -> None:
     assert both.equals(d)
     stats = pl.read_csv(tmp_path / "s.tsv", separator="\t")
     assert stats["pairs"].item() == 6 * len(seqs)
+
+    # and nail's seeds, of any order and any number of files, one with none; and those with more
+    rows = [f"Mini{m}\t{i}\n" for m in range(1, 7) for i in reversed(seqs)]
+    parts = {"a.tsv": rows[:100], "b.tsv.gz": rows[100:], "c.tsv": []}
+    for name, part in parts.items():
+        data = ("model\tprotein_id\n" + "".join(part)).encode()
+        (tmp_path / name).write_bytes(gzip.compress(data) if name.endswith("gz") else data)
+    assert searched(tmp_path, seqs, range(0), "--seeds", *parts).equals(d)
+    lean = searched(tmp_path, seqs, range(0), "--seeds", "a.tsv", "--block", 30)
+    assert 0 < lean.height < d.height
+    more = ("--seeds", "a.tsv", "--block", 30, "--more-pairs", "more")
+    assert (
+        searched(tmp_path, seqs, range(0), *more)
+        .filter(pl.col("model") > "PF90002")
+        .equals(d.filter(pl.col("model") > "PF90002"))
+    )
+    for bad in ("Mini1\t999999\n", "Other\t1\n"):
+        (tmp_path / "bad.tsv").write_text("model\tprotein_id\n" + bad)
+        with pytest.raises(subprocess.CalledProcessError):
+            searched(tmp_path, seqs, range(0), "--seeds", "bad.tsv")
+    d = searched(tmp_path, seqs, range(6))
 
     # the check finds it whole, and finds what is missing when a model is left out
     check = (

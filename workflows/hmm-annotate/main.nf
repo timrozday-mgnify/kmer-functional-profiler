@@ -1,7 +1,8 @@
 // MGnify proteins -> any HMM collection, by kfpfam's prefilter and HMMER on its candidates,
-// or by HMMER alone (--engine hmmsearch). See README.md. PLAN and FASTA are pfam-reannotate's.
+// by nail's seeds and HMMER (--engine nail), or by HMMER alone (--engine hmmsearch). See README.md. PLAN and FASTA are pfam-reannotate's.
 
 include { PLAN; FASTA; flag } from '../pfam-reannotate/main'
+include { NAIL_SEED; NAIL_SEED as NAIL_MEMBERS } from './nail'
 
 process PREP {
     label 'process_prep'
@@ -30,7 +31,7 @@ process PREP {
     ${params.kfpfam_python} tables.py thresholds --hmm models.hmm --models prep/models.tsv ${source}
     ${params.kfpfam_python} annotate.py press --hmm models.hmm --models prep/models.tsv --out models
     mkdir index
-    if [[ ${params.engine == 'kfpfam' || flag(params.member_filter)} == true ]]; then
+    if [[ ${'kfpfam' in [params.engine, params.member_filter]} == true ]]; then
         export RAYON_NUM_THREADS=${task.cpus}
         ${params.kfpfam_python} seeds.py bars --models prep/models.tsv --thresholds thresholds.tsv \\
             --ga ga.tsv --gapped index/gapped.txt --slack ${kfpfam.slack}
@@ -56,7 +57,7 @@ process SEARCH {
     publishDir "${params.outdir}/logs", mode: params.publish_mode, pattern: '*.log'
 
     input:
-    tuple val(_arm), val(chunk), path(faa), path(counts)
+    tuple val(_arm), val(chunk), path(faa), path(counts), path(seeds)  // seeds: nail's, or none
     path hmm
     path prep
     path index
@@ -77,7 +78,7 @@ process SEARCH {
     ${params.engine == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
         ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
             --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-            ${params.engine == 'kfpfam' ? '' : '--all-pairs'} \\
+            ${searchable(params.engine, seeds)} \\
             ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
             ${flag(params.members) ? "--near chunk${chunk}.near.parquet --near-slack ${params.member_slack}" : ''} \\
             --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv
@@ -98,6 +99,11 @@ def prefilter(prep, index, faa, chunk, cpus) {
         FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
         ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
         ${params.kfpfam_block} ${faa} /dev/stdout; } 2>> chunk${chunk}.log |""".stripIndent()
+}
+
+// Where the pairs to search come from, if not stdin
+def searchable(engine, seeds) {
+    engine == 'nail' ? "--seeds ${[seeds].flatten().join(' ')} --block ${params.kfpfam_block}" : engine == 'hmmsearch' ? '--all-pairs' : ''
 }
 
 // The CPU, and the filter's log: its kernel and CPU time, for bench.py. Nextflow's own log has it too.
@@ -131,7 +137,7 @@ process MEMBER_PAIRS {
     """
     ${params.python} ${code} --threads ${task.cpus} --memory '${task.memory.toGiga()}GB' pairs --release '${params.release}' \\
         --near ${near} --lo ${lo} --hi ${hi} --sample ${params.sample} --check-sample ${params.check_sample} \\
-        ${flag(params.member_filter) ? "--all --min-cluster ${params.min_cluster}" : ''} \\
+        ${params.member_filter ? "--all --min-cluster ${params.min_cluster}" : ''} \\
         --width ${params.member_width} --out pairs${batch}
     rm -rf duckdb_tmp
     """
@@ -174,7 +180,7 @@ process MEMBER_SEARCH {
     publishDir "${params.outdir}/logs", mode: params.publish_mode, pattern: '*.log'
 
     input:
-    tuple val(chunk), path(faa), path(counts), path(pairs)
+    tuple val(chunk), path(faa), path(counts), path(pairs), path(seeds)
     path hmm
     path prep
     path index
@@ -188,14 +194,15 @@ process MEMBER_SEARCH {
     path "chunk${chunk}.log", emit: log
 
     script:
-    def filtered = flag(params.member_filter)
+    def filtered = params.member_filter as boolean
     """
     set -o pipefail
     ${logged(chunk)}
-    ${filtered ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
+    ${params.member_filter == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
     ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
         --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-        ${filtered ? "--more-pairs ${pairs}" : ''} ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
+        ${filtered ? "--more-pairs ${pairs}" : ''} ${searchable(params.member_filter, seeds)} \\
+        ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
         --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv ${filtered ? '' : "< ${pairs}"}
     ${searched(chunk, counts)}
     """
@@ -292,8 +299,8 @@ workflow {
     if (!(params.targets in ['reps', 'all'])) {
         error "--targets ${params.targets}: reps or all"
     }
-    if (!(params.engine in ['kfpfam', 'hmmsearch'])) {
-        error "--engine ${params.engine}: kfpfam or hmmsearch"
+    if (!(params.engine in ['kfpfam', 'nail', 'hmmsearch'])) {
+        error "--engine ${params.engine}: kfpfam, nail or hmmsearch"
     }
     if (!(params.kfpfam_mode in params.kfpfam_modes)) {
         error "--kfpfam_mode ${params.kfpfam_mode}: ${params.kfpfam_modes.keySet().join(' or ')}"
@@ -301,11 +308,14 @@ workflow {
     if (flag(params.members) && params.targets != 'reps') {
         error "--members searches representatives first: it needs --targets reps"
     }
-    if (flag(params.member_filter) && !flag(params.members)) {
+    if (!(params.member_filter in ['', 'kfpfam', 'nail'])) {
+        error "--member_filter ${params.member_filter}: kfpfam or nail"
+    }
+    if (params.member_filter && !flag(params.members)) {
         error "--member_filter is for --members true"
     }
-    if (params.min_cluster as int > 1 && !flag(params.member_filter)) {
-        error "--min_cluster leaves the smaller clusters to the prefilter: it needs --member_filter true"
+    if (params.min_cluster as int > 1 && !params.member_filter) {
+        error "--min_cluster leaves the smaller clusters to the prefilter: it needs --member_filter"
     }
     if (!params.hmm) {
         error "--hmm: the collection's HMM file, plain or gzipped"
@@ -329,7 +339,13 @@ workflow {
         .map { r -> ['real', r.chunk as int, r.lo as long, r.hi as long, r.proteins as long] }
         .ifEmpty { error "nothing to search: no protein is in the sample, or no cluster of --min_cluster" }
     FASTA(ch_chunks)
-    SEARCH(FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
+    ch_search = FASTA.out.map { arm, chunk, faa, counts -> [arm, chunk, faa, counts, []] }
+    if (params.engine == 'nail') {
+        NAIL_SEED(FASTA.out.map { _arm, chunk, faa, _counts -> [chunk, faa] }, PREP.out.hmm)
+        ch_search = FASTA.out.map { arm, chunk, faa, counts -> [chunk, arm, faa, counts] }.join(NAIL_SEED.out.seeds)
+            .map { chunk, arm, faa, counts, found -> [arm, chunk, faa, counts, found] }
+    }
+    SEARCH(ch_search, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
     def ch_stats = SEARCH.out.stats
     def ch_check = SEARCH.out.domains.map { chunk, faa, domains -> ['check', chunk, faa, domains, params.sample] }
     if (flag(params.members)) {
@@ -350,7 +366,12 @@ workflow {
         ch_shards.map { s -> "m${s}\t${s * (params.member_width as long)}\t${(s + 1) * (params.member_width as long)}\n" }
             .collectFile(name: 'ranges.members.tsv', seed: "chunk\tlo\thi\n", sort: true, storeDir: params.outdir)
         MEMBER_FASTA(ch_shards, MEMBER_PAIRS.out.pairs.collect(), PREP.out.thresholds, members)
-        MEMBER_SEARCH(MEMBER_FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
+        ch_members = MEMBER_FASTA.out.map { chunk, faa, counts, pairs -> [chunk, faa, counts, pairs, []] }
+        if (params.member_filter == 'nail') {
+            NAIL_MEMBERS(MEMBER_FASTA.out.map { chunk, faa, _counts, _pairs -> [chunk, faa] }, PREP.out.hmm)
+            ch_members = MEMBER_FASTA.out.join(NAIL_MEMBERS.out.seeds)
+        }
+        MEMBER_SEARCH(ch_members, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
         ch_stats = ch_stats.mix(MEMBER_SEARCH.out.stats)
         ch_check = ch_check.mix(MEMBER_SEARCH.out.domains.map { chunk, faa, domains -> ['check.members', chunk, faa, domains, 1] })
     }

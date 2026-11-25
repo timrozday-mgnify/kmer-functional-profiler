@@ -1,4 +1,4 @@
-"""HMMER on kfpfam's candidate (protein, model) pairs, or on all: domain rows, and labels.
+"""HMMER on kfpfam's or nail's candidate (protein, model) pairs, or on all: domain rows, labels.
 
 Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``main.nf``:
 
@@ -7,6 +7,7 @@ Runs in the kfpfam image (pyhmmer and pyarrow). One subcommand per step of ``mai
 - ``search``: pairs on stdin, from kfpfam's ``filter join`` run with ``FILTER_BINARY=1`` beside this
   script on the same FASTA (``protein_id`` as the name) -> ``--domains`` Parquet, ``--labels``
   Parquet (protein_id, model; proteins passing the model's thresholds), one-row ``--stats`` TSV.
+  Or from ``--seeds``, files with columns model (its name) and protein_id (nail's), and no stdin.
   ``--more-pairs``: a file of further pairs in the same blocks, searched as well.
   With ``--all-pairs``, every protein against every model as ``hmmsearch`` does, and no stdin.
   ``--near``: also (protein_id, model) within ``--near-slack`` bits of passing, for ``members.py``.
@@ -39,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.csv
 import pyarrow.parquet as pq
 import pyhmmer
 from pyhmmer.easel import Alphabet, DigitalSequenceBlock, SequenceFile
@@ -235,16 +237,11 @@ def union(streams: list[bytes]) -> bytes:
     return np.stack([keys & 0xFFFFFFFF, keys >> 32], axis=1).astype("<u4").tobytes()
 
 
-def read_blocks(streams: list, proteins: SequenceFile) -> Iterator[tuple]:
+def streamed(stream, proteins: SequenceFile) -> Iterator[tuple]:
     """`filter join`'s blocks: their proteins, read forward from the FASTA it read, and their pairs,
-    as one flat array of protein in the block, model, protein, model... in model order. Of several
-    streams, the pairs in any of them."""
-    while any(found := [read_block(s) for s in streams]):
-        if not all(found) or len({head for head, _ in found}) > 1:
-            sys.exit("the two sets of pairs are not in the same blocks")
-        n, residues = found[0][0]
-        pairs = array("I")
-        pairs.frombytes(found[0][1] if len(found) == 1 else union([p for _, p in found]))
+    as the bytes of protein in the block, model, protein, model... in model order."""
+    while found := read_block(stream):
+        (n, residues), pairs = found
         block = proteins.read_block(sequences=n)
         if (len(block), sum(map(len, block))) != (n, residues):
             sys.exit("the filter's blocks are not of these proteins")
@@ -253,10 +250,65 @@ def read_blocks(streams: list, proteins: SequenceFile) -> Iterator[tuple]:
         sys.exit("the filter's output stops before the last protein")
 
 
+def read_seeds(paths: list[Path], names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """The proteins of every pair, sorted, and the numbers of its model."""
+    number = {n: i for i, n in enumerate(names)}
+    parts = []
+    for path in paths:
+        t = pyarrow.csv.read_csv(
+            path,
+            parse_options=pyarrow.csv.ParseOptions(delimiter="\t", quote_char=False),
+            convert_options=pyarrow.csv.ConvertOptions(
+                column_types={"model": pa.dictionary(pa.int32(), pa.string()), "protein_id": "i8"},
+                strings_can_be_null=False,
+            ),
+        ).unify_dictionaries()
+        for c in t.to_batches():
+            found = c["model"].dictionary.to_pylist()
+            if unknown := set(found) - set(number):
+                sys.exit(f"{path}: not models of this collection: {sorted(unknown)[:5]}")
+            lookup = np.array([number[n] for n in found], dtype="<u4")
+            parts.append((c["protein_id"].to_numpy(), lookup[c["model"].indices.to_numpy()]))
+    if not parts:
+        return np.empty(0, "i8"), np.empty(0, "<u4")
+    proteins, models = (np.concatenate(x) for x in zip(*parts, strict=True))
+    order = np.argsort(proteins, kind="stable")
+    return proteins[order], models[order]
+
+
+def seeded(paths: list[Path], names: list[str], proteins: SequenceFile, n: int) -> Iterator[tuple]:
+    """The same from nail's seeds: n proteins at a time, and their pairs."""
+    ids, models = read_seeds(paths, names)
+    used = 0
+    while block := proteins.read_block(sequences=n):
+        here = np.array([pid(s) for s in block])
+        left, right = np.searchsorted(ids, here), np.searchsorted(ids, here, "right")
+        counts = right - left
+        at = np.repeat(left - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())
+        pairs = np.stack([np.repeat(np.arange(len(here)), counts), models[at]], axis=1)
+        used += len(pairs)
+        yield block, union([pairs.astype("<u4").tobytes()])
+    if used != len(ids):
+        sys.exit(f"{len(ids) - used} seeds are not of these proteins")
+
+
+def with_more(blocks, stream) -> Iterator[tuple]:
+    """The blocks with the pairs of `stream` too, which are in the same blocks."""
+    for block, pairs in blocks:
+        found = read_block(stream)
+        if not found or found[0] != (len(block), sum(map(len, block))):
+            sys.exit("the two sets of pairs are not in the same blocks")
+        yield block, union([pairs, found[1]])
+    if read_block(stream):
+        sys.exit("the two sets of pairs are not in the same blocks")
+
+
 def batches(blocks, size: int, counts: Counter) -> Iterator[dict[int, list]]:
     """Candidate proteins by model, of as many blocks as make `size` pairs."""
     targets, n = defaultdict(list), 0
-    for block, pairs in blocks:
+    for block, data in blocks:
+        pairs = array("I")
+        pairs.frombytes(data)
         counts["proteins"] += len(block)
         lengths = [len(s) for s in block]
         counts["residues"] += sum(lengths)
@@ -329,10 +381,12 @@ def search(a: argparse.Namespace) -> None:
         if a.all_pairs:
             run(every_pair(proteins, optimized, counts), thresholds, pool, output, a)
         else:
-            streams = [sys.stdin.buffer]
+            if a.seeds:
+                blocks = seeded(a.seeds, [t[1] for t in thresholds], proteins, a.block)
+            else:
+                blocks = streamed(sys.stdin.buffer, proteins)
             if a.more_pairs:
-                streams.append(open(a.more_pairs, "rb"))  # noqa: SIM115, read to the end
-            blocks = read_blocks(streams, proteins)
+                blocks = with_more(blocks, open(a.more_pairs, "rb"))  # noqa: SIM115, read to the end
             for targets in batches(blocks, BATCH, counts):
                 # built here, not in the workers: across 6 threads blocks ran about 40x slower
                 jobs = (
@@ -413,6 +467,8 @@ def main() -> None:
     x.add_argument("--stats", type=Path, required=True)
     x.add_argument("--near", type=Path)
     x.add_argument("--near-slack", type=float, default=8)
+    x.add_argument("--seeds", type=Path, nargs="+", help="TSV: model, protein_id; may be gzipped")
+    x.add_argument("--block", type=int, default=80_000, help="proteins of --seeds at a time")
     x.add_argument("--more-pairs", type=Path, help="as members.py fasta writes them")
     x.add_argument("--all-pairs", action="store_true", help="no prefilter: hmmsearch")
     x.add_argument("--weak-evalue", type=float, default=0, help="0: passing domains only")
