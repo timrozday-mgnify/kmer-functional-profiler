@@ -10,7 +10,7 @@
 # or hmmsearch alone (workflows/hmm-annotate/README.md). Inputs, as environment variables:
 #   ENGINE=kfpfam-top              kfpfam's top mode, kfpfam-fast, nail (its seeds at P 0.01, as B11's arm,
 #                                  then HMMER), or hmmsearch: every model, no prefilter
-#   ENGINE=release                 PFAM=38.2 only: HMMER on the release's own Pfam table's (protein, family) pairs,
+#   ENGINE=release                 PFAM=38.1 only: HMMER on the release's own Pfam table's (protein, family) pairs,
 #                                  so its domains with alignments, for lookup-index, without searching every model
 #   MEMBERS=true                   representatives by ENGINE, then their members by HMMER alone, on the models the
 #                                  representative nearly passes. Every protein still, at a fraction of the cost
@@ -22,7 +22,8 @@
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
 #                                  the index must be of the models the reads are aligned to
-#   COLLECTION=pfam PFAM=38.2      also compares with the release's own Pfam table, made with 38.2
+#   COLLECTION=pfam PFAM=38.1      also compares with the release's own Pfam table, made with 38.1 (its README says 38.2;
+#                                  38.1 reproduces its rows exactly, 38.2 not those of families rebuilt since)
 #                                  (COMPARE=true or false says otherwise)
 #   COLLECTION=kofam               HMM=<all profiles in one file>  THRESHOLDS=<ko_list[.gz]>; labels only
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
@@ -40,13 +41,13 @@
 #   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
 #                                  reads most of the release's 1 TB of sequences, as samples are spread out
 # First, and look at check.tsv and trace.tsv before the whole:
-#   PFAM=38.2 sbatch run.sh
+#   PFAM=38.1 sbatch run.sh
 #   PFAM=39.0 sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=kfpfam-fast sbatch --dependency=afterany:<that job> run.sh
 #   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
 #   PFAM=39.0 ENGINE=hmmsearch MEMBERS=fast sbatch --dependency=afterany:<that job> run.sh     # check.members.tsv
 #   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
-#   PFAM=38.2 ENGINE=release SAMPLE=1 sbatch run.sh                                # the release's 38.2 domains, aligned
+#   PFAM=38.1 ENGINE=release SAMPLE=1 sbatch run.sh                                # the release's 38.2 domains, aligned
 #   PFAM=38.2 PROFILE=true SAMPLE=100000 sbatch run.sh                             # cost per protein, both tools
 #   COLLECTION=weefams HMM=<weefams.hmm> sbatch run.sh                             # weefams by kfpfam top
 # kfpfam's and nail's speed against hmmsearch's on the HPC's CPUs, and what it misses: benchmark.sh
@@ -54,7 +55,7 @@
 # Read results-<collection><release>-<engine>[-members[-fast|-top|-nail][-min<n>]]-<sample>/ (results-pfam39.0-hmmsearch-1000):
 #   check.members.tsv  with MEMBERS, the members' recall; check.tsv is the representatives'
 #   check.tsv       kfpfam's recall of the passing domains of full hmmsearch, all and by model
-#   compare.tsv     the same against the release's own table (38.2)
+#   compare.tsv     the same against the release's own table (made with 38.1)
 #   summary.tsv     proteins, residues, pairs, domains passing
 #   trace.tsv       time and memory per task: realtime x cpus of SEARCH x SAMPLE is the whole run's cost
 #   domains/        lookup-index's input (Pfam)
@@ -85,8 +86,8 @@ case $engine in
     hmmsearch | nail | kfpfam-top | kfpfam-fast | release) ;;
     *) echo "ENGINE=$engine: hmmsearch, nail, kfpfam-top, kfpfam-fast or release" >&2; exit 1 ;;
 esac
-if [[ $engine == release && ( ${COLLECTION:-pfam} != pfam || ${PFAM:-39.0} != 38.2 || $members != false ) ]]; then
-    echo "ENGINE=release: the release's table is of Pfam 38.2: COLLECTION=pfam PFAM=38.2, no MEMBERS" >&2
+if [[ $engine == release && ( ${COLLECTION:-pfam} != pfam || ${PFAM:-39.0} != 38.1 || $members != false ) ]]; then
+    echo "ENGINE=release: the release's table is of Pfam 38.1: COLLECTION=pfam PFAM=38.1, no MEMBERS" >&2
     exit 1
 fi
 filter=
@@ -115,7 +116,7 @@ case $collection in
         release=${PFAM:-39.0}
         name=pfam$release
         if [[ $members == false && $profile == false ]]; then
-            args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
+            args+=(--compare_release "${COMPARE:-$([[ $release == 38.1 ]] && echo true || echo false)}")
         fi
         args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam$release/Pfam-A.hmm.gz}")
         ;;

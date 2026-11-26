@@ -40,7 +40,7 @@ singularity build kfp-lookup.sif docker-archive://kfp-lookup.tar
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--pfam` | | hmm-annotate's output directory for Pfam, `--targets all --sample 1`: a full annotation, or `--engine release` (the release's 38.2 table, aligned) |
+| `--pfam` | | hmm-annotate's output directory for Pfam, `--targets all --sample 1`: a full annotation, or `--engine release` (the release's table, made with Pfam 38.1, aligned) |
 | `--hmm` | | The `Pfam-A.hmm[.gz]` it was made with (checked by SHA-256) |
 | `--labels` | | `ko=DIR,ec=DIR`: hmm-annotate outputs whose models are the labels |
 | `--groups` | `400` | `BUILD` tasks, about |

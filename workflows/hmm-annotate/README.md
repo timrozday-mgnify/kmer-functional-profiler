@@ -61,7 +61,7 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--hmm` | | The collection: one HMM file, plain or gzipped |
-| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `nail`: its seeds (an MMseqs2 profile search), then HMMER on those; `hmmsearch`: HMMER on every model; `release`: HMMER on the release's own Pfam table's (protein, family) pairs only (`RELEASE_SEED`), so that table's domains with alignments, for lookup-index; Pfam 38.2, `--targets all` |
+| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `nail`: its seeds (an MMseqs2 profile search), then HMMER on those; `hmmsearch`: HMMER on every model; `release`: HMMER on the release's own Pfam table's (protein, family) pairs only (`RELEASE_SEED`), so that table's domains with alignments, for lookup-index; Pfam 38.1 (what made the table), `--targets all` |
 | `--cutoff` | `gathering` | The HMM file's own thresholds: `gathering`, `trusted` or `noise` |
 | `--thresholds` | | Or a TSV with a header: model, threshold, `full` or `domain`. KOfam's `ko_list` as it is |
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |
@@ -70,7 +70,7 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | `--min_cluster` | `1` | With `--member_filter`: `--engine` has the representatives of clusters this size or more only. The prefilter has the whole of the others, whose members get no candidates from their representative |
 | `--sample` | `1000` | 1 in N targets by `protein_id`; with `--members`, 1 in N clusters |
 | `--check_sample` | `0` | 1 in N of those also against every model, without the prefilter; `0`: none |
-| `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.2 |
+| `--compare_release` | `false` | Compare with the release's `mgy_proteins_pfam.parquet`, made with Pfam 38.1 (its README says 38.2; 38.1 reproduces its rows exactly) |
 | `--domains` | `true` | Write the domain rows; labels are always written |
 | `--weak_evalue` | `0` | Also domains under the thresholds, at this E-value (Z = 10⁶); `0`: none |
 | `--chunk_proteins` | `1000000` | Proteins per `SEARCH` task, the same for every engine so that they share FASTAs |
@@ -128,7 +128,7 @@ sample is `protein_id % --sample == 0`, so the same proteins for every run, engi
   `SEARCH` found, and how many it has that `hmmsearch` doesn't (`extra`, none expected). `check.members.tsv`: of the members.
 
 - **`compare.tsv`**: the same columns with the release's own Pfam table as the truth; a domain is the same if
-  its envelope is. Use it with Pfam 38.2 only, and `--cutoff gathering`, as the table was made.
+  its envelope is. Use it with Pfam 38.1 only, and `--cutoff gathering`, as the table was made.
 
 `work/` holds the FASTA of every chunk until deleted: about 1.1 TB for every protein of the release.
 
