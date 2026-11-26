@@ -31,7 +31,7 @@ bash workflows/setup.sh   # creates .venv in the repo root
 ```
 
 kfpfam's image is published nowhere. Build it where Docker is, from kfpfam's `prep-any-hmm` branch
-(`63a4cf6`) or later, and convert it on the HPC. Older ones lack `top`'s windows, need `ACC` and `GA` lines, which KOfam's profiles
+(`75e543d`) or later, and convert it on the HPC. Older ones need `ACC` and `GA` lines, which KOfam's profiles
 lack, panic on a protein over 65,535 residues, and are very slow at these settings.
 
 ```bash

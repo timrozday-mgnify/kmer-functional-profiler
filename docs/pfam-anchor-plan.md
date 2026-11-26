@@ -829,3 +829,15 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   - **The HPC test of `top` (2026-11-25, the user's request):** `hpc/kfp-ablations/hmm-annotate/benchmark.sh` runs `hmmsearch`, `top`, `fast` and `nail` on the same 1 in 1,000 proteins and `bench.py` compares CPU time, SIMD kernel, CPU and domains missed. The user expects `top` to be faster on Codon than on the laptop (1.5×). Run emulated (AVX2) on the test data; not on Codon yet.
   - **`fast` on real reads:** 400,000 ORFs of ERR10889147, 2,725 pairs at GA: 69× `hmmsearch`, 3 missed (top 14×, 0; r999 39×, 2). Added as the B11 arm `kfpfam_fast` (nar-review-response, not in git).
   - **Nextflow 26.04.1's `-resume` reuses a task whose script changed only by a `params` value** (minimal case; 25.10.4, 26.10.0 and 26.10.2 don't; inputs and `ext.args` are tracked). `hpc/kfp-ablations/common.sh` refuses 26.04.
+- 2026-11-26: trimmed-Pfam study for `top` on whole proteins (kfpfam docs/scaling.md, "Models trimmed to 50 columns").
+  One 50-column stretch per model: 7.5× `hmmsearch` but 1,360 of 8,723 pairs missed; with hindsight no single stretch keeps
+  600 of them (partial domains). A second gapped bar on the whole diagonal (`FILTER_SECOND_GAPPED`, uncommitted): 2.9× for 1
+  pair; Viterbi slack and windowed HMMER lossy. Gate (13.6 CPU-s) caps `top` near 13×; measured best without loss about 3×.
+- 2026-11-26: evidence concentration per model (kfpfam docs/scaling.md, "How concentrated a model's evidence is"). Nearly
+  every true domain has 50 columns that reach the bar, but where varies by protein; seed-chosen regions miss many.
+  Regions chosen on half the slice: 50 columns, 1.13 a model, 7.0× `hmmsearch`, 0.8% of held-out pairs missed; 75 columns
+  5.1×, 0.37% (`top`: 2.5×, 0.03%).
+- 2026-11-26: kfpfam is for reads; MGnify proteins are annotated with `--engine hmmsearch`, and `top` on them stays a benchmark
+  of the method. On 309,149 read ORFs the whole-protein windows made the filter 22.3 → 27.4 CPU-s for the same pairs and
+  32:12/8/64 only won it back, so kfpfam's filter is 7a6cce4's again (kfpfam 75e543d) and hm-annotate's `top` is the reads'
+  settings. Kept: `--forward-slack 8` (reads 4.14 → 3.37 HMMER CPU-s, nothing lost). Short models (weefams) suit the filter.
