@@ -78,7 +78,7 @@ process SEARCH {
     ${params.engine == 'kfpfam' ? prefilter(prep, index, faa, chunk, task.cpus) : ''} \\
         ${params.kfpfam_python} annotate.py search --faa ${faa} --pressed models \\
             --thresholds ${thresholds} --threads ${task.cpus} --weak-evalue ${params.weak_evalue} \\
-            ${searchable(params.engine, seeds)} ${params.engine == 'hmmsearch' ? '' : forward()} \\
+            ${searchable(params.engine, seeds)} ${params.engine in ['hmmsearch', 'release'] ? '' : forward()} \\
             ${flag(params.domains) ? "--domains chunk${chunk}.domains.parquet" : ''} \\
             ${flag(params.members) ? "--near chunk${chunk}.near.parquet --near-slack ${params.member_slack}" : ''} \\
             --labels chunk${chunk}.labels.parquet --stats chunk${chunk}.stats.tsv
