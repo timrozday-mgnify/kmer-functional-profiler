@@ -202,17 +202,26 @@ def main() -> None:
 
     # both as SEARCH runs them: each model on all the proteins (hmmsearch) or on its candidates
     # (kfpfam)
+    # the blocks are built off the clock: hmmsearch builds its one block once, and a block's cost is
+    # Python's, which for every model on a read's 300,000 ORFs would be most of it
+    everything = DigitalSequenceBlock(ALPHABET, seqs)
+
     def batch(models, every):
         profiles = mine(a.pressed)
-        t = time.thread_time()
+        spent = 0.0
         for m in models:
-            targets = seqs if every else [seqs[i] for i in by_model.get(m, [])]
-            if not targets:
+            if every:
+                targets = everything
+            elif m in by_model:
+                targets = DigitalSequenceBlock(ALPHABET, [seqs[i] for i in by_model[m]])
+            else:
                 continue
             _, _, seq_t, _ = thresholds[m]
-            cut = None if every else slack(profiles[m], seq_t)
-            pipe(a.z, cut).search_hmm(profiles[m], DigitalSequenceBlock(ALPHABET, targets))
-        return time.thread_time() - t
+            p = pipe(a.z, None if every else slack(profiles[m], seq_t))
+            t = time.thread_time()
+            p.search_hmm(profiles[m], targets)
+            spent += time.thread_time() - t
+        return spent
 
     by_model: dict[int, list] = {}
     for i, ms in cand.items():
