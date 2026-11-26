@@ -841,3 +841,4 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   of the method. On 309,149 read ORFs the whole-protein windows made the filter 22.3 → 27.4 CPU-s for the same pairs and
   32:12/8/64 only won it back, so kfpfam's filter is 7a6cce4's again (kfpfam 75e543d) and hm-annotate's `top` is the reads'
   settings. Kept: `--forward-slack 8` (reads 4.14 → 3.37 HMMER CPU-s, nothing lost). Short models (weefams) suit the filter.
+- 2026-11-26: raw-reads pipeline (`pfam-orf-filter-nail`): KFPFAM_HMMER passes `--forward-slack 8` to hmmer_pairs.py (`kfpfam_forward_slack`); same domtbl on 309,149 read ORFs, HMMER 19% less. nail's path unchanged.
