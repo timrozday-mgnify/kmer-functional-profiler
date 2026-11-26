@@ -12,6 +12,7 @@ FASTA          per range: the sequences                                         
 SEARCH         per range: filter join | annotate.py search -> domains/ and labels/
                (--engine hmmsearch: annotate.py search --all-pairs, no index)
 NAIL_SEED      per range, with --engine nail: its seeds, for SEARCH; NAIL_MEMBERS, the same of the members
+RELEASE_SEED   per range, with --engine release: the release's Pfam table's pairs as seeds, for SEARCH
 MEMBER_PAIRS   with --members: the models each representative nearly passes -> its members' pairs, by member id
 MEMBER_FASTA   per --member_width ids: those members' sequences and pairs
 MEMBER_SEARCH  per --member_width ids: HMMER on the pairs -> domains/ and labels/
@@ -60,7 +61,7 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--hmm` | | The collection: one HMM file, plain or gzipped |
-| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `nail`: its seeds (an MMseqs2 profile search), then HMMER on those; `hmmsearch`: HMMER on every model |
+| `--engine` | `kfpfam` | `kfpfam`: its prefilter, then HMMER on the candidates; `nail`: its seeds (an MMseqs2 profile search), then HMMER on those; `hmmsearch`: HMMER on every model; `release`: HMMER on the release's own Pfam table's (protein, family) pairs only (`RELEASE_SEED`), so that table's domains with alignments, for lookup-index; Pfam 38.2, `--targets all` |
 | `--cutoff` | `gathering` | The HMM file's own thresholds: `gathering`, `trusted` or `noise` |
 | `--thresholds` | | Or a TSV with a header: model, threshold, `full` or `domain`. KOfam's `ko_list` as it is |
 | `--targets` | `all` | `all`: every protein; `reps`: MGnify90 representatives |

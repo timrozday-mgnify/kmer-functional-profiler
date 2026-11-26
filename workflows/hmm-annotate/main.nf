@@ -102,9 +102,42 @@ def prefilter(prep, index, faa, chunk, cpus, out = '/dev/stdout', extra = '') {
         ${params.kfpfam_block} ${faa} ${out}; } 2>> chunk${chunk}.log ${out == '/dev/stdout' ? '|' : ''}""".stripIndent()
 }
 
+// --engine release: the release's own Pfam table's (protein, family) pairs of the chunk as seeds, so
+// HMMER aligns only what that table already has (its domains, with alignments, for lookup-index)
+process RELEASE_SEED {
+    tag "${chunk}"
+    label 'process_small'
+
+    input:
+    tuple val(chunk), val(lo), val(hi)
+    path thresholds
+
+    output:
+    tuple val(chunk), path("chunk${chunk}.seeds.tsv.gz")
+
+    script:
+    """
+    ${params.python} - <<'EOF'
+import duckdb
+duckdb.sql(\"\"\"
+    COPY (
+        SELECT DISTINCT t.name AS model, p.protein_id
+        FROM read_parquet('${params.release}/mgy_proteins_pfam.parquet') p
+        JOIN read_csv('${thresholds}', delim = '\\t', header = true) t
+            ON t.model = format('PF{:05d}', p.pfam_accession)
+        WHERE p.protein_id BETWEEN ${lo} AND ${hi - 1} AND p.protein_id % ${params.sample} = 0
+    ) TO 'chunk${chunk}.seeds.tsv.gz' (FORMAT csv, DELIMITER '\\t', HEADER, COMPRESSION gzip)
+\"\"\")
+EOF
+    """
+
+    stub:
+    "echo | gzip > chunk${chunk}.seeds.tsv.gz"
+}
+
 // Where the pairs to search come from, if not stdin
 def searchable(engine, seeds) {
-    engine == 'nail' ? "--seeds ${[seeds].flatten().join(' ')} --block ${params.kfpfam_block}" : engine == 'hmmsearch' ? '--all-pairs' : ''
+    engine in ['nail', 'release'] ?"--seeds ${[seeds].flatten().join(' ')} --block ${params.kfpfam_block}" : engine == 'hmmsearch' ? '--all-pairs' : ''
 }
 
 def forward() {
@@ -361,8 +394,11 @@ workflow {
     if (!(params.targets in ['reps', 'all'])) {
         error "--targets ${params.targets}: reps or all"
     }
-    if (!(params.engine in ['kfpfam', 'nail', 'hmmsearch'])) {
-        error "--engine ${params.engine}: kfpfam, nail or hmmsearch"
+    if (!(params.engine in ['kfpfam', 'nail', 'hmmsearch', 'release'])) {
+        error "--engine ${params.engine}: kfpfam, nail, hmmsearch or release"
+    }
+    if (params.engine == 'release' && (params.targets != 'all' || flag(params.members))) {
+        error "--engine release takes the release table's pairs of every protein: --targets all, no --members"
     }
     if (!(params.kfpfam_mode in params.kfpfam_modes)) {
         error "--kfpfam_mode ${params.kfpfam_mode}: ${params.kfpfam_modes.keySet().join(' or ')}"
@@ -415,6 +451,11 @@ workflow {
         if (params.engine == 'nail') {
             NAIL_SEED(FASTA.out.map { _arm, chunk, faa, _counts -> [chunk, faa] }, PREP.out.hmm)
             ch_search = FASTA.out.map { arm, chunk, faa, counts -> [chunk, arm, faa, counts] }.join(NAIL_SEED.out.seeds)
+                .map { chunk, arm, faa, counts, found -> [arm, chunk, faa, counts, found] }
+        }
+        if (params.engine == 'release') {
+            RELEASE_SEED(ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }, PREP.out.thresholds)
+            ch_search = FASTA.out.map { arm, chunk, faa, counts -> [chunk, arm, faa, counts] }.join(RELEASE_SEED.out)
                 .map { chunk, arm, faa, counts, found -> [arm, chunk, faa, counts, found] }
         }
         SEARCH(ch_search, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)

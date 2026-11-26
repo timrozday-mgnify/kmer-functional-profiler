@@ -10,6 +10,8 @@
 # or hmmsearch alone (workflows/hmm-annotate/README.md). Inputs, as environment variables:
 #   ENGINE=kfpfam-top              kfpfam's top mode, kfpfam-fast, nail (its seeds at P 0.01, as B11's arm,
 #                                  then HMMER), or hmmsearch: every model, no prefilter
+#   ENGINE=release                 PFAM=38.2 only: HMMER on the release's own Pfam table's (protein, family) pairs,
+#                                  so its domains with alignments, for lookup-index, without searching every model
 #   MEMBERS=true                   representatives by ENGINE, then their members by HMMER alone, on the models the
 #                                  representative nearly passes. Every protein still, at a fraction of the cost
 #   MEMBERS=fast                   representatives by ENGINE (hmmsearch, or kfpfam-fast), and then kfpfam's fast mode on
@@ -44,6 +46,7 @@
 #   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
 #   PFAM=39.0 ENGINE=hmmsearch MEMBERS=fast sbatch --dependency=afterany:<that job> run.sh     # check.members.tsv
 #   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
+#   PFAM=38.2 ENGINE=release SAMPLE=1 sbatch run.sh                                # the release's 38.2 domains, aligned
 #   PFAM=38.2 PROFILE=true SAMPLE=100000 sbatch run.sh                             # cost per protein, both tools
 #   COLLECTION=weefams HMM=<weefams.hmm> sbatch run.sh                             # weefams by kfpfam top
 # kfpfam's and nail's speed against hmmsearch's on the HPC's CPUs, and what it misses: benchmark.sh
@@ -79,9 +82,13 @@ case $members in
     *) echo "MEMBERS=$members: false, true, fast, top or nail" >&2; exit 1 ;;
 esac
 case $engine in
-    hmmsearch | nail | kfpfam-top | kfpfam-fast) ;;
-    *) echo "ENGINE=$engine: hmmsearch, nail, kfpfam-top or kfpfam-fast" >&2; exit 1 ;;
+    hmmsearch | nail | kfpfam-top | kfpfam-fast | release) ;;
+    *) echo "ENGINE=$engine: hmmsearch, nail, kfpfam-top, kfpfam-fast or release" >&2; exit 1 ;;
 esac
+if [[ $engine == release && ( ${COLLECTION:-pfam} != pfam || ${PFAM:-39.0} != 38.2 || $members != false ) ]]; then
+    echo "ENGINE=release: the release's table is of Pfam 38.2: COLLECTION=pfam PFAM=38.2, no MEMBERS" >&2
+    exit 1
+fi
 filter=
 case $members in
     fast | top) filter=kfpfam ;;

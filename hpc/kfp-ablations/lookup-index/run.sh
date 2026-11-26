@@ -7,15 +7,16 @@
 #SBATCH --mem=8G
 #SBATCH --export=ALL
 # The MGnify90 lookup bundle of the whole release (workflows/lookup-index/README.md), from hmm-annotate's
-# SAMPLE=1 runs of Pfam 39.0 and KOfam. Inputs, as environment variables:
+# SAMPLE=1 runs of Pfam (38.2 by ENGINE=release, or a full one) and KOfam. Inputs, as environment variables:
 #   SIF=<kfp-lookup.sif>         workflows/pfam-anchor/lookup/Dockerfile's image; ../images/kfp-lookup.{tar,sif} by default
-#   HMM=<Pfam-A.hmm[.gz]>        the file hmm-annotate searched, and the one the reads are aligned to:
-#                                $B11_DIR/pfam/39.0/Pfam-A.hmm, or the FTP site's 39.0 (it is checked)
-#   PFAM=../hmm-annotate/results-pfam39.0-hmmsearch-1   or the engine's it was run with
+#   HMM=<Pfam-A.hmm[.gz]>        the file hmm-annotate searched, and the one the reads are aligned to
+#                                (it is checked): the FTP site's Pfam38.2/Pfam-A.hmm.gz for ENGINE=release
+#   PFAM=../hmm-annotate/results-pfam38.2-release-1     the release's 38.2 domains, aligned (hmm-annotate
+#                                ENGINE=release); or a full annotation's, results-pfam39.0-hmmsearch-1 with PFAM_VERSION=39.0
 #   KOFAM=../hmm-annotate/results-kofam-kfpfam-top-1   its labels; KOFAM= (empty) for a bundle with none
 #   SAMPLE_PARQUET=<*_pfam_alignments.parquet>   optional: profiled with the bundle at the end
 #   RELEASE=<mirror>             a local mirror instead of the FTP site
-#   PFAM_VERSION=39.0 MGNIFY_VERSION=2026_07     recorded in the bundle
+#   PFAM_VERSION=38.2 MGNIFY_VERSION=2026_07     recorded in the bundle
 # Read:
 #   results/bundle/           the index, for the raw-reads pipeline's --pfam_lookup_bundle
 #   results/bundle/manifest.json   rows, member rows, rows_label_dropped
@@ -29,11 +30,11 @@
 source ../common.sh
 : "${HMM:?the Pfam-A.hmm that was annotated with}"
 SIF=${SIF:-$(sif kfp-lookup)}
-PFAM=${PFAM:-../hmm-annotate/results-pfam39.0-hmmsearch-1}
+PFAM=${PFAM:-../hmm-annotate/results-pfam38.2-release-1}
 KOFAM=${KOFAM-../hmm-annotate/results-kofam-kfpfam-top-1}
 nextflow run "$WF/lookup-index" -c ../site.config ${RELEASE:+--release "$RELEASE"} \
     --lookup_sif "$(realpath "$SIF")" --hmm "$(realpath "$HMM")" --pfam "$(realpath "$PFAM")" \
     ${KOFAM:+--labels "ko=$(realpath "$KOFAM")"} \
     ${SAMPLE_PARQUET:+--check_parquet "$(realpath "$SAMPLE_PARQUET")"} \
-    --pfam_version "${PFAM_VERSION:-39.0}" --mgnify_version "${MGNIFY_VERSION:-2026_07}" \
+    --pfam_version "${PFAM_VERSION:-38.2}" --mgnify_version "${MGNIFY_VERSION:-2026_07}" \
     --outdir results -resume
