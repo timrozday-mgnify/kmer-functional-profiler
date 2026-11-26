@@ -16,7 +16,7 @@
 #                                  every member too: HMMER has the models of either. MEMBERS=top: its top mode; nail: nail
 #   MIN_CLUSTER=1                  with MEMBERS=fast, top or nail, ENGINE has the representatives of clusters this size or more only;
 #                                  kfpfam or nail has the whole of the others
-#   SIF=<kfpfam-filter.sif>        kfpfam's image, 75e543d or later (all engines); ../images/kfpfam-filter.{tar,sif} by default
+#   SIF=<kfpfam-filter.sif>        kfpfam's image, 9833cf6 or later (all engines); ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
 #                                  the index must be of the models the reads are aligned to
@@ -25,6 +25,14 @@
 #   COLLECTION=kofam               HMM=<all profiles in one file>  THRESHOLDS=<ko_list[.gz]>; labels only
 #                                  (with SAMPLE > 1 domains too, for the check). From KEGG's FTP site:
 #                                  cat profiles/K*.hmm > kofam.hmm
+#   COLLECTION=weefams             HMM=<weefams.hmm>: mgnifams-explore's library (results/wcollect/weefams.hmm, the
+#                                  accepted ones, each with its cut as GA); NAME is its id, as it has no ACC
+#   PROFILE=true                   instead of annotating, each sampled protein's cost by hmmsearch and by ENGINE
+#                                  (a kfpfam mode), timed per protein on the same proteins: results-<...>-profile-<engine>-<sample>/
+#                                  profile.{lengths,models}.tsv, profile.{proteins,pairs}.parquet. Plot where matplotlib is:
+#                                  uv run --with matplotlib python workflows/hmm-annotate/profile_plot.py plot <dir>/profile
+#                                  SAMPLE=100000 is some tens of thousands of proteins (protein_id % SAMPLE == 0: the same
+#                                  proteins every time, for every collection and engine)
 #   SAMPLE=1000                    1 in N proteins, and full hmmsearch on 1 in CHECK (10) of those
 #                                  (none for ENGINE=hmmsearch, but its MEMBERS)
 #   RELEASE=<mirror>               a local mirror instead of the FTP site. Worth having: even 1 in 1,000
@@ -36,6 +44,8 @@
 #   PFAM=39.0 ENGINE=hmmsearch sbatch --dependency=afterany:<that job> run.sh      # the benchmark
 #   PFAM=39.0 ENGINE=hmmsearch MEMBERS=fast sbatch --dependency=afterany:<that job> run.sh     # check.members.tsv
 #   PFAM=39.0 ENGINE=hmmsearch SAMPLE=1 sbatch run.sh                              # or a kfpfam mode
+#   PFAM=38.2 PROFILE=true SAMPLE=100000 sbatch run.sh                             # cost per protein, both tools
+#   COLLECTION=weefams HMM=<weefams.hmm> sbatch run.sh                             # weefams by kfpfam top
 # kfpfam's and nail's speed against hmmsearch's on the HPC's CPUs, and what it misses: benchmark.sh
 # One at a time in this directory: they share its work/ and -resume cache.
 # Read results-<collection><release>-<engine>[-members[-fast|-top|-nail][-min<n>]]-<sample>/ (results-pfam39.0-hmmsearch-1000):
@@ -63,6 +73,7 @@ engine=${ENGINE:-kfpfam-top}
 check=${CHECK:-10}
 members=${MEMBERS:-false}
 min_cluster=${MIN_CLUSTER:-1}
+profile=${PROFILE:-false}
 case $members in
     false | true | fast | top | nail) ;;
     *) echo "MEMBERS=$members: false, true, fast, top or nail" >&2; exit 1 ;;
@@ -84,7 +95,11 @@ if [[ $min_cluster != 1 && -z $filter ]]; then
     echo "MIN_CLUSTER needs MEMBERS=fast, top or nail" >&2
     exit 1
 fi
-if [[ $sample == 1 || ( $engine == hmmsearch && $members == false ) ]]; then check=0; fi
+if [[ $profile == true && ( $engine != kfpfam-* || $members != false ) ]]; then
+    echo "PROFILE=true times hmmsearch against ENGINE=kfpfam-top or kfpfam-fast, without MEMBERS" >&2
+    exit 1
+fi
+if [[ $sample == 1 || $profile == true || ( $engine == hmmsearch && $members == false ) ]]; then check=0; fi
 args=(--engine "${engine%%-*}")
 if [[ $engine == kfpfam-* ]]; then args+=(--kfpfam_mode "${engine#*-}"); fi
 name=$collection
@@ -92,7 +107,7 @@ case $collection in
     pfam)
         release=${PFAM:-39.0}
         name=pfam$release
-        if [[ $members == false ]]; then
+        if [[ $members == false && $profile == false ]]; then
             args+=(--compare_release "${COMPARE:-$([[ $release == 38.2 ]] && echo true || echo false)}")
         fi
         args+=(--hmm "${HMM:-https://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam$release/Pfam-A.hmm.gz}")
@@ -119,6 +134,7 @@ if [[ -n $filter ]]; then
     if [[ $filter == kfpfam && $engine != kfpfam-* ]]; then args+=(--kfpfam_mode "$members"); fi
     if [[ $min_cluster != 1 ]]; then engine+=-min$min_cluster; fi
 fi
+if [[ $profile == true ]]; then args+=(--profile true); engine=profile-$engine; fi
 nextflow run "$WF/hmm-annotate" -c ../site.config \
     ${RELEASE:+--release "$RELEASE"} --kfpfam_sif "$(realpath "$SIF")" "${args[@]}" \
     --targets "$targets" --sample "$sample" --check_sample "$check" \

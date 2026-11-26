@@ -31,7 +31,7 @@ bash workflows/setup.sh   # creates .venv in the repo root
 ```
 
 kfpfam's image is published nowhere. Build it where Docker is, from kfpfam's `prep-any-hmm` branch
-(`75e543d`) or later, and convert it on the HPC. Older ones need `ACC` and `GA` lines, which KOfam's profiles
+(`9833cf6`) or later, and convert it on the HPC (`--profile` needs its `FILTER_PER_ORF`). Older ones need `ACC` and `GA` lines, which KOfam's profiles
 lack, panic on a protein over 65,535 residues, and are very slow at these settings.
 
 ```bash
@@ -80,9 +80,30 @@ On HPC, `hpc/kfp-ablations/hmm-annotate/run.sh` runs 1 in 1,000 proteins with th
 | `--kfpfam_mode` | `top` | `top`: as near every domain as it goes; `fast`: gapped bars per model from its threshold, 99.8% of domains. Settings: `kfpfam_modes` in `nextflow.config` |
 | `--kfpfam_band`, `_diagonals` | 15, `any` | A band around every diagonal at the bar, until one reaches the gapped bar |
 | `--kfpfam_block` | `80000` | Proteins the filter holds at a time |
+| `--profile` | `false` | A run of its own: each sampled protein's cost by `hmmsearch` and by kfpfam (`--kfpfam_mode`), on the same proteins (below) |
 
 A model in the HMM file with no threshold is an error. A `-` in the table is not: that model never
 passes, and shows only with `--weak_evalue`.
+
+Weefams (mgnifams-explore's short families, `results/wcollect/weefams.hmm`) are a collection like any other: each has
+its cut as a GA line and no ACC, so it is named by its NAME (`wee<n>`). `COLLECTION=weefams HMM=<weefams.hmm>` in
+`run.sh`.
+
+### Cost per protein (`--profile`)
+
+`PLAN`, `FASTA`, then `PROFILE` per chunk and `PROFILE_SUMMARY`; nothing else runs. `profile.py` gives each protein:
+- `hmmsearch_s`: the protein against every model, HMMER's pipeline as `--engine hmmsearch` runs it. Its passing models
+  are the truth (`true_models`, `true_lengths`).
+- kfpfam's filter (`filter join` with `FILTER_PER_ORF`): the diagonal, bound and exact gapped stages timed per protein;
+  the gate's time shared out by k-mer hits (its cost per hit hardly varies) and the survivor sort's by diagonals.
+- `kf_hmmer_s`: HMMER on each candidate pair alone, with `--forward_slack` as `SEARCH` has it; `kf_missed`, `kf_extra`.
+
+A call's own setup is paid once per model in a batch, so each timed search has an empty one's taken off, and each tool's
+per-protein times are scaled to sum to the same search run as `SEARCH` runs it, on the chunk at once (`scale` in
+`profile.run.json`, about 1.1 and 1.35 on the laptop: the profiles don't stay in cache one protein at a time). The
+sample is `protein_id % --sample == 0`, so the same proteins for every run, engine and collection.
+`profile.lengths.tsv` and `profile.models.tsv` are by protein and by true model length; `profile_plot.py plot` draws them
+(matplotlib, which the workflow's environment needn't have).
 
 ## Output
 

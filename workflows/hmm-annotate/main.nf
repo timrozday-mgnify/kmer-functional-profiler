@@ -31,7 +31,7 @@ process PREP {
     ${params.kfpfam_python} tables.py thresholds --hmm models.hmm --models prep/models.tsv ${source}
     ${params.kfpfam_python} annotate.py press --hmm models.hmm --models prep/models.tsv --out models
     mkdir index
-    if [[ ${'kfpfam' in [params.engine, params.member_filter]} == true ]]; then
+    if [[ ${'kfpfam' in [params.engine, params.member_filter] || flag(params.profile)} == true ]]; then
         export RAYON_NUM_THREADS=${task.cpus}
         ${params.kfpfam_python} seeds.py bars --models prep/models.tsv --thresholds thresholds.tsv \\
             --ga ga.tsv --gapped index/gapped.txt --slack ${kfpfam.slack}
@@ -91,14 +91,15 @@ process SEARCH {
 
 // The filter writes each block's pairs to the pipe as numbers, and HMMER searches them while the
 // next block is filtered, as in the raw-reads pipeline's KFPFAM_HMMER. Both use every core.
-def prefilter(prep, index, faa, chunk, cpus) {
+// PROFILE writes them to a file instead, with each protein's work beside them.
+def prefilter(prep, index, faa, chunk, cpus, out = '/dev/stdout', extra = '') {
     def kfpfam = params.kfpfam_modes[params.kfpfam_mode]
     """\
         { time RAYON_NUM_THREADS=${cpus} FILTER_MIN_GAPPED=${kfpfam.min_gapped} \\
         FILTER_GAPPED_FILE=${index}/gapped.txt FILTER_BAND=${params.kfpfam_band} \\
-        FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
+        FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 ${extra} \\
         ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
-        ${params.kfpfam_block} ${faa} /dev/stdout; } 2>> chunk${chunk}.log |""".stripIndent()
+        ${params.kfpfam_block} ${faa} ${out}; } 2>> chunk${chunk}.log ${out == '/dev/stdout' ? '|' : ''}""".stripIndent()
 }
 
 // Where the pairs to search come from, if not stdin
@@ -123,6 +124,63 @@ def searched(chunk, counts) {
         echo "chunk${chunk}: proteins or residues searched are not those of ${counts}" >&2
         exit 1
     fi"""
+}
+
+// Each protein's cost by hmmsearch and by kfpfam on the same proteins (profile.py)
+process PROFILE {
+    tag "${chunk}"
+    label 'process_search'
+    label 'kfpfam'
+    publishDir "${params.outdir}/profile", mode: params.publish_mode, pattern: '*.{parquet,json,log}'
+
+    input:
+    tuple val(_arm), val(chunk), path(faa), path(_counts)
+    path hmm
+    path prep
+    path index
+    path thresholds
+    path code
+
+    output:
+    path "chunk${chunk}.proteins.parquet", emit: proteins
+    path "chunk${chunk}.pairs.parquet", emit: pairs
+    path "chunk${chunk}.run.json", emit: run
+    path "chunk${chunk}.log", emit: log
+
+    script:
+    """
+    set -o pipefail
+    ${logged(chunk)}
+    ${prefilter(prep, index, faa, chunk, task.cpus, "chunk${chunk}.pairs.bin", "FILTER_PER_ORF=chunk${chunk}.orf.tsv")}
+    ${params.kfpfam_python} profile.py --faa ${faa} --pressed models --thresholds ${thresholds} \\
+        --pairs-bin chunk${chunk}.pairs.bin --per-orf chunk${chunk}.orf.tsv --filter-log chunk${chunk}.log \\
+        ${forward()} --threads ${task.cpus} \\
+        --proteins chunk${chunk}.proteins.parquet --pairs chunk${chunk}.pairs.parquet --run chunk${chunk}.run.json
+    rm chunk${chunk}.pairs.bin chunk${chunk}.orf.tsv
+    """
+
+    stub:
+    "touch chunk${chunk}.proteins.parquet chunk${chunk}.pairs.parquet chunk${chunk}.run.json chunk${chunk}.log"
+}
+
+process PROFILE_SUMMARY {
+    label 'process_small'
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path proteins, stageAs: 'proteins/*'
+    path pairs, stageAs: 'pairs/*'
+    path runs, stageAs: 'runs/*'
+    path code
+
+    output:
+    path 'profile.*'
+
+    script:
+    "${params.python} profile_plot.py summary --proteins proteins --pairs pairs --runs runs --out profile"
+
+    stub:
+    "touch profile.bins.tsv"
 }
 
 process MEMBER_PAIRS {
@@ -324,6 +382,9 @@ workflow {
     if (!params.hmm) {
         error "--hmm: the collection's HMM file, plain or gzipped"
     }
+    if (flag(params.profile) && (params.engine != 'kfpfam' || flag(params.members))) {
+        error "--profile times hmmsearch and kfpfam (--kfpfam_mode) on the same proteins: leave --engine kfpfam, without --members"
+    }
     if (params.check_sample as int > 0 && !flag(params.domains)) {
         error "--check_sample compares domains: it needs --domains true"
     }
@@ -343,56 +404,64 @@ workflow {
         .map { r -> ['real', r.chunk as int, r.lo as long, r.hi as long, r.proteins as long] }
         .ifEmpty { error "nothing to search: no protein is in the sample, or no cluster of --min_cluster" }
     FASTA(ch_chunks)
-    ch_search = FASTA.out.map { arm, chunk, faa, counts -> [arm, chunk, faa, counts, []] }
-    if (params.engine == 'nail') {
-        NAIL_SEED(FASTA.out.map { _arm, chunk, faa, _counts -> [chunk, faa] }, PREP.out.hmm)
-        ch_search = FASTA.out.map { arm, chunk, faa, counts -> [chunk, arm, faa, counts] }.join(NAIL_SEED.out.seeds)
-            .map { chunk, arm, faa, counts, found -> [arm, chunk, faa, counts, found] }
-    }
-    SEARCH(ch_search, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
-    def ch_stats = SEARCH.out.stats
-    def ch_check = SEARCH.out.domains.map { chunk, faa, domains -> ['check', chunk, faa, domains, params.sample] }
-    if (flag(params.members)) {
-        def members = file("${projectDir}/members.py", checkIfExists: true)
-        // in the order of the representatives, so that a batch is a range of them, and the batches are every
-        // range: the clusters under min_cluster are in no chunk
-        ch_near = ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }.join(SEARCH.out.near)
-            .toSortedList { a, b -> a[0] <=> b[0] }
-            .flatMap { rows ->
-                def parts = rows.groupBy { r -> r[1].intdiv(params.member_batch as long) }.values() as List
-                parts.withIndex().collect { part, i ->
-                    [i, i == 0 ? 0L : part[0][1], i + 1 < parts.size() ? parts[i + 1][0][1] : Long.MAX_VALUE,
-                     part.collect { r -> r[3] }]
-                }
-            }
-        MEMBER_PAIRS(ch_near, members)
-        ch_shards = MEMBER_PAIRS.out.shards.splitText().map { s -> s.trim() as long }.unique()
-        ch_shards.map { s -> "m${s}\t${s * (params.member_width as long)}\t${(s + 1) * (params.member_width as long)}\n" }
-            .collectFile(name: 'ranges.members.tsv', seed: "chunk\tlo\thi\n", sort: true, storeDir: params.outdir)
-        MEMBER_FASTA(ch_shards, MEMBER_PAIRS.out.pairs.collect(), PREP.out.thresholds, members)
-        ch_members = MEMBER_FASTA.out.map { chunk, faa, counts, pairs -> [chunk, faa, counts, pairs, []] }
-        if (params.member_filter == 'nail') {
-            NAIL_MEMBERS(MEMBER_FASTA.out.map { chunk, faa, _counts, _pairs -> [chunk, faa] }, PREP.out.hmm)
-            ch_members = MEMBER_FASTA.out.join(NAIL_MEMBERS.out.seeds)
+    if (flag(params.profile)) {
+        // a run of its own: both tools on the sample's proteins, timed per protein, and nothing else
+        def profiling = [annotate, file("${projectDir}/profile.py", checkIfExists: true)]
+        PROFILE(FASTA.out, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, profiling)
+        PROFILE_SUMMARY(PROFILE.out.proteins.collect(), PROFILE.out.pairs.collect(), PROFILE.out.run.collect(),
+            file("${projectDir}/profile_plot.py", checkIfExists: true))
+    } else {
+        ch_search = FASTA.out.map { arm, chunk, faa, counts -> [arm, chunk, faa, counts, []] }
+        if (params.engine == 'nail') {
+            NAIL_SEED(FASTA.out.map { _arm, chunk, faa, _counts -> [chunk, faa] }, PREP.out.hmm)
+            ch_search = FASTA.out.map { arm, chunk, faa, counts -> [chunk, arm, faa, counts] }.join(NAIL_SEED.out.seeds)
+                .map { chunk, arm, faa, counts, found -> [arm, chunk, faa, counts, found] }
         }
-        MEMBER_SEARCH(ch_members, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
-        ch_stats = ch_stats.mix(MEMBER_SEARCH.out.stats)
-        ch_check = ch_check.mix(MEMBER_SEARCH.out.domains.map { chunk, faa, domains -> ['check.members', chunk, faa, domains, 1] })
+        SEARCH(ch_search, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
+        def ch_stats = SEARCH.out.stats
+        def ch_check = SEARCH.out.domains.map { chunk, faa, domains -> ['check', chunk, faa, domains, params.sample] }
+        if (flag(params.members)) {
+            def members = file("${projectDir}/members.py", checkIfExists: true)
+            // in the order of the representatives, so that a batch is a range of them, and the batches are every
+            // range: the clusters under min_cluster are in no chunk
+            ch_near = ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }.join(SEARCH.out.near)
+                .toSortedList { a, b -> a[0] <=> b[0] }
+                .flatMap { rows ->
+                    def parts = rows.groupBy { r -> r[1].intdiv(params.member_batch as long) }.values() as List
+                    parts.withIndex().collect { part, i ->
+                        [i, i == 0 ? 0L : part[0][1], i + 1 < parts.size() ? parts[i + 1][0][1] : Long.MAX_VALUE,
+                         part.collect { r -> r[3] }]
+                    }
+                }
+            MEMBER_PAIRS(ch_near, members)
+            ch_shards = MEMBER_PAIRS.out.shards.splitText().map { s -> s.trim() as long }.unique()
+            ch_shards.map { s -> "m${s}\t${s * (params.member_width as long)}\t${(s + 1) * (params.member_width as long)}\n" }
+                .collectFile(name: 'ranges.members.tsv', seed: "chunk\tlo\thi\n", sort: true, storeDir: params.outdir)
+            MEMBER_FASTA(ch_shards, MEMBER_PAIRS.out.pairs.collect(), PREP.out.thresholds, members)
+            ch_members = MEMBER_FASTA.out.map { chunk, faa, counts, pairs -> [chunk, faa, counts, pairs, []] }
+            if (params.member_filter == 'nail') {
+                NAIL_MEMBERS(MEMBER_FASTA.out.map { chunk, faa, _counts, _pairs -> [chunk, faa] }, PREP.out.hmm)
+                ch_members = MEMBER_FASTA.out.join(NAIL_MEMBERS.out.seeds)
+            }
+            MEMBER_SEARCH(ch_members, PREP.out.hmm, PREP.out.prep, PREP.out.index, PREP.out.thresholds, annotate)
+            ch_stats = ch_stats.mix(MEMBER_SEARCH.out.stats)
+            ch_check = ch_check.mix(MEMBER_SEARCH.out.domains.map { chunk, faa, domains -> ['check.members', chunk, faa, domains, 1] })
+        }
+        SUMMARY(ch_stats.collect(), tables)
+        def ch_checks = channel.empty()
+        if (params.check_sample as int > 0) {
+            CHECK(ch_check, PREP.out.hmm, PREP.out.thresholds, annotate)
+            ch_checks = CHECK.out.groupTuple()
+        }
+        if (flag(params.compare_release)) {
+            def compare = file("${projectDir}/compare.py", checkIfExists: true)
+            COMPARE(
+                ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }
+                    .join(SEARCH.out.domains.map { chunk, _faa, domains -> [chunk, domains] }),
+                compare,
+            )
+            ch_checks = ch_checks.mix(COMPARE.out.collect().map { c -> ['compare', c] })
+        }
+        CHECK_SUMMARY(ch_checks, tables)
     }
-    SUMMARY(ch_stats.collect(), tables)
-    def ch_checks = channel.empty()
-    if (params.check_sample as int > 0) {
-        CHECK(ch_check, PREP.out.hmm, PREP.out.thresholds, annotate)
-        ch_checks = CHECK.out.groupTuple()
-    }
-    if (flag(params.compare_release)) {
-        def compare = file("${projectDir}/compare.py", checkIfExists: true)
-        COMPARE(
-            ch_chunks.map { _arm, chunk, lo, hi, _n -> [chunk, lo, hi] }
-                .join(SEARCH.out.domains.map { chunk, _faa, domains -> [chunk, domains] }),
-            compare,
-        )
-        ch_checks = ch_checks.mix(COMPARE.out.collect().map { c -> ['compare', c] })
-    }
-    CHECK_SUMMARY(ch_checks, tables)
 }

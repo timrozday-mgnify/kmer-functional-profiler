@@ -842,3 +842,10 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   32:12/8/64 only won it back, so kfpfam's filter is 7a6cce4's again (kfpfam 75e543d) and hm-annotate's `top` is the reads'
   settings. Kept: `--forward-slack 8` (reads 4.14 → 3.37 HMMER CPU-s, nothing lost). Short models (weefams) suit the filter.
 - 2026-11-26: raw-reads pipeline (`pfam-orf-filter-nail`): KFPFAM_HMMER passes `--forward-slack 8` to hmmer_pairs.py (`kfpfam_forward_slack`); same domtbl on 309,149 read ORFs, HMMER 19% less. nail's path unchanged.
+- 2026-11-26: hm-annotate `--profile` (`PROFILE=true` in run.sh): each sampled protein's cost by hmmsearch and by kfpfam
+  on the same proteins (`protein_id % sample == 0`), with kfpfam's filter stages per protein from kfpfam 9833cf6's
+  `FILTER_PER_ORF` (free on reads when off: 22.5 against 22.3 CPU-s), and recall by protein and true model length;
+  `profile_plot.py`. Laptop preview, 24,000 proteins against 7,534 Pfam 38.2 models: kfpfam top 10.9x hmmsearch under 50
+  residues, 2.2x at 200-300, even near 1,000-1,600, 0.84x over 1,600; no pair missed. Weefams: hm-annotate takes them
+  as a collection (`COLLECTION=weefams`); the raw-reads pipeline's `hpc/pfam-arms` has `weefams_setup.sh` (top's index)
+  and the arms `kfpfam_top_weefams` and `current_weefams`.
