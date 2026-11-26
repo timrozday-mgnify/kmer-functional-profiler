@@ -16,7 +16,7 @@
 #                                  every member too: HMMER has the models of either. MEMBERS=top: its top mode; nail: nail
 #   MIN_CLUSTER=1                  with MEMBERS=fast, top or nail, ENGINE has the representatives of clusters this size or more only;
 #                                  kfpfam or nail has the whole of the others
-#   SIF=<kfpfam-filter.sif>        kfpfam's image, e54c21a or later (all engines); ../images/kfpfam-filter.{tar,sif} by default
+#   SIF=<kfpfam-filter.sif>        kfpfam's image, 63a4cf6 or later (all engines); ../images/kfpfam-filter.{tar,sif} by default
 #   COLLECTION=pfam PFAM=39.0      HMM=<Pfam-A.hmm[.gz]>: the FTP site's of that release if not set. 39.0 is
 #                                  what the B11 arms search ($B11_DIR/pfam/39.0/Pfam-A.hmm is the same file):
 #                                  the index must be of the models the reads are aligned to

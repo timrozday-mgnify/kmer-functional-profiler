@@ -39,7 +39,7 @@ process PREP {
         ${params.kfpfam_python} seeds.py choose --table seeds.f32 --shape ${params.kfpfam_seed} \\
             --theta ${kfpfam.theta} --out T.txt
         FILTER_T_FILE=T.txt ${params.kfpfam_filter} build prep ${params.kfpfam_seed} 0 index.idx
-        ${params.kfpfam_filter} tile prep index.idx index/index.tidx
+        ${kfpfam.window ? "FILTER_WINDOW=${kfpfam.window}" : ''} ${params.kfpfam_filter} tile prep index.idx index/index.tidx
         rm index.idx seeds.f32
     fi
     """
@@ -97,6 +97,7 @@ def prefilter(prep, index, faa, chunk, cpus) {
         { time RAYON_NUM_THREADS=${cpus} FILTER_MIN_GAPPED=${kfpfam.min_gapped} \\
         FILTER_GAPPED_FILE=${index}/gapped.txt FILTER_BAND=${params.kfpfam_band} \\
         FILTER_DIAGONALS=${params.kfpfam_diagonals} FILTER_BINARY=1 \\
+        ${kfpfam.diag_window != '' ? "FILTER_DIAG_WINDOW=${kfpfam.diag_window}" : ''} ${kfpfam.gapped_window != '' ? "FILTER_GAPPED_WINDOW=${kfpfam.gapped_window}" : ''} \\
         ${params.kfpfam_filter} join ${prep} ${index}/index.tidx ${kfpfam.bar} ${kfpfam.gate} \\
         ${params.kfpfam_block} ${faa} /dev/stdout; } 2>> chunk${chunk}.log |""".stripIndent()
 }
