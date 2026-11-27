@@ -892,3 +892,4 @@ Every shape is above .998 at 90% identity, so the choice only matters for reads 
   synthetic bundle of large families); margin 40 kept every real read's score on the slice with 6.5x fewer banded rows.
   Details: `workflows/pfam-anchor/lookup/REPORT.md`, "Query speed". Pending: margins on PF00005 (pfam-anchor-large), the
   rebuilt kfp-lookup image, and Codon's timings.
+- 2026-11-27: `bundle.py profile --part I/N` and `bundle.py merge`: a sample's lookup in runs of families of about equal alignments, merged into the same files as one run (byte-identical on the heldout bundle and the pipeline's fixture). The pipeline's `PFAM_LOOKUP` runs in parts of `pfam_lookup_chunk_size` (250 MB), `PFAM_LOOKUP_MERGE` publishes.

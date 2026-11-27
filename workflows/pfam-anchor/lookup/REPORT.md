@@ -309,6 +309,13 @@ the heldout bundle rebuilt with members (26,456 representative and 50,859 member
 reads, 2000:1000, and margins 40 and 60, which happen to change no call there). `cargo test` (the batched first stage
 against one read at a time for several K, ties and u16 wrapping), `test_bundle.py`, and `PFAM_LOOKUP`'s real-command test.
 
+**Parts (`profile --part I/N`, then `merge`).** A sample's alignments split into N runs of families in accession order
+with about equal alignments, so that a part reads and decodes only its own families' blocks: the bundle is decoded once
+in all, whatever N. `merge` writes the profile from every part, as a read's best call may be in any. One run and 3 parts
+give byte-identical `reads.parquet` and `summary.json` (heldout bundle, 11,996 alignments, parts of 3,987-4,009), and 2
+parts the same `ko.tsv` too (the pipeline's fixture). The pipeline sizes N by `pfam_lookup_chunk_size` (250 MB of the
+alignments Parquet, about 4.5 M alignments at the B11 Parquets' 47-62 bytes each).
+
 **Timing, synthetic bundle, M4, 4 threads** (the old binary, then the new): decode 0.74 → 0.11 s; search 27.3 → 28.3 s at
 2000:1000 (the same work), and 9.9 s at margin 40. Search CPU at margin 40: first stage 14.3 s, members 1.1, columns 20.6,
 banded 0.3; 4,235 rows a read take a column score (the top K and their members), 4 the banded one. The log line now gives

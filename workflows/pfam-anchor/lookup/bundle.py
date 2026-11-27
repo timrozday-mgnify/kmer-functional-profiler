@@ -6,6 +6,9 @@
   bundle.py verify  DIR            every file's SHA-256
   bundle.py profile --bundle DIR --parquet SAMPLE_pfam_alignments.parquet... --out PREFIX
                     [--floor 0.4] [--hmm Pfam-A.hmm] [--k 2000] [--second 1000] [--margin 0]
+                    [--part I/N]   only the I-th of N runs of families, for merge
+  bundle.py merge   --bundle DIR --parts PART.reads.parquet... --out PREFIX [--floor 0.4]
+                    the parts into what one profile writes
 
 A bundle:
   manifest.json   format, releases, flank, collapse, schemes, and each file's bytes and SHA-256
@@ -459,6 +462,11 @@ def profile(a: argparse.Namespace) -> None:
             x = x.filter("above_ga")
         parts.append(x.select("read", "pfam", "hmm_from", "cigar", "residues", "acc"))
     d = pl.concat(parts).sort("acc", maintain_order=True).with_row_index("qid")
+    part, nparts = map(int, a.part.split("/"))
+    if not 1 <= part <= nparts:
+        sys.exit(f"--part {a.part}: I/N with 1 <= I <= N")
+    if nparts > 1:
+        d = d.filter(pl.col("acc").is_in(part_families(d["acc"], part, nparts)))
     tmp = Path(f"{a.out}.queries.bin")
     with open(tmp, "wb") as f:
         for (acc,), g in d.group_by("acc", maintain_order=True):
@@ -507,20 +515,52 @@ def profile(a: argparse.Namespace) -> None:
             pl.format("MGYP{}", pl.col("acc").cast(pl.String).str.zfill(12))
         )
     ).drop("acc")
-    x.write_parquet(f"{a.out}.reads.parquet")
+    if nparts > 1:  # merge writes the rest, from every part: a read's best call may be in another
+        x.write_parquet(f"{a.out}.reads.parquet")
+        print(f"part {a.part}: {x.height} alignments in {d['acc'].n_unique()} families")
+        return
+    summarise(x, m, a.out, a.floor)
+
+
+def part_families(acc: pl.Series, part: int, nparts: int) -> list[int]:
+    """The families of part `part` (1-based) of `nparts`: runs of families in accession order
+    holding about equal shares of the alignments, so that each part reads only its own families'
+    blocks of the bundle."""
+    n = acc.value_counts().sort("acc")
+    before = n["count"].cum_sum() - n["count"]
+    which = before * nparts // max(int(n["count"].sum()), 1) + 1
+    return n.filter(which == part)["acc"].to_list()
+
+
+def merge(a: argparse.Namespace) -> None:
+    """The parts of a profile (profile --part I/N, each its own PREFIX) into the profile one run
+    would write."""
+    m = manifest_of(a.bundle)
+    x = pl.concat([pl.read_parquet(p) for p in a.parts], how="vertical_relaxed").sort("qid")
+    if x["qid"].n_unique() != x.height or (x.height and x["qid"].max() != x.height - 1):
+        sys.exit(
+            f"{len(a.parts)} parts hold {x.height} alignments, not the whole sample's: "
+            "a part is missing or twice"
+        )
+    summarise(x, m, a.out, a.floor)
+
+
+def summarise(x: pl.DataFrame, m: dict, out: str, floor: float) -> None:
+    """PREFIX.reads.parquet (every alignment's call), PREFIX.<scheme>.tsv, PREFIX.summary.json."""
+    x.write_parquet(f"{out}.reads.parquet")
     best = (
-        x.filter(pl.col("similarity") >= a.floor)
+        x.filter(pl.col("similarity") >= floor)
         .sort("score", "qid", descending=[True, False])
         .unique("read", keep="first", maintain_order=True)
     )
-    reads = d["read"].n_unique()
+    reads = x["read"].n_unique()
     summary = {
-        "alignments": d.height,
+        "alignments": x.height,
         "alignments_in_families_indexed": int(x["score"].is_not_null().sum()),
         "reads": reads,
         "reads_called": best.height,
         "reads_under_floor": reads - best.height,
-        "floor": a.floor,
+        "floor": floor,
         "pfam": m["pfam"],
         "mgnify": m["mgnify"],
         "labelled_reads": {},
@@ -533,8 +573,8 @@ def profile(a: argparse.Namespace) -> None:
             .agg(reads=pl.len(), similarity=pl.col("similarity").mean().round(4))
             .sort(["reads", "label"], descending=[True, False])
         )
-        t.write_csv(f"{a.out}.{s}.tsv", separator="\t")
-    Path(f"{a.out}.summary.json").write_text(json.dumps(summary, indent=1))
+        t.write_csv(f"{out}.{s}.tsv", separator="\t")
+    Path(f"{out}.summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary))
 
 
@@ -595,6 +635,20 @@ def main() -> None:
         "40 kept every real read's score on the slice, with 6.5x fewer rows (REPORT.md)",
     )
     q.add_argument("--threads", type=int, default=4)
+    q.add_argument(
+        "--part",
+        default="1/1",
+        help="I/N: only the I-th of N runs of families of about equal alignments, written as "
+        "PREFIX.reads.parquet for merge",
+    )
+    mg = sub.add_parser("merge")
+    mg.set_defaults(run=merge)
+    mg.add_argument("--bundle", type=Path, required=True)
+    mg.add_argument(
+        "--parts", type=Path, nargs="+", required=True, help="the parts' PREFIX.reads.parquet"
+    )
+    mg.add_argument("--out", required=True)
+    mg.add_argument("--floor", type=float, default=0.4)
     a = p.parse_args()
     a.run(a)
 
