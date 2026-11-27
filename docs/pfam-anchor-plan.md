@@ -385,6 +385,41 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
 1. **Gate thresholds.** The numbers in phases 1–3 are proposals.
 2. **Where it lives.** This plan puts the work in this repo, as units are this project's concept, with kfpfam supplying read hits. It could go in kfpfam instead.
 
+## Mapping every read to the lookup's proteins
+
+Added 2026-11-27 at the user's request: after kfpfam and the lookup (`bundle.py profile`, the raw-reads pipeline's `PFAM_LOOKUP`), the MGnify proteins the lookup called become the sample's reference, and every read is aligned to them, so that `kfp-pileup call` can profile sequence variants. This is "Confirm, then map every read" with the lookup as the confirmation. The mapper settled on 2026-11-08 (tier 2 routing, then `seed_align`, then `call`) needs tree-index leaves for its routing. What is missing is a seed index over the called proteins. `seed_align` and `call` are used as they are.
+
+**Reach.** Only proteins with a GA domain are called (33.5% of units). The rest of the reads are flanks and mates of those proteins; reads of proteins with no domain need the unanchored route.
+
+**What sets the seeds.** A reference of R residues gives a read about (query positions) × R / 17^w chance seed hits at weight w: at R = 3×10⁷ and 33 residues, about 36 k at w 4, 2 k at w 5, 130 at w 6. Contiguous k4, fine against kfpfam's profiles, is too noisy here. Chance of at least one seed, independent matches (an upper bound, as conservation clumps):
+
+| Seed (weight) | 33 aa at 70% / 60% / 50% | 50 aa at 70% / 60% / 50% |
+| --- | --- | --- |
+| contiguous k4 (4) | .98 / .89 / .68 | 1.0 / .97 / .83 |
+| kfpfam's Golomb `10110001` (4) | .99 / .92 / .73 | 1.0 / .98 / .88 |
+| contiguous k5 (5) | .90 / .68 / .40 | .97 / .84 / .55 |
+| two 5-of-9 rulers `110100011`, `110010101` (5) | .98 / .87 / .62 | 1.0 / .97 / .79 |
+| contiguous k6 (6) | .76 / .46 / .21 | .89 / .63 / .32 |
+| 3-2-3 `11100111` (6) | .81 / .53 / .25 | .93 / .70 / .37 |
+
+Every shape is above .998 at 90% identity, so the choice only matters for reads at 50–70% to their reference.
+
+**Options.**
+
+1. **DIAMOND `blastx`** (`--sensitive -F 15 --top 10`) against the reference, into `call`. Works today and handles frameshifts; only emulated timings exist (15–19 core-ms per pair). The baseline in any case.
+2. **A kfp index, then DIAMOND.** Pays only if the index drops most reads before DIAMOND, which DIAMOND's own seeding already does on a small reference. Not pursued.
+3. **A per-sample seed index, then `seed_align` (the main arm).** Every position of the called proteins, 2–3 spaced shapes of weight 5–6, a two-seed diagonal filter, then fill, X-drop and BTOP lines for `call`. About R × shapes × 4 bytes (0.25 GB at 3×10⁷ residues): it grows with the sample's complexity, not its reads. New code is the index alone.
+4. **kfpfam's join as the sensitive pass.** Each protein as a BLOSUM62 profile, neighbourhood words at T, kfpfam's tiled SIMD join and diagonal scoring, then `seed_align`. The most sensitive at 40–60% and the most reuse, but the index is large (kfpfam has about 400 entries per column) and T needs calibrating against identity, not GA. Only for reads option 3 leaves, if they are many.
+5. **A nucleotide second round, for the variants.** Protein alignment hides synonymous sites, the strain signal. `call`'s consensus CDS already goes to bwa-mem2 and freebayes, LoFreq, Floria and inStrain in the pileup workflow (`MAP_CONSENSUS` onwards), so this is reuse, not new work.
+
+**For any of them.** Mate first: a pair the lookup called tries that protein with `seed_align` before the index. A cascade: a strict pass, then the sensitive pass on what is left. Members: index representatives only, then re-score against the cluster's members (the bundle stores them as differences) to choose the variant reference.
+
+**Steps.**
+
+1. **Measure (built 2026-11-27, to run on Codon).** `workflows/pfam-anchor/lookup/mapref.py` (`ref`, `measure`, `check`) and `hpc/kfp-ablations/lookup-map/run.sh`: the representatives the lookup called as the reference (kfp's store), DIAMOND as option 1 on the first 2 M pairs, then R, each mate's identity to its best hit, the share of called pairs whose mates' best hit is the lookup's own protein, DIAMOND's native time, and, per identity bin, which shapes above have a seed in DIAMOND's real alignments (gapless runs of its BTOP). Biased towards what DIAMOND finds, but it uses real conservation.
+2. **Choose** from it: the shapes and weight (the smallest weight with seeded share ≥ .99 at the bins that hold most mates), whether option 4 is needed (mates under 60%), how much mate first saves.
+3. **Build option 3** in `crates/core` beside `seedalign.rs`, written as `call`'s DIAMOND lines; compare with step 1's DIAMOND lines on the same reads (`call`'s pileups, posteriors and per-unit identity, as phase 4b).
+
 ## Progress log
 
 - **Test case sized (2026-11-06).** The tables under "What is measured so far". Scripts were scratch only, so phase 0 still has to write them into the repo.
@@ -849,3 +884,4 @@ Added 2026-11-07. kfpfam (`~/Documents/kfpfam`) now writes read hits with their 
   residues, 2.2x at 200-300, even near 1,000-1,600, 0.84x over 1,600; no pair missed. Weefams: hm-annotate takes them
   as a collection (`COLLECTION=weefams`); the raw-reads pipeline's `hpc/pfam-arms` has `weefams_setup.sh` (top's index)
   and the arms `kfpfam_top_weefams` and `current_weefams`.
+- 2026-11-27: **mapping every read to the lookup's proteins**, at the user's request: options and seed sizing in the section of that name. Step 1 built: `mapref.py` (`check` passes; `ref` and `measure` checked on the test store with made-up lookup calls and DIAMOND lines) and `hpc/kfp-ablations/lookup-map/run.sh` (`bash -n` only: not run, as DIAMOND isn't on the laptop and the lookup has not run at scale). It needs a sample's lookup calls (`lookup-profile`) and its ENA run.
