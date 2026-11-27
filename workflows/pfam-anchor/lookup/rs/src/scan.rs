@@ -50,12 +50,70 @@ pub fn bar(scores: &[u16], k: usize) -> u16 {
     1
 }
 
+/// Rows to a tile in `scan_batch`: a read's scores (u16) and the columns it reads stay in cache for the whole batch.
+pub const BATCH_TILE: usize = 4096;
+
+/// The first stage for a batch of reads at once, as `score_rows` then `bar` then the rows at or over the bar, per read.
+/// `m`: the family's residues by column (column c's rows at c * nr..); `reads`: each read's (column, residue, weight).
+/// Rows go a tile at a time to every read of the batch, so a tile is read from memory once for all of them, not once a
+/// read. A read keeps only rows at or over the bar of the rows scored so far, which is never over the final bar, so no
+/// read holds a score for every row. Returns each read's rows in row order.
+pub fn scan_batch(m: &[u8], nr: usize, reads: &[Vec<(usize, u8, u16)>], k: usize) -> Vec<Vec<u32>> {
+    // per read: a histogram of scores so far, the bar (the highest score that k rows reach or pass, or 1: `bar`), the
+    // rows at or over it, and how many rows score at least the bar
+    struct St {
+        h: Vec<u32>,
+        bar: usize,
+        above: usize,
+        keep: Vec<(u32, u16)>,
+    }
+    let mut acc = vec![0u16; BATCH_TILE];
+    let mut st: Vec<St> = reads.iter().map(|cols| {
+        // scores add up as u16, wrapping as `score_rows`'s do: past 65,535 every value can occur
+        let most = cols.iter().map(|x| x.2 as usize).sum::<usize>().min(u16::MAX as usize);
+        St { h: vec![0; most + 2], bar: 1, above: 0, keep: vec![] }
+    }).collect();
+    for lo in (0..nr).step_by(BATCH_TILE) {
+        let hi = (lo + BATCH_TILE).min(nr);
+        let acc = &mut acc[..hi - lo];
+        for (cols, x) in reads.iter().zip(st.iter_mut()) {
+            acc.fill(0);
+            for &(c, q, w) in cols {
+                for (a, &v) in acc.iter_mut().zip(&m[c * nr + lo..c * nr + hi]) {
+                    *a = a.wrapping_add(if v == q { w } else { 0 });
+                }
+            }
+            let b = x.bar as u16;
+            for (j, &s) in acc.iter().enumerate() {
+                x.h[s as usize] += 1;
+                if s >= b {
+                    x.above += 1;
+                    x.keep.push(((lo + j) as u32, s));
+                }
+            }
+            // raise the bar while k rows still reach the next score
+            while x.above - x.h[x.bar] as usize >= k {
+                x.above -= x.h[x.bar] as usize;
+                x.bar += 1;
+            }
+            if x.keep.len() > 4 * k.max(BATCH_TILE) {
+                let b = x.bar as u16;
+                x.keep.retain(|y| y.1 >= b);
+            }
+        }
+    }
+    st.into_iter().map(|x| {
+        let b = x.bar as u16;
+        x.keep.into_iter().filter(|y| y.1 >= b).map(|y| y.0).collect()
+    }).collect()
+}
+
 /// `flank`: residues either side of the domain for the banded score, or the whole protein.
 /// `configs`: K:SECOND pairs; `subs`: keep 1 in 2^sub units; `limit`: the first queries only (0: all).
 /// scan.tsv: sub, k, second, qid, score, ties, units. scan_times.tsv: core-seconds by stage, summed over threads.
 /// `members`: also score the members of the clusters the first stage keeps (their FLANK-10 residues, whatever `flank`).
 #[allow(clippy::too_many_arguments)]
-pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], threads: usize, limit: usize, weak: bool, flank: Option<usize>, members: bool) {
+pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize, i16)], subs: &[u32], threads: usize, limit: usize, weak: bool, flank: Option<usize>, members: bool) {
     let fams = families(dir);
     let q = Queries::load(dir, &fams);
     let rows = Rows::load(dir, "reps", &fams);
@@ -65,10 +123,10 @@ pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], thr
     let bl = blosum();
     let nq = if limit > 0 { limit.min(q.len()) } else { q.len() };
     let mem = members.then(|| Members::load(dir, &fams, q.len()));
-    let mut o = String::from("sub\tk\tsecond\tqid\tscore\tties\tunits\n");
-    let mut times = String::from("sub\tk\tsecond\tthreads\treads\trows_read\tcells\trows_kept\tscan_s\ttop_s\tcolumns_s\tgapped_s\twall_s\tmember_rows\n");
+    let mut o = String::from("sub\tk\tsecond\tqid\tscore\tties\tunits\tmargin\n");
+    let mut times = String::from("sub\tk\tsecond\tthreads\treads\trows_read\tcells\trows_kept\tscan_s\ttop_s\tcolumns_s\tgapped_s\twall_s\tmember_rows\tmargin\tbanded_rows\n");
     for &sub in subs {
-        let mut sums = vec![[0f64; 9]; configs.len()]; // rows, cells, kept, scan, top, columns, gapped, wall, member rows
+        let mut sums = vec![[0f64; 10]; configs.len()]; // rows, cells, kept, scan, top, columns, gapped, wall, member rows, banded rows
         for fi in 0..fams.len() {
             let mine: Vec<usize> = (0..nq).filter(|&i| q.fam[i] as usize == fi).collect();
             if mine.is_empty() {
@@ -85,13 +143,13 @@ pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], thr
                     m[c * n + r] = a;
                 }
             }
-            for (ci, &(k, second)) in configs.iter().enumerate() {
-                let done = std::sync::Mutex::new((vec![], [0f64; 9]));
+            for (ci, &(k, second, margin)) in configs.iter().enumerate() {
+                let done = std::sync::Mutex::new((vec![], [0f64; 10]));
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 let wall = Instant::now();
                 parallel(threads, threads, |_| {
                     let mut s = vec![0u16; n];
-                    let (mut buf, mut lines, mut a) = (vec![], vec![], [0f64; 9]);
+                    let (mut buf, mut lines, mut a) = (vec![], vec![], [0f64; 10]);
                     loop {
                         let x = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(&i) = mine.get(x) else { break };
@@ -127,7 +185,11 @@ pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], thr
                             a[8] += (v.len() - n0) as f64;
                         }
                         v.sort_unstable_by(|a, b| b.cmp(a));
-                        let cut = v.get(second.min(v.len()).saturating_sub(1)).map_or(0, |x| x.0);
+                        let mut cut = v.get(second.min(v.len()).saturating_sub(1)).map_or(0, |x| x.0);
+                        if margin > 0 {
+                            cut = cut.max(v.first().map_or(0, |x| x.0).saturating_sub(margin));
+                        }
+                        a[9] += v.iter().take_while(|x| x.0 >= cut).count() as f64;
                         let t3 = Instant::now();
                         let mut best: (i16, Vec<u32>) = (0, vec![]);
                         for &(_, r, is_member) in v.iter().take_while(|x| x.0 >= cut) {
@@ -172,7 +234,7 @@ pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], thr
                             *x += y;
                         }
                         let l: Vec<String> = best.1.iter().take(200).map(|u| u.to_string()).collect();
-                        lines.push((i, format!("{sub}\t{k}\t{second}\t{i}\t{}\t{}\t{}\n", best.0, best.1.len(), l.join(","))));
+                        lines.push((i, format!("{sub}\t{k}\t{second}\t{i}\t{}\t{}\t{}\t{margin}\n", best.0, best.1.len(), l.join(","))));
                     }
                     let mut g = done.lock().unwrap();
                     g.0.extend(lines);
@@ -186,9 +248,9 @@ pub fn run(dir: &Path, out: &Path, configs: &[(usize, usize)], subs: &[u32], thr
                 sums[ci][7] += wall;
             }
         }
-        for (&(k, second), a) in configs.iter().zip(&sums) {
-            writeln!(times, "{sub}\t{k}\t{second}\t{threads}\t{nq}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.0}", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]).unwrap();
-            eprintln!("sub {sub} K {k} second {second} threads {threads}: scan {:.3} + top {:.3} ns a row, {:.1} GB/s a thread; columns {:.0} + gapped {:.0} us a read",
+        for (&(k, second, margin), a) in configs.iter().zip(&sums) {
+            writeln!(times, "{sub}\t{k}\t{second}\t{threads}\t{nq}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.0}\t{margin}\t{:.0}", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]).unwrap();
+            eprintln!("sub {sub} K {k} second {second} margin {margin} threads {threads}: {:.0} rows to the banded score a read; scan {:.3} + top {:.3} ns a row, {:.1} GB/s a thread; columns {:.0} + gapped {:.0} us a read", a[9] / nq as f64,
                 a[3] * 1e9 / a[0], a[4] * 1e9 / a[0], a[1] / a[3] / 1e9, a[5] * 1e6 / nq as f64, a[6] * 1e6 / nq as f64);
         }
     }
@@ -255,5 +317,81 @@ mod tests {
         let mut v = s.clone();
         v.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(bar(&s, 500), v[499].max(1));
+    }
+    /// The batched scan keeps exactly the rows that one read at a time does, for any K, ties and wrapping included.
+    #[test]
+    fn batch_is_the_scan() {
+        let (n, len) = (3 * BATCH_TILE + 17, 30);
+        let h = crate::cand::hash;
+        // few residues, so that many rows tie
+        let mut m = vec![0u8; n * len];
+        for c in 0..len {
+            for r in 0..n {
+                m[c * n + r] = if h((r * 31 + c) as u64) % 9 == 0 { 21 } else { (h((r * 7 + c * 3) as u64) % 4) as u8 };
+            }
+        }
+        let reads: Vec<Vec<(usize, u8, u16)>> = (0..9u64).map(|i| {
+            (0..len).filter(|&c| h(i * 100 + c as u64) % 3 > 0)
+                .map(|c| (c, (h(i + c as u64) % 4) as u8, if i == 8 { 5000 } else { 1 + (h(i * 3 + c as u64) % 40) as u16 }))
+                .collect()
+        }).collect();
+        for k in [1, 5, 700, BATCH_TILE + 3, n + 10] {
+            let got = scan_batch(&m, n, &reads, k.min(n));
+            for (cols, g) in reads.iter().zip(&got) {
+                let cw: Vec<(&[u8], u8, u16)> = cols.iter().map(|&(c, q, w)| (&m[c * n..(c + 1) * n], q, w)).collect();
+                let mut s = vec![0u16; n];
+                score_rows(&cw, &mut s);
+                let lo = bar(&s, k.min(n));
+                let want: Vec<u32> = (0..n as u32).filter(|&r| s[r as usize] >= lo).collect();
+                assert_eq!(g, &want, "K {k}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench_scan {
+    use super::*;
+    /// cargo test --release bench_first_stage -- --ignored --nocapture: ns a row, one read at a time against batched
+    #[test]
+    #[ignore]
+    fn bench_first_stage() {
+        let h = crate::cand::hash;
+        let (n, len, nq, k) = (400_000usize, 200usize, 256usize, 2000usize);
+        let m: Vec<u8> = (0..n * len).map(|i| (h(i as u64) % 20) as u8).collect();
+        let reads: Vec<Vec<(usize, u8, u16)>> = (0..nq as u64).map(|i| {
+            let s = (h(i) % 150) as usize;
+            (s..s + 45).map(|c| (c, (h(i * 1000 + c as u64) % 20) as u8, 1 + (h(i + c as u64) % 40) as u16)).collect()
+        }).collect();
+        for threads in [1, 4, 8] {
+            let t = std::time::Instant::now();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            crate::data::parallel(threads, threads, |_| {
+                let mut s = vec![0u16; n];
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(cols) = reads.get(i) else { break };
+                    let cw: Vec<(&[u8], u8, u16)> = cols.iter().map(|&(c, q, w)| (&m[c * n..(c + 1) * n], q, w)).collect();
+                    score_rows(&cw, &mut s);
+                    let b = bar(&s, k);
+                    std::hint::black_box((0..n as u32).filter(|&r| s[r as usize] >= b).count());
+                }
+            });
+            let one = t.elapsed().as_secs_f64() * 1e9 * threads as f64 / (n * nq) as f64;
+            let mut line = format!("{threads} threads: one at a time {one:.2} ns a row (CPU)");
+            for batch in [4, 16, 64] {
+                let t = std::time::Instant::now();
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                crate::data::parallel(threads, threads, |_| loop {
+                    let lo = next.fetch_add(batch, std::sync::atomic::Ordering::Relaxed);
+                    if lo >= nq {
+                        break;
+                    }
+                    std::hint::black_box(scan_batch(&m, n, &reads[lo..(lo + batch).min(nq)], k));
+                });
+                line += &format!(", batch {batch} {:.2}", t.elapsed().as_secs_f64() * 1e9 * threads as f64 / (n * nq) as f64);
+            }
+            eprintln!("{line}");
+        }
     }
 }

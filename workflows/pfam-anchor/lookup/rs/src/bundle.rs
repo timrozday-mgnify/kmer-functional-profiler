@@ -20,7 +20,7 @@
 //! All little-endian. Accessions fit 5 bytes: 1.1e12.
 use crate::cand::hash;
 use crate::data::*;
-use crate::scan::{bar, kadane, score_rows};
+use crate::scan::{kadane, scan_batch};
 use crate::sw;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -50,9 +50,9 @@ impl Row {
     pub fn unit(&self) -> u64 {
         if self.cluster == 0 { self.acc } else { self.cluster }
     }
-    /// Residues on the model's columns, and each one's position in `seq` (u16::MAX: none).
-    pub fn columns(&self, len: usize) -> Result<(Vec<u8>, Vec<u16>), String> {
-        let (mut codes, mut pos) = (vec![NONE; len], vec![u16::MAX; len]);
+    /// Calls `f(column, position in seq)` for each residue on a match column, checking the row against a model of
+    /// `len` columns.
+    pub fn walk(&self, len: usize, mut f: impl FnMut(usize, usize)) -> Result<(), String> {
         let (mut c, mut p) = (self.hmm_from as usize - 1, self.left as usize);
         for &(op, n) in &self.ops {
             let n = n as usize;
@@ -64,8 +64,7 @@ impl Row {
             }
             match op {
                 0 => {
-                    codes[c..c + n].copy_from_slice(&self.seq[p..p + n]);
-                    (0..n).for_each(|k| pos[c + k] = (p + k) as u16);
+                    (0..n).for_each(|k| f(c + k, p + k));
                     c += n;
                     p += n;
                 }
@@ -76,7 +75,22 @@ impl Row {
         if p + self.right as usize != self.seq.len() {
             return Err(format!("{}: the CIGAR uses {p} residues and {} flank, of {}", self.acc, self.right, self.seq.len()));
         }
+        Ok(())
+    }
+    /// Residues on the model's columns, and each one's position in `seq` (u16::MAX: none).
+    pub fn columns(&self, len: usize) -> Result<(Vec<u8>, Vec<u16>), String> {
+        let (mut codes, mut pos) = (vec![NONE; len], vec![u16::MAX; len]);
+        self.columns_into(&mut codes, &mut pos)?;
         Ok((codes, pos))
+    }
+    /// `columns` into buffers of the model's length, which are overwritten.
+    pub fn columns_into(&self, codes: &mut [u8], pos: &mut [u16]) -> Result<(), String> {
+        codes.fill(NONE);
+        pos.fill(u16::MAX);
+        self.walk(codes.len(), |c, p| {
+            codes[c] = self.seq[p];
+            pos[c] = p as u16;
+        })
     }
 }
 
@@ -364,6 +378,7 @@ fn block(acc: u32, len: usize, schemes: usize, rows: &[Row], bits: &[u8]) -> Vec
     o
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // tests: the whole block, against `layout` and its parts
 pub struct Block {
     pub acc: u32,
     pub len: usize,
@@ -371,7 +386,56 @@ pub struct Block {
     pub bits: Vec<u8>,
     pub rows: Vec<Row>,
 }
+/// The whole block decoded: `layout`, then every representative and every cluster's members.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_block(b: &[u8]) -> Result<Block, String> {
+    let l = layout(b)?;
+    let mut rows = (0..l.reps).map(|i| l.rep(i)).collect::<Result<Vec<_>, _>>()?;
+    for k in 0..l.clusters.len() {
+        let m = l.members(k, &rows)?;
+        rows.extend(m);
+    }
+    Ok(Block { acc: l.acc, len: l.len, reps: l.reps, bits: l.part[0].to_vec(), rows })
+}
+
+/// A cluster with members: its representative's accession, its members (indices among the block's members), and
+/// where in the parts its first member's bytes start (CIGARs, residues, parents, runs) with the parent row before it.
+#[derive(Clone, Copy, Debug)]
+pub struct Cluster {
+    pub acc: u64,
+    pub first: usize,
+    pub n: usize,
+    at: [usize; 4],
+    last: i64,
+}
+
+/// Where a block's rows are, from one pass that decodes nothing: representatives can then be decoded in parallel
+/// (`rep`), and a cluster's members only when a read keeps the cluster (`members`).
+pub struct Layout<'a> {
+    pub acc: u32,
+    pub len: usize,
+    pub n: usize,
+    pub reps: usize,
+    schemes: usize,
+    part: Vec<&'a [u8]>,
+    rep_at: Vec<(usize, usize)>, // a representative's CIGAR and residues
+    pub clusters: Vec<Cluster>,  // in the block's order, which is by accession
+}
+
+fn skip_ops(b: &[u8], at: &mut usize) -> Option<()> {
+    loop {
+        let x = *b.get(*at)?;
+        *at += 1;
+        if x == 0xFF {
+            return Some(());
+        }
+        if x & 63 == 63 {
+            *at += 2;
+        }
+    }
+}
+
+pub fn layout(b: &[u8]) -> Result<Layout<'_>, String> {
     let u = |at: usize| -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) };
     if b.len() < TOP || &b[..4] != MAGIC {
         return Err("not a block".into());
@@ -385,80 +449,148 @@ pub fn read_block(b: &[u8]) -> Result<Block, String> {
     let mut at = TOP;
     let part: Vec<&[u8]> = sizes.iter().map(|&s| { at += s; &b[at - s..at] }).collect();
     let nr = n - members;
-    let (mut rows, mut o, mut q, mut ra, mut pa, mut last): (Vec<Row>, _, _, _, _, i64) = (Vec::with_capacity(n), 0, 0, 0, 0, 0);
-    let mut ppos: Vec<Option<Vec<u16>>> = vec![None; nr];
+    let mut l = Layout { acc, len, n, reps: nr, schemes, part, rep_at: Vec::with_capacity(nr), clusters: vec![] };
+    let (mut o, mut q, mut ra, mut pa, mut last) = (0, 0, 0, 0, 0i64);
     for i in 0..n {
-        // a member's head has no accession: its last 5 bytes only
-        let (acc_r, h) = match i.checked_sub(nr) {
-            None => (part[1][HEAD * i..HEAD * i + 5].iter().rev().fold(0, |a, &x| a << 8 | x as u64), &part[1][HEAD * i + 5..HEAD * (i + 1)]),
-            Some(j) => (0, &part[1][HEAD * nr + 5 * j..HEAD * nr + 5 * (j + 1)]),
-        };
-        let sl = u16::from_le_bytes([h[2], h[3]]) as usize;
-        let mut r = Row {
-            acc: acc_r,
-            hmm_from: u16::from_le_bytes([h[0], h[1]]),
-            left: h[4] >> 4,
-            right: h[4] & 15,
-            ops: vec![],
-            seq: vec![0; sl],
-            labels: (0..schemes).map(|s| { let x = 2 * (s * n + i); u16::from_le_bytes([part[2][x], part[2][x + 1]]) }).collect(),
-            cluster: 0,
-        };
-        let mut clipped = None;
-        if i >= nr && part[3].get(o) == Some(&CLIPPED) {
-            o += 1; // the parent's, cut below
-            clipped = Some(unleb(part[3], &mut o).ok_or("short CIGARs")?);
-        } else {
-            r.ops = unpack_ops(part[3], &mut o).ok_or("short CIGARs")?;
-        }
+        let sl = l.head(i).2;
         if i < nr {
-            let bytes = part[4].get(q..q + (5 * sl).div_ceil(8)).ok_or("short sequences")?;
-            q += bytes.len();
-            r.seq = unpack5(bytes, sl);
-            rows.push(r);
+            l.rep_at.push((o, q));
+            skip_ops(l.part[3], &mut o).ok_or("short CIGARs")?;
+            q += (5 * sl).div_ceil(8);
             continue;
         }
-        let pi = last + unzigzag(unleb(part[5], &mut pa).ok_or("short parents")?);
+        let state = ([o, q, pa, ra], last);
+        if l.part[3].get(o) == Some(&CLIPPED) {
+            o += 1;
+            unleb(l.part[3], &mut o).ok_or("short CIGARs")?;
+        } else {
+            skip_ops(l.part[3], &mut o).ok_or("short CIGARs")?;
+        }
+        let pi = last + unzigzag(unleb(l.part[5], &mut pa).ok_or("short parents")?);
         last = pi;
         let pi = usize::try_from(pi).ok().filter(|&x| x < nr).ok_or_else(|| format!("PF{acc:05}: a member's parent is not a representative"))?;
-        let parent = &rows[pi];
-        r.cluster = parent.acc;
-        if let Some(w) = clipped {
-            let c0 = r.hmm_from as usize - 1;
-            r.ops = clip(&parent.ops, parent.hmm_from as usize - 1, c0, c0 + w);
-            if span(&r.ops) != w {
-                return Err(format!("PF{acc:05}: a member's columns are not all its parent's"));
-            }
+        let cl = l.head(pi).0;
+        match l.clusters.last_mut() {
+            Some(c) if c.acc == cl => c.n += 1,
+            _ => l.clusters.push(Cluster { acc: cl, first: i - nr, n: 1, at: state.0, last: state.1 }),
         }
-        let pp = match &ppos[pi] {
-            Some(x) => x,
-            None => ppos[pi].insert(parent.columns(len)?.1),
-        };
-        let m = mapping(&r, pp);
-        let (mut p, mut literal_at) = (0, vec![]);
+        let (mut p, mut lit) = (0, 0);
         while p < sl {
-            let (a, e) = get_pair(part[6], &mut ra).ok_or("short runs")?;
+            let (a, e) = get_pair(l.part[6], &mut ra).ok_or("short runs")?;
             if p + a + e > sl {
                 return Err(format!("PF{acc:05}: a member's runs pass its end"));
             }
-            for k in p..p + a {
-                r.seq[k] = *m[k].and_then(|x| parent.seq.get(x)).ok_or_else(|| format!("PF{acc:05}: a copied residue outside the parent"))?;
-            }
-            literal_at.extend(p + a..p + a + e);
+            lit += e;
             p += a + e;
         }
-        let bytes = part[4].get(q..q + (5 * literal_at.len()).div_ceil(8)).ok_or("short sequences")?;
-        q += bytes.len();
-        let got = unpack5(bytes, literal_at.len());
-        for (k, x) in literal_at.into_iter().zip(got) {
-            r.seq[k] = x;
-        }
-        rows.push(r);
+        q += (5 * lit).div_ceil(8);
     }
-    if o != part[3].len() || q != part[4].len() || pa != part[5].len() || ra != part[6].len() {
+    if o > l.part[3].len() || q > l.part[4].len() {
+        return Err(format!("PF{acc:05}: short {}", if q > l.part[4].len() { "sequences" } else { "CIGARs" }));
+    }
+    if o != l.part[3].len() || q != l.part[4].len() || pa != l.part[5].len() || ra != l.part[6].len() {
         return Err(format!("PF{acc:05}: bytes left over"));
     }
-    Ok(Block { acc, len, reps: n - members, bits: part[0].to_vec(), rows })
+    if !l.clusters.is_sorted_by_key(|c| c.acc) {
+        return Err(format!("PF{acc:05}: members are not sorted by cluster"));
+    }
+    Ok(l)
+}
+
+impl Layout<'_> {
+    /// Row i's accession (0 for a member: a member's head has none, only its last 5 bytes), hmm_from, residues and
+    /// flanks.
+    fn head(&self, i: usize) -> (u64, u16, usize, u8) {
+        let nr = self.reps;
+        let (acc, h) = match i.checked_sub(nr) {
+            None => (self.part[1][HEAD * i..HEAD * i + 5].iter().rev().fold(0, |a, &x| a << 8 | x as u64), &self.part[1][HEAD * i + 5..HEAD * (i + 1)]),
+            Some(j) => (0, &self.part[1][HEAD * nr + 5 * j..HEAD * nr + 5 * (j + 1)]),
+        };
+        (acc, u16::from_le_bytes([h[0], h[1]]), u16::from_le_bytes([h[2], h[3]]) as usize, h[4])
+    }
+    fn row_head(&self, i: usize) -> Row {
+        let (acc, hmm_from, sl, fl) = self.head(i);
+        let n = self.n;
+        let part = &self.part[2];
+        Row {
+            acc,
+            hmm_from,
+            left: fl >> 4,
+            right: fl & 15,
+            ops: vec![],
+            seq: vec![0; sl],
+            labels: (0..self.schemes).map(|s| { let x = 2 * (s * n + i); u16::from_le_bytes([part[x], part[x + 1]]) }).collect(),
+            cluster: 0,
+        }
+    }
+    /// Representative i.
+    pub fn rep(&self, i: usize) -> Result<Row, String> {
+        let mut r = self.row_head(i);
+        let (mut o, q) = self.rep_at[i];
+        r.ops = unpack_ops(self.part[3], &mut o).ok_or("short CIGARs")?;
+        let bytes = self.part[4].get(q..q + (5 * r.seq.len()).div_ceil(8)).ok_or("short sequences")?;
+        r.seq = unpack5(bytes, r.seq.len());
+        Ok(r)
+    }
+    /// The members of cluster k, given the representatives (`rep`, all of them).
+    pub fn members(&self, k: usize, reps: &[Row]) -> Result<Vec<Row>, String> {
+        let (acc, len, nr, part) = (self.acc, self.len, self.reps, &self.part);
+        let c = self.clusters[k];
+        let ([mut o, mut q, mut pa, mut ra], mut last) = (c.at, c.last);
+        let mut ppos: Vec<(usize, Vec<u16>)> = vec![]; // the parents' positions by column: a cluster has few parents
+        let mut out = Vec::with_capacity(c.n);
+        for j in c.first..c.first + c.n {
+            let mut r = self.row_head(nr + j);
+            let sl = r.seq.len();
+            let mut clipped = None;
+            if part[3].get(o) == Some(&CLIPPED) {
+                o += 1; // the parent's, cut below
+                clipped = Some(unleb(part[3], &mut o).ok_or("short CIGARs")?);
+            } else {
+                r.ops = unpack_ops(part[3], &mut o).ok_or("short CIGARs")?;
+            }
+            let pi = last + unzigzag(unleb(part[5], &mut pa).ok_or("short parents")?);
+            last = pi;
+            let pi = usize::try_from(pi).ok().filter(|&x| x < nr).ok_or_else(|| format!("PF{acc:05}: a member's parent is not a representative"))?;
+            let parent = &reps[pi];
+            r.cluster = parent.acc;
+            if let Some(w) = clipped {
+                let c0 = r.hmm_from as usize - 1;
+                r.ops = clip(&parent.ops, parent.hmm_from as usize - 1, c0, c0 + w);
+                if span(&r.ops) != w {
+                    return Err(format!("PF{acc:05}: a member's columns are not all its parent's"));
+                }
+            }
+            let at = match ppos.iter().position(|x| x.0 == pi) {
+                Some(x) => x,
+                None => {
+                    ppos.push((pi, parent.columns(len)?.1));
+                    ppos.len() - 1
+                }
+            };
+            let m = mapping(&r, &ppos[at].1);
+            let (mut p, mut literal_at) = (0, vec![]);
+            while p < sl {
+                let (a, e) = get_pair(part[6], &mut ra).ok_or("short runs")?;
+                if p + a + e > sl {
+                    return Err(format!("PF{acc:05}: a member's runs pass its end"));
+                }
+                for k in p..p + a {
+                    r.seq[k] = *m[k].and_then(|x| parent.seq.get(x)).ok_or_else(|| format!("PF{acc:05}: a copied residue outside the parent"))?;
+                }
+                literal_at.extend(p + a..p + a + e);
+                p += a + e;
+            }
+            let bytes = part[4].get(q..q + (5 * literal_at.len()).div_ceil(8)).ok_or("short sequences")?;
+            q += bytes.len();
+            let got = unpack5(bytes, literal_at.len());
+            for (k, x) in literal_at.into_iter().zip(got) {
+                r.seq[k] = x;
+            }
+            out.push(r);
+        }
+        Ok(out)
+    }
 }
 
 /// bundle-build OUT_DIR T < stream: (acc u32, columns u32, rows u32, schemes u32, rows...)*. Writes rows.bin and families.tsv
@@ -504,10 +636,37 @@ pub fn build(out: &Path, t: f32) {
     std::fs::write(out.join("families.tsv"), tsv).unwrap();
 }
 
-/// bundle-query DIR QUERIES OUT K SECOND: QUERIES is the same stream with no schemes, a row's accession being the query's id.
-/// OUT: qid, score, self score, tied clusters, accession of the first, then each scheme's commonest label among the tied rows.
-/// A cluster is named by its representative's accession, also when a member's row scored best.
-pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, threads: usize) {
+/// Reads to a batch of the first stage (`scan_batch`).
+const BATCH: usize = 16;
+
+/// Asks for the cache line at `p` ahead of its use: the column scores read rows at random places.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    // SAFETY: a prefetch is a hint and never faults, whatever the address
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    }
+}
+const AHEAD: usize = 16; // rows prefetched ahead
+
+/// A pointer that threads may write through at places no other thread writes.
+struct Shared(*mut u8);
+unsafe impl Sync for Shared {}
+
+/// bundle-query DIR QUERIES OUT K SECOND [MARGIN]: QUERIES is the same stream with no schemes, a row's accession being
+/// the query's id. OUT: qid, score, self score, tied clusters, accession of the first, then each scheme's commonest
+/// label among the tied rows. A cluster is named by its representative's accession, also when a member's row scored best.
+/// The banded score sees the best SECOND rows by column score, and with MARGIN > 0 only those within MARGIN of the
+/// read's best column score.
+pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, margin: i16, threads: usize) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Instant;
     let index: Vec<Vec<u64>> = std::fs::read_to_string(dir.join("families.tsv")).unwrap().lines()
         .map(|l| l.split('\t').map(|x| x.parse().unwrap()).collect()).collect();
     let mut f = File::open(dir.join("rows.bin")).unwrap();
@@ -515,82 +674,152 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
     let bl = blosum();
     let mut o = String::new();
     let (mut t_read, mut t_decode, mut t_search) = (0.0, 0.0, 0.0);
+    // CPU time by stage, summed over threads, in ns: first stage, members decoded, column scores, banded
+    let cpu: [AtomicU64; 4] = Default::default();
+    // reads searched, and rows they took to the column and banded scores
+    let rows: [AtomicU64; 3] = Default::default();
+    let ns = |t: Instant| t.elapsed().as_nanos() as u64;
     while let Some(acc) = i.u32() {
         let (len, n, _) = (i.u32().unwrap() as usize, i.u32().unwrap() as usize, i.u32().unwrap());
         let qs: Vec<Row> = (0..n).map(|_| i.row(0).expect("the queries end inside a family")).collect();
         let Some(x) = index.iter().find(|x| x[0] == acc as u64) else { continue }; // a family with no row in the index
         assert_eq!(x[1] as usize, len, "PF{acc:05}: the reads' model has {len} columns, the index's {}", x[1]);
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut b = vec![0; x[5] as usize];
         f.seek(SeekFrom::Start(x[4])).unwrap();
         f.read_exact(&mut b).expect("rows.bin is shorter than families.tsv says");
-        let t1 = std::time::Instant::now();
-        let bk = read_block(&b).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((bk.acc, bk.len), (acc, len));
-        drop(b);
-        let nr = bk.reps; // the first stage sees representatives only
-        let rc: Vec<(Vec<u8>, Vec<u16>)> = bk.rows.iter().map(|r| r.columns(len).unwrap()).collect();
-        let mclusters: Vec<u64> = bk.rows[nr..].iter().map(|r| r.cluster).collect();
-        let mut m = vec![NONE; nr * len];
-        rc[..nr].iter().enumerate().for_each(|(r, x)| x.0.iter().enumerate().for_each(|(c, &a)| m[c * nr + r] = a));
-        let t2 = std::time::Instant::now();
+        let t1 = Instant::now();
+        let lay = layout(&b).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((lay.acc, lay.len), (acc, len));
+        let nr = lay.reps; // the first stage sees representatives only
+        let reps: Vec<Row> = par_map(nr, if nr < 4096 { 1 } else { threads }, |r| {
+            let x = lay.rep(r).and_then(|x| x.walk(len, |_, _| {}).map(|_| x));
+            x.unwrap_or_else(|e| panic!("PF{acc:05} {e}"))
+        });
+        let bits = &lay.part[0];
+        // the representatives' residues by column, each row written by one thread
+        // the representatives' residues by column (the first stage) and by row (the column scores), each row written
+        // by one thread
+        let (mut m, mut rm) = (vec![NONE; nr * len], vec![NONE; nr * len]);
+        let (mp, rp) = (Shared(m.as_mut_ptr()), Shared(rm.as_mut_ptr()));
+        parallel(nr.div_ceil(4096), threads.min(nr.div_ceil(4096)), |t| {
+            let (mp, rp) = (&mp, &rp);
+            for (r, x) in reps.iter().enumerate().skip(t * 4096).take(4096) {
+                // SAFETY: walk checked the columns (c < len), and row r is this thread's only
+                x.walk(len, |c, p| unsafe {
+                    *mp.0.add(c * nr + r) = x.seq[p];
+                    *rp.0.add(r * len + c) = x.seq[p];
+                }).unwrap();
+            }
+        });
+        // a cluster's members and their residues by column, decoded when a read first keeps the cluster
+        let members: Vec<OnceLock<(Vec<Row>, Vec<u8>)>> = (0..lay.clusters.len()).map(|_| OnceLock::new()).collect();
+        let cluster = |k: usize| -> &(Vec<Row>, Vec<u8>) {
+            members[k].get_or_init(|| {
+                let t = Instant::now();
+                let x = lay.members(k, &reps).unwrap_or_else(|e| panic!("{e}"));
+                let mut codes = vec![NONE; x.len() * len];
+                for (r, ch) in x.iter().zip(codes.chunks_mut(len)) {
+                    r.walk(len, |c, p| ch[c] = r.seq[p]).unwrap_or_else(|e| panic!("PF{acc:05} {e}"));
+                }
+                cpu[1].fetch_add(ns(t), Relaxed);
+                (x, codes)
+            })
+        };
+        let member = |j: usize| -> &Row {
+            let k = lay.clusters.partition_point(|c| c.first + c.n <= j);
+            &cluster(k).0[j - lay.clusters[k].first]
+        };
+        let row_of = |r: usize| if r < nr { &reps[r] } else { member(r - nr) };
+        let t2 = Instant::now();
         let lines = Mutex::new(vec![]);
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        let next = AtomicUsize::new(0);
         parallel(threads, threads, |_| {
-            let (mut s, mut buf, mut mine) = (vec![0u16; nr], vec![], vec![]);
+            let (mut buf, mut mine, mut x, mut tp) = (vec![], vec![], vec![NONE; len], vec![0u16; len]);
             loop {
-                let Some(q) = qs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else { break };
-                let (row, pos) = q.columns(len).unwrap_or_else(|e| panic!("PF{acc:05}, read {e}: another Pfam release?"));
-                let cols: Vec<usize> = (0..len).filter(|&c| row[c] < 20).collect();
-                let cw: Vec<(&[u8], u8, u16)> = cols.iter()
-                    .map(|&c| (&m[c * nr..(c + 1) * nr], row[c], bk.bits[20 * c + row[c] as usize] as u16)).collect();
-                score_rows(&cw, &mut s);
-                let lo = bar(&s, k.min(nr));
-                let mut keep: Vec<usize> = (0..nr).filter(|&r| s[r] >= lo).collect();
-                if !mclusters.is_empty() {
-                    let mut us: Vec<u64> = keep.iter().map(|&r| bk.rows[r].acc).collect();
-                    us.sort_unstable();
-                    us.dedup();
-                    for u in us {
-                        let (a, e) = (mclusters.partition_point(|&x| x < u), mclusters.partition_point(|&x| x <= u));
-                        keep.extend(nr + a..nr + e);
+                let lo = next.fetch_add(BATCH, Relaxed);
+                let Some(batch) = qs.get(lo..(lo + BATCH).min(qs.len())) else { break };
+                if batch.is_empty() {
+                    break;
+                }
+                let t = Instant::now();
+                let rp: Vec<(Vec<u8>, Vec<u16>)> = batch.iter()
+                    .map(|q| q.columns(len).unwrap_or_else(|e| panic!("PF{acc:05}, read {e}: another Pfam release?"))).collect();
+                let cws: Vec<Vec<(usize, u8, u16)>> = rp.iter()
+                    .map(|(row, _)| (0..len).filter(|&c| row[c] < 20).map(|c| (c, row[c], bits[20 * c + row[c] as usize] as u16)).collect())
+                    .collect();
+                let kept = scan_batch(&m, nr, &cws, k.clamp(1, nr.max(1)));
+                cpu[0].fetch_add(ns(t), Relaxed);
+                for ((q, (row, pos)), keep) in batch.iter().zip(&rp).zip(kept) {
+                    let t = Instant::now();
+                    let cols: Vec<usize> = (0..len).filter(|&c| row[c] < 20).collect();
+                    let col_score = |x: &[u8]| kadane(cols.iter().map(|&c| if x[c] < 21 { bl[row[c] as usize][x[c] as usize] } else { -4 }));
+                    // (column score, row): representatives, then the members of their clusters, a cluster at a time
+                    let (c0, c1) = (cols.first().copied().unwrap_or(0), cols.last().copied().unwrap_or(0));
+                    let mut v: Vec<(i16, usize)> = keep.iter().enumerate().map(|(i, &r)| {
+                        if let Some(&n) = keep.get(i + AHEAD) {
+                            prefetch(rm[n as usize * len + c0..].as_ptr());
+                            prefetch(rm[n as usize * len + c1..].as_ptr());
+                        }
+                        (col_score(&rm[r as usize * len..(r as usize + 1) * len]), r as usize)
+                    }).collect();
+                    let mut members_t = 0;
+                    if !lay.clusters.is_empty() {
+                        let mut us: Vec<u64> = keep.iter().map(|&r| reps[r as usize].acc).collect();
+                        us.sort_unstable();
+                        us.dedup();
+                        for u in us {
+                            if let Ok(k) = lay.clusters.binary_search_by_key(&u, |c| c.acc) {
+                                let tm = Instant::now();
+                                let codes = &cluster(k).1;
+                                members_t += ns(tm);
+                                let first = nr + lay.clusters[k].first;
+                                v.extend(codes.chunks(len).enumerate().map(|(t, x)| (col_score(x), first + t)));
+                            }
+                        }
                     }
-                }
-                let mut v: Vec<(i16, usize)> = keep.into_iter().map(|r| {
-                    let x = &rc[r].0;
-                    (kadane(cols.iter().map(|&c| if x[c] < 21 { bl[row[c] as usize][x[c] as usize] } else { -4 })), r)
-                }).collect();
-                v.sort_unstable_by(|a, b| b.cmp(a));
-                let cut = v.get(second.min(v.len()).saturating_sub(1)).map_or(0, |x| x.0);
-                let mut best: (i16, Vec<usize>) = (0, vec![]);
-                for &(_, r) in v.iter().take_while(|x| x.0 >= cut) {
-                    let (x, tp) = &rc[r];
-                    let mut d: Vec<i32> = cols.iter().filter(|&&c| x[c] == row[c]).map(|&c| tp[c] as i32 - pos[c] as i32).collect();
-                    d.sort_unstable();
-                    let Some(&d) = d.get(d.len() / 2) else { continue };
-                    let tt = &bk.rows[r].seq;
-                    let a = (d - 8).clamp(0, tt.len() as i32);
-                    let e = (q.seq.len() as i32 + d + 8).clamp(a, tt.len() as i32);
-                    let sc = sw::score(&q.seq, &tt[a as usize..e as usize], &bl, Some((d - 8 - a, d + 8 - a)), &mut buf);
-                    if sc > best.0 {
-                        best = (sc, vec![r]);
-                    } else if sc == best.0 && sc > 0 {
-                        best.1.push(r);
+                    rows[0].fetch_add(1, Relaxed);
+                    rows[1].fetch_add(v.len() as u64, Relaxed);
+                    v.sort_unstable_by(|a, b| b.cmp(a));
+                    let mut cut = v.get(second.min(v.len()).saturating_sub(1)).map_or(0, |x| x.0);
+                    if margin > 0 {
+                        cut = cut.max(v.first().map_or(0, |x| x.0).saturating_sub(margin));
                     }
+                    rows[2].fetch_add(v.iter().take_while(|x| x.0 >= cut).count() as u64, Relaxed);
+                    cpu[2].fetch_add(ns(t).saturating_sub(members_t), Relaxed);
+                    let t = Instant::now();
+                    let mut best: (i16, Vec<usize>) = (0, vec![]);
+                    for &(_, r) in v.iter().take_while(|x| x.0 >= cut) {
+                        let rw = row_of(r);
+                        rw.columns_into(&mut x, &mut tp).unwrap();
+                        let mut d: Vec<i32> = cols.iter().filter(|&&c| x[c] == row[c]).map(|&c| tp[c] as i32 - pos[c] as i32).collect();
+                        d.sort_unstable();
+                        let Some(&d) = d.get(d.len() / 2) else { continue };
+                        let tt = &rw.seq;
+                        let a = (d - 8).clamp(0, tt.len() as i32);
+                        let e = (q.seq.len() as i32 + d + 8).clamp(a, tt.len() as i32);
+                        let sc = sw::score(&q.seq, &tt[a as usize..e as usize], &bl, Some((d - 8 - a, d + 8 - a)), &mut buf);
+                        if sc > best.0 {
+                            best = (sc, vec![r]);
+                        } else if sc == best.0 && sc > 0 {
+                            best.1.push(r);
+                        }
+                    }
+                    cpu[3].fetch_add(ns(t), Relaxed);
+                    let own: i32 = q.seq.iter().filter(|&&a| a < 20).map(|&a| bl[a as usize][a as usize] as i32).sum();
+                    let mut tied: Vec<u64> = best.1.iter().map(|&r| row_of(r).unit()).collect();
+                    tied.sort_unstable_by_key(|&u| (hash(u), u)); // the cluster named is any of the tied, always the same
+                    tied.dedup();
+                    let mut l = format!("{}\t{}\t{own}\t{}\t{}", q.acc, best.0, tied.len(), tied.first().map_or(0, |&u| u));
+                    for sch in 0..if lay.n > 0 { lay.schemes } else { 0 } {
+                        let mut c: std::collections::BTreeMap<u16, usize> = Default::default();
+                        best.1.iter().for_each(|&r| *c.entry(row_of(r).labels[sch]).or_default() += 1);
+                        // commonest; a label before none, then the lower number, on a tie
+                        let top = c.iter().max_by_key(|(&x, &n)| (n, x > 0, std::cmp::Reverse(x))).map_or(0, |x| *x.0);
+                        write!(l, "\t{top}").unwrap();
+                    }
+                    mine.push((q.acc, l));
                 }
-                let own: i32 = q.seq.iter().filter(|&&a| a < 20).map(|&a| bl[a as usize][a as usize] as i32).sum();
-                let mut tied: Vec<u64> = best.1.iter().map(|&r| bk.rows[r].unit()).collect();
-                tied.sort_unstable_by_key(|&u| (hash(u), u)); // the cluster named is any of the tied, always the same
-                tied.dedup();
-                let mut l = format!("{}\t{}\t{own}\t{}\t{}", q.acc, best.0, tied.len(), tied.first().map_or(0, |&u| u));
-                for sch in 0..bk.rows.first().map_or(0, |r| r.labels.len()) {
-                    let mut c: std::collections::BTreeMap<u16, usize> = Default::default();
-                    best.1.iter().for_each(|&r| *c.entry(bk.rows[r].labels[sch]).or_default() += 1);
-                    // commonest; a label before none, then the lower number, on a tie
-                    let top = c.iter().max_by_key(|(&x, &n)| (n, x > 0, std::cmp::Reverse(x))).map_or(0, |x| *x.0);
-                    write!(l, "\t{top}").unwrap();
-                }
-                mine.push((q.acc, l));
             }
             lines.lock().unwrap().extend(mine);
         });
@@ -602,7 +831,11 @@ pub fn query(dir: &Path, queries: &Path, out: &Path, k: usize, second: usize, th
         t_search += t2.elapsed().as_secs_f64();
     }
     std::fs::write(out, o).unwrap();
-    eprintln!("read {t_read:.2} s, decode {t_decode:.2} s, search {t_search:.2} s on {threads} threads");
+    let c: Vec<f64> = cpu.iter().map(|x| x.load(Relaxed) as f64 / 1e9).collect();
+    let r: Vec<f64> = rows.iter().map(|x| x.load(Relaxed) as f64).collect();
+    eprintln!("read {t_read:.2} s, decode {t_decode:.2} s, search {t_search:.2} s on {threads} threads; \
+               search CPU: first stage {:.1} s, members {:.1} s, columns {:.1} s, banded {:.1} s; \
+               rows a read: {:.0} to the column score, {:.0} to the banded", c[0], c[1], c[2], c[3], r[1] / r[0].max(1.0), r[2] / r[0].max(1.0));
 }
 
 #[cfg(test)]

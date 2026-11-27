@@ -19,6 +19,10 @@
 #   reads, by family size), size.tsv (bytes the family needs), scan*.times.tsv (core-seconds by stage).
 # Estimates, not measured: prepare 2-8 h (streaming), align 5-10 CPU-h in all, truth about 40-80 CPU-h for PF00005,
 #   scan 2-6 CPU-h; 60 GB of disk in PF<family>/ and 64 GB of memory at most.
+# CONFIGS: the scan's K:SECOND[:MARGIN] list; MARGIN sends the banded score only rows within that of the read's best
+#   column score. After a finished run, the margins alone (FAMILY as before):
+#   KFP_RUN_DIR=$PWD CONFIGS=2000:1000,2000:1000:40,2000:1000:60 sbatch --cpus-per-task=16 --mem=64G --time=12:00:00 --export=ALL run.sh scan
+#   then ./run.sh report: report.tsv and report_by_library.tsv have a margin column.
 # Re-running a step skips what it has finished. Needs the repo's venv (setup.sh) and singularity, and cargo or else the Rust image, pulled once by prepare.
 set -Eeuo pipefail   # -E: the ERR trap fires inside functions too
 trap 'echo "failed at line $LINENO: $BASH_COMMAND" >&2' ERR

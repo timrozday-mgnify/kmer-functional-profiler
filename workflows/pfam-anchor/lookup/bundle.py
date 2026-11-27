@@ -5,7 +5,7 @@
                     [--kfpfam-index X.tidx --kfpfam-prep DIR] [--mgnify 2026_07] [--pfam 37.4]
   bundle.py verify  DIR            every file's SHA-256
   bundle.py profile --bundle DIR --parquet SAMPLE_pfam_alignments.parquet... --out PREFIX
-                    [--floor 0.4] [--hmm Pfam-A.hmm]
+                    [--floor 0.4] [--hmm Pfam-A.hmm] [--k 2000] [--second 1000] [--margin 0]
 
 A bundle:
   manifest.json   format, releases, flank, collapse, schemes, and each file's bytes and SHA-256
@@ -467,7 +467,7 @@ def profile(a: argparse.Namespace) -> None:
                 f.write(record(qid, hf, 0, 0, cg, seq))
     calls = Path(f"{a.out}.calls.tsv")
     r = subprocess.run(
-        [LOOKUP, "bundle-query", a.bundle, tmp, calls, str(a.k), str(a.second)],
+        [LOOKUP, "bundle-query", a.bundle, tmp, calls, str(a.k), str(a.second), str(a.margin)],
         env={**os.environ, "THREADS": str(a.threads)},
     )
     if r.returncode:
@@ -587,6 +587,13 @@ def main() -> None:
     q.add_argument("--hmm", type=Path, help="the models the Parquets were aligned to, to check")
     q.add_argument("--k", type=int, default=2000, help="rows the scan keeps (REPORT.md)")
     q.add_argument("--second", type=int, default=1000, help="of those, rows to the banded score")
+    q.add_argument(
+        "--margin",
+        type=int,
+        default=0,
+        help="and of those, only rows within this of the best column score (BLOSUM62); 0 for none. "
+        "40 kept every real read's score on the slice, with 6.5x fewer rows (REPORT.md)",
+    )
     q.add_argument("--threads", type=int, default=4)
     a = p.parse_args()
     a.run(a)

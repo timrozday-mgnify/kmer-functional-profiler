@@ -37,18 +37,23 @@ fn main() {
             let o: Vec<&str> = a[4..].iter().map(|x| &x[..]).collect();
             follow::run(dir, &o, Path::new(&a[3]), threads, &arms)
         }
-        // scan DIR OUT.tsv K:SECOND[,K:SECOND...] [SUB,SUB...]: the method end to end. THREADS (1 for timing), LIMIT, WEAK=1, FLANK, MEMBERS=1
+        // scan DIR OUT.tsv K:SECOND[:MARGIN][,...] [SUB,SUB...]: the method end to end. THREADS (1 for timing), LIMIT, WEAK=1, FLANK, MEMBERS=1
         "scan" => {
-            let pair = |x: &str| x.split_once(':').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
-            let configs: Vec<(usize, usize)> = a[4].split(',').map(pair).collect();
+            // K:SECOND[:MARGIN]
+            let pair = |x: &str| {
+                let v: Vec<&str> = x.split(':').collect();
+                (v[0].parse().unwrap(), v[1].parse().unwrap(), v.get(2).map_or(0, |m| m.parse().unwrap()))
+            };
+            let configs: Vec<(usize, usize, i16)> = a[4].split(',').map(pair).collect();
             let subs: Vec<u32> = a.get(5).map_or(vec![0], |x| x.split(',').map(|y| y.parse().unwrap()).collect());
             let limit = std::env::var("LIMIT").map_or(0, |x| x.parse().unwrap());
             scan::run(dir, Path::new(&a[3]), &configs, &subs, threads, limit, std::env::var("WEAK").is_ok(), std::env::var("FLANK").ok().map(|x| x.parse().unwrap()), std::env::var("MEMBERS").is_ok_and(|x| x == "1"))
         }
         // bundle-build OUT_DIR T < rows
         "bundle-build" => bundle::build(dir, a[3].parse().unwrap()),
-        // bundle-query DIR QUERIES OUT K SECOND
-        "bundle-query" => bundle::query(dir, Path::new(&a[3]), Path::new(&a[4]), a[5].parse().unwrap(), a[6].parse().unwrap(), threads),
+        // bundle-query DIR QUERIES OUT K SECOND [MARGIN]
+        "bundle-query" => bundle::query(dir, Path::new(&a[3]), Path::new(&a[4]), a[5].parse().unwrap(), a[6].parse().unwrap(),
+                                        a.get(7).map_or(0, |x| x.parse().unwrap()), threads),
         "truthsub" => large::truthsub(dir, threads), // truthsub DIR
         // pick IDS.u64 OUT_PREFIX CHUNKS < FASTA
         "pick" => large::pick(dir, &a[3], a[4].parse().unwrap()),

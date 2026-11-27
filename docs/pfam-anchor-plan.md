@@ -885,3 +885,10 @@ Every shape is above .998 at 90% identity, so the choice only matters for reads 
   as a collection (`COLLECTION=weefams`); the raw-reads pipeline's `hpc/pfam-arms` has `weefams_setup.sh` (top's index)
   and the arms `kfpfam_top_weefams` and `current_weefams`.
 - 2026-11-27: **mapping every read to the lookup's proteins**, at the user's request: options and seed sizing in the section of that name. Step 1 built: `mapref.py` (`check` passes; `ref` and `measure` checked on the test store with made-up lookup calls and DIAMOND lines) and `hpc/kfp-ablations/lookup-map/run.sh` (`bash -n` only: not run, as DIAMOND isn't on the laptop and the lookup has not run at scale). It needs a sample's lookup calls (`lookup-profile`) and its ENA run.
+- 2026-11-27: **lookup query speed** (the user's request, after Codon's 38.1 PFAM_LOOKUP took 1.7–5.7 h a library: decode a
+  fixed ~45 min, then 6–9 ms of CPU an alignment). `bundle-query`: a layout pass, representatives decoded in parallel,
+  members only for kept clusters; `--margin` (pipeline default 40) for the banded score; the first stage in batches; stage
+  timers and rows a read in the log line. Same calls as before at the same settings (heldout bundle with members, a
+  synthetic bundle of large families); margin 40 kept every real read's score on the slice with 6.5x fewer banded rows.
+  Details: `workflows/pfam-anchor/lookup/REPORT.md`, "Query speed". Pending: margins on PF00005 (pfam-anchor-large), the
+  rebuilt kfp-lookup image, and Codon's timings.

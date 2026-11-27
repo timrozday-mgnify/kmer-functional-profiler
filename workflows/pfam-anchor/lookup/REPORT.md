@@ -268,6 +268,52 @@ column and banded stages, scored like a representative, and the best cluster is 
   once, a member whose representative has no row is left out, and `--clusters` with collapsing is refused.
 - **Not yet run:** the check on all 40 families (about 1 GB of disk, which the laptop did not have).
 
+## Query speed (2026-11-27)
+
+Codon's 38.1 run (`PFAM_LOOKUP`, 8 threads, 11 B11 libraries at full depth, K 2000, SECOND 1000) took 1.7–5.7 h a library:
+decode 2,530–2,780 s whatever the library (the whole bundle, on one thread, members and all), then 6–9 ms of CPU an
+alignment, of which most is the banded score of up to 1,000 rows. Three changes to `bundle-query`, none to the bundle's
+format:
+
+- **Decoding.** A pass over each block finds where every row is without decoding it (`layout`). Representatives are then
+  decoded in parallel, and a cluster's members only when a read keeps the cluster, once, shared by the threads. The rows'
+  columns are held once by column (the first stage) and once by row (the column scores) for representatives, and for a
+  decoded cluster's members, not three bytes a column for every row as before.
+- **Margin (`--margin`, pipeline `pfam_lookup_margin`).** Of the SECOND best rows by column score, only those within
+  MARGIN of the read's best go to the banded score. On the slice (3,399 real, 3,380 simulated read domains, exhaustive
+  truth, FLANK 10):
+
+  | K:SECOND | Margin | Rows to the banded score | Banded µs a read | Real: right | Real reads scoring lower | Simulated scoring lower |
+  |---|---|---|---|---|---|---|
+  | 2000:1000 | none | 1,030 | 2,234 | .9994 | (baseline) | (baseline) |
+  | 2000:1000 | 20 | 60 | 126 | .9976 | 7 | 13 |
+  | 2000:1000 | 30 | 103 | 216 | .9988 | 2 | 4 |
+  | 2000:1000 | **40** | 158 | 332 | .9994 | 0 | 1 |
+  | 2000:1000 | 60 | 303 | 626 | .9994 | 0 | 0 |
+  | 1000:1000 | 40 | 147 | 321 | .9994 | 0 | 1 |
+  | 500:500 | 40 | 110 | 244 | .9991 | 1 | 1 |
+
+  The pipeline's default is 40; `bundle.py`'s stays 0 (none). Not yet measured on PF00005, whose misses at 2000:1000 were
+  near ties: `hpc/kfp-ablations/pfam-anchor-large/run.sh` has the command (CONFIGS with margins; report.tsv has a margin
+  column). K 1000 halves the column stage and kept every real read here, but is left at 2000 until PF00005 says so.
+- **First stage in batches (`scan_batch`).** 16 reads at a time over tiles of 4,096 rows, each read keeping only rows at or
+  over the bar of the rows seen so far (raised as rows come), so no read holds a score per row. Here, on an M4 whose
+  memory bandwidth is not the limit, it is as fast as one read at a time (2.09 against 2.08 ns a row on one thread, 2.21
+  against 2.31 on four). The gain sought is Codon's, where 16 threads ran at 3.14 ns a row against 1.48 on one (PF00005).
+  The new timers will show it.
+- **Column scores** read rows 16 ahead (prefetch): about 25% off that stage on the synthetic bundle.
+
+**Checks.** The calls (score, ties, protein) are identical to the previous binary's, alignment for alignment:
+the heldout bundle rebuilt with members (26,456 representative and 50,859 member rows, 11,996 real alignments; K:SECOND
+2000:1000, 50:20 and 5:3), and a synthetic bundle of two families of 200,000 representatives and 399,476 members (30,000
+reads, 2000:1000, and margins 40 and 60, which happen to change no call there). `cargo test` (the batched first stage
+against one read at a time for several K, ties and u16 wrapping), `test_bundle.py`, and `PFAM_LOOKUP`'s real-command test.
+
+**Timing, synthetic bundle, M4, 4 threads** (the old binary, then the new): decode 0.74 → 0.11 s; search 27.3 → 28.3 s at
+2000:1000 (the same work), and 9.9 s at margin 40. Search CPU at margin 40: first stage 14.3 s, members 1.1, columns 20.6,
+banded 0.3; 4,235 rows a read take a column score (the top K and their members), 4 the banded one. The log line now gives
+these stages and rows on every run.
+
 ## Uncertainties, and what I could not test
 
 1. **Family size.** The tests stop at 58,000 rows per family; the median read domain lands at 0.27 M and the mean at 0.77 M, against a mean of 16,000 here: 17× and 47×, and 860× at the largest (14 M). Over a 16× range of N (1/16 subsamples), top-100 recall did not fall (.9991, .9982, .9985), and within-20-bits

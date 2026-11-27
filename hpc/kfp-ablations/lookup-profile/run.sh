@@ -15,7 +15,7 @@
 #   PARQUETS  a glob, quoted, or a list: one arm's alignments, a file per sample
 #   BUNDLE=../lookup-index/results/bundle    OUT=results
 #   SIF       ../images/kfp-lookup.{tar,sif} by default
-#   FLOOR=0.4 K=2000 SECOND=1000             bundle.py's settings
+#   FLOOR=0.4 K=2000 SECOND=1000 MARGIN=40   bundle.py's settings, as the pipeline's PFAM_LOOKUP (MARGIN=0: none)
 #   MEM=128G  if the largest family does not fit: the index holds one family at a time (PF00005 30-40 GB, estimated)
 #   DRY_RUN=1 lists the samples and submits nothing
 # Read, in OUT:
@@ -51,4 +51,4 @@ out=$(realpath "$OUT")
 singularity exec --bind "$BUNDLE" --bind "$(dirname "$HMM")" --bind "$(dirname "$parquet")" --bind "$out" "$SIF" \
     python3 /opt/lookup/bundle.py profile --bundle "$BUNDLE" --hmm "$HMM" --parquet "$parquet" \
     --out "$out/${sample}_pfam_lookup" --threads "${SLURM_CPUS_PER_TASK:-8}" \
-    --floor "${FLOOR:-0.4}" --k "${K:-2000}" --second "${SECOND:-1000}"
+    --floor "${FLOOR:-0.4}" --k "${K:-2000}" --second "${SECOND:-1000}" --margin "${MARGIN:-40}"

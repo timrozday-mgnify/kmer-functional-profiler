@@ -167,6 +167,14 @@ pub fn family_units(fams: &[Family], arms: &[&Rows]) -> Vec<Vec<u32>> {
 }
 
 /// Run `f(i)` for i in 0..n on `threads` threads, in any order.
+/// `f(0..n)` in order, computed on `threads` threads.
+pub fn par_map<T: Send>(n: usize, threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let chunk = n.div_ceil(threads.max(1) * 8).max(1);
+    let parts: Vec<std::sync::Mutex<Vec<T>>> = (0..n.div_ceil(chunk)).map(|_| Default::default()).collect();
+    parallel(parts.len(), threads, |p| *parts[p].lock().unwrap() = (p * chunk..((p + 1) * chunk).min(n)).map(&f).collect());
+    parts.into_iter().flat_map(|x| x.into_inner().unwrap()).collect()
+}
+
 pub fn parallel(n: usize, threads: usize, f: impl Fn(usize) + Sync) {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {

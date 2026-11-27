@@ -220,6 +220,8 @@ def report(a: argparse.Namespace) -> None:
     s = pl.read_csv(a.out / "scan.tsv", separator="\t", schema_overrides={"units": pl.String}).join(
         t, on=["sub", "qid"]
     )
+    if "margin" not in s.columns:  # scan.tsv from before margins
+        s = s.with_columns(margin=pl.lit(0))
     bad = s.filter(pl.col("score") > pl.col("best")).height
     if bad:
         sys.exit(f"{bad} calls score above the exhaustive best: truth and scan disagree")
@@ -234,15 +236,15 @@ def report(a: argparse.Namespace) -> None:
     ]
     r = (
         s.filter(pl.col("set") == "real")
-        .group_by("sub", "k", "second")
+        .group_by("sub", "k", "second", "margin")
         .agg(by)
-        .sort("sub", "k", "second")
+        .sort("sub", "k", "second", "margin")
     )
     lib = (
         s.filter((pl.col("set") == "real") & (pl.col("sub") == 0))
-        .group_by("k", "second", "run")
+        .group_by("k", "second", "margin", "run")
         .agg(by)
-        .sort("k", "second", "run")
+        .sort("k", "second", "margin", "run")
     )
     r.write_csv(a.out / "report.tsv", separator="\t")
     lib.write_csv(a.out / "report_by_library.tsv", separator="\t")
@@ -273,7 +275,17 @@ def report(a: argparse.Namespace) -> None:
                 )
                 / pl.col("reads")
                 * 1e3,
-            ).select("sub", "k", "second", "threads", "rows", "scan_ns", "top_ns", "ms_a_read"),
+            ).select(
+                "sub",
+                "k",
+                "second",
+                *(["margin", "banded_rows"] if "margin" in x.columns else []),
+                "threads",
+                "rows",
+                "scan_ns",
+                "top_ns",
+                "ms_a_read",
+            ),
         )
 
 
